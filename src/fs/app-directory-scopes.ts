@@ -11,13 +11,6 @@ import {
 } from 'node:fs/promises';
 import path from 'node:path';
 import {StableIdSchema} from '../domain/schema-primitives';
-import {
-  createOutputStoreWithAuthority,
-  createRunStoreWithAuthority,
-  type OutputStore,
-  type RunStore,
-  type RunStoreOptions,
-} from '../pipeline/run-store';
 
 const O_NOFOLLOW_ANY = 0x20000000;
 
@@ -473,7 +466,7 @@ const openNewScopedFile = async (
   }
 };
 
-export const openExistingWorkFile = async (
+const openExistingWorkFile = async (
   scope: WorkDirectoryScope,
   relativePath: string,
 ): Promise<FileHandle> => await openExistingScopedFile(
@@ -481,7 +474,7 @@ export const openExistingWorkFile = async (
   relativePath,
 );
 
-export const openNewWorkFile = async (
+const openNewWorkFile = async (
   scope: WorkDirectoryScope,
   relativePath: string,
 ): Promise<FileHandle> => await openNewScopedFile(
@@ -635,7 +628,7 @@ const syncScopedDirectory = async (
   }
 };
 
-export const inspectWorkEntry = async (
+const inspectWorkEntry = async (
   scope: WorkDirectoryScope,
   relativePath: string,
 ): Promise<AppDirectoryEntryKind> => await inspectScopedEntry(
@@ -651,7 +644,7 @@ const inspectOutputEntry = async (
   relativePath,
 );
 
-export const unlinkWorkFile = async (
+const unlinkWorkFile = async (
   scope: WorkDirectoryScope,
   relativePath: string,
 ): Promise<void> => await unlinkScopedFile(
@@ -723,61 +716,489 @@ const syncOutputDirectory = async (
   relativePath,
 );
 
+const PROJECT_LOCK_PATH = 'pipeline.lock';
+
+export const inspectProjectLockFile = async (
+  scope: WorkDirectoryScope,
+): Promise<AppDirectoryEntryKind> => await inspectWorkEntry(
+  scope,
+  PROJECT_LOCK_PATH,
+);
+
+export const openExistingProjectLockFile = async (
+  scope: WorkDirectoryScope,
+): Promise<FileHandle> => await openExistingWorkFile(scope, PROJECT_LOCK_PATH);
+
+export const openNewProjectLockFile = async (
+  scope: WorkDirectoryScope,
+): Promise<FileHandle> => await openNewWorkFile(scope, PROJECT_LOCK_PATH);
+
+export const unlinkProjectLockFile = async (
+  scope: WorkDirectoryScope,
+): Promise<void> => await unlinkWorkFile(scope, PROJECT_LOCK_PATH);
+
+
+const CURRENT_PATH = 'current.json';
+const TEMP_PATH = 'current.json.tmp';
+const ROLLBACK_PATH = 'current.json.rollback';
+
+const STAGE_IDS = [
+  'preflight',
+  'ingest',
+  'narration',
+  'compile',
+  'draft',
+  'review',
+  'release',
+] as const;
+const PRESETS = ['assets', 'draft', 'release'] as const;
+const POINTER_STATES = ['passed', 'needs_review'] as const;
+
+export type StageId = typeof STAGE_IDS[number];
+export type PipelinePreset = typeof PRESETS[number];
+export type CurrentPointerState = typeof POINTER_STATES[number];
+
+export interface CurrentPointer {
+  runId: string;
+  relativePath: string;
+  preset: PipelinePreset;
+  stageIds: StageId[];
+  completedStage: StageId;
+  state: CurrentPointerState;
+  publishedAt: string;
+}
+
+export type RunStoreErrorCode =
+  | 'RUN_POINTER_INVALID'
+  | 'RUN_POINTER_UNSAFE'
+  | 'RUN_POINTER_TEMP_EXISTS'
+  | 'RUN_POINTER_ROLLBACK_FAILED';
+
+export class RunStoreError extends Error {
+  constructor(
+    readonly code: RunStoreErrorCode,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = 'RunStoreError';
+  }
+}
+
+export type FileOpsPhase = 'publish';
+
+export interface FileOps {
+  writeFile(handle: FileHandle, data: string): Promise<void>;
+  syncFile(handle: FileHandle): Promise<void>;
+  rename(operation: () => Promise<void>, phase: FileOpsPhase): Promise<void>;
+  syncDirectory(
+    operation: () => Promise<void>,
+    phase: FileOpsPhase,
+  ): Promise<void>;
+}
+
+export interface RunStoreOptions {
+  readonly fileOps?: Partial<FileOps>;
+}
+
+interface PointerScopeAuthority<Scope> {
+  inspect(scope: Scope, relativePath: string): Promise<AppDirectoryEntryKind>;
+  openExisting(scope: Scope, relativePath: string): Promise<FileHandle>;
+  openNew(scope: Scope, relativePath: string): Promise<FileHandle>;
+  unlink(scope: Scope, relativePath: string): Promise<void>;
+  rename(
+    scope: Scope,
+    sourceRelativePath: string,
+    targetRelativePath: string,
+  ): Promise<void>;
+  link(
+    scope: Scope,
+    sourceRelativePath: string,
+    targetRelativePath: string,
+  ): Promise<void>;
+  syncDirectory(scope: Scope, relativePath?: string): Promise<void>;
+}
+
+const DEFAULT_FILE_OPS: FileOps = {
+  writeFile: async (handle, data) => await handle.writeFile(data),
+  syncFile: async (handle) => await handle.sync(),
+  rename: async (operation) => await operation(),
+  syncDirectory: async (operation) => await operation(),
+};
+
+const mergeFileOps = (options: RunStoreOptions): FileOps => ({
+  ...DEFAULT_FILE_OPS,
+  ...options.fileOps,
+});
+
+const isExactObject = (
+  value: unknown,
+  expectedKeys: readonly string[],
+): value is Record<string, unknown> => value !== null
+  && typeof value === 'object'
+  && !Array.isArray(value)
+  && Object.keys(value).sort().join('\0') === [...expectedKeys].sort().join('\0');
+
+const isOneOf = <Value extends string>(
+  value: unknown,
+  allowed: readonly Value[],
+): value is Value => typeof value === 'string' && allowed.includes(value as Value);
+
+const invalidPointer = (message: string, cause?: unknown): never => {
+  throw new RunStoreError(
+    'RUN_POINTER_INVALID',
+    message,
+    cause === undefined ? undefined : {cause},
+  );
+};
+
+const validatePointer = (
+  value: unknown,
+  owner: 'work' | 'output',
+): CurrentPointer => {
+  const keys = [
+    'runId',
+    'relativePath',
+    'preset',
+    'stageIds',
+    'completedStage',
+    'state',
+    'publishedAt',
+  ] as const;
+  if (!isExactObject(value, keys)) {
+    return invalidPointer('current pointer shape is invalid');
+  }
+
+  let runId: string;
+  try {
+    runId = StableIdSchema.parse(value.runId);
+  } catch (error) {
+    return invalidPointer('current pointer runId is invalid', error);
+  }
+  if (typeof value.relativePath !== 'string') {
+    return invalidPointer('current pointer relativePath is invalid');
+  }
+  const expectedPath = owner === 'work' ? `runs/${runId}` : `releases/${runId}`;
+  if (value.relativePath !== expectedPath) {
+    return invalidPointer(`current pointer must target ${expectedPath}`);
+  }
+  if (!isOneOf(value.preset, PRESETS)) {
+    return invalidPointer('current pointer preset is invalid');
+  }
+  if (!Array.isArray(value.stageIds) || value.stageIds.length === 0) {
+    return invalidPointer('current pointer stageIds must be a non-empty array');
+  }
+  const stageIds: StageId[] = [];
+  let previousIndex = -1;
+  for (const stageId of value.stageIds) {
+    if (!isOneOf(stageId, STAGE_IDS)) {
+      return invalidPointer('current pointer contains an invalid stageId');
+    }
+    const stageIndex = STAGE_IDS.indexOf(stageId);
+    if (stageIndex <= previousIndex) {
+      return invalidPointer('current pointer stageIds must be unique and ordered');
+    }
+    stageIds.push(stageId);
+    previousIndex = stageIndex;
+  }
+  if (!isOneOf(value.completedStage, STAGE_IDS)) {
+    return invalidPointer('current pointer completedStage is invalid');
+  }
+  if (!stageIds.includes(value.completedStage)) {
+    return invalidPointer('current pointer completedStage must be selected');
+  }
+  if (!isOneOf(value.state, POINTER_STATES)) {
+    return invalidPointer('current pointer state is invalid');
+  }
+  if (value.state === 'needs_review' && value.completedStage !== 'review') {
+    return invalidPointer('needs_review pointers must stop at review');
+  }
+  if (typeof value.publishedAt !== 'string') {
+    return invalidPointer('current pointer publishedAt is invalid');
+  }
+  const publishedAt = new Date(value.publishedAt);
+  if (
+    Number.isNaN(publishedAt.valueOf())
+    || publishedAt.toISOString() !== value.publishedAt
+  ) {
+    return invalidPointer('current pointer publishedAt must be canonical ISO time');
+  }
+  if (
+    owner === 'output'
+    && (
+      value.completedStage !== 'release'
+      || value.state !== 'passed'
+      || !stageIds.includes('release')
+    )
+  ) {
+    return invalidPointer('output current pointer requires a passed release');
+  }
+
+  return {
+    runId,
+    relativePath: value.relativePath,
+    preset: value.preset,
+    stageIds,
+    completedStage: value.completedStage,
+    state: value.state,
+    publishedAt: value.publishedAt,
+  };
+};
+
+const parsePointer = (
+  raw: string,
+  owner: 'work' | 'output',
+): CurrentPointer => {
+  try {
+    return validatePointer(JSON.parse(raw), owner);
+  } catch (error) {
+    if (error instanceof RunStoreError) throw error;
+    return invalidPointer('current pointer is not valid JSON', error);
+  }
+};
+
+const serializePointer = (pointer: CurrentPointer): string =>
+  `${JSON.stringify(pointer, null, 2)}\n`;
+
+const unsafePointer = (relativePath: string): never => {
+  throw new RunStoreError(
+    'RUN_POINTER_UNSAFE',
+    `pointer path must be absent or a regular file: ${relativePath}`,
+  );
+};
+
+const readPointerRaw = async <Scope>(
+  scope: Scope,
+  authority: PointerScopeAuthority<Scope>,
+): Promise<string | null> => {
+  const kind = await authority.inspect(scope, CURRENT_PATH);
+  if (kind === 'missing') return null;
+  if (kind !== 'file') return unsafePointer(CURRENT_PATH);
+  const handle = await authority.openExisting(scope, CURRENT_PATH);
+  try {
+    return await handle.readFile('utf8');
+  } finally {
+    await handle.close();
+  }
+};
+
+const assertScratchPathAbsent = async <Scope>(
+  scope: Scope,
+  authority: PointerScopeAuthority<Scope>,
+  relativePath: string,
+): Promise<void> => {
+  const kind = await authority.inspect(scope, relativePath);
+  if (kind === 'missing') return;
+  if (kind === 'symlink' || kind === 'directory' || kind === 'other') {
+    return unsafePointer(relativePath);
+  }
+  throw new RunStoreError(
+    'RUN_POINTER_TEMP_EXISTS',
+    `pointer scratch file already exists: ${relativePath}`,
+  );
+};
+
+const cleanupRegularFile = async <Scope>(
+  scope: Scope,
+  authority: PointerScopeAuthority<Scope>,
+  relativePath: string,
+): Promise<void> => {
+  const kind = await authority.inspect(scope, relativePath).catch(() => 'missing' as const);
+  if (kind === 'file') await authority.unlink(scope, relativePath).catch(() => undefined);
+};
+
+const publishPointer = async <Scope>(
+  scope: Scope,
+  authority: PointerScopeAuthority<Scope>,
+  pointer: CurrentPointer,
+  fileOps: FileOps,
+): Promise<void> => {
+  const oldRaw = await readPointerRaw(scope, authority);
+  await assertScratchPathAbsent(scope, authority, TEMP_PATH);
+  await assertScratchPathAbsent(scope, authority, ROLLBACK_PATH);
+
+  let tempHandle: FileHandle | undefined;
+  let tempCreated = false;
+  let backupCreated = false;
+  let published = false;
+  try {
+    if (oldRaw !== null) {
+      await authority.link(scope, CURRENT_PATH, ROLLBACK_PATH);
+      backupCreated = true;
+    }
+
+    tempHandle = await authority.openNew(scope, TEMP_PATH);
+    tempCreated = true;
+    await fileOps.writeFile(tempHandle, serializePointer(pointer));
+    await fileOps.syncFile(tempHandle);
+    await tempHandle.close();
+    tempHandle = undefined;
+
+    await fileOps.rename(
+      async () => {
+        await authority.rename(scope, TEMP_PATH, CURRENT_PATH);
+        tempCreated = false;
+        published = true;
+      },
+      'publish',
+    );
+    tempCreated = false;
+    published = true;
+    await fileOps.syncDirectory(
+      async () => await authority.syncDirectory(scope),
+      'publish',
+    );
+
+    if (backupCreated) {
+      await authority.unlink(scope, ROLLBACK_PATH);
+      backupCreated = false;
+    }
+  } catch (error) {
+    await tempHandle?.close().catch(() => undefined);
+    let rollbackError: unknown;
+    if (published) {
+      try {
+        if (oldRaw === null) {
+          await authority.unlink(scope, CURRENT_PATH);
+        } else {
+          if (!backupCreated) {
+            throw new Error('pointer rollback anchor is missing');
+          }
+          await authority.rename(scope, ROLLBACK_PATH, CURRENT_PATH);
+          backupCreated = false;
+        }
+        await authority.syncDirectory(scope);
+      } catch (caught) {
+        rollbackError = caught;
+      }
+    }
+    if (tempCreated) await cleanupRegularFile(scope, authority, TEMP_PATH);
+    if (backupCreated) await cleanupRegularFile(scope, authority, ROLLBACK_PATH);
+    if (rollbackError !== undefined) {
+      throw new RunStoreError(
+        'RUN_POINTER_ROLLBACK_FAILED',
+        'pointer publication failed and the old pointer could not be restored',
+        {cause: new AggregateError([error, rollbackError])},
+      );
+    }
+    throw error;
+  }
+};
+
+const WORK_POINTER_AUTHORITY: PointerScopeAuthority<WorkDirectoryScope> = {
+  inspect: inspectWorkEntry,
+  openExisting: openExistingWorkFile,
+  openNew: openNewWorkFile,
+  unlink: unlinkWorkFile,
+  rename: renameWorkFile,
+  link: linkWorkFile,
+  syncDirectory: syncWorkDirectory,
+};
+
+const OUTPUT_POINTER_AUTHORITY: PointerScopeAuthority<OutputDirectoryScope> = {
+  inspect: inspectOutputEntry,
+  openExisting: openExistingOutputFile,
+  openNew: openNewOutputFile,
+  unlink: unlinkOutputFile,
+  rename: renameOutputFile,
+  link: linkOutputFile,
+  syncDirectory: syncOutputDirectory,
+};
+
+export class RunStore {
+  readonly #workspaceRoot: string;
+  readonly #fileOps: FileOps;
+
+  constructor(workspaceRoot: string, options: RunStoreOptions = {}) {
+    this.#workspaceRoot = workspaceRoot;
+    this.#fileOps = mergeFileOps(options);
+    Object.freeze(this);
+  }
+
+  async createWork(projectId: string): Promise<WorkDirectoryScope> {
+    return await createWorkScope(this.#workspaceRoot, projectId);
+  }
+
+  async createRun(projectId: string, runId: string): Promise<RunDirectoryScope> {
+    return await mintRunScope(this.#workspaceRoot, projectId, runId, 'create');
+  }
+
+  async openExistingRun(
+    projectId: string,
+    runId: string,
+  ): Promise<RunDirectoryScope> {
+    return await mintRunScope(this.#workspaceRoot, projectId, runId, 'existing');
+  }
+
+  async readCurrent(projectId: string): Promise<CurrentPointer | null> {
+    const work = await createWorkScope(this.#workspaceRoot, projectId);
+    const raw = await readPointerRaw(work, WORK_POINTER_AUTHORITY);
+    return raw === null ? null : parsePointer(raw, 'work');
+  }
+
+  async publishCurrent(
+    projectId: string,
+    value: CurrentPointer,
+  ): Promise<void> {
+    const pointer = validatePointer(value, 'work');
+    await mintRunScope(this.#workspaceRoot, projectId, pointer.runId, 'existing');
+    const work = await createWorkScope(this.#workspaceRoot, projectId);
+    await publishPointer(work, WORK_POINTER_AUTHORITY, pointer, this.#fileOps);
+  }
+}
+
+export class OutputStore {
+  readonly #workspaceRoot: string;
+  readonly #fileOps: FileOps;
+
+  constructor(workspaceRoot: string, options: RunStoreOptions = {}) {
+    this.#workspaceRoot = workspaceRoot;
+    this.#fileOps = mergeFileOps(options);
+    Object.freeze(this);
+  }
+
+  async openProject(projectId: string): Promise<OutputDirectoryScope> {
+    return await mintOutputScope(this.#workspaceRoot, projectId);
+  }
+
+  async createRelease(
+    projectId: string,
+    runId: string,
+  ): Promise<OutputDirectoryScope> {
+    const validatedRunId = StableIdSchema.parse(runId);
+    const scope = await mintOutputScope(this.#workspaceRoot, projectId);
+    const state = stateFor(outputStates, scope, 'OutputDirectoryScope');
+    await ensureScopedDirectory(state, 'releases');
+    await ensureScopedDirectory(state, `releases/${validatedRunId}`, true);
+    return scope;
+  }
+
+  async readCurrent(projectId: string): Promise<CurrentPointer | null> {
+    const output = await mintOutputScope(this.#workspaceRoot, projectId);
+    const raw = await readPointerRaw(output, OUTPUT_POINTER_AUTHORITY);
+    return raw === null ? null : parsePointer(raw, 'output');
+  }
+
+  async publishCurrent(
+    projectId: string,
+    value: CurrentPointer,
+  ): Promise<void> {
+    const pointer = validatePointer(value, 'output');
+    const output = await openOutputRelease(
+      this.#workspaceRoot,
+      projectId,
+      pointer.runId,
+    );
+    await publishPointer(output, OUTPUT_POINTER_AUTHORITY, pointer, this.#fileOps);
+  }
+}
+
 export const createRunStore = (
   workspaceRoot: string,
   options: RunStoreOptions = {},
-): RunStore =>
-  createRunStoreWithAuthority({
-    createWork: async (projectId) => await createWorkScope(workspaceRoot, projectId),
-    createRun: async (projectId, runId) => await mintRunScope(
-      workspaceRoot,
-      projectId,
-      runId,
-      'create',
-    ),
-    openExistingRun: async (projectId, runId) => await mintRunScope(
-      workspaceRoot,
-      projectId,
-      runId,
-      'existing',
-    ),
-    workPointer: {
-      inspect: inspectWorkEntry,
-      openExisting: openExistingWorkFile,
-      openNew: openNewWorkFile,
-      unlink: unlinkWorkFile,
-      rename: renameWorkFile,
-      link: linkWorkFile,
-      syncDirectory: syncWorkDirectory,
-    },
-  }, options);
+): RunStore => new RunStore(workspaceRoot, options);
 
 export const createOutputStore = (
   workspaceRoot: string,
   options: RunStoreOptions = {},
-): OutputStore =>
-  createOutputStoreWithAuthority({
-    openProject: async (projectId) => await mintOutputScope(workspaceRoot, projectId),
-    createRelease: async (projectId, runId) => {
-      const validatedRunId = StableIdSchema.parse(runId);
-      const scope = await mintOutputScope(workspaceRoot, projectId);
-      const state = stateFor(outputStates, scope, 'OutputDirectoryScope');
-      await ensureScopedDirectory(state, 'releases');
-      await ensureScopedDirectory(state, `releases/${validatedRunId}`, true);
-      return scope;
-    },
-    openRelease: async (projectId, runId) => await openOutputRelease(
-      workspaceRoot,
-      projectId,
-      runId,
-    ),
-    outputPointer: {
-      inspect: inspectOutputEntry,
-      openExisting: openExistingOutputFile,
-      openNew: openNewOutputFile,
-      unlink: unlinkOutputFile,
-      rename: renameOutputFile,
-      link: linkOutputFile,
-      syncDirectory: syncOutputDirectory,
-    },
-  }, options);
+): OutputStore => new OutputStore(workspaceRoot, options);

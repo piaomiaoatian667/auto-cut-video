@@ -1,16 +1,14 @@
 import {hostname as nodeHostname} from 'node:os';
 import {StableIdSchema} from '../domain/schema-primitives';
 import {
-  inspectWorkEntry,
-  openExistingWorkFile,
-  openNewWorkFile,
-  unlinkWorkFile,
+  inspectProjectLockFile,
+  openExistingProjectLockFile,
+  openNewProjectLockFile,
+  unlinkProjectLockFile,
   type WorkDirectoryScope,
 } from '../fs/app-directory-scopes';
 import {ProcessExecutionError} from '../process/process-error';
 import {runProcess} from '../process/run-process';
-
-const LOCK_PATH = 'pipeline.lock';
 
 export interface ProjectLockRecord {
   pid: number;
@@ -167,7 +165,7 @@ const serializeRecord = (record: ProjectLockRecord): string =>
 const readRawLock = async (
   work: WorkDirectoryScope,
 ): Promise<string | undefined> => {
-  const kind = await inspectWorkEntry(work, LOCK_PATH);
+  const kind = await inspectProjectLockFile(work);
   if (kind === 'missing') return undefined;
   if (kind !== 'file') {
     throw new ProjectLockError(
@@ -175,7 +173,7 @@ const readRawLock = async (
       'project lock path is not a regular file',
     );
   }
-  const handle = await openExistingWorkFile(work, LOCK_PATH);
+  const handle = await openExistingProjectLockFile(work);
   try {
     return await handle.readFile('utf8');
   } finally {
@@ -190,7 +188,8 @@ const classifyRecord = async (
   if (record.hostname !== runtime.hostname()) return 'live';
   if (!await runtime.isProcessAlive(record.pid)) return 'stale';
   const currentStart = await runtime.processStart(record.pid);
-  if (currentStart === null || currentStart !== record.processStart) return 'stale';
+  if (currentStart === null || currentStart.trim().length === 0) return 'live';
+  if (currentStart.trim() !== record.processStart.trim()) return 'stale';
   return 'live';
 };
 
@@ -221,7 +220,7 @@ const writeNewLock = async (
   work: WorkDirectoryScope,
   record: ProjectLockRecord,
 ): Promise<void> => {
-  const handle = await openNewWorkFile(work, LOCK_PATH);
+  const handle = await openNewProjectLockFile(work);
   let complete = false;
   try {
     await handle.writeFile(serializeRecord(record));
@@ -229,7 +228,7 @@ const writeNewLock = async (
     complete = true;
   } finally {
     await handle.close().catch(() => undefined);
-    if (!complete) await unlinkWorkFile(work, LOCK_PATH).catch(() => undefined);
+    if (!complete) await unlinkProjectLockFile(work).catch(() => undefined);
   }
 };
 
@@ -285,7 +284,7 @@ export async function acquireProjectLock(
         return;
       }
       if (!recordsEqual(current, record) || current.runId !== record.runId) return;
-      await unlinkWorkFile(work, LOCK_PATH);
+      await unlinkProjectLockFile(work);
       released = true;
     },
   };
@@ -316,5 +315,5 @@ export async function clearStaleLock(
       current,
     );
   }
-  await unlinkWorkFile(work, LOCK_PATH);
+  await unlinkProjectLockFile(work);
 }

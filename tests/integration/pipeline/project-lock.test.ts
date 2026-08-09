@@ -13,8 +13,8 @@ import {
 } from 'vitest';
 import {
   createWorkDirectoryScope,
-  openNewWorkFile,
-  unlinkWorkFile,
+  openNewProjectLockFile,
+  unlinkProjectLockFile,
   type WorkDirectoryScope,
 } from '../../../src/fs/app-directory-scopes';
 import {
@@ -59,7 +59,7 @@ const writeLock = async (
   work: WorkDirectoryScope,
   record: ProjectLockRecord,
 ): Promise<void> => {
-  const handle = await openNewWorkFile(work, 'pipeline.lock');
+  const handle = await openNewProjectLockFile(work);
   try {
     await handle.writeFile(`${JSON.stringify(record, null, 2)}\n`);
     await handle.sync();
@@ -128,6 +128,40 @@ describe('project lock', () => {
     )).resolves.toContain('old marker');
   });
 
+  it.each([null, '   '] as const)(
+    'fails closed when a live PID process-start marker is unavailable: %s',
+    async (unavailableMarker) => {
+      const {workspaceRoot, work} = await makeWorkScope();
+      await writeLock(work, lockRecord());
+      const lockPath = path.join(workspaceRoot, '.work', 'demo', 'pipeline.lock');
+      const before = await readFile(lockPath);
+      const unavailableRuntime = runtime({
+        currentPid: () => 5100,
+        isProcessAlive: async () => true,
+        processStart: async (pid) => (
+          pid === 5100 ? 'caller process marker' : unavailableMarker
+        ),
+      });
+
+      let acquireError: unknown;
+      try {
+        await acquireProjectLock(work, 'run-two', unavailableRuntime);
+      } catch (error) {
+        acquireError = error;
+      }
+      let clearError: unknown;
+      try {
+        await clearStaleLock(work, unavailableRuntime);
+      } catch (error) {
+        clearError = error;
+      }
+
+      expect(acquireError).toMatchObject({code: 'PROJECT_LOCKED'});
+      expect(clearError).toMatchObject({code: 'PROJECT_LOCKED'});
+      await expect(readFile(lockPath)).resolves.toEqual(before);
+    },
+  );
+
   it('fails closed for a lock owned on another host', async () => {
     const {work} = await makeWorkScope();
     await writeLock(work, lockRecord({hostname: 'remote-host'}));
@@ -141,7 +175,7 @@ describe('project lock', () => {
   it('does not release a replacement lock owned by another runId', async () => {
     const {workspaceRoot, work} = await makeWorkScope();
     const lease = await acquireProjectLock(work, 'run-one', runtime());
-    await unlinkWorkFile(work, 'pipeline.lock');
+    await unlinkProjectLockFile(work);
     await writeLock(work, lockRecord({runId: 'run-two'}));
 
     await lease.release();
@@ -160,7 +194,7 @@ describe('project lock', () => {
       isProcessAlive: async () => {
         probes += 1;
         if (probes === 1) {
-          await unlinkWorkFile(work, 'pipeline.lock');
+          await unlinkProjectLockFile(work);
           await writeLock(work, lockRecord({runId: 'run-two'}));
           return false;
         }

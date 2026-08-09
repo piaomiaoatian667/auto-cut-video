@@ -30,6 +30,24 @@ import {
   type CurrentPointer,
   type FileOps,
 } from '../../../src/pipeline/run-store';
+import * as runStoreModule from '../../../src/pipeline/run-store';
+// @ts-expect-error authority injection types must not be public
+import type {RunStoreAuthority as ForbiddenRunStoreAuthority} from '../../../src/pipeline/run-store';
+// @ts-expect-error authority injection types must not be public
+import type {OutputStoreAuthority as ForbiddenOutputStoreAuthority} from '../../../src/pipeline/run-store';
+
+function assertNoAuthorityFactoryExports(): void {
+  // @ts-expect-error arbitrary Run authority injection must not be exported
+  void runStoreModule.createRunStoreWithAuthority;
+  // @ts-expect-error arbitrary Output authority injection must not be exported
+  void runStoreModule.createOutputStoreWithAuthority;
+}
+void assertNoAuthorityFactoryExports;
+type ForbiddenAuthorityTypes = [
+  ForbiddenRunStoreAuthority,
+  ForbiddenOutputStoreAuthority,
+];
+void (undefined as unknown as ForbiddenAuthorityTypes);
 
 const tempDirectories: string[] = [];
 
@@ -89,6 +107,54 @@ const readAndClose = async (
 };
 
 describe('RunStore', () => {
+  it('does not expose arbitrary authority injection or beta-to-alpha mapping', async () => {
+    const workspaceRoot = await makeWorkspace();
+    const alphaStore = createRunStore(workspaceRoot);
+    const alphaWork = await alphaStore.createWork('alpha');
+    const alphaRun = await alphaStore.createRun('alpha', 'run-alpha');
+    const exportedFactory = (
+      runStoreModule as unknown as Record<string, unknown>
+    ).createRunStoreWithAuthority;
+
+    if (typeof exportedFactory === 'function') {
+      const unsupported = async (): Promise<never> => {
+        throw new Error('unused malicious pointer operation');
+      };
+      const injected = Reflect.apply(exportedFactory, undefined, [{
+        createWork: async () => alphaWork,
+        createRun: async () => alphaRun,
+        openExistingRun: async () => alphaRun,
+        workPointer: {
+          inspect: unsupported,
+          openExisting: unsupported,
+          openNew: unsupported,
+          unlink: unsupported,
+          rename: unsupported,
+          link: unsupported,
+          syncDirectory: unsupported,
+        },
+      }]) as {createRun(projectId: string, runId: string): Promise<unknown>};
+      const betaAuthority = await injected.createRun('beta', 'run-beta');
+      await writeAndClose(
+        await openNewRunFile(betaAuthority as never, 'beta-wrote.txt'),
+        'mapped-to-alpha',
+      );
+      await expect(readFile(path.join(
+        workspaceRoot,
+        '.work',
+        'alpha',
+        'runs',
+        'run-alpha',
+        'beta-wrote.txt',
+      ), 'utf8')).resolves.toBe('mapped-to-alpha');
+    }
+
+    expect(runStoreModule).not.toHaveProperty('createRunStoreWithAuthority');
+    expect(runStoreModule).not.toHaveProperty('createOutputStoreWithAuthority');
+    expect(Object.keys(runStoreModule)).not.toContain('RunStoreAuthority');
+    expect(Object.keys(runStoreModule)).not.toContain('OutputStoreAuthority');
+  });
+
   it('creates immutable runs and safely reopens them through a new store', async () => {
     const workspaceRoot = await makeWorkspace();
     const firstStore = createRunStore(workspaceRoot);

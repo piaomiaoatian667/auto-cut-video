@@ -6,7 +6,6 @@ import {
   rename,
   rm,
   symlink,
-  unlink,
   writeFile,
   type FileHandle,
 } from 'node:fs/promises';
@@ -31,14 +30,41 @@ import {
   ensureRunDirectory,
   openExistingOutputFile,
   openExistingRunFile,
-  openExistingWorkFile,
   openNewOutputFile,
   openNewOutputReadWriteFile,
   openNewRunFile,
   openNewRunReadWriteFile,
-  openNewWorkFile,
 } from '../../../src/fs/app-directory-scopes';
+import * as appDirectoryScopes from '../../../src/fs/app-directory-scopes';
 import {runProcess} from '../../../src/process/run-process';
+
+type FixedProjectLockApi = {
+  openExistingProjectLockFile(scope: WorkDirectoryScope): Promise<FileHandle>;
+  openNewProjectLockFile(scope: WorkDirectoryScope): Promise<FileHandle>;
+};
+
+const fixedProjectLockApi = (): FixedProjectLockApi => {
+  const candidate = appDirectoryScopes as unknown as Partial<FixedProjectLockApi>;
+  if (
+    typeof candidate.openExistingProjectLockFile !== 'function'
+    || typeof candidate.openNewProjectLockFile !== 'function'
+  ) {
+    throw new TypeError('fixed project-lock Work API is unavailable');
+  }
+  return candidate as FixedProjectLockApi;
+};
+
+function assertNoArbitraryWorkExports(): void {
+  // @ts-expect-error Work scope must not expose arbitrary relative-path reads
+  void appDirectoryScopes.openExistingWorkFile;
+  // @ts-expect-error Work scope must not expose arbitrary relative-path writes
+  void appDirectoryScopes.openNewWorkFile;
+  // @ts-expect-error Work scope must not expose arbitrary relative-path deletion
+  void appDirectoryScopes.unlinkWorkFile;
+  // @ts-expect-error Work scope must not expose arbitrary relative-path inspection
+  void appDirectoryScopes.inspectWorkEntry;
+}
+void assertNoArbitraryWorkExports;
 
 function assertNominalScopeTypes(
   project: ProjectDirectoryScope,
@@ -162,17 +188,16 @@ describe('app-owned directory scopes', () => {
     ['empty', ''],
   ])('rejects %s paths before opening', async (_label, relativePath) => {
     const workspaceRoot = await makeTempDirectory('app-scopes-relative-');
-    const work = await createWorkDirectoryScope(workspaceRoot, 'demo');
+    const run = await createRunStore(workspaceRoot).createRun('demo', 'run-one');
 
-    await expect(openNewWorkFile(work, relativePath)).rejects.toBeInstanceOf(
+    await expect(openNewRunFile(run, relativePath)).rejects.toBeInstanceOf(
       AppDirectoryScopeError,
     );
   });
 
   it('rejects runtime scope forgery', async () => {
-    await expect(openNewWorkFile(
+    await expect(fixedProjectLockApi().openNewProjectLockFile(
       {} as WorkDirectoryScope,
-      'pipeline.lock',
     )).rejects.toBeInstanceOf(TypeError);
   });
 
@@ -209,7 +234,7 @@ describe('app-owned directory scopes', () => {
       .rejects.toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
   });
 
-  it('rejects Work lock and pointer symlinks', async () => {
+  it('rejects a Work project-lock symlink', async () => {
     const workspaceRoot = await makeTempDirectory('app-scopes-work-');
     const outsideRoot = await makeTempDirectory('app-scopes-outside-');
     const outsideFile = path.join(outsideRoot, 'outside.json');
@@ -217,30 +242,35 @@ describe('app-owned directory scopes', () => {
     const work = await createWorkDirectoryScope(workspaceRoot, 'demo');
     const workRoot = path.join(workspaceRoot, '.work', 'demo');
 
-    for (const name of ['pipeline.lock', 'current.json']) {
-      await symlink(outsideFile, path.join(workRoot, name));
-      await expect(openExistingWorkFile(work, name)).rejects.toMatchObject({
-        code: 'APP_PATH_OUTSIDE_SCOPE',
-      });
-      await expect(openNewWorkFile(work, name)).rejects.toMatchObject({
-        code: 'APP_PATH_OUTSIDE_SCOPE',
-      });
-      await unlink(path.join(workRoot, name));
-    }
+    await symlink(outsideFile, path.join(workRoot, 'pipeline.lock'));
+    await expect(fixedProjectLockApi().openExistingProjectLockFile(work))
+      .rejects.toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
+    await expect(fixedProjectLockApi().openNewProjectLockFile(work))
+      .rejects.toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
     await expect(readFile(outsideFile, 'utf8')).resolves.toBe('outside');
   });
 
-  it('rejects internal symlink escape for Work reads and writes', async () => {
-    const workspaceRoot = await makeTempDirectory('app-scopes-work-');
-    const outsideRoot = await makeTempDirectory('app-scopes-outside-');
-    await writeFile(path.join(outsideRoot, 'secret.txt'), 'secret');
+  it('does not expose Work authority over Run artifacts', async () => {
+    const workspaceRoot = await makeTempDirectory('app-scopes-work-minimal-');
     const work = await createWorkDirectoryScope(workspaceRoot, 'demo');
-    await symlink(outsideRoot, path.join(workspaceRoot, '.work', 'demo', 'escape'));
+    const run = await createRunStore(workspaceRoot).createRun('demo', 'run-one');
+    await writeAndClose(await openNewRunFile(run, 'artifact.txt'), 'immutable');
 
-    await expect(openExistingWorkFile(work, 'escape/secret.txt'))
-      .rejects.toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
-    await expect(openNewWorkFile(work, 'escape/new.txt'))
-      .rejects.toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
+    expect(appDirectoryScopes).not.toHaveProperty('openExistingWorkFile');
+    expect(appDirectoryScopes).not.toHaveProperty('openNewWorkFile');
+    expect(appDirectoryScopes).not.toHaveProperty('unlinkWorkFile');
+    expect(appDirectoryScopes).not.toHaveProperty('inspectWorkEntry');
+    expect(appDirectoryScopes).toHaveProperty('openExistingProjectLockFile');
+    expect(appDirectoryScopes).toHaveProperty('openNewProjectLockFile');
+
+    await expect(Reflect.apply(
+      fixedProjectLockApi().openExistingProjectLockFile,
+      undefined,
+      [work, 'runs/run-one/artifact.txt'],
+    )).rejects.toMatchObject({code: 'ENOENT'});
+    await expect(readAndClose(
+      await openExistingRunFile(run, 'artifact.txt'),
+    )).resolves.toBe('immutable');
   });
 
   it.each(['run', 'output'] as const)(
@@ -346,7 +376,7 @@ describe('app-owned directory scopes', () => {
       await mkdir(scopeRoot);
 
       const pending = kind === 'work'
-        ? openNewWorkFile(scope as WorkDirectoryScope, 'new.txt')
+        ? fixedProjectLockApi().openNewProjectLockFile(scope as WorkDirectoryScope)
         : kind === 'run'
           ? openNewRunReadWriteFile(scope as RunDirectoryScope, 'new.mp4')
           : openNewOutputReadWriteFile(scope as OutputDirectoryScope, 'new.mp4');
@@ -375,7 +405,7 @@ describe('app-owned directory scopes', () => {
       await symlink(outsideRoot, scopeRoot);
 
       const pending = kind === 'work'
-        ? openNewWorkFile(scope as WorkDirectoryScope, 'new.txt')
+        ? fixedProjectLockApi().openNewProjectLockFile(scope as WorkDirectoryScope)
         : kind === 'run'
           ? openNewRunFile(scope as RunDirectoryScope, 'new.txt')
           : openNewOutputFile(scope as OutputDirectoryScope, 'new.txt');
