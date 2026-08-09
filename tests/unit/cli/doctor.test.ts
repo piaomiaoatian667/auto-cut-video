@@ -84,7 +84,7 @@ const fixture = (result: PreflightResult = successfulResult()) => {
     stdout: {write: (chunk) => { stdout += chunk; }},
     stderr: {write: (chunk) => { stderr += chunk; }},
     loadProject: vi.fn(async () => projectInputs),
-    sourceBytes: 1024,
+    measureSourceBytes: vi.fn(async () => 1024),
     preflight: vi.fn(async () => result),
     ffmpegExecutable: '/configured/ffmpeg',
     ffprobeExecutable: '/configured/ffprobe',
@@ -115,6 +115,7 @@ describe('videoctl doctor', () => {
 
     expect(exitCode).toBe(EXIT_CODES.success);
     expect(dependencies.loadProject).toHaveBeenCalledWith('/workspace', 'demo');
+    expect(dependencies.measureSourceBytes).toHaveBeenCalledWith(projectInputs);
     expect(dependencies.preflight).toHaveBeenCalledWith({
       workspaceRoot: '/workspace',
       projectDirectory: projectInputs.projectDirectory,
@@ -141,20 +142,9 @@ describe('videoctl doctor', () => {
     expect(stderr()).toBe('');
   });
 
-  it('fails closed on scoped project substitution without raw source reads', async () => {
-    const {dependencies, projectInputs, stdout, stderr} = fixture();
-    dependencies.sourceBytes = 4096;
-    const forbiddenRawSourceRead = vi.fn();
-    Object.defineProperty(dependencies, 'measureSourceBytes', {
-      configurable: true,
-      get: () => {
-        forbiddenRawSourceRead();
-        return async () => 999_999;
-      },
-    });
-    dependencies.preflight = vi.fn(async (input) => {
-      expect(input.projectDirectory).toBe(projectInputs.projectDirectory);
-      expect(input.sourceBytes).toBe(4096);
+  it('maps scoped source measurement failures to project validation JSON', async () => {
+    const {dependencies, stdout, stderr} = fixture();
+    dependencies.measureSourceBytes = vi.fn(async () => {
       throw new ProjectPathError(
         'project directory changed after scope creation: assets/source',
       );
@@ -168,11 +158,11 @@ describe('videoctl doctor', () => {
       checks: Array<{code?: string}>;
     };
 
-    expect(exitCode).toBe(EXIT_CODES.environmentFailed);
-    expect(forbiddenRawSourceRead).not.toHaveBeenCalled();
-    expect(dependencies.preflight).toHaveBeenCalledOnce();
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(dependencies.preflight).not.toHaveBeenCalled();
     expect(report.checks).toContainEqual(expect.objectContaining({
-      code: 'ENV_PREFLIGHT_FAILED',
+      id: 'source-assets',
+      code: 'PROJECT_SOURCE_INVALID',
     }));
     expect(stdout()).not.toContain('assets/source');
     expect(stderr()).toBe('');

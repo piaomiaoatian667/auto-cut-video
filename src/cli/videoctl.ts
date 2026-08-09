@@ -1,10 +1,15 @@
 import {pathToFileURL} from 'node:url';
 import path from 'node:path';
+import {opendir} from 'node:fs/promises';
 import {Command, CommanderError} from 'commander';
 import {
   loadProject,
   type ProjectInputs,
 } from '../domain/load-project';
+import {
+  openExistingProjectFile,
+  type ProjectDirectoryScope,
+} from '../fs/project-paths';
 import {
   createSystemPreflightDependencies,
   runPreflight,
@@ -28,7 +33,7 @@ export interface VideoctlDependencies {
   stdout: OutputWriter;
   stderr: OutputWriter;
   loadProject(workspaceRoot: string, projectId: string): Promise<ProjectInputs>;
-  sourceBytes: number;
+  measureSourceBytes(project: ProjectInputs): Promise<number>;
   preflight(input: PreflightInput): Promise<PreflightResult>;
   ffmpegExecutable?: string;
   ffprobeExecutable?: string;
@@ -38,15 +43,364 @@ interface DoctorOptions {
   json?: boolean;
 }
 
+export interface SourceMeterStat {
+  dev: number | bigint;
+  ino: number | bigint;
+  size: number;
+  isFile(): boolean;
+  isDirectory(): boolean;
+}
+
+export interface SourceMeterFileHandle {
+  fd: number;
+  stat(): Promise<SourceMeterStat>;
+  close(): Promise<void>;
+}
+
+export interface SourceMeterDirectoryEntry {
+  name: string;
+  isSymbolicLink(): boolean;
+}
+
+export interface SourceMeterDirectory {
+  read(): Promise<SourceMeterDirectoryEntry | null>;
+  close(): Promise<void>;
+}
+
+export interface SourceMeterDependencies {
+  openExistingProjectFile(
+    scope: ProjectDirectoryScope,
+    relativePath: string,
+  ): Promise<SourceMeterFileHandle>;
+  openDirectory(fdPath: string): Promise<SourceMeterDirectory>;
+}
+
+export class ProjectSourceMeasurementError extends Error {
+  readonly code = 'PROJECT_SOURCE_INVALID';
+
+  constructor(options?: ErrorOptions) {
+    super('Project source assets could not be measured safely.', options);
+    this.name = 'ProjectSourceMeasurementError';
+  }
+}
+
+const invalidSource = (cause?: unknown): ProjectSourceMeasurementError =>
+  new ProjectSourceMeasurementError(cause === undefined ? undefined : {cause});
+
+const sameIdentity = (
+  left: Pick<SourceMeterStat, 'dev' | 'ino'>,
+  right: Pick<SourceMeterStat, 'dev' | 'ino'>,
+): boolean => left.dev === right.dev && left.ino === right.ino;
+
+const sameOpenedPath = (
+  actual: SourceMeterStat,
+  expected: SourceMeterStat,
+): boolean => (
+  sameIdentity(actual, expected)
+  && actual.isFile() === expected.isFile()
+  && actual.isDirectory() === expected.isDirectory()
+  && (!expected.isFile() || actual.size === expected.size)
+);
+
+const validateDirectoryEntryName = (name: string): void => {
+  if (
+    name.length === 0
+    || name === '.'
+    || name === '..'
+    || name.includes('/')
+    || name.includes('\0')
+  ) {
+    throw invalidSource();
+  }
+};
+
+const childRelativePath = (parent: string, name: string): string =>
+  parent === '.' ? name : path.posix.join(parent, name);
+
+const findDirectoryEntry = async (
+  scope: ProjectDirectoryScope,
+  parentRelativePath: string,
+  expectedParent: SourceMeterStat,
+  name: string,
+  dependencies: SourceMeterDependencies,
+): Promise<SourceMeterDirectoryEntry | undefined> => {
+  let parent: SourceMeterFileHandle | undefined;
+  let directory: SourceMeterDirectory | undefined;
+  try {
+    parent = await dependencies.openExistingProjectFile(
+      scope,
+      parentRelativePath,
+    );
+    const parentStatus = await parent.stat();
+    if (!parentStatus.isDirectory() || !sameOpenedPath(parentStatus, expectedParent)) {
+      throw invalidSource();
+    }
+    directory = await dependencies.openDirectory(`/dev/fd/${parent.fd}`);
+    while (true) {
+      const entry = await directory.read();
+      if (entry === null) return undefined;
+      validateDirectoryEntryName(entry.name);
+      if (entry.name === name) return entry;
+    }
+  } finally {
+    try {
+      if (directory !== undefined) await directory.close();
+    } finally {
+      if (parent !== undefined) await parent.close();
+    }
+  }
+};
+
+const requireNonSymlinkEntry = async (
+  scope: ProjectDirectoryScope,
+  parentRelativePath: string,
+  expectedParent: SourceMeterStat,
+  name: string,
+  dependencies: SourceMeterDependencies,
+): Promise<void> => {
+  const entry = await findDirectoryEntry(
+    scope,
+    parentRelativePath,
+    expectedParent,
+    name,
+    dependencies,
+  );
+  if (entry === undefined || entry.isSymbolicLink()) throw invalidSource();
+};
+
+const revalidateOpenedPath = async (
+  scope: ProjectDirectoryScope,
+  relativePath: string,
+  expected: SourceMeterStat,
+  dependencies: SourceMeterDependencies,
+): Promise<void> => {
+  const verification = await dependencies.openExistingProjectFile(
+    scope,
+    relativePath,
+  );
+  try {
+    const status = await verification.stat();
+    if (!sameOpenedPath(status, expected)) throw invalidSource();
+  } finally {
+    await verification.close();
+  }
+};
+
+const measureOpenedDirectory = async (
+  scope: ProjectDirectoryScope,
+  relativePath: string,
+  handle: SourceMeterFileHandle,
+  initialStatus: SourceMeterStat,
+  dependencies: SourceMeterDependencies,
+): Promise<number> => {
+  let directory: SourceMeterDirectory | undefined;
+  try {
+    if (!initialStatus.isDirectory()) throw invalidSource();
+    directory = await dependencies.openDirectory(`/dev/fd/${handle.fd}`);
+
+    let totalBytes = 0;
+    while (true) {
+      const entry = await directory.read();
+      if (entry === null) break;
+      validateDirectoryEntryName(entry.name);
+      if (entry.isSymbolicLink()) throw invalidSource();
+
+      const relativeEntry = childRelativePath(relativePath, entry.name);
+      const child = await dependencies.openExistingProjectFile(
+        scope,
+        relativeEntry,
+      );
+      try {
+        const childStatus = await child.stat();
+        await requireNonSymlinkEntry(
+          scope,
+          relativePath,
+          initialStatus,
+          entry.name,
+          dependencies,
+        );
+        await revalidateOpenedPath(
+          scope,
+          relativeEntry,
+          childStatus,
+          dependencies,
+        );
+
+        if (childStatus.isFile()) {
+          if (
+            !Number.isSafeInteger(childStatus.size)
+            || childStatus.size < 0
+            || totalBytes > Number.MAX_SAFE_INTEGER - childStatus.size
+          ) {
+            throw invalidSource();
+          }
+          totalBytes += childStatus.size;
+        } else if (childStatus.isDirectory()) {
+          const childBytes = await measureOpenedDirectory(
+            scope,
+            relativeEntry,
+            child,
+            childStatus,
+            dependencies,
+          );
+          if (totalBytes > Number.MAX_SAFE_INTEGER - childBytes) {
+            throw invalidSource();
+          }
+          totalBytes += childBytes;
+        } else {
+          throw invalidSource();
+        }
+
+        await requireNonSymlinkEntry(
+          scope,
+          relativePath,
+          initialStatus,
+          entry.name,
+          dependencies,
+        );
+        await revalidateOpenedPath(
+          scope,
+          relativeEntry,
+          childStatus,
+          dependencies,
+        );
+      } finally {
+        await child.close();
+      }
+    }
+
+    await revalidateOpenedPath(
+      scope,
+      relativePath,
+      initialStatus,
+      dependencies,
+    );
+    return totalBytes;
+  } finally {
+    if (directory !== undefined) await directory.close();
+  }
+};
+
+const measureProjectSourceBytesUnsafe = async (
+  scope: ProjectDirectoryScope,
+  dependencies: SourceMeterDependencies,
+): Promise<number> => {
+  let projectRoot: SourceMeterFileHandle | undefined;
+  let assets: SourceMeterFileHandle | undefined;
+  let source: SourceMeterFileHandle | undefined;
+  try {
+    projectRoot = await dependencies.openExistingProjectFile(scope, '.');
+    const projectRootStatus = await projectRoot.stat();
+    if (!projectRootStatus.isDirectory()) throw invalidSource();
+
+    await requireNonSymlinkEntry(
+      scope,
+      '.',
+      projectRootStatus,
+      'assets',
+      dependencies,
+    );
+    assets = await dependencies.openExistingProjectFile(scope, 'assets');
+    const assetsStatus = await assets.stat();
+    if (!assetsStatus.isDirectory()) throw invalidSource();
+    await requireNonSymlinkEntry(
+      scope,
+      '.',
+      projectRootStatus,
+      'assets',
+      dependencies,
+    );
+    await revalidateOpenedPath(scope, 'assets', assetsStatus, dependencies);
+
+    await requireNonSymlinkEntry(
+      scope,
+      'assets',
+      assetsStatus,
+      'source',
+      dependencies,
+    );
+    source = await dependencies.openExistingProjectFile(scope, 'assets/source');
+    const sourceStatus = await source.stat();
+    if (!sourceStatus.isDirectory()) throw invalidSource();
+    await requireNonSymlinkEntry(
+      scope,
+      'assets',
+      assetsStatus,
+      'source',
+      dependencies,
+    );
+    await revalidateOpenedPath(
+      scope,
+      'assets/source',
+      sourceStatus,
+      dependencies,
+    );
+    const totalBytes = await measureOpenedDirectory(
+      scope,
+      'assets/source',
+      source,
+      sourceStatus,
+      dependencies,
+    );
+
+    await requireNonSymlinkEntry(
+      scope,
+      'assets',
+      assetsStatus,
+      'source',
+      dependencies,
+    );
+    await revalidateOpenedPath(
+      scope,
+      'assets/source',
+      sourceStatus,
+      dependencies,
+    );
+    await requireNonSymlinkEntry(
+      scope,
+      '.',
+      projectRootStatus,
+      'assets',
+      dependencies,
+    );
+    await revalidateOpenedPath(scope, 'assets', assetsStatus, dependencies);
+    await revalidateOpenedPath(scope, '.', projectRootStatus, dependencies);
+    return totalBytes;
+  } finally {
+    try {
+      if (source !== undefined) await source.close();
+    } finally {
+      try {
+        if (assets !== undefined) await assets.close();
+      } finally {
+        if (projectRoot !== undefined) await projectRoot.close();
+      }
+    }
+  }
+};
+
+export const measureProjectSourceBytes = async (
+  scope: ProjectDirectoryScope,
+  dependencies: SourceMeterDependencies,
+): Promise<number> => {
+  try {
+    return await measureProjectSourceBytesUnsafe(scope, dependencies);
+  } catch (error) {
+    if (error instanceof ProjectSourceMeasurementError) throw error;
+    throw invalidSource(error);
+  }
+};
+
 const doctorInput = (
   project: ProjectInputs,
+  sourceBytes: number,
   dependencies: VideoctlDependencies,
 ): PreflightInput => ({
   workspaceRoot: project.workspaceRoot,
   projectDirectory: project.projectDirectory,
   project: project.project,
   script: project.script,
-  sourceBytes: dependencies.sourceBytes,
+  sourceBytes,
   workDirectory: path.join(
     project.workspaceRoot,
     '.work',
@@ -84,9 +438,26 @@ const runDoctor = async (
     return EXIT_CODES.validationFailed;
   }
 
+  let sourceBytes: number;
+  try {
+    sourceBytes = await dependencies.measureSourceBytes(project);
+  } catch {
+    dependencies.stdout.write(formatDoctorFailure(
+      projectId,
+      options.json === true,
+      {
+        id: 'source-assets',
+        code: 'PROJECT_SOURCE_INVALID',
+        message: 'Project source assets could not be measured safely.',
+      },
+    ));
+    return EXIT_CODES.validationFailed;
+  }
+
   try {
     const result = await dependencies.preflight(doctorInput(
       project,
+      sourceBytes,
       dependencies,
     ));
     dependencies.stdout.write(options.json === true
@@ -138,13 +509,20 @@ export async function runVideoctl(
 }
 
 export interface SystemVideoctlOptions {
-  sourceBytes: number;
+  sourceMeter?: SourceMeterDependencies;
 }
 
+const SYSTEM_SOURCE_METER: SourceMeterDependencies = {
+  openExistingProjectFile: async (scope, relativePath) =>
+    await openExistingProjectFile(scope, relativePath),
+  openDirectory: async (fdPath) => await opendir(fdPath),
+};
+
 export const createSystemVideoctlDependencies = (
-  options: SystemVideoctlOptions,
+  options: SystemVideoctlOptions = {},
 ): VideoctlDependencies => {
   const preflightDependencies = createSystemPreflightDependencies();
+  const sourceMeter = options.sourceMeter ?? SYSTEM_SOURCE_METER;
   const ffmpegExecutable = process.env.FFMPEG_PATH;
   const ffprobeExecutable = process.env.FFPROBE_PATH;
   return {
@@ -152,7 +530,10 @@ export const createSystemVideoctlDependencies = (
     stdout: process.stdout,
     stderr: process.stderr,
     loadProject,
-    sourceBytes: options.sourceBytes,
+    measureSourceBytes: async (project) => await measureProjectSourceBytes(
+      project.projectDirectory,
+      sourceMeter,
+    ),
     preflight: async (input) => runPreflight(input, preflightDependencies),
     ...(ffmpegExecutable === undefined ? {} : {ffmpegExecutable}),
     ...(ffprobeExecutable === undefined ? {} : {ffprobeExecutable}),
@@ -165,7 +546,7 @@ const directlyExecuted = process.argv[1] !== undefined
 if (directlyExecuted) {
   void runVideoctl(
     process.argv.slice(2),
-    createSystemVideoctlDependencies({sourceBytes: 0}),
+    createSystemVideoctlDependencies(),
   ).then(
     (exitCode) => { process.exitCode = exitCode; },
     () => {

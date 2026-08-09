@@ -1,8 +1,16 @@
 import {createHash} from 'node:crypto';
 import path from 'node:path';
 import {describe, expect, it, vi} from 'vitest';
-import {createProjectFixture, createScriptFixture} from '../../helpers/temp-project';
-import type {ProjectDirectoryScope} from '../../../src/fs/project-paths';
+import {
+  createEditFixture,
+  createProjectFixture,
+  createScriptFixture,
+} from '../../helpers/temp-project';
+import type {ProjectInputs} from '../../../src/domain/load-project';
+import {
+  ProjectPathError,
+  type ProjectDirectoryScope,
+} from '../../../src/fs/project-paths';
 import {
   runPreflight,
   type PreflightDependencies,
@@ -10,6 +18,11 @@ import {
   type PreflightInput,
   type PreflightProcessResult,
 } from '../../../src/pipeline/stages/preflight';
+import {
+  createSystemVideoctlDependencies,
+  measureProjectSourceBytes,
+  type SourceMeterDependencies,
+} from '../../../src/cli/videoctl';
 
 const GIB = 1024 ** 3;
 const FFMPEG_SELECTION = '/configured/ffmpeg';
@@ -217,6 +230,269 @@ const errorCheck = (result: Awaited<ReturnType<typeof runPreflight>>, id: string
 
 const sha256 = (value: string): string =>
   `sha256:${createHash('sha256').update(value).digest('hex')}`;
+
+interface SourceNodeBase {
+  dev: number;
+  ino: number;
+}
+
+interface SourceDirectoryNode extends SourceNodeBase {
+  kind: 'directory';
+  entries: Record<string, SourceNode>;
+}
+
+interface SourceFileNode extends SourceNodeBase {
+  kind: 'file';
+  size: number;
+}
+
+interface SourceSymlinkNode extends SourceNodeBase {
+  kind: 'symlink';
+}
+
+type SourceNode = SourceDirectoryNode | SourceFileNode | SourceSymlinkNode;
+
+const sourceDirectory = (
+  ino: number,
+  entries: Record<string, SourceNode>,
+): SourceDirectoryNode => ({kind: 'directory', dev: 1, ino, entries});
+
+const sourceFile = (ino: number, size: number): SourceFileNode => ({
+  kind: 'file',
+  dev: 1,
+  ino,
+  size,
+});
+
+const sourceSymlink = (ino: number): SourceSymlinkNode => ({
+  kind: 'symlink',
+  dev: 1,
+  ino,
+});
+
+interface SourceMeterFixtureOptions {
+  substituteSourceBeforeOpenPath?: string;
+  failStatPath?: string;
+  failDirectoryPath?: string;
+  failClosePath?: string;
+}
+
+const sourceMeterFixture = (
+  sourceNode: SourceNode | undefined,
+  options: SourceMeterFixtureOptions = {},
+) => {
+  const root = sourceDirectory(1, {
+    assets: sourceDirectory(2, sourceNode === undefined ? {} : {source: sourceNode}),
+  });
+  const nodes = new Map<string, SourceNode>();
+  const indexNode = (relativePath: string, node: SourceNode): void => {
+    nodes.set(relativePath, node);
+    if (node.kind !== 'directory') return;
+    for (const [name, child] of Object.entries(node.entries)) {
+      indexNode(
+        relativePath === '.' ? name : path.posix.join(relativePath, name),
+        child,
+      );
+    }
+  };
+  indexNode('.', root);
+
+  let nextFd = 20;
+  const fdPaths = new Map<number, string>();
+  const fdNodes = new Map<number, SourceNode>();
+  const fdOffsets = new Map<number, number>();
+  const fileCloses: Array<ReturnType<typeof vi.fn>> = [];
+  const directoryCloses: Array<ReturnType<typeof vi.fn>> = [];
+  const statPaths: string[] = [];
+
+  const openExistingProjectFile = vi.fn(async (
+    _scope: ProjectDirectoryScope,
+    relativePath: string,
+  ) => {
+    if (relativePath === options.substituteSourceBeforeOpenPath) {
+      nodes.set('assets/source', sourceSymlink(10_000));
+      throw new ProjectPathError(
+        `project directory changed after scope creation: ${relativePath}`,
+      );
+    }
+    const node = nodes.get(relativePath);
+    if (node === undefined || node.kind === 'symlink') {
+      throw new Error('scoped path is unavailable');
+    }
+    const fd = nextFd;
+    nextFd += 1;
+    fdPaths.set(fd, relativePath);
+    fdNodes.set(fd, node);
+    fdOffsets.set(fd, 0);
+    const close = vi.fn(async () => {
+      if (relativePath === options.failClosePath) {
+        throw new Error('close failed');
+      }
+    });
+    fileCloses.push(close);
+    return {
+      fd,
+      stat: vi.fn(async () => {
+        if (relativePath === options.failStatPath) {
+          throw new Error('stat failed');
+        }
+        statPaths.push(relativePath);
+        return {
+          dev: node.dev,
+          ino: node.ino,
+          size: node.kind === 'file' ? node.size : 0,
+          isFile: () => node.kind === 'file',
+          isDirectory: () => node.kind === 'directory',
+        };
+      }),
+      close,
+    };
+  });
+
+  const openDirectory = vi.fn(async (fdPath: string) => {
+    const match = /^\/dev\/fd\/(\d+)$/u.exec(fdPath);
+    const fd = match === null ? undefined : Number.parseInt(match[1]!, 10);
+    const relativePath = fd === undefined ? undefined : fdPaths.get(fd);
+    if (relativePath === options.failDirectoryPath) {
+      throw new Error('directory enumeration failed');
+    }
+    const node = fd === undefined ? undefined : fdNodes.get(fd);
+    if (node?.kind !== 'directory') throw new Error('invalid directory fd');
+    const entries = Object.keys(node.entries).sort().map((name) => ({
+      name,
+      isSymbolicLink: () => node.entries[name]!.kind === 'symlink',
+    }));
+    const close = vi.fn(async () => {});
+    directoryCloses.push(close);
+    return {
+      read: vi.fn(async () => {
+        if (fd === undefined) throw new Error('invalid directory fd');
+        const index = fdOffsets.get(fd) ?? 0;
+        fdOffsets.set(fd, index + 1);
+        return entries[index] ?? null;
+      }),
+      close,
+    };
+  });
+
+  const dependencies: SourceMeterDependencies = {
+    openExistingProjectFile,
+    openDirectory,
+  };
+  return {
+    dependencies,
+    scope: {} as ProjectDirectoryScope,
+    openExistingProjectFile,
+    statPaths,
+    expectAllClosed: () => {
+      for (const close of fileCloses) expect(close).toHaveBeenCalledOnce();
+      for (const close of directoryCloses) expect(close).toHaveBeenCalledOnce();
+    },
+  };
+};
+
+describe('scoped source measurement', () => {
+  it('feeds a measured 1 GiB tree into the 3 GiB Preflight estimate', async () => {
+    const meter = sourceMeterFixture(sourceDirectory(3, {
+      video: sourceFile(4, GIB - 512),
+      nested: sourceDirectory(5, {audio: sourceFile(6, 512)}),
+    }));
+    const projectInputs: ProjectInputs = {
+      workspaceRoot: '/workspace',
+      projectDirectory: meter.scope,
+      project: createProjectFixture(),
+      script: createScriptFixture(),
+      edit: createEditFixture(),
+    };
+    const system = createSystemVideoctlDependencies({
+      sourceMeter: meter.dependencies,
+    });
+
+    const measuredBytes = await system.measureSourceBytes(projectInputs);
+    const preflight = fixture({sourceBytes: measuredBytes});
+    const result = await runPreflight(preflight.input, preflight.dependencies);
+
+    expect(measuredBytes).toBe(GIB);
+    expect(result.system).toMatchObject({
+      sourceBytes: GIB,
+      requiredBytes: 3 * GIB,
+    });
+    expect(meter.openExistingProjectFile.mock.calls.every(([, relativePath]) => (
+      !path.isAbsolute(relativePath)
+    ))).toBe(true);
+    meter.expectAllClosed();
+  });
+
+  it('rejects an assets/source symlink without opening its target', async () => {
+    const meter = sourceMeterFixture(sourceSymlink(3));
+
+    await expect(measureProjectSourceBytes(meter.scope, meter.dependencies))
+      .rejects.toMatchObject({code: 'PROJECT_SOURCE_INVALID'});
+
+    expect(meter.openExistingProjectFile).not.toHaveBeenCalledWith(
+      meter.scope,
+      'assets/source',
+    );
+    meter.expectAllClosed();
+  });
+
+  it('rejects symlink entries and closes every opened FD and directory', async () => {
+    const meter = sourceMeterFixture(sourceDirectory(3, {
+      safe: sourceFile(4, 100),
+      escape: sourceSymlink(5),
+    }));
+
+    await expect(measureProjectSourceBytes(meter.scope, meter.dependencies))
+      .rejects.toMatchObject({code: 'PROJECT_SOURCE_INVALID'});
+
+    expect(meter.openExistingProjectFile).not.toHaveBeenCalledWith(
+      meter.scope,
+      'assets/source/escape',
+    );
+    meter.expectAllClosed();
+  });
+
+  it('fails closed when assets/source is replaced by an external symlink', async () => {
+    const meter = sourceMeterFixture(
+      sourceDirectory(3, {outside: sourceFile(4, 9 * GIB)}),
+      {substituteSourceBeforeOpenPath: 'assets/source/outside'},
+    );
+
+    await expect(measureProjectSourceBytes(meter.scope, meter.dependencies))
+      .rejects.toMatchObject({code: 'PROJECT_SOURCE_INVALID'});
+
+    expect(meter.statPaths).not.toContain('assets/source/outside');
+    meter.expectAllClosed();
+  });
+
+  it('maps missing source and enumeration/stat I/O failures to source errors', async () => {
+    const missing = sourceMeterFixture(undefined);
+    const enumeration = sourceMeterFixture(
+      sourceDirectory(3, {}),
+      {failDirectoryPath: 'assets/source'},
+    );
+    const statFailure = sourceMeterFixture(
+      sourceDirectory(3, {video: sourceFile(4, 100)}),
+      {failStatPath: 'assets/source/video'},
+    );
+
+    for (const meter of [missing, enumeration, statFailure]) {
+      await expect(measureProjectSourceBytes(meter.scope, meter.dependencies))
+        .rejects.toMatchObject({code: 'PROJECT_SOURCE_INVALID'});
+      meter.expectAllClosed();
+    }
+  });
+
+  it('maps FD close failures to a structured source error', async () => {
+    const meter = sourceMeterFixture(
+      sourceDirectory(3, {}),
+      {failClosePath: '.'},
+    );
+
+    await expect(measureProjectSourceBytes(meter.scope, meter.dependencies))
+      .rejects.toMatchObject({code: 'PROJECT_SOURCE_INVALID'});
+  });
+});
 
 describe('runPreflight', () => {
   it.each([
