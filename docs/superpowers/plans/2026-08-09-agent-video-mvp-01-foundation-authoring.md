@@ -683,7 +683,7 @@ Expected: FAIL because the handle/capability API and open-time substitution defe
 
 Use Darwin `O_NOFOLLOW_ANY = 0x20000000` as a numeric Node 22 open flag. Path-only canonicalization helpers remain module-private and never authorize production I/O.
 
-- `createProjectDirectoryScope(workspaceRoot, projectRelativeRoot)` is the only factory for the opaque `ProjectDirectoryScope`. It canonicalizes workspace and initial project roots, rejects equality/escape, stores the canonical project root in a class-private field or module-private `WeakMap`, and exposes no path string.
+- `createProjectDirectoryScope(workspaceRoot, projectRelativeRoot)` is the only factory for the opaque `ProjectDirectoryScope`. The class carries a true private instance brand (`#private` or `declare private`), not merely a private constructor, so structurally compatible objects cannot forge the type under strict TypeScript. The factory canonicalizes workspace and initial project roots, rejects equality/escape, stores the canonical project root in class-private/module-private state, and exposes no path string.
 - `prepareExistingProjectFile()` and `openExistingProjectFile(projectDirectory, relativePath)` canonicalize the saved project root and target, verify target containment, then open the canonical target with `O_RDONLY | O_NOFOLLOW_ANY`.
 - `prepareNewProjectFile()` and `openNewProjectFile(projectDirectory, relativePath)` canonicalize the saved project root and real parent, verify parent containment, check a static final symlink with `lstat`, then open `parentReal + basename` with `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW_ANY` and mode `0o600`.
 - Safe prepared capabilities may be exposed for staged operations and deterministic race tests, but they expose only `open()` and never a path string.
@@ -696,7 +696,7 @@ Threat boundary: this prevents symlink traversal and symlink substitution betwee
 
 - [ ] **Step 4: Implement JSON loading and project context**
 
-`readJson(projectDirectory, filePath, schema)` must obtain a `FileHandle` from `openExistingProjectFile()`, read from that same handle, and always close it in `finally`. `filePath` is relative to the project root. The function owns the handle. Wrap open, JSON, and Zod failures in `JsonFileError` containing `filePath` and `cause`.
+`readJson(projectDirectory, filePath, schema)` must obtain a `FileHandle` from `openExistingProjectFile()`, read from that same handle, and always close it. `filePath` is relative to the project root. The function owns the handle. Wrap open, read, JSON, and Zod failures in `JsonFileError` containing `filePath` and the primary `cause`. If close also fails after a primary failure, preserve that primary `cause` and attach the close error as `closeCause`; if reading/parsing succeeds and close alone fails, throw a `JsonFileError` containing `filePath`, with that close error exposed consistently as `cause`/`closeCause`.
 
 `src/domain/load-project.ts` rejects invalid IDs, creates one `ProjectDirectoryScope` from `workspaceRootReal + projects/<id>`, and reads `project.json`, `script.json`, and `edit.json` as project-relative paths through that same Scope.
 
@@ -716,7 +716,7 @@ Check `project.json` ID mismatch immediately after its Schema parse, before read
 
 - [ ] **Step 5: Add loader tests and verify**
 
-Tests must prove valid files load, malformed JSON and unknown fields retain their causes through `JsonFileError`, project IDs cannot contain `/` or `..`, ID mismatch wins over damaged later files, every authoring read uses the same opaque Scope with `project.json`/`script.json`/`edit.json` relative paths, and cross-file validation runs only after all three Schemas pass. Verify handle closure on success, JSON failure, and Zod failure. `createTempProject()` must remove a partially initialized workspace before rethrowing.
+Tests must prove valid files load, malformed JSON and unknown fields retain their causes through `JsonFileError`, project IDs cannot contain `/` or `..`, ID mismatch wins over damaged later files, every authoring read uses the same opaque Scope with `project.json`/`script.json`/`edit.json` relative paths, and cross-file validation runs only after all three Schemas pass. Add a strict type regression with `@ts-expect-error` proving `{}` cannot be assigned to `ProjectDirectoryScope`. Verify handle closure on success, JSON failure, and Zod failure, plus JSON failure + close failure, Zod failure + close failure, and close-only failure; the first two retain the parse/validation error as `cause` and expose the close diagnostic separately. `createTempProject()` must remove a partially initialized workspace before rethrowing.
 
 Run:
 
@@ -771,7 +771,7 @@ describe('runProcess', () => {
 });
 ```
 
-Add table-driven Darwin regressions for abort and timeout where the leader uses default `SIGTERM` behavior but a ready-signaled grandchild ignores `SIGTERM`; assert the grandchild is already gone when the Runner Promise settles. Add borrowed-FD tests for child reads/writes, `3 + index` mapping, invalid descriptors, post-call array mutation, spawn failure, and caller ownership after normal, nonzero, abort, and timeout outcomes.
+Add table-driven Darwin regressions for abort and timeout where the leader uses default `SIGTERM` behavior but a ready-signaled grandchild ignores `SIGTERM`; assert the grandchild is already gone when the Runner Promise settles. Add borrowed-FD tests for child reads/writes, `3 + index` mapping, invalid descriptors, post-call array mutation, spawn failure, and caller ownership after normal, nonzero, abort, and timeout outcomes. Close a handle before passing its stale FD and assert synchronous pre-spawn validation rejects with `PROCESS_SPAWN_FAILED`, preserves `cause.code === 'EBADF'`, and does not execute a marker-writing child command. Also prove a caller may close its handle immediately after `runProcess()` returns because descriptor validation and `spawn()` have already completed synchronously.
 
 - [ ] **Step 2: Implement the runner**
 
@@ -789,7 +789,7 @@ export interface ProcessResult {
 }
 ```
 
-`RunProcessOptions.extraStdioFds?: readonly number[]` snapshots and validates nonnegative integer parent FDs, then maps index `i` to child FD `3 + i` via `stdio: ['ignore', 'pipe', 'pipe', ...snapshot]`. FDs are borrowed: the Runner never seeks or closes them; each caller opens a fresh handle per independent consumer and closes it in `finally` after the Promise settles.
+`RunProcessOptions.extraStdioFds?: readonly number[]` snapshots and validates nonnegative integer parent FDs, then synchronously calls `fstatSync()` on every snapshotted FD before creating stdio pipes or invoking `spawn()`. A closed/stale descriptor fails as `PROCESS_SPAWN_FAILED` with the original `EBADF` cause and no child side effects. Only after validation does index `i` map to child FD `3 + i` via `stdio: ['ignore', 'pipe', 'pipe', ...snapshot]`. FDs are borrowed: the Runner never seeks or closes them; each caller opens a fresh handle per independent consumer and closes it in `finally` after the Promise settles.
 
 Reject non-zero exits with `ProcessExecutionError` carrying `PROCESS_EXIT_NONZERO`, and use `PROCESS_TIMEOUT` and `PROCESS_ABORTED` for those conditions. Normal execution settles on leader `close`. After abort/timeout on Darwin, retain the leader result but do not settle until both leader `close` and `process.kill(-pgid, 0)` reporting `ESRCH` confirm group exit. Treat success/`EPERM` as still alive, send group `SIGKILL` after the grace period, poll until disappearance, and preserve the original abort/timeout code with structured reason/cause on kill/probe failure or bounded final timeout.
 

@@ -702,7 +702,7 @@ Expected: FAIL because the handle/capability API and open-time substitution defe
 
 Use Darwin `O_NOFOLLOW_ANY = 0x20000000` as a numeric Node 22 open flag. Path-only canonicalization helpers remain module-private and never authorize production I/O.
 
-- `createProjectDirectoryScope(workspaceRoot, projectRelativeRoot)` is the only async factory for the opaque `ProjectDirectoryScope`; it stores the canonical project root only in class-private/module-private state and exposes no path string.
+- `createProjectDirectoryScope(workspaceRoot, projectRelativeRoot)` is the only async factory for the opaque `ProjectDirectoryScope`; the class carries a true private instance brand (`#private` or `declare private`), not merely a private constructor, so `{}` cannot satisfy the type under strict TypeScript. It stores the canonical project root only in class-private/module-private state and exposes no path string.
 - `prepareExistingProjectFile()` and `openExistingProjectFile(projectDirectory, relativePath)` canonicalize the saved root and target, verify project containment, then open the canonical target with `O_RDONLY | O_NOFOLLOW_ANY`.
 - `prepareNewProjectFile()` and `openNewProjectFile(projectDirectory, relativePath)` canonicalize the saved root and real parent, check a static final symlink with `lstat`, then open `parentReal + basename` with `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW_ANY` and mode `0o600`.
 - Safe prepared capabilities may be exposed for staged operations and deterministic race tests, but they expose only `open()` and never a path string.
@@ -715,7 +715,7 @@ Threat boundary: this prevents symlink traversal and symlink substitution betwee
 
 - [ ] **Step 4: Implement JSON loading and project context**
 
-`readJson(projectDirectory, filePath, schema)` must obtain a `FileHandle` from `openExistingProjectFile()`, read from that same handle, and always close it in `finally`. The path is relative to the project root and the function owns the handle. Wrap open, JSON, and Zod failures in `JsonFileError` containing `filePath` and `cause`.
+`readJson(projectDirectory, filePath, schema)` must obtain a `FileHandle` from `openExistingProjectFile()`, read from that same handle, and always close it. The path is relative to the project root and the function owns the handle. Wrap open, read, JSON, and Zod failures in `JsonFileError` containing `filePath` and the primary `cause`. A simultaneous close failure is attached as `closeCause` without replacing that primary cause; a close-only failure also becomes a `JsonFileError` with `filePath` and consistent close diagnostics.
 
 `src/domain/load-project.ts` rejects invalid IDs, creates one Scope from `workspaceRootReal + projects/<id>`, reads `project.json`, `script.json`, and `edit.json` relative to that Scope, returns `projectDirectory`, and exposes no public `projectRoot` string.
 
@@ -735,7 +735,7 @@ Check `project.json` ID mismatch immediately after its Schema parse, before read
 
 - [ ] **Step 5: Add loader tests and verify**
 
-Tests must prove valid files load, malformed JSON and unknown fields retain their causes through `JsonFileError`, project IDs cannot contain `/` or `..`, ID mismatch wins over damaged later files, every authoring read uses the same opaque Scope with project-relative file names, and cross-file validation runs only after all three Schemas pass. Verify handle closure on success, JSON failure, and Zod failure. `createTempProject()` must remove a partially initialized workspace before rethrowing.
+Tests must prove valid files load, malformed JSON and unknown fields retain their causes through `JsonFileError`, project IDs cannot contain `/` or `..`, ID mismatch wins over damaged later files, every authoring read uses the same opaque Scope with project-relative file names, and cross-file validation runs only after all three Schemas pass. Add `@ts-expect-error` coverage proving `{}` cannot forge `ProjectDirectoryScope`. Verify handle closure on success, JSON failure, and Zod failure, plus JSON+close, Zod+close, and close-only failures with primary-error precedence. `createTempProject()` must remove a partially initialized workspace before rethrowing.
 
 Run:
 
@@ -789,7 +789,7 @@ describe('runProcess', () => {
 });
 ```
 
-Add table-driven Darwin regressions for abort and timeout where the leader uses default `SIGTERM` behavior but a ready-signaled grandchild ignores `SIGTERM`; assert the grandchild is already gone when the Runner Promise settles. Add borrowed-FD tests for child reads/writes, `3 + index` mapping, invalid descriptors, post-call array mutation, spawn failure, and caller ownership after normal, nonzero, abort, and timeout outcomes.
+Add table-driven Darwin regressions for abort and timeout where the leader uses default `SIGTERM` behavior but a ready-signaled grandchild ignores `SIGTERM`; assert the grandchild is already gone when the Runner Promise settles. Add borrowed-FD tests for child reads/writes, `3 + index` mapping, invalid descriptors, post-call array mutation, spawn failure, and caller ownership after normal, nonzero, abort, and timeout outcomes. A stale FD from an already closed handle must fail before child side effects with `PROCESS_SPAWN_FAILED` and `cause.code === 'EBADF'`; a caller may close its handle immediately after `runProcess()` returns because validation and spawn have already occurred synchronously.
 
 - [ ] **Step 2: Implement the runner**
 
@@ -807,7 +807,7 @@ export interface ProcessResult {
 }
 ```
 
-`RunProcessOptions.extraStdioFds?: readonly number[]` snapshots and validates nonnegative integer parent FDs, maps index `i` to child FD `3 + i`, and treats every FD as borrowed. The caller opens a fresh handle per independent consumer and closes it in `finally`; the Runner never seeks or closes it.
+`RunProcessOptions.extraStdioFds?: readonly number[]` snapshots and validates nonnegative integer parent FDs, synchronously calls `fstatSync()` on each snapshot before creating pipes or invoking `spawn()`, then maps index `i` to child FD `3 + i`. Closed/stale descriptors fail as `PROCESS_SPAWN_FAILED` with the original `EBADF` cause and no child command side effects. Every FD remains borrowed: the caller opens a fresh handle per independent consumer and closes it in `finally`; the Runner never seeks or closes it.
 
 Reject non-zero exits with `ProcessExecutionError` carrying `PROCESS_EXIT_NONZERO`, and use `PROCESS_TIMEOUT` and `PROCESS_ABORTED` for those conditions. Once Darwin termination starts, settle only after leader `close` and process-group probe `ESRCH`; success/`EPERM` means alive, grace expiry sends group `SIGKILL`, and unexpected probe/kill errors or final timeout retain the original abort/timeout code with structured reason/cause.
 
@@ -943,9 +943,9 @@ Use `open(lockPath, 'wx', 0o600)` for acquisition. Record `hostname()`, PID, run
 
 - [ ] **Step 5: Write app-owned scope and atomic pointer tests**
 
-Define opaque `RunDirectoryScope` and `OutputDirectoryScope` values created only by async factories from a trusted canonical `workspaceRoot` plus an app-owned relative root. The factory rejects an initial canonical root outside the canonical workspace. Store the canonical scope root only in a class `#private` field or module-private `WeakMap`; scope APIs accept only Run- or Output-relative paths and never expose/reaccept the root string as authority.
+Define opaque `RunDirectoryScope` and `OutputDirectoryScope` values created only by async factories from a trusted canonical `workspaceRoot` plus an app-owned relative root. Each class has its own true private instance brand (`#private` or `declare private`), not merely a private constructor. Strict `@ts-expect-error` regressions reject `{}` forgery and all six cross-assignments among Project, Run, and Output scopes. The factory rejects an initial canonical root outside the canonical workspace. Store the canonical scope root only in a class `#private` field or module-private `WeakMap`; scope APIs accept only Run- or Output-relative paths and never expose/reaccept the root string as authority.
 
-Table-driven tests cover an initial canonical root outside the workspace, read/write escape through symlinks, lexical-root substitution after scope creation, canonical-root replacement with an external symlink, exclusive create, and symbolic links at work/output pointer paths. Existing/new opens canonicalize the target or real parent, re-check containment against the saved canonical root, and use Darwin `O_NOFOLLOW_ANY`. FDs remain borrowed: each consumer opens a fresh handle from its owning scope and closes it in `finally` after success, failure, abort, or timeout.
+Both app-owned scopes expose existing-file read, exclusive write-only new-file, and exclusive read-write new-file capabilities. The read-write form opens with `O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW_ANY` and mode `0o600` for seek/readback consumers such as MP4 muxers. Table-driven tests cover an initial canonical root outside the workspace, read/write escape through symlinks, lexical-root substitution after scope creation, canonical-root replacement with an external symlink, write-only and read-write exclusive create, read-write seek/readback permissions, and symbolic links at work/output pointer paths. Existing/new opens canonicalize the target or real parent, re-check containment against the saved canonical root, and use Darwin `O_NOFOLLOW_ANY`. FDs remain borrowed: each consumer opens a fresh handle from its owning scope and closes it in `finally` after success, failure, abort, or timeout.
 
 Use an injected `FileOps` interface to force failures in temporary-file write, sync, and rename. Each test begins with an existing `current.json` and asserts its contents remain unchanged after the simulated failure.
 
@@ -963,7 +963,7 @@ export interface CurrentPointer {
 
 - [ ] **Step 6: Implement immutable runs and atomic pointer publication**
 
-`RunStore.createRun()` creates `.work/<project>/runs/<runId>` and returns its opaque `RunDirectoryScope`, never a root string. Add a safe `RunStore.openExistingRun()` that recreates authority only through the trusted workspace/app-root factory. `RunStore` retains module-private authority for `.work/<project>/current.json` and `pipeline.lock` without exposing that app-owned root as a string or per-Run scope. Stage output files are write-once; later stages append new files without overwriting earlier artifacts. Release creation/publication uses a separate `OutputDirectoryScope` rooted at `output/<project>`. Project, Run, and Output scopes are not interchangeable. `publishCurrent()` opens a new same-directory `current.json.tmp` with no-follow/exclusive flags, writes and calls `sync()` on the file handle, atomically renames it, syncs the parent directory, and removes the temporary file on failure. Reject a symbolic link at either pointer path instead of following it.
+`RunStore.createRun()` creates `.work/<project>/runs/<runId>` and returns its opaque `RunDirectoryScope`, never a root string. Add a safe `RunStore.openExistingRun()` that recreates authority only through the trusted workspace/app-root factory. `RunStore` retains module-private authority for `.work/<project>/current.json` and `pipeline.lock` without exposing that app-owned root as a string or per-Run scope. Stage output files are write-once; later stages append new files without overwriting earlier artifacts. Release creation/publication uses a separate `OutputDirectoryScope` rooted at `output/<project>`. Project, Run, and Output scopes are not interchangeable. Seekable container outputs use the owning scope's exclusive read-write new-file capability; ordinary immutable files may use write-only creation. `publishCurrent()` opens a new same-directory `current.json.tmp` with no-follow/exclusive flags, writes and calls `sync()` on the file handle, atomically renames it, syncs the parent directory, and removes the temporary file on failure. Reject a symbolic link at either pointer path instead of following it.
 
 Use the same helper for `output/<project>/current.json`, whose `relativePath` points at `releases/<runId>` and whose `completedStage` is always `release`.
 
@@ -1556,19 +1556,19 @@ Generate one valid release and fixtures with missing audio, wrong dimensions, ex
 
 1. Render final muted H.264 video at 1920×1080 into the Run scope.
 2. Read and verify the Draft Stage output references for `audio/filter-graph.txt` and `audio/mixed-normalized.wav`; include both hashes in Release fingerprint/provenance and reuse the normalized mixed audio without executing the graph or writing either artifact again.
-3. Open fresh Run-scope input handles and an Output-scope final file handle, then mux with borrowed FDs:
+3. Open fresh Run-scope input handles and an Output-scope exclusive read-write new-file handle for `releases/<runId>/final.mp4`, then mux with borrowed FDs:
 
 ```text
 ffmpeg -y -i /dev/fd/3 -i /dev/fd/4 \
   -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -ar 48000 -ac 2 \
-  -movflags +faststart /dev/fd/5
+  -movflags +faststart -f mp4 /dev/fd/5
 ```
 
-Do not use `-shortest`. Draft already trims and normalizes the reusable audio to Composition duration; Release verifies that duration/hash contract before muxing and closes all handles in `finally`.
+Do not use `-shortest`. FD 5 must be seekable because `+faststart` reads and rewrites MP4 metadata; a write-only handle is invalid. Draft already trims and normalizes the reusable audio to Composition duration; Release verifies that duration/hash contract before muxing and closes all handles in `finally` after `runProcess()` settles.
 
 - [ ] **Step 3: Implement full release verification**
 
-Open a fresh Output-scope read handle for each full-decode, probe, and checksum consumer; run the equivalent of `ffmpeg -v error -xerror -i /dev/fd/3 -f null -` and require exit 0. Probe streams and require one H.264 `yuv420p` 1920×1080 30FPS stream and one AAC 48kHz stereo stream. Require A/V duration difference ≤50ms, parseable SRT within video duration, valid loudness metrics, and unchanged source hashes. Each borrowed FD is consumed once and closed by the caller in `finally`.
+The integration test executes the exact mux command above, asserts the Output-scope file is non-empty, fully decodes it through a fresh Output-scope read handle, and parses top-level MP4 atoms through another fresh handle. The parser handles bounded 32-bit sizes, extended 64-bit sizes, and size-zero-to-EOF atoms and requires `moov` to precede `mdat`. Open a fresh Output-scope read handle for each full-decode, probe, atom-parse, and checksum consumer; run the equivalent of `ffmpeg -v error -xerror -i /dev/fd/3 -f null -` and require exit 0. Probe streams and require one H.264 `yuv420p` 1920×1080 30FPS stream and one AAC 48kHz stereo stream. Require A/V duration difference ≤50ms, parseable SRT within video duration, valid loudness metrics, and unchanged source hashes. Each borrowed FD is consumed once and closed by the caller in `finally`.
 
 - [ ] **Step 4: Generate remaining artifacts**
 
@@ -1796,11 +1796,15 @@ expect(finalProbe.videoCodec).toBe('h264');
 expect(finalProbe.pixelFormat).toBe('yuv420p');
 expect(finalProbe.audioCodec).toBe('aac');
 expect(finalProbe.audioSampleRate).toBe(48_000);
-expect(await fullDecode(finalPath)).toEqual({ok: true});
+expect(await fullDecodeFromOutputScope(outputDirectory, finalRelativePath)).toEqual({ok: true});
+const atoms = await readTopLevelAtomsFromOutputScope(outputDirectory, finalRelativePath);
+expect(atoms.moov.offset).toBeLessThan(atoms.mdat.offset);
 expect(await sourceHashesAfter()).toEqual(await sourceHashesBefore());
 ```
 
 It also verifies `subtitles.srt`, `thumbnail.jpg`, `review.json`, `validation-report.json`, and `checksums.sha256` exist under the release referenced by `output/<project>/current.json`. Stage reports must retain stable IDs while displaying the correct `position/total` for each selected Preset.
+
+Both final-MP4 helpers must open their own fresh `OutputDirectoryScope` read handle rather than reopening a resolved path, proving the exact seekable `+faststart -f mp4 /dev/fd/5` contract executed.
 
 - [ ] **Step 4: Write cache invalidation acceptance test**
 
@@ -1853,7 +1857,7 @@ Checkpoint C is complete when all nineteen MVP acceptance criteria in the specif
 - [ ] Every JSON authoring file rejects unknown fields.
 - [ ] Script display limits use the project setting and Unicode grapheme counting.
 - [ ] Reversed and out-of-bounds Trim tests pass before rendering.
-- [ ] Project/Run/Output read/write escape, scope substitution, exclusive-create, and atomic pointer-symlink tests pass.
+- [ ] Project/Run/Output nominal forgery/cross-assignment, read/write escape, scope substitution, write-only/read-write exclusive-create, seek/readback, and atomic pointer-symlink tests pass.
 - [ ] Lock contention, stale lock, SIGINT, and SIGTERM tests pass.
 - [ ] Preflight and runtime disk exhaustion remain distinct failures.
 - [ ] Exact-frame and non-aligned caption boundary tests pass.
@@ -1861,8 +1865,8 @@ Checkpoint C is complete when all nineteen MVP acceptance criteria in the specif
 - [ ] A 100-interval `audio/filter-graph.txt` executes; it and `audio/mixed-normalized.wav` appear with path/SHA-256 in Draft Stage outputs, every frozen Audio Mix input independently changes the fingerprint, and Release reuses both hashes without overwriting either artifact.
 - [ ] Narration concat succeeds from a project path containing spaces while retaining `-safe 1`.
 - [ ] Remotion output contains no audio stream.
-- [ ] Final mux copies H.264 video and encodes AAC audio only.
-- [ ] Final MP4 passes full FFmpeg decode.
+- [ ] Final mux copies H.264 video and encodes AAC audio only through an Output-scope `O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW_ANY` handle.
+- [ ] Exact `-movflags +faststart -f mp4 /dev/fd/5` output is non-empty, passes full FFmpeg decode, and has top-level `moov` before `mdat`.
 - [ ] Failed publication preserves previous work and release pointers.
 - [ ] Changing one script segment reuses all unchanged segment audio.
 - [ ] Stage registry IDs are unique and every Preset references a contiguous registered sequence.

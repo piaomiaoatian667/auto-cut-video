@@ -804,9 +804,20 @@ Gate：
 7. 从已批准的非黑关键帧生成 1280 × 720 缩略图。
 8. 生成 SRT、校验和和最终报告。
 
+最终合流命令固定为：
+
+```text
+ffmpeg -y -i /dev/fd/3 -i /dev/fd/4 \
+  -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -ar 48000 -ac 2 \
+  -movflags +faststart -f mp4 /dev/fd/5
+```
+
+FD 3/4 分别来自 Run Scope 的全新只读 Handle；FD 5 必须来自 Output Scope 的 no-follow/exclusive **read-write new-file capability**，以支持 MP4 muxer 的 seek/readback。所有 Handle 均为 borrowed，`runProcess()` settle 后由调用方在 `finally` 关闭。这里不新增 Stage。
+
 发布硬性验证：
 
 - 对最终 MP4 执行从头到尾的完整解码。
+- 最终 MP4 非空，解析 top-level atoms 后 `moov` 必须位于 `mdat` 之前。
 - 仅包含一个视频流和一个音频流。
 - 分辨率为 1920 × 1080。
 - 帧率为 30 FPS。
@@ -1077,19 +1088,21 @@ CLI 必须支持：
 - 使用 `spawn` 或等价参数数组 API，禁止拼接 Shell 命令字符串。
 - FFmpeg 输入协议默认只允许本地 `file` 和受控 `pipe`。
 - 受控文件描述符通过 `RunProcessOptions.extraStdioFds` 按数组下标映射到子进程 FD `3 + index`。描述符为借用资源：每个独立消费者必须从对应 Scope 打开全新 `FileHandle`，一次性传给一个子进程，并在 Promise settle 后于 `finally` 关闭；Runner 不 seek、不关闭调用方 FD。
+- Runner 必须先快照并校验 FD 为非负整数，再在创建 pipe/调用 `spawn()` 前同步 `fstatSync()` 每个 FD；已关闭描述符以保留 `EBADF` cause 的结构化 `PROCESS_SPAWN_FAILED` 拒绝，且子命令不得产生副作用。
 - 对 FFmpeg、Remotion 和 Provider 设置超时和最大并发。
 - 限制允许的素材大小、像素尺寸和最长时长，避免资源耗尽。
 - 日志保存经过转义的展示命令，不保存可直接重新执行的未验证字符串。
 
 ### 18.2 文件操作
 
-- 所有项目文件操作必须持有由 canonical workspace root 与项目相对目录建立的 opaque `ProjectDirectoryScope`；Scope API 只接收项目相对路径，并在每次打开前验证目标或真实父目录仍位于 Scope 保存的 canonical project root 内。
+- 所有项目文件操作必须持有由 canonical workspace root 与项目相对目录建立的 opaque `ProjectDirectoryScope`；Scope 类型必须带真正的 private 实例 brand，而不能只依赖 private constructor。Scope API 只接收项目相对路径，并在每次打开前验证目标或真实父目录仍位于 Scope 保存的 canonical project root 内。
 - 禁止符号链接逃逸项目目录。
 - 可写目标必须先解析并验证其真实父目录；若目标已存在且是符号链接则拒绝。
 - Darwin 新文件使用 `O_CREAT | O_EXCL | O_NOFOLLOW_ANY` 创建；已有指针或发布文件只能通过同目录安全临时文件和原子重命名替换，禁止直接跟随目标路径写入。
 - 原素材在 Ingest 和 Release 分别计算 Hash。
 - 输出使用临时文件和原子重命名。
-- Project Scope 不授权 `.work` 或 `output`；P02 必须提供 opaque `RunDirectoryScope` 和 `OutputDirectoryScope`。两者只能由可信 canonical workspace root 与 app-owned 相对根异步创建，canonical 根保持私有，API 只接收各自根内相对路径，并在每次 existing/new open 前重新验证 containment、使用 Darwin `O_NOFOLLOW_ANY`、拒绝 symlink traversal/substitution。每个独立消费者从所属 Project/Run/Output Scope 打开新 `FileHandle`；FD 为 borrowed，调用方在 Promise settle 后 `finally` 关闭。
+- Project Scope 不授权 `.work` 或 `output`；P02 必须提供 opaque `RunDirectoryScope` 和 `OutputDirectoryScope`。三种 Scope 各自带不同的 private 实例 brand，禁止 `{}` 伪造和 Project/Run/Output 之间的结构化互赋值。Run/Output Scope 只能由可信 canonical workspace root 与 app-owned 相对根异步创建，canonical 根保持私有，API 只接收各自根内相对路径，并在每次 existing/new open 前重新验证 containment、使用 Darwin `O_NOFOLLOW_ANY`、拒绝 symlink traversal/substitution。
+- Run/Output Scope 除 existing read 与 exclusive write-only new-file 外，还必须提供 exclusive read-write new-file capability：`O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW_ANY`、mode `0o600`。该能力用于需要 seek/readback 的容器写入；每个独立消费者仍从所属 Project/Run/Output Scope 打开新 `FileHandle`，FD 为 borrowed，调用方在 Promise settle 后 `finally` 关闭。
 
 ### 18.3 运行时代码
 
@@ -1198,6 +1211,7 @@ ATOMIC_PUBLISH_FAILED
 - 在包含空格的项目目录运行 Narration，验证 `-safe 1` concat 清单只使用受控相对文件名。
 - 修改一个脚本段后验证另一个语音段命中缓存。
 - 先执行 `assets`、再执行 `draft`、最后执行 `release`，验证共同 Stage 复用已有产物，且 Release 复用 Draft 的 Filter Graph/混音 Hash 而不重复混音或覆盖 write-once artifact。
+- 用 Output Scope 的 exclusive read-write new-file Handle 执行固定 `-movflags +faststart -f mp4 /dev/fd/5` 命令；验证输出非空、可由 FFmpeg 完整解码，并用全新的 Output-scope read Handle 解析 32-bit、extended 64-bit 和 size-zero top-level atom，确认 `moov` 在 `mdat` 前。
 - `--plan` 不创建 Run、不获取项目锁且不启动子进程。
 - 中断 Release 后验证上一次成功输出未被覆盖。
 
@@ -1211,7 +1225,8 @@ ATOMIC_PUBLISH_FAILED
 
 - 在项目内创建指向项目外文件和目录的符号链接，验证读取路径在打开前返回 `ASSET_PATH_OUTSIDE_PROJECT`。
 - 创建一个指向项目外文件的可写目标符号链接，验证安全创建 API 拒绝写入且项目外文件内容保持不变。
-- 对 Run/Output Scope 分别覆盖读写逃逸、factory 后 lexical/canonical root substitution、exclusive create 和 work/output pointer symlink，验证所有情况 fail closed 且 borrowed FD 所有权仍归调用方。
+- 用 `@ts-expect-error` 覆盖 `{}` 伪造以及 Project/Run/Output Scope 全部双向互赋，证明三种 authority nominally distinct。
+- 对 Run/Output Scope 分别覆盖读写逃逸、factory 后 lexical/canonical root substitution、write-only/read-write exclusive create、read-write seek/readback 权限和 work/output pointer symlink，验证所有情况 fail closed 且 borrowed FD 所有权仍归调用方。
 - 同时启动两个写入型命令，验证第二个命令返回 `PROJECT_LOCKED`，且第一个命令的锁不会被覆盖。
 - 构造已退出进程留下的锁，验证系统只在确认同主机 PID 不存在后将其报告为 `PROJECT_LOCK_STALE`，并要求显式清理。
 - 分别向运行进程发送 `SIGINT` 和 `SIGTERM`，验证子进程被终止、临时文件被清理、锁被释放、旧 `current.json` 保持不变。
@@ -1268,7 +1283,7 @@ ATOMIC_PUBLISH_FAILED
 9. 输出 1920 × 1080、30 FPS、H.264、`yuv420p` 的最终 MP4。
 10. 最终音频为 AAC、48kHz、立体声，并满足项目响度策略。
 11. 输出与脚本段落一致的 SRT。
-12. 最终 MP4 可以从头到尾完整解码。
+12. 最终 MP4 非空、可以从头到尾完整解码，并且 top-level `moov` atom 位于 `mdat` 之前。
 13. 原始素材 Hash 在运行前后保持一致。
 14. 修改一个脚本段落后，未修改段落的语音缓存继续命中。
 15. 任一阶段失败后，`--resume` 从第一个失效阶段继续。

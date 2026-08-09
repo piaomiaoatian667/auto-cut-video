@@ -93,23 +93,25 @@ Checkpoint B is complete: a narrated, captioned draft can be explicitly approved
 
 Generate one valid release and fixtures with missing audio, wrong dimensions, excessive A/V duration difference, and truncated MP4. Assert the exact errors `RELEASE_DECODE_FAILED` or `RELEASE_DURATION_MISMATCH`. Add a regression test that pre-creates the Draft filter graph and normalized mixed audio, runs Release, and proves their bytes/hashes remain unchanged.
 
+Add an exact borrowed-FD mux integration test using the command in Step 2. Obtain child FD 5 from the Output scope's exclusive read-write new-file capability, wait for `runProcess()` to settle, then close the mux handle in `finally`. Assert the output is non-empty, a fresh Output-scope read handle fully decodes through FFmpeg, and another fresh Output-scope read handle parses top-level MP4 atoms—including normal 32-bit sizes, extended 64-bit sizes, and size-zero-to-EOF semantics—so the `moov` atom offset is strictly before the `mdat` atom offset.
+
 - [ ] **Step 2: Implement final rendering and muxing**
 
 1. Render final muted H.264 video at 1920×1080 into the Run scope.
 2. Read and verify the Draft Stage output references for `audio/filter-graph.txt` and `audio/mixed-normalized.wav`. Include both hashes in the Release fingerprint/provenance, then reuse the normalized mixed audio without executing the graph or writing either Draft artifact again.
-3. Open fresh Run-scope handles for final video and normalized mixed audio plus a fresh Output-scope handle for `releases/<runId>/final.mp4`, then mux with borrowed FDs:
+3. Open fresh Run-scope handles for final video and normalized mixed audio plus a fresh Output-scope **exclusive read-write new-file** handle for `releases/<runId>/final.mp4`, then mux with borrowed FDs:
 
 ```text
 ffmpeg -y -i /dev/fd/3 -i /dev/fd/4 \
   -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -ar 48000 -ac 2 \
-  -movflags +faststart /dev/fd/5
+  -movflags +faststart -f mp4 /dev/fd/5
 ```
 
-Do not use `-shortest`. Draft already trims and normalizes the reusable mixed audio to Composition duration; Release verifies that duration/hash contract before muxing. Close every caller-owned handle in `finally` after `runProcess()` settles.
+Do not use `-shortest`. FD 5 must be seekable because FFmpeg's `+faststart` pass reads and rewrites MP4 metadata; a write-only Output handle is invalid. Draft already trims and normalizes the reusable mixed audio to Composition duration; Release verifies that duration/hash contract before muxing. Close every caller-owned handle in `finally` after `runProcess()` settles.
 
 - [ ] **Step 3: Implement full release verification**
 
-Open a fresh Output-scope read handle for each full-decode, probe, and checksum consumer; run the equivalent of `ffmpeg -v error -xerror -i /dev/fd/3 -f null -` and require exit 0. Probe streams and require one H.264 `yuv420p` 1920×1080 30FPS stream and one AAC 48kHz stereo stream. Require A/V duration difference ≤50ms, parseable SRT within video duration, valid loudness metrics, and unchanged source hashes. Each borrowed FD is consumed once and closed by the caller in `finally`.
+Open a fresh Output-scope read handle for each full-decode, probe, top-level-atom parse, and checksum consumer; run the equivalent of `ffmpeg -v error -xerror -i /dev/fd/3 -f null -` and require exit 0. Probe streams and require one H.264 `yuv420p` 1920×1080 30FPS stream and one AAC 48kHz stereo stream. Parse top-level MP4 atoms with bounds checks for 32-bit, extended 64-bit, and size-zero forms; require exactly discoverable `moov` and `mdat` atoms with `moov` before `mdat`. Require A/V duration difference ≤50ms, parseable SRT within video duration, valid loudness metrics, and unchanged source hashes. Each borrowed FD is consumed once and closed by the caller in `finally`.
 
 - [ ] **Step 4: Generate remaining artifacts**
 
@@ -139,7 +141,7 @@ pnpm typecheck
 git diff --check
 ```
 
-Expected: all tests pass, Draft owns both fixed audio artifact references, Release is blocked without approval, Release reuses their exact hashes without overwriting either artifact, the final MP4 fully decodes, and injected pointer failures preserve the previous successful release.
+Expected: all tests pass, Draft owns both fixed audio artifact references, Release is blocked without approval, Release reuses their exact hashes without overwriting either artifact, the exact `-movflags +faststart -f mp4 /dev/fd/5` mux succeeds through an Output-scope read-write handle, the final MP4 is non-empty and fully decodes with `moov` before `mdat`, and injected pointer failures preserve the previous successful release.
 
 - [ ] **Step 2: Re-run the release artifact contract test verbosely**
 
