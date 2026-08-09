@@ -30,9 +30,11 @@ describe('loadProject', () => {
     onTestFinished(temp.cleanup);
     await writeFile(path.join(temp.projectRoot, 'script.json'), '{');
 
-    await expect(loadProject(temp.workspaceRoot, 'demo')).rejects.toBeInstanceOf(
-      SyntaxError,
-    );
+    await expect(loadProject(temp.workspaceRoot, 'demo')).rejects.toMatchObject({
+      name: 'JsonFileError',
+      filePath: 'projects/demo/script.json',
+      cause: expect.any(SyntaxError),
+    });
   });
 
   it('rejects unknown fields through the strict schemas', async () => {
@@ -44,10 +46,14 @@ describe('loadProject', () => {
     onTestFinished(temp.cleanup);
 
     await expect(loadProject(temp.workspaceRoot, 'demo')).rejects.toMatchObject({
-      name: 'ZodError',
-      issues: expect.arrayContaining([
-        expect.objectContaining({code: 'unrecognized_keys'}),
-      ]),
+      name: 'JsonFileError',
+      filePath: 'projects/demo/project.json',
+      cause: expect.objectContaining({
+        name: 'ZodError',
+        issues: expect.arrayContaining([
+          expect.objectContaining({code: 'unrecognized_keys'}),
+        ]),
+      }),
     });
   });
 
@@ -73,13 +79,17 @@ describe('loadProject', () => {
     );
 
     await expect(loadProject(workspace.workspaceRoot, 'escape')).rejects.toMatchObject({
-      code: 'ASSET_PATH_OUTSIDE_PROJECT',
+      name: 'JsonFileError',
+      filePath: 'projects/escape/project.json',
+      cause: expect.objectContaining({code: 'ASSET_PATH_OUTSIDE_PROJECT'}),
     });
   });
 
   it('rejects a project.json id that does not match its directory id', async () => {
     const temp = await createTempProject({
       project: createProjectFixture('other-project'),
+      script: '{',
+      edit: '{',
     });
     onTestFinished(temp.cleanup);
 
@@ -103,10 +113,14 @@ describe('loadProject', () => {
     onTestFinished(temp.cleanup);
 
     await expect(loadProject(temp.workspaceRoot, 'demo')).rejects.toMatchObject({
-      name: 'ZodError',
-      issues: expect.arrayContaining([
-        expect.objectContaining({code: 'unrecognized_keys'}),
-      ]),
+      name: 'JsonFileError',
+      filePath: 'projects/demo/edit.json',
+      cause: expect.objectContaining({
+        name: 'ZodError',
+        issues: expect.arrayContaining([
+          expect.objectContaining({code: 'unrecognized_keys'}),
+        ]),
+      }),
     });
 
     await writeFile(

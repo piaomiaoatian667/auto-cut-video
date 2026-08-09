@@ -1,7 +1,6 @@
 import {realpath} from 'node:fs/promises';
 import path from 'node:path';
 import {readJson} from '../fs/json-files';
-import {resolveExistingProjectPath} from '../fs/project-paths';
 import {EditSchema, type Edit} from './edit-schema';
 import {ProjectSchema, type Project} from './project-schema';
 import {StableIdSchema} from './schema-primitives';
@@ -37,27 +36,28 @@ export async function loadProject(
 ): Promise<ProjectInputs> {
   const validatedProjectId = StableIdSchema.parse(projectId);
   const workspaceRootReal = await realpath(workspaceRoot);
-  const projectRoot = await resolveExistingProjectPath(
-    workspaceRootReal,
-    path.join('projects', validatedProjectId),
-  );
+  const projectRelativeRoot = path.join('projects', validatedProjectId);
+  const projectRoot = path.join(workspaceRootReal, projectRelativeRoot);
 
   const project = await readJson(
-    await resolveExistingProjectPath(projectRoot, 'project.json'),
+    workspaceRootReal,
+    path.join(projectRelativeRoot, 'project.json'),
     ProjectSchema,
   );
-  const script = await readJson(
-    await resolveExistingProjectPath(projectRoot, 'script.json'),
-    ScriptSchema,
-  );
-  const edit = await readJson(
-    await resolveExistingProjectPath(projectRoot, 'edit.json'),
-    EditSchema,
-  );
-
   if (project.id !== validatedProjectId) {
     throw new ProjectIdMismatchError(validatedProjectId, project.id);
   }
+
+  const script = await readJson(
+    workspaceRootReal,
+    path.join(projectRelativeRoot, 'script.json'),
+    ScriptSchema,
+  );
+  const edit = await readJson(
+    workspaceRootReal,
+    path.join(projectRelativeRoot, 'edit.json'),
+    EditSchema,
+  );
   validateAuthoringInputs({project, script, edit});
 
   return {

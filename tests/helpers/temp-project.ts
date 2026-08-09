@@ -80,6 +80,7 @@ export const createEditFixture = (): Edit => ({
 
 export interface TempProjectOptions {
   projectId?: string;
+  tempPrefix?: string;
   project?: unknown;
   script?: unknown;
   edit?: unknown;
@@ -98,28 +99,36 @@ export async function createTempProject(
   options: TempProjectOptions = {},
 ): Promise<TempProject> {
   const projectId = options.projectId ?? 'demo';
-  const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'agent-video-workspace-'));
-  const projectRoot = path.join(workspaceRoot, 'projects', projectId);
-  await mkdir(projectRoot, {recursive: true});
+  const workspaceRoot = await mkdtemp(path.join(
+    tmpdir(),
+    options.tempPrefix ?? 'agent-video-workspace-',
+  ));
+  try {
+    const projectRoot = path.join(workspaceRoot, 'projects', projectId);
+    await mkdir(projectRoot, {recursive: true});
 
-  await Promise.all([
-    writeFile(
-      path.join(projectRoot, 'project.json'),
-      serialize(options.project ?? createProjectFixture(projectId)),
-    ),
-    writeFile(
-      path.join(projectRoot, 'script.json'),
-      serialize(options.script ?? createScriptFixture()),
-    ),
-    writeFile(
-      path.join(projectRoot, 'edit.json'),
-      serialize(options.edit ?? createEditFixture()),
-    ),
-  ]);
+    await Promise.all([
+      writeFile(
+        path.join(projectRoot, 'project.json'),
+        serialize(options.project ?? createProjectFixture(projectId)),
+      ),
+      writeFile(
+        path.join(projectRoot, 'script.json'),
+        serialize(options.script ?? createScriptFixture()),
+      ),
+      writeFile(
+        path.join(projectRoot, 'edit.json'),
+        serialize(options.edit ?? createEditFixture()),
+      ),
+    ]);
 
-  return {
-    workspaceRoot,
-    projectRoot,
-    cleanup: async () => rm(workspaceRoot, {recursive: true, force: true}),
-  };
+    return {
+      workspaceRoot,
+      projectRoot,
+      cleanup: async () => rm(workspaceRoot, {recursive: true, force: true}),
+    };
+  } catch (error) {
+    await rm(workspaceRoot, {recursive: true, force: true});
+    throw error;
+  }
 }
