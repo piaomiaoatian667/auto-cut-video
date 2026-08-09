@@ -1,7 +1,10 @@
 import {describe, expect, it, vi} from 'vitest';
 import {createEditFixture, createProjectFixture, createScriptFixture} from '../../helpers/temp-project';
 import type {ProjectInputs} from '../../../src/domain/load-project';
-import type {ProjectDirectoryScope} from '../../../src/fs/project-paths';
+import {
+  ProjectPathError,
+  type ProjectDirectoryScope,
+} from '../../../src/fs/project-paths';
 import type {PreflightResult} from '../../../src/pipeline/stages/preflight';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
 import {runVideoctl, type VideoctlDependencies} from '../../../src/cli/videoctl';
@@ -81,7 +84,7 @@ const fixture = (result: PreflightResult = successfulResult()) => {
     stdout: {write: (chunk) => { stdout += chunk; }},
     stderr: {write: (chunk) => { stderr += chunk; }},
     loadProject: vi.fn(async () => projectInputs),
-    measureSourceBytes: vi.fn(async () => 1024),
+    sourceBytes: 1024,
     preflight: vi.fn(async () => result),
     ffmpegExecutable: '/configured/ffmpeg',
     ffprobeExecutable: '/configured/ffprobe',
@@ -112,7 +115,6 @@ describe('videoctl doctor', () => {
 
     expect(exitCode).toBe(EXIT_CODES.success);
     expect(dependencies.loadProject).toHaveBeenCalledWith('/workspace', 'demo');
-    expect(dependencies.measureSourceBytes).toHaveBeenCalledWith(projectInputs);
     expect(dependencies.preflight).toHaveBeenCalledWith({
       workspaceRoot: '/workspace',
       projectDirectory: projectInputs.projectDirectory,
@@ -136,6 +138,43 @@ describe('videoctl doctor', () => {
       'Environment fingerprint: sha256:environment',
       '',
     ].join('\n'));
+    expect(stderr()).toBe('');
+  });
+
+  it('fails closed on scoped project substitution without raw source reads', async () => {
+    const {dependencies, projectInputs, stdout, stderr} = fixture();
+    dependencies.sourceBytes = 4096;
+    const forbiddenRawSourceRead = vi.fn();
+    Object.defineProperty(dependencies, 'measureSourceBytes', {
+      configurable: true,
+      get: () => {
+        forbiddenRawSourceRead();
+        return async () => 999_999;
+      },
+    });
+    dependencies.preflight = vi.fn(async (input) => {
+      expect(input.projectDirectory).toBe(projectInputs.projectDirectory);
+      expect(input.sourceBytes).toBe(4096);
+      throw new ProjectPathError(
+        'project directory changed after scope creation: assets/source',
+      );
+    });
+
+    const exitCode = await runVideoctl(
+      ['doctor', 'demo', '--json'],
+      dependencies,
+    );
+    const report = JSON.parse(stdout()) as {
+      checks: Array<{code?: string}>;
+    };
+
+    expect(exitCode).toBe(EXIT_CODES.environmentFailed);
+    expect(forbiddenRawSourceRead).not.toHaveBeenCalled();
+    expect(dependencies.preflight).toHaveBeenCalledOnce();
+    expect(report.checks).toContainEqual(expect.objectContaining({
+      code: 'ENV_PREFLIGHT_FAILED',
+    }));
+    expect(stdout()).not.toContain('assets/source');
     expect(stderr()).toBe('');
   });
 
@@ -261,5 +300,43 @@ describe('videoctl doctor', () => {
     expect(stdout()).toBe('');
     expect(stderr()).toBe('Unable to load project "demo".\n');
     expect(stderr()).not.toContain('/private/projects');
+  });
+
+  it('prints structured JSON when project loading or validation fails', async () => {
+    const {dependencies, stdout, stderr} = fixture();
+    dependencies.loadProject = vi.fn(async () => {
+      throw new Error('secret workspace authority /private/projects');
+    });
+
+    const exitCode = await runVideoctl(
+      ['doctor', 'demo', '--json'],
+      dependencies,
+    );
+    const report = JSON.parse(stdout()) as {
+      command: string;
+      project: string;
+      ok: boolean;
+      checks: Array<{
+        id: string;
+        severity: string;
+        code: string;
+        message: string;
+      }>;
+    };
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(report).toMatchObject({
+      command: 'doctor',
+      project: 'demo',
+      ok: false,
+      checks: [{
+        id: 'project-load',
+        severity: 'error',
+        code: 'PROJECT_LOAD_FAILED',
+        message: 'Unable to load or validate project.',
+      }],
+    });
+    expect(stdout()).not.toContain('/private/projects');
+    expect(stderr()).toBe('');
   });
 });

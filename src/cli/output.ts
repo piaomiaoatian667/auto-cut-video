@@ -9,9 +9,7 @@ export interface DoctorFailureReport {
   command: 'doctor';
   project: string;
   ok: false;
-  checks: Array<Omit<PreflightCheck, 'code'> & {
-    code: 'ENV_PREFLIGHT_FAILED';
-  }>;
+  checks: Array<Omit<PreflightCheck, 'code'> & {code: string}>;
   toolIdentities: {
     ffmpeg: null;
     qtFaststart: null;
@@ -22,6 +20,18 @@ export interface DoctorFailureReport {
   system: null;
   environmentFingerprint: null;
 }
+
+export interface DoctorFailure {
+  id: string;
+  code: string;
+  message: string;
+}
+
+const PREFLIGHT_FAILURE: DoctorFailure = {
+  id: 'doctor',
+  code: 'ENV_PREFLIGHT_FAILED',
+  message: 'Preflight failed unexpectedly.',
+};
 
 const statusLabel = (check: OutputCheck): string => {
   switch (check.severity) {
@@ -105,15 +115,16 @@ export const formatDoctorJson = (
 
 export const createDoctorFailureReport = (
   project: string,
+  failure: DoctorFailure = PREFLIGHT_FAILURE,
 ): DoctorFailureReport => ({
   command: 'doctor',
   project,
   ok: false,
   checks: [{
-    id: 'doctor',
+    id: failure.id,
     severity: 'error',
-    code: 'ENV_PREFLIGHT_FAILED',
-    message: 'Preflight failed unexpectedly.',
+    code: failure.code,
+    message: failure.message,
   }],
   toolIdentities: {ffmpeg: null, qtFaststart: null},
   fonts: [],
@@ -126,8 +137,9 @@ export const createDoctorFailureReport = (
 export const formatDoctorFailure = (
   project: string,
   json: boolean,
+  failure: DoctorFailure = PREFLIGHT_FAILURE,
 ): string => {
-  const report = createDoctorFailureReport(project);
+  const report = createDoctorFailureReport(project, failure);
   if (json) return `${JSON.stringify(report, null, 2)}\n`;
   return [
     `Environment doctor: ${project}`,

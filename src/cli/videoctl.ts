@@ -1,6 +1,5 @@
 import {pathToFileURL} from 'node:url';
 import path from 'node:path';
-import {lstat, readdir} from 'node:fs/promises';
 import {Command, CommanderError} from 'commander';
 import {
   loadProject,
@@ -29,7 +28,7 @@ export interface VideoctlDependencies {
   stdout: OutputWriter;
   stderr: OutputWriter;
   loadProject(workspaceRoot: string, projectId: string): Promise<ProjectInputs>;
-  measureSourceBytes(project: ProjectInputs): Promise<number>;
+  sourceBytes: number;
   preflight(input: PreflightInput): Promise<PreflightResult>;
   ffmpegExecutable?: string;
   ffprobeExecutable?: string;
@@ -39,67 +38,15 @@ interface DoctorOptions {
   json?: boolean;
 }
 
-const isNodeError = (error: unknown): error is NodeJS.ErrnoException =>
-  error instanceof Error && 'code' in error;
-
-const measureDirectoryBytes = async (
-  directory: string,
-  missingIsEmpty: boolean,
-): Promise<number> => {
-  let directoryStatus;
-  try {
-    directoryStatus = await lstat(directory);
-  } catch (error) {
-    if (missingIsEmpty && isNodeError(error) && error.code === 'ENOENT') return 0;
-    throw error;
-  }
-  if (!directoryStatus.isDirectory() || directoryStatus.isSymbolicLink()) {
-    throw new Error('source path is not a regular directory');
-  }
-
-  const entries = await readdir(directory);
-  entries.sort((left, right) => left.localeCompare(right));
-  let totalBytes = 0;
-  for (const entry of entries) {
-    const candidate = path.join(directory, entry);
-    const status = await lstat(candidate);
-    if (status.isSymbolicLink()) {
-      throw new Error('source directory contains a symbolic link');
-    }
-    if (status.isDirectory()) {
-      totalBytes += await measureDirectoryBytes(candidate, false);
-    } else if (status.isFile()) {
-      totalBytes += status.size;
-    } else {
-      throw new Error('source directory contains an unsupported file type');
-    }
-    if (!Number.isSafeInteger(totalBytes)) {
-      throw new Error('source byte count exceeds the safe integer range');
-    }
-  }
-  return totalBytes;
-};
-
-const measureProjectSourceBytes = async (
-  project: ProjectInputs,
-): Promise<number> => measureDirectoryBytes(path.join(
-  project.workspaceRoot,
-  'projects',
-  project.project.id,
-  'assets',
-  'source',
-), true);
-
 const doctorInput = (
   project: ProjectInputs,
-  sourceBytes: number,
   dependencies: VideoctlDependencies,
 ): PreflightInput => ({
   workspaceRoot: project.workspaceRoot,
   projectDirectory: project.projectDirectory,
   project: project.project,
   script: project.script,
-  sourceBytes,
+  sourceBytes: dependencies.sourceBytes,
   workDirectory: path.join(
     project.workspaceRoot,
     '.work',
@@ -125,15 +72,21 @@ const runDoctor = async (
       projectId,
     );
   } catch {
-    dependencies.stderr.write(`Unable to load project "${projectId}".\n`);
+    if (options.json === true) {
+      dependencies.stdout.write(formatDoctorFailure(projectId, true, {
+        id: 'project-load',
+        code: 'PROJECT_LOAD_FAILED',
+        message: 'Unable to load or validate project.',
+      }));
+    } else {
+      dependencies.stderr.write(`Unable to load project "${projectId}".\n`);
+    }
     return EXIT_CODES.validationFailed;
   }
 
   try {
-    const sourceBytes = await dependencies.measureSourceBytes(project);
     const result = await dependencies.preflight(doctorInput(
       project,
-      sourceBytes,
       dependencies,
     ));
     dependencies.stdout.write(options.json === true
@@ -184,7 +137,13 @@ export async function runVideoctl(
   }
 }
 
-export const createSystemVideoctlDependencies = (): VideoctlDependencies => {
+export interface SystemVideoctlOptions {
+  sourceBytes: number;
+}
+
+export const createSystemVideoctlDependencies = (
+  options: SystemVideoctlOptions,
+): VideoctlDependencies => {
   const preflightDependencies = createSystemPreflightDependencies();
   const ffmpegExecutable = process.env.FFMPEG_PATH;
   const ffprobeExecutable = process.env.FFPROBE_PATH;
@@ -193,7 +152,7 @@ export const createSystemVideoctlDependencies = (): VideoctlDependencies => {
     stdout: process.stdout,
     stderr: process.stderr,
     loadProject,
-    measureSourceBytes: measureProjectSourceBytes,
+    sourceBytes: options.sourceBytes,
     preflight: async (input) => runPreflight(input, preflightDependencies),
     ...(ffmpegExecutable === undefined ? {} : {ffmpegExecutable}),
     ...(ffprobeExecutable === undefined ? {} : {ffprobeExecutable}),
@@ -206,7 +165,7 @@ const directlyExecuted = process.argv[1] !== undefined
 if (directlyExecuted) {
   void runVideoctl(
     process.argv.slice(2),
-    createSystemVideoctlDependencies(),
+    createSystemVideoctlDependencies({sourceBytes: 0}),
   ).then(
     (exitCode) => { process.exitCode = exitCode; },
     () => {
