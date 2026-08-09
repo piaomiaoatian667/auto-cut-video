@@ -1,5 +1,4 @@
 import {realpath} from 'node:fs/promises';
-import path from 'node:path';
 import {readJson} from '../fs/json-files';
 import {
   createProjectDirectoryScope,
@@ -40,10 +39,9 @@ export async function loadProject(
 ): Promise<ProjectInputs> {
   const validatedProjectId = StableIdSchema.parse(projectId);
   const workspaceRootReal = await realpath(workspaceRoot);
-  const projectRelativeRoot = path.join('projects', validatedProjectId);
   const projectDirectory = await createProjectDirectoryScope(
     workspaceRootReal,
-    projectRelativeRoot,
+    validatedProjectId,
   );
 
   const project = await readJson(

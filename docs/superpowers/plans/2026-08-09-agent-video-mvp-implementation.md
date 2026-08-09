@@ -702,7 +702,7 @@ Expected: FAIL because the handle/capability API and open-time substitution defe
 
 Use Darwin `O_NOFOLLOW_ANY = 0x20000000` as a numeric Node 22 open flag. Path-only canonicalization helpers remain module-private and never authorize production I/O.
 
-- `createProjectDirectoryScope(workspaceRoot, projectRelativeRoot)` is the only async factory for the opaque `ProjectDirectoryScope`; the class carries a true private instance brand (`#private` or `declare private`), not merely a private constructor, so `{}` cannot satisfy the type under strict TypeScript. It stores the canonical project root only in class-private/module-private state and exposes no path string.
+- `createProjectDirectoryScope(workspaceRoot, projectId)` is the only public async factory for the opaque `ProjectDirectoryScope`; the class exposes no static or arbitrary-relative-root factory. It validates `projectId` with the shared `StableIdSchema`, derives `projects/<id>` internally, requires the fixed lexical `workspace/projects` directory to canonicalize to itself rather than a symlink target, and requires the canonical project root to remain strictly beneath that canonical Projects root. The class carries a true private instance brand (`#private` or `declare private`) and stores both canonical roots only in class-private/module-private state without exposing path strings.
 - `prepareExistingProjectFile()` and `openExistingProjectFile(projectDirectory, relativePath)` canonicalize the saved root and target, verify project containment, then open the canonical target with `O_RDONLY | O_NOFOLLOW_ANY`.
 - `prepareNewProjectFile()` and `openNewProjectFile(projectDirectory, relativePath)` canonicalize the saved root and real parent, check a static final symlink with `lstat`, then open `parentReal + basename` with `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW_ANY` and mode `0o600`.
 - Safe prepared capabilities may be exposed for staged operations and deterministic race tests, but they expose only `open()` and never a path string.
@@ -711,13 +711,13 @@ Use Darwin `O_NOFOLLOW_ANY = 0x20000000` as a numeric Node 22 open flag. Path-on
 
 Never call `writeFile()` directly on a user-derived writable target. Immutable artifacts use `openNewProjectFile()`. Pointer replacement uses a same-directory temporary capability, sync, and atomic rename.
 
-Threat boundary: this prevents symlink traversal and symlink substitution between canonicalization and open. It does not claim to prevent hard-link substitution, replacement with ordinary directories or mount points, or concurrent modification of an already opened file's contents. Project Scope never authorizes `.work` or `output`; P02 supplies separate app-owned scopes.
+Threat boundary: this prevents symlink traversal and symlink substitution between canonicalization and open. It does not claim to prevent hard-link substitution, replacement with ordinary directories or mount points, or concurrent modification of an already opened file's contents. Project Scope never authorizes `.work` or `output`; P02 supplies separate app-owned Run/Output scopes whose public factories derive their own fixed prefixes and never accept arbitrary authority roots.
 
 - [ ] **Step 4: Implement JSON loading and project context**
 
 `readJson(projectDirectory, filePath, schema)` must obtain a `FileHandle` from `openExistingProjectFile()`, read from that same handle, and always close it. The path is relative to the project root and the function owns the handle. Wrap open, read, JSON, and Zod failures in `JsonFileError` containing `filePath` and the primary `cause`. A simultaneous close failure is attached as `closeCause` without replacing that primary cause; a close-only failure also becomes a `JsonFileError` with `filePath` and consistent close diagnostics.
 
-`src/domain/load-project.ts` rejects invalid IDs, creates one Scope from `workspaceRootReal + projects/<id>`, reads `project.json`, `script.json`, and `edit.json` relative to that Scope, returns `projectDirectory`, and exposes no public `projectRoot` string.
+`src/domain/load-project.ts` rejects invalid IDs and passes the validated ID to `createProjectDirectoryScope(workspaceRootReal, projectId)`; only that factory derives the fixed `projects/<id>` authority. It reads `project.json`, `script.json`, and `edit.json` relative to that Scope, returns `projectDirectory`, and exposes no public `projectRoot` string.
 
 ```ts
 export interface ProjectInputs {
@@ -735,7 +735,7 @@ Check `project.json` ID mismatch immediately after its Schema parse, before read
 
 - [ ] **Step 5: Add loader tests and verify**
 
-Tests must prove valid files load, malformed JSON and unknown fields retain their causes through `JsonFileError`, project IDs cannot contain `/` or `..`, ID mismatch wins over damaged later files, every authoring read uses the same opaque Scope with project-relative file names, and cross-file validation runs only after all three Schemas pass. Add `@ts-expect-error` coverage proving `{}` cannot forge `ProjectDirectoryScope`. Verify handle closure on success, JSON failure, and Zod failure, plus JSON+close, Zod+close, and close-only failures with primary-error precedence. `createTempProject()` must remove a partially initialized workspace before rethrowing.
+Tests must prove valid files load, malformed JSON and unknown fields retain their causes through `JsonFileError`, project IDs cannot contain `/` or `..` (including `.work/...` and `output/...` authority attempts), `projects/<id>` symlinks into `.work`, `output`, other workspace siblings, or outside the workspace are rejected, a redirected `workspace/projects` root is rejected, ID mismatch wins over damaged later files, every authoring read uses the same opaque Scope with project-relative file names, stable internal project symlinks remain usable, and cross-file validation runs only after all three Schemas pass. Add type/runtime coverage proving `{}` and prototype-forged objects cannot acquire `ProjectDirectoryScope`, and prove the class exposes no arbitrary-root static factory. Verify handle closure on success, JSON failure, and Zod failure, plus JSON+close, Zod+close, and close-only failures with primary-error precedence. `createTempProject()` must remove a partially initialized workspace before rethrowing.
 
 Run:
 

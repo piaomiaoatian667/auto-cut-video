@@ -1,4 +1,4 @@
-import {realpath, symlink, writeFile} from 'node:fs/promises';
+import {mkdir, realpath, rename, symlink, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {describe, expect, it, onTestFinished} from 'vitest';
 import {loadProject} from '../../../src/domain/load-project';
@@ -63,7 +63,13 @@ describe('loadProject', () => {
     const temp = await createTempProject();
     onTestFinished(temp.cleanup);
 
-    for (const projectId of ['demo/escape', '..', 'demo..escape']) {
+    for (const projectId of [
+      '.work/demo',
+      'output/demo',
+      'demo/escape',
+      '..',
+      'demo..escape',
+    ]) {
       await expect(loadProject(temp.workspaceRoot, projectId), projectId).rejects.toMatchObject({
         name: 'ZodError',
       });
@@ -81,6 +87,38 @@ describe('loadProject', () => {
     );
 
     await expect(loadProject(workspace.workspaceRoot, 'escape')).rejects.toMatchObject({
+      code: 'ASSET_PATH_OUTSIDE_PROJECT',
+    });
+  });
+
+  it.each([
+    '.work/demo',
+    'output/demo',
+    'shared/demo',
+  ])('rejects a project directory symlink into workspace sibling %s', async (
+    targetRelativePath,
+  ) => {
+    const temp = await createTempProject();
+    onTestFinished(temp.cleanup);
+    const targetRoot = path.join(temp.workspaceRoot, targetRelativePath);
+    await mkdir(path.dirname(targetRoot), {recursive: true});
+    await rename(temp.projectRoot, targetRoot);
+    await symlink(targetRoot, temp.projectRoot);
+
+    await expect(loadProject(temp.workspaceRoot, 'demo')).rejects.toMatchObject({
+      code: 'ASSET_PATH_OUTSIDE_PROJECT',
+    });
+  });
+
+  it('rejects a projects root redirected through a symlink', async () => {
+    const temp = await createTempProject();
+    onTestFinished(temp.cleanup);
+    const projectsRoot = path.join(temp.workspaceRoot, 'projects');
+    const redirectedProjectsRoot = path.join(temp.workspaceRoot, 'project-storage');
+    await rename(projectsRoot, redirectedProjectsRoot);
+    await symlink(redirectedProjectsRoot, projectsRoot);
+
+    await expect(loadProject(temp.workspaceRoot, 'demo')).rejects.toMatchObject({
       code: 'ASSET_PATH_OUTSIDE_PROJECT',
     });
   });

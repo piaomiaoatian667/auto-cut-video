@@ -41,10 +41,7 @@ const makeProjectDirectory = async (
   return {
     workspaceRoot,
     projectRoot,
-    scope: await createProjectDirectoryScope(
-      workspaceRoot,
-      path.join('projects', projectId),
-    ),
+    scope: await createProjectDirectoryScope(workspaceRoot, projectId),
   };
 };
 
@@ -67,7 +64,7 @@ describe('project file handles', () => {
 
     await expect(createProjectDirectoryScope(
       '/path/that/must/not-be-read',
-      'projects/demo',
+      'demo',
     )).rejects.toMatchObject({
       code: 'ENV_PLATFORM_UNSUPPORTED',
       platform: 'linux',
@@ -117,10 +114,7 @@ describe('project file handles', () => {
     await mkdir(root, {recursive: true});
     await mkdir(sibling);
     await writeFile(path.join(sibling, 'secret.txt'), 'secret');
-    const scope = await createProjectDirectoryScope(
-      workspaceRoot,
-      path.join('projects', 'project'),
-    );
+    const scope = await createProjectDirectoryScope(workspaceRoot, 'project');
 
     await expect(
       openExistingProjectFile(scope, '../project-secret/secret.txt'),

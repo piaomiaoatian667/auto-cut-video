@@ -16,7 +16,7 @@ import {
   createProjectDirectoryScope,
   openExistingProjectFile,
   openNewProjectFile,
-  type ProjectDirectoryScope,
+  ProjectDirectoryScope,
 } from '../../../src/fs/project-paths';
 
 const makeTempDirectory = async (prefix: string): Promise<string> => {
@@ -41,16 +41,46 @@ describe('ProjectDirectoryScope', () => {
     acceptScope({});
   });
 
+  it('does not expose an arbitrary-root static factory', () => {
+    expect(Object.hasOwn(ProjectDirectoryScope, 'create')).toBe(false);
+
+    if (false) {
+      // @ts-expect-error ProjectDirectoryScope has no public static authority factory
+      void ProjectDirectoryScope.create('/workspace', 'projects/demo');
+    }
+  });
+
+  it('rejects runtime-forged scope instances', async () => {
+    const forged = Object.create(
+      ProjectDirectoryScope.prototype,
+    ) as ProjectDirectoryScope;
+
+    expect(forged).toBeInstanceOf(ProjectDirectoryScope);
+    await expect(
+      openExistingProjectFile(forged, 'project.json'),
+    ).rejects.toThrow(TypeError);
+  });
+
+  it('rejects arbitrary app-owned roots passed as project IDs', async () => {
+    const workspaceRoot = await makeTempDirectory('project-scope-workspace-');
+    await mkdir(path.join(workspaceRoot, '.work', 'demo'), {recursive: true});
+    await mkdir(path.join(workspaceRoot, 'output', 'demo'), {recursive: true});
+
+    for (const projectId of ['.work/demo', 'output/demo']) {
+      await expect(
+        createProjectDirectoryScope(workspaceRoot, projectId),
+        projectId,
+      ).rejects.toMatchObject({name: 'ZodError'});
+    }
+  });
+
   it('is opaque and accepts project-relative file operations only', async () => {
     const workspaceRoot = await makeTempDirectory('project-scope-workspace-');
     const projectRoot = path.join(workspaceRoot, 'projects', 'demo');
     await mkdir(projectRoot, {recursive: true});
     await writeFile(path.join(projectRoot, 'project.json'), 'inside');
 
-    const scope = await createProjectDirectoryScope(
-      workspaceRoot,
-      path.join('projects', 'demo'),
-    );
+    const scope = await createProjectDirectoryScope(workspaceRoot, 'demo');
 
     expect(Object.keys(scope)).toEqual([]);
     expect(JSON.stringify(scope)).toBe('{}');
@@ -71,10 +101,7 @@ describe('ProjectDirectoryScope', () => {
     await mkdir(sharedRoot);
     await writeFile(path.join(sharedRoot, 'secret.txt'), 'secret');
     await symlink('../../shared', path.join(projectRoot, 'shared-link'));
-    const scope = await createProjectDirectoryScope(
-      workspaceRoot,
-      path.join('projects', 'demo'),
-    );
+    const scope = await createProjectDirectoryScope(workspaceRoot, 'demo');
 
     await expect(
       openExistingProjectFile(scope, 'shared-link/secret.txt'),
@@ -88,22 +115,19 @@ describe('ProjectDirectoryScope', () => {
   it('does not expand when the lexical project link changes after scope creation', async () => {
     const workspaceRoot = await makeTempDirectory('project-scope-workspace-');
     const projectsRoot = path.join(workspaceRoot, 'projects');
-    const storedProject = path.join(workspaceRoot, 'stored-demo');
-    const replacementProject = path.join(workspaceRoot, 'replacement-demo');
+    const storedProject = path.join(projectsRoot, 'stored-demo');
+    const replacementProject = path.join(projectsRoot, 'replacement-demo');
     const lexicalProject = path.join(projectsRoot, 'demo');
     await mkdir(projectsRoot);
     await mkdir(storedProject);
     await mkdir(replacementProject);
     await writeFile(path.join(storedProject, 'project.json'), 'stored');
     await writeFile(path.join(replacementProject, 'project.json'), 'replacement');
-    await symlink('../stored-demo', lexicalProject);
+    await symlink('stored-demo', lexicalProject);
 
-    const scope = await createProjectDirectoryScope(
-      workspaceRoot,
-      path.join('projects', 'demo'),
-    );
+    const scope = await createProjectDirectoryScope(workspaceRoot, 'demo');
     await unlink(lexicalProject);
-    await symlink('../replacement-demo', lexicalProject);
+    await symlink('replacement-demo', lexicalProject);
 
     await expect(
       readAndClose(await openExistingProjectFile(scope, 'project.json')),
@@ -118,10 +142,7 @@ describe('ProjectDirectoryScope', () => {
     await mkdir(projectRoot, {recursive: true});
     await writeFile(path.join(projectRoot, 'project.json'), 'inside');
     await writeFile(path.join(outsideRoot, 'project.json'), 'outside');
-    const scope = await createProjectDirectoryScope(
-      workspaceRoot,
-      path.join('projects', 'demo'),
-    );
+    const scope = await createProjectDirectoryScope(workspaceRoot, 'demo');
 
     await rename(projectRoot, movedProject);
     await symlink(outsideRoot, projectRoot);
@@ -142,7 +163,7 @@ describe('ProjectDirectoryScope', () => {
 
     await expect(createProjectDirectoryScope(
       workspaceRoot,
-      path.join('projects', 'escape'),
+      'escape',
     )).rejects.toMatchObject({code: 'ASSET_PATH_OUTSIDE_PROJECT'});
   });
 
@@ -152,10 +173,7 @@ describe('ProjectDirectoryScope', () => {
     await mkdir(path.join(projectRoot, 'assets'), {recursive: true});
     await writeFile(path.join(projectRoot, 'assets', 'clip.txt'), 'fixture');
     await symlink('assets', path.join(projectRoot, 'asset-link'));
-    const scope = await createProjectDirectoryScope(
-      workspaceRoot,
-      path.join('projects', 'demo'),
-    );
+    const scope = await createProjectDirectoryScope(workspaceRoot, 'demo');
 
     await expect(
       readAndClose(await openExistingProjectFile(scope, 'asset-link/clip.txt')),

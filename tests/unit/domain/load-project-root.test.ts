@@ -1,4 +1,4 @@
-import {rename, symlink} from 'node:fs/promises';
+import {mkdir, rename, symlink} from 'node:fs/promises';
 import path from 'node:path';
 import {expect, it, onTestFinished, vi} from 'vitest';
 import type {ProjectDirectoryScope} from '../../../src/fs/project-paths';
@@ -28,9 +28,13 @@ import {createTempProject} from '../../helpers/temp-project';
 it('uses one opaque project scope and project-relative authoring paths', async () => {
   const temp = await createTempProject();
   onTestFinished(temp.cleanup);
-  const storedProject = path.join(temp.workspaceRoot, 'stored-demo');
-  await rename(temp.projectRoot, storedProject);
-  await symlink('../stored-demo', temp.projectRoot);
+  const authoringDirectory = path.join(temp.projectRoot, 'authoring');
+  await mkdir(authoringDirectory);
+  await rename(
+    path.join(temp.projectRoot, 'project.json'),
+    path.join(authoringDirectory, 'project.json'),
+  );
+  await symlink('authoring/project.json', path.join(temp.projectRoot, 'project.json'));
 
   const inputs = await loadProject(temp.workspaceRoot, 'demo');
 

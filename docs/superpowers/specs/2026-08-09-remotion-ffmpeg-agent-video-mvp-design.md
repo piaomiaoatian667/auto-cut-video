@@ -1109,13 +1109,13 @@ CLI 必须支持：
 
 ### 18.2 文件操作
 
-- 所有项目文件操作必须持有由 canonical workspace root 与项目相对目录建立的 opaque `ProjectDirectoryScope`；Scope 类型必须带真正的 private 实例 brand，而不能只依赖 private constructor。Scope API 只接收项目相对路径，并在每次打开前验证目标或真实父目录仍位于 Scope 保存的 canonical project root 内。
+- 所有项目文件操作必须持有 opaque `ProjectDirectoryScope`。唯一公开工厂是 `createProjectDirectoryScope(workspaceRoot, projectId)`：使用共享 `StableIdSchema` 校验 ID，内部固定派生 `projects/<id>`，且 class 不公开 static 或任意相对根 factory。固定 lexical `workspace/projects` 必须 canonicalize 到自身而不是 symlink 目标，canonical project root 必须严格位于该 canonical Projects root 内；两者只保存在 class-private/module-private state。Scope 类型必须带真正的 private 实例 brand，而不能只依赖 private constructor。Scope API 只接收项目相对路径，并在每次打开前验证 Projects root、project root、目标或真实父目录仍满足保存的 authority 与 containment。
 - 禁止符号链接逃逸项目目录。
 - 可写目标必须先解析并验证其真实父目录；若目标已存在且是符号链接则拒绝。
 - Darwin 新文件使用 `O_CREAT | O_EXCL | O_NOFOLLOW_ANY` 创建；已有指针或发布文件只能通过同目录安全临时文件和原子重命名替换，禁止直接跟随目标路径写入。
 - 原素材在 Ingest 和 Release 分别计算 Hash。
 - 输出使用临时文件和原子重命名。
-- Project Scope 不授权 `.work` 或 `output`；P02 必须提供 opaque `RunDirectoryScope` 和 `OutputDirectoryScope`。三种 Scope 各自带不同的 private 实例 brand，禁止 `{}` 伪造和 Project/Run/Output 之间的结构化互赋值。Run/Output Scope 只能由可信 canonical workspace root 与 app-owned 相对根异步创建，canonical 根保持私有，API 只接收各自根内相对路径，并在每次 existing/new open 前重新验证 containment、使用 Darwin `O_NOFOLLOW_ANY`、拒绝 symlink traversal/substitution。
+- Project Scope 不授权 `.work` 或 `output`；P02 必须提供 opaque `RunDirectoryScope` 和 `OutputDirectoryScope`。三种 Scope 各自带不同的 private 实例 brand，禁止 `{}` 伪造和 Project/Run/Output 之间的结构化互赋值。Run/Output Scope 的公开工厂必须分别从可信 canonical workspace root 与各自固定的 app-owned 前缀派生 authority，绝不接受任意相对根；canonical 根保持私有，API 只接收各自根内相对路径，并在每次 existing/new open 前重新验证 containment、使用 Darwin `O_NOFOLLOW_ANY`、拒绝 symlink traversal/substitution。
 - Run/Output Scope 除 existing read 与 exclusive write-only new-file 外，还必须提供 exclusive read-write new-file capability：`O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW_ANY`、mode `0o600`。Run Scope 的该能力用于 FFmpeg seekable intermediate；Output Scope 的该能力用于 `qt-faststart` final output。每个独立消费者仍从所属 Project/Run/Output Scope 打开新 `FileHandle`，FD 为 borrowed，调用方在对应 Promise settle 后 `finally` 关闭。
 
 ### 18.3 运行时代码

@@ -1,6 +1,7 @@
 import {constants} from 'node:fs';
 import {lstat, open, realpath, type FileHandle} from 'node:fs/promises';
 import path from 'node:path';
+import {StableIdSchema} from '../domain/schema-primitives';
 
 const O_NOFOLLOW_ANY = 0x20000000;
 
@@ -27,6 +28,7 @@ export interface PreparedProjectFile {
 }
 
 interface ProjectDirectoryState {
+  canonicalProjectsRoot: string;
   canonicalProjectRoot: string;
 }
 
@@ -35,6 +37,8 @@ const projectDirectoryStates = new WeakMap<
   ProjectDirectoryState
 >();
 
+let mintProjectDirectoryScope!: () => ProjectDirectoryScope;
+
 export class ProjectDirectoryScope {
   readonly #projectDirectoryScopeBrand = undefined;
 
@@ -42,46 +46,53 @@ export class ProjectDirectoryScope {
     Object.freeze(this);
   }
 
-  static async create(
-    workspaceRoot: string,
-    projectRelativeRoot: string,
-  ): Promise<ProjectDirectoryScope> {
-    assertDarwin();
-    assertRelativePath(projectRelativeRoot);
-    if (projectRelativeRoot.length === 0 || projectRelativeRoot === '.') {
-      throw new ProjectPathError('project directory must be below the workspace root');
-    }
-
-    try {
-      const workspaceRootReal = await realpath(workspaceRoot);
-      const projectRootReal = await realpath(path.resolve(
-        workspaceRootReal,
-        projectRelativeRoot,
-      ));
-      if (
-        projectRootReal === workspaceRootReal
-        || !isWithin(workspaceRootReal, projectRootReal)
-      ) {
-        throw new ProjectPathError(
-          `project directory escapes workspace: ${projectRelativeRoot}`,
-        );
-      }
-
-      const scope = new ProjectDirectoryScope();
-      projectDirectoryStates.set(scope, {canonicalProjectRoot: projectRootReal});
-      return scope;
-    } catch (error) {
-      if (error instanceof ProjectPathError) throw error;
-      return mapSymlinkLoop(error, projectRelativeRoot);
-    }
+  static {
+    mintProjectDirectoryScope = () => new ProjectDirectoryScope();
   }
 }
 
 export const createProjectDirectoryScope = async (
   workspaceRoot: string,
-  projectRelativeRoot: string,
-): Promise<ProjectDirectoryScope> =>
-  await ProjectDirectoryScope.create(workspaceRoot, projectRelativeRoot);
+  projectId: string,
+): Promise<ProjectDirectoryScope> => {
+  assertDarwin();
+  const validatedProjectId = StableIdSchema.parse(projectId);
+  const projectRelativeRoot = path.join('projects', validatedProjectId);
+
+  try {
+    const workspaceRootReal = await realpath(workspaceRoot);
+    const lexicalProjectsRoot = path.join(workspaceRootReal, 'projects');
+    const canonicalProjectsRoot = await realpath(lexicalProjectsRoot);
+    if (canonicalProjectsRoot !== lexicalProjectsRoot) {
+      throw new ProjectPathError(
+        'workspace projects directory must not be redirected by a symlink',
+      );
+    }
+
+    const canonicalProjectRoot = await realpath(path.join(
+      canonicalProjectsRoot,
+      validatedProjectId,
+    ));
+    if (
+      canonicalProjectRoot === canonicalProjectsRoot
+      || !isWithin(canonicalProjectsRoot, canonicalProjectRoot)
+    ) {
+      throw new ProjectPathError(
+        `project directory escapes workspace projects root: ${projectRelativeRoot}`,
+      );
+    }
+
+    const scope = mintProjectDirectoryScope();
+    projectDirectoryStates.set(scope, {
+      canonicalProjectsRoot,
+      canonicalProjectRoot,
+    });
+    return scope;
+  } catch (error) {
+    if (error instanceof ProjectPathError) throw error;
+    return mapSymlinkLoop(error, projectRelativeRoot);
+  }
+};
 
 const isNodeError = (error: unknown): error is NodeJS.ErrnoException =>
   error instanceof Error && 'code' in error;
@@ -110,20 +121,31 @@ const assertRelativePath = (relativePath: string): void => {
   }
 };
 
-const canonicalProjectRoot = (scope: ProjectDirectoryScope): string => {
+const projectDirectoryState = (
+  scope: ProjectDirectoryScope,
+): ProjectDirectoryState => {
   const state = projectDirectoryStates.get(scope);
   if (!state) throw new TypeError('invalid ProjectDirectoryScope');
-  return state.canonicalProjectRoot;
+  return state;
 };
 
 const assertCanonicalProjectRootStable = async (
   scope: ProjectDirectoryScope,
   relativePath: string,
 ): Promise<string> => {
-  const savedProjectRoot = canonicalProjectRoot(scope);
+  const {
+    canonicalProjectsRoot: savedProjectsRoot,
+    canonicalProjectRoot: savedProjectRoot,
+  } = projectDirectoryState(scope);
   try {
+    const currentProjectsRoot = await realpath(savedProjectsRoot);
     const currentProjectRoot = await realpath(savedProjectRoot);
-    if (currentProjectRoot !== savedProjectRoot) {
+    if (
+      currentProjectsRoot !== savedProjectsRoot
+      || currentProjectRoot !== savedProjectRoot
+      || savedProjectRoot === savedProjectsRoot
+      || !isWithin(savedProjectsRoot, savedProjectRoot)
+    ) {
       throw new ProjectPathError(
         `project directory changed after scope creation: ${relativePath}`,
       );
