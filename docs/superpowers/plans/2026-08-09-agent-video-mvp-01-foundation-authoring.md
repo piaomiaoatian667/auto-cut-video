@@ -593,6 +593,8 @@ export interface CompiledTimeline {
 
 Keep `kind: 'video' | 'image'` independent from `sourceInMs?: number`; do not replace this exact shape with a discriminated union. When present, `sourceInMs` is nonnegative. Frame and layer fields use integer constraints, frame starts are nonnegative, frame durations are positive, and scale/opacity/fade constraints match the authoring Schema. Visual clips and overlays share one timeline ID namespace; compiled captions are unique by their own ID. Narration interval `segmentId` references are not required to be unique.
 
+This frozen P01 Schema stores narration intervals plus BGM metadata only. It intentionally has no Ducking interval/envelope field: P04 deterministically derives that envelope from these fields, Composition duration, `project.audio`, and an explicit Audio Mix algorithm version.
+
 `src/domain/review-schema.ts`:
 
 ```ts
@@ -648,6 +650,7 @@ git commit -m "feat: define strict video project schemas"
 - Create: `src/domain/validate-authoring.ts`
 - Create: `tests/helpers/temp-project.ts`
 - Test: `tests/unit/fs/project-paths.test.ts`
+- Test: `tests/unit/fs/project-directory-scope.test.ts`
 - Test: `tests/unit/fs/json-files.test.ts`
 - Test: `tests/unit/domain/load-project.test.ts`
 - Test: `tests/unit/domain/load-project-root.test.ts`
@@ -659,7 +662,11 @@ git commit -m "feat: define strict video project schemas"
 Target macOS 15+ only. Tests must exercise real `fs.open()` behavior rather than assert a numeric constant:
 
 - canonical in-root reads and exclusive creates succeed through `FileHandle` APIs;
-- final and ancestor symlinks resolving outside containment fail;
+- the async Scope factory rejects an initial project root resolving outside the canonical workspace root;
+- a project-internal symlink into a workspace sibling is rejected for both read and write;
+- replacing the lexical `projects/<id>` link after Scope creation does not expand authority;
+- replacing the saved canonical project root with an external symlink fails closed;
+- final and ancestor symlinks resolving outside the project fail;
 - a stable internal symlink is canonicalized and can be opened safely;
 - after canonicalization, replacing the canonical parent with an external symlink makes the final open fail and does not create the external file;
 - static writable target symlinks become `ProjectPathError`, while a regular target appearing after preparation preserves `EEXIST`;
@@ -668,7 +675,7 @@ Target macOS 15+ only. Tests must exercise real `fs.open()` behavior rather than
 
 - [ ] **Step 2: Run and verify failure**
 
-Run: `pnpm test tests/unit/fs/project-paths.test.ts`
+Run: `pnpm test tests/unit/fs/project-directory-scope.test.ts tests/unit/fs/project-paths.test.ts`
 
 Expected: FAIL because the handle/capability API and open-time substitution defense do not exist.
 
@@ -676,44 +683,45 @@ Expected: FAIL because the handle/capability API and open-time substitution defe
 
 Use Darwin `O_NOFOLLOW_ANY = 0x20000000` as a numeric Node 22 open flag. Path-only canonicalization helpers remain module-private and never authorize production I/O.
 
-- `openExistingProjectFile(containmentRoot, relativePath)` canonicalizes root and target, verifies containment, then opens the canonical target with `O_RDONLY | O_NOFOLLOW_ANY`.
-- `openNewProjectFile(containmentRoot, relativePath)` canonicalizes the real parent, checks a static final symlink with `lstat`, then opens `parentReal + basename` with `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW_ANY` and mode `0o600`.
+- `createProjectDirectoryScope(workspaceRoot, projectRelativeRoot)` is the only factory for the opaque `ProjectDirectoryScope`. It canonicalizes workspace and initial project roots, rejects equality/escape, stores the canonical project root in a class-private field or module-private `WeakMap`, and exposes no path string.
+- `prepareExistingProjectFile()` and `openExistingProjectFile(projectDirectory, relativePath)` canonicalize the saved project root and target, verify target containment, then open the canonical target with `O_RDONLY | O_NOFOLLOW_ANY`.
+- `prepareNewProjectFile()` and `openNewProjectFile(projectDirectory, relativePath)` canonicalize the saved project root and real parent, verify parent containment, check a static final symlink with `lstat`, then open `parentReal + basename` with `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW_ANY` and mode `0o600`.
 - Safe prepared capabilities may be exposed for staged operations and deterministic race tests, but they expose only `open()` and never a path string.
 - Map canonicalization/open `ELOOP` to `ProjectPathError`; preserve ordinary `EEXIST` from exclusive create races.
 - Reject non-Darwin platforms with `ENV_PLATFORM_UNSUPPORTED` before any path lookup.
 
 Never call `writeFile()` directly on a user-derived writable target. Immutable artifacts use `openNewProjectFile()`. Pointer replacement uses a same-directory temporary capability, sync, and atomic rename.
 
-Threat boundary: this prevents symlink traversal and symlink substitution between canonicalization and open. It does not claim to prevent hard-link substitution, replacement with ordinary directories or mount points, or concurrent modification of an already opened file's contents.
+Threat boundary: this prevents symlink traversal and symlink substitution between canonicalization and open. It does not claim to prevent hard-link substitution, replacement with ordinary directories or mount points, or concurrent modification of an already opened file's contents. Project Scope never authorizes `.work` or `output`; P02 owns separate application-controlled Run/Output scopes.
 
 - [ ] **Step 4: Implement JSON loading and project context**
 
-`readJson(containmentRoot, filePath, schema)` must obtain a `FileHandle` from `openExistingProjectFile()`, read from that same handle, and always close it in `finally`. The function owns the handle. Wrap open, JSON, and Zod failures in `JsonFileError` containing `filePath` and `cause`.
+`readJson(projectDirectory, filePath, schema)` must obtain a `FileHandle` from `openExistingProjectFile()`, read from that same handle, and always close it in `finally`. `filePath` is relative to the project root. The function owns the handle. Wrap open, JSON, and Zod failures in `JsonFileError` containing `filePath` and `cause`.
 
-`src/domain/load-project.ts` rejects invalid IDs and reads all authoring files with `workspaceRootReal` as the only containment root and `projects/<id>/<file>` as relative paths. Never re-root trust at a previously resolved `projectRoot`.
+`src/domain/load-project.ts` rejects invalid IDs, creates one `ProjectDirectoryScope` from `workspaceRootReal + projects/<id>`, and reads `project.json`, `script.json`, and `edit.json` as project-relative paths through that same Scope.
 
 ```ts
 export interface ProjectInputs {
   workspaceRoot: string;
-  projectRoot: string;
+  projectDirectory: ProjectDirectoryScope;
   project: Project;
   script: Script;
   edit: Edit;
 }
 ```
 
-`projectRoot` is informational only and must never be reused as a containment root or filesystem capability.
+No public `projectRoot` string is returned. Downstream project file I/O must carry `projectDirectory`; generated `.work` and `output` files use later app-owned scopes instead.
 
 Check `project.json` ID mismatch immediately after its Schema parse, before reading `script.json` or `edit.json`. After all three Schemas pass, call `validateAuthoringInputs()`. Count `segment.text` with `Intl.Segmenter('zh-CN', {granularity: 'grapheme'})`; throw `SCRIPT_SEGMENT_TEXT_TOO_LONG` when a segment exceeds `project.captions.maximumChineseCharacters`.
 
 - [ ] **Step 5: Add loader tests and verify**
 
-Tests must prove valid files load, malformed JSON and unknown fields retain their causes through `JsonFileError`, project IDs cannot contain `/` or `..`, ID mismatch wins over damaged later files, every authoring read keeps `workspaceRootReal` as containment root, and cross-file validation runs only after all three Schemas pass. Verify handle closure on success, JSON failure, and Zod failure. `createTempProject()` must remove a partially initialized workspace before rethrowing.
+Tests must prove valid files load, malformed JSON and unknown fields retain their causes through `JsonFileError`, project IDs cannot contain `/` or `..`, ID mismatch wins over damaged later files, every authoring read uses the same opaque Scope with `project.json`/`script.json`/`edit.json` relative paths, and cross-file validation runs only after all three Schemas pass. Verify handle closure on success, JSON failure, and Zod failure. `createTempProject()` must remove a partially initialized workspace before rethrowing.
 
 Run:
 
 ```bash
-pnpm test tests/unit/fs/project-paths.test.ts tests/unit/fs/json-files.test.ts tests/unit/domain/load-project.test.ts tests/unit/domain/load-project-root.test.ts tests/unit/domain/validate-authoring.test.ts tests/unit/helpers/temp-project.test.ts
+pnpm test tests/unit/fs/project-directory-scope.test.ts tests/unit/fs/project-paths.test.ts tests/unit/fs/json-files.test.ts tests/unit/domain/load-project.test.ts tests/unit/domain/load-project-root.test.ts tests/unit/domain/validate-authoring.test.ts tests/unit/helpers/temp-project.test.ts
 pnpm typecheck
 ```
 
@@ -723,7 +731,7 @@ Expected: PASS.
 
 ```bash
 git add src/fs src/domain/load-project.ts src/domain/validate-authoring.ts tests/helpers tests/unit/fs tests/unit/domain/load-project.test.ts tests/unit/domain/load-project-root.test.ts tests/unit/domain/validate-authoring.test.ts tests/unit/helpers/temp-project.test.ts
-git commit -m "fix: close project path race windows"
+git commit -m "fix: enforce project directory file scopes"
 ```
 
 
@@ -763,6 +771,8 @@ describe('runProcess', () => {
 });
 ```
 
+Add table-driven Darwin regressions for abort and timeout where the leader uses default `SIGTERM` behavior but a ready-signaled grandchild ignores `SIGTERM`; assert the grandchild is already gone when the Runner Promise settles. Add borrowed-FD tests for child reads/writes, `3 + index` mapping, invalid descriptors, post-call array mutation, spawn failure, and caller ownership after normal, nonzero, abort, and timeout outcomes.
+
 - [ ] **Step 2: Implement the runner**
 
 `runProcess()` must use `spawn(command, args, {shell: false})`, collect capped stdout/stderr, kill the process group on timeout or abort, and return:
@@ -779,7 +789,9 @@ export interface ProcessResult {
 }
 ```
 
-Reject non-zero exits with `ProcessExecutionError` carrying `PROCESS_EXIT_NONZERO`, and use `PROCESS_TIMEOUT` and `PROCESS_ABORTED` for those conditions.
+`RunProcessOptions.extraStdioFds?: readonly number[]` snapshots and validates nonnegative integer parent FDs, then maps index `i` to child FD `3 + i` via `stdio: ['ignore', 'pipe', 'pipe', ...snapshot]`. FDs are borrowed: the Runner never seeks or closes them; each caller opens a fresh handle per independent consumer and closes it in `finally` after the Promise settles.
+
+Reject non-zero exits with `ProcessExecutionError` carrying `PROCESS_EXIT_NONZERO`, and use `PROCESS_TIMEOUT` and `PROCESS_ABORTED` for those conditions. Normal execution settles on leader `close`. After abort/timeout on Darwin, retain the leader result but do not settle until both leader `close` and `process.kill(-pgid, 0)` reporting `ESRCH` confirm group exit. Treat success/`EPERM` as still alive, send group `SIGKILL` after the grace period, poll until disappearance, and preserve the original abort/timeout code with structured reason/cause on kill/probe failure or bounded final timeout.
 
 - [ ] **Step 3: Write failing Gate tests**
 
@@ -830,7 +842,7 @@ export interface CheckResult {
 pnpm test tests/unit/process/run-process.test.ts tests/unit/pipeline/gate.test.ts
 pnpm typecheck
 git add src/process src/pipeline/types.ts src/pipeline/gate.ts tests/unit/process tests/unit/pipeline/gate.test.ts
-git commit -m "feat: add safe subprocess and gate protocol"
+git commit -m "fix: complete process group and fd protocol"
 ```
 
 
@@ -839,7 +851,7 @@ git commit -m "feat: add safe subprocess and gate protocol"
 - [ ] **Step 1: Run the complete P01 test set**
 
 ```bash
-pnpm test tests/unit/domain/mvp-profile.test.ts tests/unit/domain/schemas.test.ts tests/unit/domain/validate-authoring.test.ts tests/unit/domain/load-project.test.ts tests/unit/fs/project-paths.test.ts tests/unit/process/run-process.test.ts tests/unit/pipeline/gate.test.ts
+pnpm test
 pnpm typecheck
 git diff --check
 ```

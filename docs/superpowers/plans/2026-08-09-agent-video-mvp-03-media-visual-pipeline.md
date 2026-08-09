@@ -20,7 +20,7 @@
 - **May Run In Parallel With:** P04 after P02.
 - **Primary Write Set:** `src/media/ffprobe.ts`, `src/media/transcode.ts`, Ingest/Compile Stages, `src/timeline/**`, `src/remotion/**`, media fixture helpers, and visual-pipeline tests.
 - **Must Not Modify:** TTS providers, narration/caption implementations, audio mixing, Review/Release, Stage registry, Presets, or Runner.
-- **Exit Artifact:** Validated `asset-manifest.json`, validated `compiled-timeline.json`, fixed visual component registry, and decodable muted H.264 render.
+- **Exit Artifact:** Validated `asset-manifest.json`, validated `compiled-timeline.json` containing narration intervals plus BGM metadata but no Ducking envelope, fixed visual component registry, and decodable muted H.264 render.
 
 ## Entry Criteria
 
@@ -89,7 +89,7 @@ Write to the current immutable run directory, never next to the source.
 
 - [ ] **Step 5: Implement Ingest**
 
-Open each source through `openExistingProjectFile(workspaceRootReal, projectRelativePath)` and keep the returned handle/FD as the I/O authority. Hash, ffprobe, sample-decode, and transcode through that controlled FD: explicitly map the FD into the child process `stdio` and reference the inherited descriptor (for example `/dev/fd/3`), or use a controlled pipe. Never resolve a path string and later reopen it. Transcode only when required, write `asset-manifest.json`, and verify the source hash again through the same handle/FD strategy after processing.
+Open each source through `openExistingProjectFile(projectDirectory, projectRelativePath)`. Hashing, ffprobe, sample-decode, transcode, and final hash verification are independent consumers: each must open a fresh `FileHandle` from the same `ProjectDirectoryScope`, use it once, and close it in `finally` after that consumer settles. For child processes, map every read and write FD through `runProcess(..., {extraStdioFds: [...]})`; for example source child FD 3 is `/dev/fd/3` and a Run-scope output child FD 4 is `pipe:4` or `/dev/fd/4`. Each FD/pipe is one-shot. Never resolve a path string and later reopen it. Transcode only when required and write `asset-manifest.json` through the app-owned Run scope.
 
 - [ ] **Step 6: Verify and commit**
 
@@ -175,6 +175,7 @@ The compiler must:
 7. Merge touching visual ranges and reject gaps unless `allowBackgroundGaps` is true.
 8. Validate BGM available duration after `startMs`.
 9. Emit only project-relative render paths and input hashes.
+10. Persist narration intervals plus BGM metadata only. Do not compile or persist Ducking intervals/envelopes; P04 derives them deterministically from the compiled narration intervals, Composition duration, BGM metadata, `project.audio`, and its algorithm version.
 
 - [ ] **Step 4: Verify and commit**
 

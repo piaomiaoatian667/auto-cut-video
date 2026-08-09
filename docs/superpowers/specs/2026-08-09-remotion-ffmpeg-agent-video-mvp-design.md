@@ -480,9 +480,11 @@ MVP 中字幕 Cue 直接继承对应语音段的开始和结束时间，不执�
 - 视频和图片 Clip。
 - 已解析的注册组件及 Props。
 - 字幕 Cue 对应的帧范围。
-- 旁白区间和 BGM Ducking 区间。
+- 旁白区间和 BGM 元数据（项目相对渲染路径、开始时间、可用时长）。
 
 编译结果必须记录其全部输入 Hash，并且不得包含项目目录外的绝对路径。
+
+`compiled-timeline.json` 不持久化 Ducking 包络或 Ducking 区间。P04 Audio Mix 必须以编译后的旁白区间、Composition 时长、BGM 元数据和 `project.audio` 配置为完整输入，使用固定算法版本确定性派生包络；因此 P01/P03 不拥有第二份可漂移的 Ducking artifact。
 
 ## 10. 时间模型
 
@@ -790,7 +792,7 @@ Gate：
 执行：
 
 1. Remotion 使用最终画布渲染无声 H.264 视频。
-2. FFmpeg 根据旁白区间生成 BGM 音量自动化；完整 Filter Graph 写入当前 Run 内的只读脚本文件，再通过参数数组传给 FFmpeg，不把随段落数量线性增长的表达式直接拼进命令行。
+2. P04 Audio Mix 根据编译后的旁白区间、Composition 时长、BGM 元数据和 `project.audio` 配置确定性派生 BGM 音量自动化；完整 Filter Graph 固定写入当前 Run 的 `audio/filter-graph.txt`，其 Run 相对路径和 SHA-256 进入该 Stage 的 `outputs`，再通过参数数组传给 FFmpeg，不把随段落数量线性增长的表达式直接拼进命令行。
 3. BGM 在旁白期间降低配置的 dB 值，并使用短 Attack/Release 避免突变。
 4. Ducking 包络始终裁剪到 `[0, compositionDurationMs]`；最后一段旁白的 Release 不得延长 Composition 或最终音频。
 5. 旁白和 BGM 混合后执行两遍响度分析与归一化。
@@ -1072,19 +1074,20 @@ CLI 必须支持：
 
 - 使用 `spawn` 或等价参数数组 API，禁止拼接 Shell 命令字符串。
 - FFmpeg 输入协议默认只允许本地 `file` 和受控 `pipe`。
+- 受控文件描述符通过 `RunProcessOptions.extraStdioFds` 按数组下标映射到子进程 FD `3 + index`。描述符为借用资源：每个独立消费者必须从对应 Scope 打开全新 `FileHandle`，一次性传给一个子进程，并在 Promise settle 后于 `finally` 关闭；Runner 不 seek、不关闭调用方 FD。
 - 对 FFmpeg、Remotion 和 Provider 设置超时和最大并发。
 - 限制允许的素材大小、像素尺寸和最长时长，避免资源耗尽。
 - 日志保存经过转义的展示命令，不保存可直接重新执行的未验证字符串。
 
 ### 18.2 文件操作
 
-- 所有用户路径必须解析后验证仍位于项目根目录。
+- 所有项目文件操作必须持有由 canonical workspace root 与项目相对目录建立的 opaque `ProjectDirectoryScope`；Scope API 只接收项目相对路径，并在每次打开前验证目标或真实父目录仍位于 Scope 保存的 canonical project root 内。
 - 禁止符号链接逃逸项目目录。
 - 可写目标必须先解析并验证其真实父目录；若目标已存在且是符号链接则拒绝。
 - 新文件使用 `O_CREAT | O_EXCL | O_NOFOLLOW` 创建；已有指针或发布文件只能通过同目录安全临时文件和原子重命名替换，禁止直接跟随目标路径写入。
 - 原素材在 Ingest 和 Release 分别计算 Hash。
 - 输出使用临时文件和原子重命名。
-- `.work`、`output` 和源素材目录严格分离。
+- Project Scope 不授权 `.work` 或 `output`；两者由独立的应用所有 Run/Output Scope 管理，并与源素材目录严格分离。
 
 ### 18.3 运行时代码
 
@@ -1118,6 +1121,8 @@ interface StageReport {
   processResults: ProcessResult[];
 }
 ```
+
+`ArtifactReference` 至少包含项目/Run 相对 `path` 与内容 `sha256`。Audio Mix 的 Stage outputs 必须包含 `{path: 'audio/filter-graph.txt', sha256: 'sha256:...'}`。
 
 错误代码首版至少包括：
 
@@ -1162,7 +1167,7 @@ ATOMIC_PUBLISH_FAILED
 - EDL Trim 边界，包括 `sourceInMs >= sourceOutMs` 和素材时长越界。
 - Composition 总时长计算。
 - 字幕 Cue 生成。
-- BGM Ducking 区间计算。
+- P04 根据旁白区间、Composition 时长、BGM 元数据、音频配置和算法版本确定性派生 BGM Ducking 包络。
 - 阶段和语音段指纹。
 - Gate 状态聚合。
 - Stage 注册表 ID 唯一性。
@@ -1187,7 +1192,7 @@ ATOMIC_PUBLISH_FAILED
 - Mock TTS 生成旁白清单。
 - Remotion 渲染 10 秒无声视频。
 - FFmpeg 混音、合流和完整解码。
-- 使用至少 100 个旁白区间生成并执行 Filter Graph 脚本，验证不会依赖超长命令行。
+- 使用至少 100 个旁白区间生成并执行固定 artifact `audio/filter-graph.txt`，验证不会依赖超长命令行，并校验其路径和 SHA-256 已进入 Audio Mix Stage outputs。
 - 在包含空格的项目目录运行 Narration，验证 `-safe 1` concat 清单只使用受控相对文件名。
 - 修改一个脚本段后验证另一个语音段命中缓存。
 - 先执行 `assets`、再执行 `draft`、最后执行 `release`，验证共同 Stage 复用已有产物。

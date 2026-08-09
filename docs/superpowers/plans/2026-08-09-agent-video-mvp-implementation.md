@@ -622,6 +622,8 @@ export interface CompiledTimeline {
 }
 ```
 
+The frozen P01 Schema stores narration intervals plus BGM metadata only. It has no Ducking interval/envelope field; P04 derives that envelope deterministically from these fields, Composition duration, `project.audio`, and an explicit algorithm version.
+
 `src/domain/review-schema.ts`:
 
 ```ts
@@ -668,6 +670,7 @@ git commit -m "feat: define strict video project schemas"
 - Create: `src/domain/validate-authoring.ts`
 - Create: `tests/helpers/temp-project.ts`
 - Test: `tests/unit/fs/project-paths.test.ts`
+- Test: `tests/unit/fs/project-directory-scope.test.ts`
 - Test: `tests/unit/fs/json-files.test.ts`
 - Test: `tests/unit/domain/load-project.test.ts`
 - Test: `tests/unit/domain/load-project-root.test.ts`
@@ -679,7 +682,10 @@ git commit -m "feat: define strict video project schemas"
 Target macOS 15+ only. Tests must exercise real `fs.open()` behavior rather than assert a numeric constant:
 
 - canonical in-root reads and exclusive creates succeed through `FileHandle` APIs;
-- final and ancestor symlinks resolving outside containment fail;
+- the async Scope factory rejects an initial project root resolving outside the canonical workspace root;
+- project-internal symlinks into workspace siblings fail for read and write;
+- lexical project-link replacement cannot expand an established Scope, and canonical-root symlink replacement fails closed;
+- final and ancestor symlinks resolving outside the project fail;
 - a stable internal symlink is canonicalized and can be opened safely;
 - after canonicalization, replacing the canonical parent with an external symlink makes the final open fail and does not create the external file;
 - static writable target symlinks become `ProjectPathError`, while a regular target appearing after preparation preserves `EEXIST`;
@@ -688,7 +694,7 @@ Target macOS 15+ only. Tests must exercise real `fs.open()` behavior rather than
 
 - [ ] **Step 2: Run and verify failure**
 
-Run: `pnpm test tests/unit/fs/project-paths.test.ts`
+Run: `pnpm test tests/unit/fs/project-directory-scope.test.ts tests/unit/fs/project-paths.test.ts`
 
 Expected: FAIL because the handle/capability API and open-time substitution defense do not exist.
 
@@ -696,44 +702,45 @@ Expected: FAIL because the handle/capability API and open-time substitution defe
 
 Use Darwin `O_NOFOLLOW_ANY = 0x20000000` as a numeric Node 22 open flag. Path-only canonicalization helpers remain module-private and never authorize production I/O.
 
-- `openExistingProjectFile(containmentRoot, relativePath)` canonicalizes root and target, verifies containment, then opens the canonical target with `O_RDONLY | O_NOFOLLOW_ANY`.
-- `openNewProjectFile(containmentRoot, relativePath)` canonicalizes the real parent, checks a static final symlink with `lstat`, then opens `parentReal + basename` with `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW_ANY` and mode `0o600`.
+- `createProjectDirectoryScope(workspaceRoot, projectRelativeRoot)` is the only async factory for the opaque `ProjectDirectoryScope`; it stores the canonical project root only in class-private/module-private state and exposes no path string.
+- `prepareExistingProjectFile()` and `openExistingProjectFile(projectDirectory, relativePath)` canonicalize the saved root and target, verify project containment, then open the canonical target with `O_RDONLY | O_NOFOLLOW_ANY`.
+- `prepareNewProjectFile()` and `openNewProjectFile(projectDirectory, relativePath)` canonicalize the saved root and real parent, check a static final symlink with `lstat`, then open `parentReal + basename` with `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW_ANY` and mode `0o600`.
 - Safe prepared capabilities may be exposed for staged operations and deterministic race tests, but they expose only `open()` and never a path string.
 - Map canonicalization/open `ELOOP` to `ProjectPathError`; preserve ordinary `EEXIST` from exclusive create races.
 - Reject non-Darwin platforms with `ENV_PLATFORM_UNSUPPORTED` before any path lookup.
 
 Never call `writeFile()` directly on a user-derived writable target. Immutable artifacts use `openNewProjectFile()`. Pointer replacement uses a same-directory temporary capability, sync, and atomic rename.
 
-Threat boundary: this prevents symlink traversal and symlink substitution between canonicalization and open. It does not claim to prevent hard-link substitution, replacement with ordinary directories or mount points, or concurrent modification of an already opened file's contents.
+Threat boundary: this prevents symlink traversal and symlink substitution between canonicalization and open. It does not claim to prevent hard-link substitution, replacement with ordinary directories or mount points, or concurrent modification of an already opened file's contents. Project Scope never authorizes `.work` or `output`; P02 supplies separate app-owned scopes.
 
 - [ ] **Step 4: Implement JSON loading and project context**
 
-`readJson(containmentRoot, filePath, schema)` must obtain a `FileHandle` from `openExistingProjectFile()`, read from that same handle, and always close it in `finally`. The function owns the handle. Wrap open, JSON, and Zod failures in `JsonFileError` containing `filePath` and `cause`.
+`readJson(projectDirectory, filePath, schema)` must obtain a `FileHandle` from `openExistingProjectFile()`, read from that same handle, and always close it in `finally`. The path is relative to the project root and the function owns the handle. Wrap open, JSON, and Zod failures in `JsonFileError` containing `filePath` and `cause`.
 
-`src/domain/load-project.ts` rejects invalid IDs and reads all authoring files with `workspaceRootReal` as the only containment root and `projects/<id>/<file>` as relative paths. Never re-root trust at a previously resolved `projectRoot`.
+`src/domain/load-project.ts` rejects invalid IDs, creates one Scope from `workspaceRootReal + projects/<id>`, reads `project.json`, `script.json`, and `edit.json` relative to that Scope, returns `projectDirectory`, and exposes no public `projectRoot` string.
 
 ```ts
 export interface ProjectInputs {
   workspaceRoot: string;
-  projectRoot: string;
+  projectDirectory: ProjectDirectoryScope;
   project: Project;
   script: Script;
   edit: Edit;
 }
 ```
 
-`projectRoot` is informational only and must never be reused as a containment root or filesystem capability.
+Downstream project file access must retain `projectDirectory`; generated Run/Output artifacts use their own app-owned scopes.
 
 Check `project.json` ID mismatch immediately after its Schema parse, before reading `script.json` or `edit.json`. After all three Schemas pass, call `validateAuthoringInputs()`. Count `segment.text` with `Intl.Segmenter('zh-CN', {granularity: 'grapheme'})`; throw `SCRIPT_SEGMENT_TEXT_TOO_LONG` when a segment exceeds `project.captions.maximumChineseCharacters`.
 
 - [ ] **Step 5: Add loader tests and verify**
 
-Tests must prove valid files load, malformed JSON and unknown fields retain their causes through `JsonFileError`, project IDs cannot contain `/` or `..`, ID mismatch wins over damaged later files, every authoring read keeps `workspaceRootReal` as containment root, and cross-file validation runs only after all three Schemas pass. Verify handle closure on success, JSON failure, and Zod failure. `createTempProject()` must remove a partially initialized workspace before rethrowing.
+Tests must prove valid files load, malformed JSON and unknown fields retain their causes through `JsonFileError`, project IDs cannot contain `/` or `..`, ID mismatch wins over damaged later files, every authoring read uses the same opaque Scope with project-relative file names, and cross-file validation runs only after all three Schemas pass. Verify handle closure on success, JSON failure, and Zod failure. `createTempProject()` must remove a partially initialized workspace before rethrowing.
 
 Run:
 
 ```bash
-pnpm test tests/unit/fs/project-paths.test.ts tests/unit/fs/json-files.test.ts tests/unit/domain/load-project.test.ts tests/unit/domain/load-project-root.test.ts tests/unit/domain/validate-authoring.test.ts tests/unit/helpers/temp-project.test.ts
+pnpm test tests/unit/fs/project-directory-scope.test.ts tests/unit/fs/project-paths.test.ts tests/unit/fs/json-files.test.ts tests/unit/domain/load-project.test.ts tests/unit/domain/load-project-root.test.ts tests/unit/domain/validate-authoring.test.ts tests/unit/helpers/temp-project.test.ts
 pnpm typecheck
 ```
 
@@ -743,7 +750,7 @@ Expected: PASS.
 
 ```bash
 git add src/fs src/domain/load-project.ts src/domain/validate-authoring.ts tests/helpers tests/unit/fs tests/unit/domain/load-project.test.ts tests/unit/domain/load-project-root.test.ts tests/unit/domain/validate-authoring.test.ts tests/unit/helpers/temp-project.test.ts
-git commit -m "fix: close project path race windows"
+git commit -m "fix: enforce project directory file scopes"
 ```
 
 ## Task 4: Build the Abortable Process Runner and Gate Protocol
@@ -782,6 +789,8 @@ describe('runProcess', () => {
 });
 ```
 
+Add table-driven Darwin regressions for abort and timeout where the leader uses default `SIGTERM` behavior but a ready-signaled grandchild ignores `SIGTERM`; assert the grandchild is already gone when the Runner Promise settles. Add borrowed-FD tests for child reads/writes, `3 + index` mapping, invalid descriptors, post-call array mutation, spawn failure, and caller ownership after normal, nonzero, abort, and timeout outcomes.
+
 - [ ] **Step 2: Implement the runner**
 
 `runProcess()` must use `spawn(command, args, {shell: false})`, collect capped stdout/stderr, kill the process group on timeout or abort, and return:
@@ -798,7 +807,9 @@ export interface ProcessResult {
 }
 ```
 
-Reject non-zero exits with `ProcessExecutionError` carrying `PROCESS_EXIT_NONZERO`, and use `PROCESS_TIMEOUT` and `PROCESS_ABORTED` for those conditions.
+`RunProcessOptions.extraStdioFds?: readonly number[]` snapshots and validates nonnegative integer parent FDs, maps index `i` to child FD `3 + i`, and treats every FD as borrowed. The caller opens a fresh handle per independent consumer and closes it in `finally`; the Runner never seeks or closes it.
+
+Reject non-zero exits with `ProcessExecutionError` carrying `PROCESS_EXIT_NONZERO`, and use `PROCESS_TIMEOUT` and `PROCESS_ABORTED` for those conditions. Once Darwin termination starts, settle only after leader `close` and process-group probe `ESRCH`; success/`EPERM` means alive, grace expiry sends group `SIGKILL`, and unexpected probe/kill errors or final timeout retain the original abort/timeout code with structured reason/cause.
 
 - [ ] **Step 3: Write failing Gate tests**
 
@@ -849,7 +860,15 @@ export interface CheckResult {
 pnpm test tests/unit/process/run-process.test.ts tests/unit/pipeline/gate.test.ts
 pnpm typecheck
 git add src/process src/pipeline/types.ts src/pipeline/gate.ts tests/unit/process tests/unit/pipeline/gate.test.ts
-git commit -m "feat: add safe subprocess and gate protocol"
+git commit -m "fix: complete process group and fd protocol"
+```
+
+### P01 Boundary Verification
+
+```bash
+pnpm test
+pnpm typecheck
+git diff --check
 ```
 
 ## Task 5: Add Fingerprints, Immutable Runs, Atomic Pointers, and Project Locks
@@ -1082,7 +1101,7 @@ Write to the current immutable run directory, never next to the source.
 
 - [ ] **Step 5: Implement Ingest**
 
-Open each source through `openExistingProjectFile(workspaceRootReal, projectRelativePath)` and keep the returned handle/FD as the I/O authority. Hash, ffprobe, sample-decode, and transcode through that controlled FD: explicitly map the FD into the child process `stdio` and reference the inherited descriptor (for example `/dev/fd/3`), or use a controlled pipe. Never resolve a path string and later reopen it. Transcode only when required, write `asset-manifest.json`, and verify the source hash again through the same handle/FD strategy after processing.
+Open each source through `openExistingProjectFile(projectDirectory, projectRelativePath)`. Hashing, ffprobe, sample-decode, transcode, and final hash verification each open a fresh scoped handle and close it in `finally` after that consumer settles. Child processes map every read and write FD through `extraStdioFds`; for example source child FD 3 is `/dev/fd/3` and a Run-scope output child FD 4 is `pipe:4` or `/dev/fd/4`. Each FD/pipe is one-shot. Never resolve a path string and later reopen it. Transcode only when required and write `asset-manifest.json` through the Run scope.
 
 - [ ] **Step 6: Verify and commit**
 
@@ -1133,7 +1152,7 @@ export interface TtsProvider {
 }
 ```
 
-Run the same contract tests against Mock and File providers. Verify cancellation, deterministic fingerprinting, missing input failure, and non-empty output. `FileTtsProvider` must require `sourceAudioPath`, resolve it through the safe project path helper, copy it into the run directory, and never modify the source WAV.
+Run the same contract tests against Mock and File providers. Verify cancellation, deterministic fingerprinting, missing input failure, and non-empty output. `FileTtsProvider` must require `sourceAudioPath`, open a fresh read handle through `ProjectDirectoryScope`, pass it through `extraStdioFds`, close it in `finally`, copy into the Run scope, and never modify the source WAV.
 
 - [ ] **Step 2: Implement MacOsSayProvider**
 
@@ -1306,6 +1325,7 @@ The compiler must:
 7. Merge touching visual ranges and reject gaps unless `allowBackgroundGaps` is true.
 8. Validate BGM available duration after `startMs`.
 9. Emit only project-relative render paths and input hashes.
+10. Persist narration intervals and BGM metadata only; P04 derives Ducking from those fields, Composition duration, `project.audio`, and its algorithm version.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -1417,19 +1437,25 @@ it('serializes a large set of narration intervals into a filter graph file', () 
   const intervals = Array.from({length: 100}, (_, index) => ({startMs: index * 1000, endMs: index * 1000 + 500}));
   expect(buildAudioFilterGraph({narration: intervals}).script).toContain('volume=');
 });
+
+it('fingerprints every deterministic audio-mix input', () => {
+  expect(audioMixFingerprint(fixture())).toMatch(/^sha256:/);
+});
 ```
 
 - [ ] **Step 2: Implement deterministic envelope math**
 
-Represent gain as a piecewise function: unity before attack, linear ramp to `10 ** (duckDb / 20)`, hold during narration, linear release, unity afterward. Merge intervals whose attack begins before the previous release ends. Clamp every endpoint to `[0, compositionDurationMs]`.
+Represent gain as a piecewise function: unity before attack, linear ramp to `10 ** (duckDb / 20)`, hold during narration, linear release, unity afterward. Merge intervals whose attack begins before the previous release ends. Clamp every endpoint to `[0, compositionDurationMs]`. Do not persist the derived envelope in the compiled timeline.
+
+Freeze an algorithm version such as `audio-mix-v1`. The fingerprint covers narration intervals, Composition duration, BGM metadata, `backgroundMusicGainDb`, `duckDuringNarrationDb`, `duckAttackMs`, `duckReleaseMs`, and the algorithm version.
 
 - [ ] **Step 3: Build the FFmpeg mix graph**
 
-Create a `volume=<globalGain>*<piecewiseExpression>:eval=frame` filter for BGM, delay it by `backgroundMusic.startMs`, and mix with narration using `amix=inputs=2:normalize=0`. Serialize the complete graph to a write-once file under the current Run and pass that file to FFmpeg through its argument-array API rather than placing the growing expression directly on the command line. Trim the result to Composition duration, resample to 48kHz, and output stereo PCM WAV. The integration test must execute a graph generated from at least 100 narration intervals.
+Create a `volume=<globalGain>*<piecewiseExpression>:eval=frame` filter for BGM, delay it by `backgroundMusic.startMs`, and mix with narration using `amix=inputs=2:normalize=0`. Serialize the complete graph to fixed Run artifact `audio/filter-graph.txt`, record its path and SHA-256 in Audio Mix Stage outputs, and pass a fresh read FD to FFmpeg rather than placing the growing expression on the command line. Every independent input/output opens a fresh Project or Run/Output handle, maps both read and write FDs through `extraStdioFds`, consumes each FD/pipe once, and closes in `finally`. Trim to Composition duration, resample to 48kHz, and output stereo PCM WAV. The integration test executes at least 100 narration intervals.
 
 - [ ] **Step 4: Implement two-pass loudnorm**
 
-First pass uses `loudnorm=I=<target>:TP=<peak>:LRA=11:print_format=json` to null output and parses measured values from stderr. Second pass supplies `measured_I`, `measured_LRA`, `measured_TP`, `measured_thresh`, and `offset`, then writes normalized WAV. Reject non-finite measurements.
+First pass uses `loudnorm=I=<target>:TP=<peak>:LRA=11:print_format=json` to null output and parses measured values from stderr. Second pass supplies `measured_I`, `measured_LRA`, `measured_TP`, `measured_thresh`, and `offset`, then writes normalized WAV. Both passes use fresh scoped handles and borrowed `extraStdioFds`; reject non-finite measurements.
 
 - [ ] **Step 5: Verify and commit**
 
@@ -1809,7 +1835,7 @@ Checkpoint C is complete when all nineteen MVP acceptance criteria in the specif
 - [ ] Preflight and runtime disk exhaustion remain distinct failures.
 - [ ] Exact-frame and non-aligned caption boundary tests pass.
 - [ ] Final Ducking release is clamped to Composition duration.
-- [ ] A 100-interval audio Filter Graph executes from a Run-local script file.
+- [ ] A 100-interval `audio/filter-graph.txt` executes, its path/SHA-256 appears in Stage outputs, and its fingerprint covers every frozen Audio Mix input.
 - [ ] Narration concat succeeds from a project path containing spaces while retaining `-safe 1`.
 - [ ] Remotion output contains no audio stream.
 - [ ] Final mux copies H.264 video and encodes AAC audio only.
