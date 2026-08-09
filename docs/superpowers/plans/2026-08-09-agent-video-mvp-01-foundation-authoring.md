@@ -17,7 +17,7 @@
 - **Project Index:** `2026-08-09-agent-video-mvp-project-index.md`
 - **Master Tasks:** 1–4
 - **Depends On:** None
-- **Primary Write Set:** `package.json`, TypeScript/test configuration, `src/domain/**`, `src/fs/**`, `src/process/**`, `src/pipeline/types.ts`, and `src/pipeline/gate.ts`.
+- **Primary Write Set:** `package.json`, `pnpm-lock.yaml`, package-manager configuration (`.npmrc`, `.pnpmfile.cjs`), TypeScript/test configuration, `src/domain/**`, `src/fs/**`, `src/process/**`, `src/pipeline/types.ts`, and `src/pipeline/gate.ts`.
 - **Must Not Implement:** Media probing, TTS, Remotion rendering, release packaging, Stage registry, Presets, or Runner behavior.
 - **Exit Artifact:** Frozen authoring Schemas, generated Manifest types, safe read/write path APIs, process protocol, and Gate aggregation.
 
@@ -32,6 +32,8 @@
 
 **Files:**
 - Create: `package.json`
+- Create: `.npmrc`
+- Create: `.pnpmfile.cjs`
 - Create: `tsconfig.json`
 - Create: `vitest.config.ts`
 - Create: `remotion.config.ts`
@@ -74,6 +76,10 @@ Expected: `package.json` and `pnpm-lock.yaml` are created, and all Remotion pack
 ```
 
 Preserve the exact dependency versions written by pnpm.
+
+Package-manager portability requirements:
+- `.npmrc` must set `auto-install-peers=false` and `lockfile-include-tarball-url=false` so pnpm does not auto-install unrequested peers and is configured not to include registry tarball URLs in the lockfile.
+- `.pnpmfile.cjs` must remove `resolution.tarball` only when the same resolution has `integrity`, keeping the frozen lockfile portable and integrity-verifiable without retaining mirror-specific tarball addresses.
 
 `tsconfig.json`:
 
@@ -174,7 +180,7 @@ Expected: PASS and exit code 0.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add package.json pnpm-lock.yaml tsconfig.json vitest.config.ts remotion.config.ts src/domain/mvp-profile.ts tests/unit/domain/mvp-profile.test.ts
+git add .npmrc .pnpmfile.cjs package.json pnpm-lock.yaml tsconfig.json vitest.config.ts remotion.config.ts src/domain/mvp-profile.ts tests/unit/domain/mvp-profile.test.ts
 git commit -m "chore: bootstrap agent video toolchain"
 ```
 
