@@ -25,7 +25,7 @@
 
 - P01–P05 exit verification passes and their commits are present in dependency order.
 - Every concrete Stage can be invoked and tested independently before it is registered.
-- The target Mac satisfies P02 Preflight and has the licensed demo font available through the Task 16 setup.
+- The target Mac satisfies P02 Preflight, including the executable sibling `qt-faststart` toolchain fingerprint, and has the licensed demo font available through the Task 16 setup.
 
 ---
 ## Task 15: Wire the Stage Registry, Presets, Execution Plan, Runner, Signals, and CLI
@@ -133,7 +133,7 @@ export interface ExecutionPlan {
 6. Apply `--force <stage>` to that Stage and all downstream registered Stages.
 7. Number only the selected plan as `1/N`, `2/N`, and so on while retaining stable `StageId` values.
 
-Tests must cover full, prefix, and sliced plans; cached and resume actions; forced invalidation; missing prerequisites; and insertion of a fake Stage without changing Runner code. Draft fingerprint fixtures include the complete P04 audio sub-fingerprint (`targetLufs` and `truePeakDb` included). Release fingerprint fixtures consume the exact Draft output hashes for `audio/filter-graph.txt` and `audio/mixed-normalized.wav`; there is no Audio Mix Stage. `--plan` prints this object and exits without creating a Run, acquiring a write lock, writing a pointer, or starting a subprocess.
+Tests must cover full, prefix, and sliced plans; cached and resume actions; forced invalidation; missing prerequisites; and insertion of a fake Stage without changing Runner code. Draft fingerprint fixtures include the complete P04 audio sub-fingerprint (`targetLufs` and `truePeakDb` included). Release fingerprint fixtures consume the exact Draft output hashes for `audio/filter-graph.txt` and `audio/mixed-normalized.wav` plus the persisted FFmpeg/`qt-faststart` environment fingerprint; there is no Audio Mix Stage. `--plan` prints this object and exits without creating a Run, acquiring a write lock, writing a pointer, or starting a subprocess.
 
 - [ ] **Step 4: Implement the Execution Plan Runner and resume behavior**
 
@@ -143,7 +143,7 @@ The Runner receives an already validated `ExecutionPlan` and has no Preset-speci
 
 - [ ] **Step 5: Implement signal behavior**
 
-Create one `AbortController`, map `SIGINT` and `SIGTERM` to `abort()`, wait for child termination, remove temporary files owned by the current Run, preserve prior pointers, and return exit code 130 for SIGINT. Integration tests send real signals to a child CLI process and assert the lock is released.
+Create one `AbortController`, map `SIGINT` and `SIGTERM` to `abort()`, wait for child termination, then clean failed Run-local intermediates through Run authority and unpublished release files through Output authority. Preserve prior pointers and return exit code 130 for SIGINT. Integration tests send real signals to a child CLI process and assert the lock is released and the previously published release remains current.
 
 - [ ] **Step 6: Implement runtime disk-exhaustion behavior**
 
@@ -167,7 +167,7 @@ videoctl clean <project>
 
 The convenience commands `doctor`, `ingest`, `run`, `compile`, and `release` translate into the same Stage IDs and call the same Execution Plan builder; they must not contain a second orchestration path. Remove the obsolete `render --preset draft` command in favor of `pipeline --preset draft`. Reject unknown Presets, unknown Stage IDs, invalid ranges, and missing prerequisites with the specification error codes.
 
-`clean` may remove failed and unreferenced work Runs only; it must never remove source assets, the Run referenced by work `current.json`, or the release referenced by output `current.json`.
+`clean` may remove failed/unreferenced work Runs and unpublished release directories not referenced by output `current.json`. It must never remove source assets, the Run referenced by work `current.json`, or the release referenced by output `current.json`. Failed FFmpeg intermediates are removed only through Run authority; unpublished `qt-faststart` finals/directories are removed only through Output authority.
 
 - [ ] **Step 8: Verify and commit**
 
@@ -238,11 +238,15 @@ expect(finalProbe.videoCodec).toBe('h264');
 expect(finalProbe.pixelFormat).toBe('yuv420p');
 expect(finalProbe.audioCodec).toBe('aac');
 expect(finalProbe.audioSampleRate).toBe(48_000);
-expect(await fullDecode(finalPath)).toEqual({ok: true});
+expect(await fullDecodeFromOutputScope(outputDirectory, finalRelativePath)).toEqual({ok: true});
+const atoms = await readTopLevelAtomsFromOutputScope(outputDirectory, finalRelativePath);
+expect(atoms.moov.offset).toBeLessThan(atoms.mdat.offset);
 expect(await sourceHashesAfter()).toEqual(await sourceHashesBefore());
 ```
 
 It also verifies `subtitles.srt`, `thumbnail.jpg`, `review.json`, `validation-report.json`, and `checksums.sha256` exist under the release referenced by `output/<project>/current.json`. Stage reports must retain stable IDs while displaying the correct `position/total` for each selected Preset.
+
+Inspect Release process results and scoped artifact references: Step A is FFmpeg ending in `-f mp4 /dev/fd/5` without `+faststart`, with a non-empty Run-scope intermediate; Step B is `qt-faststart /dev/fd/3 /dev/fd/4`, using a new Run read handle and a distinct Output read-write handle/path. Missing/failing `qt-faststart` must leave the pre-existing output pointer unchanged. Each decode/atom helper opens its own fresh Output-scope read handle.
 
 - [ ] **Step 4: Write cache invalidation acceptance test**
 
@@ -250,7 +254,7 @@ Run the `release` Preset twice, change only the second script segment, and asser
 
 - [ ] **Step 5: Document exact local usage**
 
-`README.md` must include prerequisites, installation, fixture generation, the seven stable Stage IDs, built-in Presets, Execution Plan numbering, `--plan`/`--from`/`--to`/`--force`, authoring-file roles, commands, review workflow, output pointer resolution, common error codes, and the statement that source video audio is muted in MVP.
+`README.md` must include prerequisites—including an executable `qt-faststart` sibling beside the resolved FFmpeg binary—installation, fixture generation, the seven stable Stage IDs, built-in Presets, Execution Plan numbering, `--plan`/`--from`/`--to`/`--force`, authoring-file roles, commands, review workflow, output pointer resolution, common error codes, the two-step scoped-FD publication flow, and the statement that source video audio is muted in MVP.
 
 - [ ] **Step 6: Run the complete verification suite**
 
@@ -272,12 +276,12 @@ Expected:
 
 - All unit and integration tests pass.
 - TypeScript exits 0.
-- Doctor reports no errors on the target Mac.
+- Doctor reports no errors on the target Mac and records FFmpeg/`qt-faststart` real paths, SHA-256 values, and the environment fingerprint.
 - Plan mode reports numbered Stage IDs and performs no writes or subprocess calls.
 - `assets`, `draft`, and `release` reuse all matching shared Stage artifacts; Release references the Draft filter-graph/mixed-audio hashes without rerunning audio mixing.
 - The first release run stops when Review returns `needs_review` before approval.
 - The explicit review command succeeds, and the resumed `release` Preset publishes a new output pointer without changing `runId`.
-- The current release fully decodes and matches the fixed media profile.
+- The current release was produced by the two-step FFmpeg-intermediate/`qt-faststart` flow, fully decodes, has `moov` before `mdat`, and matches the fixed media profile.
 
 - [ ] **Step 7: Commit**
 
@@ -302,8 +306,10 @@ Checkpoint C is complete when all nineteen MVP acceptance criteria in the specif
 - [ ] Draft-derived Ducking is clamped to Composition duration; a 100-interval Run-local `audio/filter-graph.txt` executes, both fixed audio path/SHA-256 references appear in Draft Stage outputs, and Release reuses those hashes without overwriting either write-once artifact.
 - [ ] Narration concat succeeds from a project path containing spaces while retaining `-safe 1`.
 - [ ] Remotion output contains no audio stream.
-- [ ] Final mux copies H.264 video and encodes AAC audio only.
-- [ ] Final MP4 passes full FFmpeg decode.
+- [ ] Preflight requires sibling `qt-faststart`, records both tool paths/hashes, and returns `ENV_TOOL_MISSING` when unavailable.
+- [ ] Step A copies H.264 and encodes AAC into a distinct non-empty Run-scope intermediate with no `+faststart`.
+- [ ] Step B uses fresh Run-input/Output-output handles with `qt-faststart /dev/fd/3 /dev/fd/4`; final passes full decode and has `moov` before `mdat`.
+- [ ] No Darwin command uses FFmpeg `-movflags +faststart` on one `/dev/fd/N`.
 - [ ] Failed publication preserves previous work and release pointers.
 - [ ] Changing one script segment reuses all unchanged segment audio.
 - [ ] Stage registry IDs are unique and every Preset references a contiguous registered sequence.
@@ -336,7 +342,7 @@ pnpm video review demo --approve --reason "acceptance review"
 pnpm video pipeline demo --preset release --resume --json
 ```
 
-Expected: plan mode has no side effects; shared Stage artifacts are reused; the first release run stops at Review; approval preserves the Run ID; the resumed release publishes a fully decodable current output.
+Expected: plan mode has no side effects; shared Stage artifacts are reused; the first release run stops at Review; approval preserves the Run ID; the resumed release publishes a fully decodable current output through the two-step FFmpeg-intermediate/`qt-faststart` flow.
 
 - [ ] **Step 3: Record the final cross-project handoff**
 

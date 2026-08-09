@@ -38,10 +38,10 @@ flowchart LR
 | ID | Project | Master Tasks | Depends On | Primary Deliverable | Executable Plan |
 | --- | --- | --- | --- | --- | --- |
 | P01 | Foundation and Authoring Core | 1–4 | None | Strict inputs, opaque project-directory scopes, process-group completion, borrowed FD and Gate contracts | [P01 Plan](2026-08-09-agent-video-mvp-01-foundation-authoring.md) |
-| P02 | Run State and Preflight | 5–6 | P01 | Opaque Run/Output scopes, fingerprints, immutable Runs, locks, atomic pointers, `doctor` | [P02 Plan](2026-08-09-agent-video-mvp-02-run-state-preflight.md) |
+| P02 | Run State and Preflight | 5–6 | P01 | Opaque Run/Output scopes, fingerprints, immutable Runs, locks, atomic pointers, FFmpeg/`qt-faststart` toolchain fingerprint, `doctor` | [P02 Plan](2026-08-09-agent-video-mvp-02-run-state-preflight.md) |
 | P03 | Media and Visual Pipeline | 7, 10, 11 | P01, P02 | Ingest, EDL compile, fixed components, muted Remotion render | [P03 Plan](2026-08-09-agent-video-mvp-03-media-visual-pipeline.md) |
 | P04 | Narration and Audio | 8, 9, 12 | P01, P02 | TTS cache, narration master, captions, BGM mix and loudness | [P04 Plan](2026-08-09-agent-video-mvp-04-narration-audio.md) |
-| P05 | Review and Release | 13–14 | P03, P04 | Draft evidence, explicit Review Gate, verified release package | [P05 Plan](2026-08-09-agent-video-mvp-05-review-release.md) |
+| P05 | Review and Release | 13–14 | P03, P04 | Draft evidence, explicit Review Gate, two-step scoped-FD faststart publication, verified release package | [P05 Plan](2026-08-09-agent-video-mvp-05-review-release.md) |
 | P06 | Workflow and Productization | 15–16 | P02, P05 | Stage registry, Presets, Execution Plan, Runner, CLI and E2E | [P06 Plan](2026-08-09-agent-video-mvp-06-workflow-productization.md) |
 
 ## Execution Waves

@@ -33,7 +33,7 @@
 | --- | --- | --- |
 | P0 | 缺少明确的剪辑决策模型 | 新增 `edit.json`，保存显式 EDL |
 | P0 | `script.json`、`project.json` 和生成时间线职责重叠 | 明确输入文件与只读生成物边界 |
-| P0 | Remotion 和 FFmpeg 都承担最终音频职责 | Remotion 始终渲染无声视频，FFmpeg 独占最终混音和封装 |
+| P0 | Remotion 和媒体工具链都承担最终音频职责 | Remotion 始终渲染无声视频；FFmpeg 独占最终混音/中间封装，`qt-faststart` 仅负责最终 MP4 atom 重排 |
 | P1 | 16 个阶段和完整 DAG 超出 MVP 范围 | 压缩为 7 个线性阶段，使用阶段指纹恢复 |
 | P1 | CosyVoice、WhisperX 对首版 macOS 环境过重 | 默认使用 macOS `say` 或用户提供的分段 WAV |
 | P1 | 所有素材强制 CFR 转码成本过高 | 先分类，仅对不兼容素材生成渲染副本 |
@@ -130,9 +130,10 @@ flowchart LR
     J --> R["Remotion 无声视频渲染"]
     N --> M["FFmpeg 音频混合"]
     P --> M
-    R --> X["FFmpeg 合流与封装"]
+    R --> X["FFmpeg 合流为中间 MP4"]
     M --> X
-    X --> V["发布验证"]
+    X --> Q["qt-faststart 最终封装"]
+    Q --> V["发布验证"]
     V --> O["MP4 / SRT / 报告"]
 ```
 
@@ -143,7 +144,7 @@ flowchart LR
 | Codex | 修改脚本、EDL 和注册组件源码；读取报告并修复 | 判定硬性验证自动通过 |
 | Pipeline Runner | 串联阶段、计算指纹、恢复和写报告 | 理解视频语义 |
 | Remotion | 画面、图片、标题和字幕的帧级渲染 | 最终音频混合和发布封装 |
-| FFmpeg/ffprobe | 探测、兼容转码、音频处理、合流、完整解码验证 | 生成剪辑决策 |
+| FFmpeg/ffprobe/qt-faststart | 探测、兼容转码、音频处理、中间合流、MP4 atom 重排、完整解码验证 | 生成剪辑决策 |
 | TTS Provider | 生成单个脚本段落的语音文件 | 决定视频时间线和字幕样式 |
 
 ## 7. 真相源与生成物
@@ -648,7 +649,9 @@ Runner、锁、报告协议和原子发布机制不应因新增普通 Stage 而�
 
 执行：
 
-- 检查运行环境为 Apple Silicon、macOS 15+，并检查 Node.js、pnpm、FFmpeg、ffprobe 和 Remotion。
+- 检查运行环境为 Apple Silicon、macOS 15+，并检查 Node.js、pnpm、FFmpeg、ffprobe、`qt-faststart` 和 Remotion。
+- 将已选择的 FFmpeg 可执行文件解析为 canonical real path，只从其真实目录定位 sibling `qt-faststart`；要求该 sibling 为可执行普通文件。
+- 记录 FFmpeg 与 `qt-faststart` 的真实路径和二进制 SHA-256，并纳入 Preflight 环境指纹和 `doctor --json` 输出。
 - 检查 FFmpeg 的 H.264 编码、AAC 编码、`loudnorm`、`silencedetect` 和 `blackdetect` 能力。
 - 检查字体文件及其 Hash。
 - 检查配置的 macOS Voice。
@@ -659,7 +662,7 @@ Runner、锁、报告协议和原子发布机制不应因新增普通 Stage 而�
 硬性 Gate：
 
 - 平台不是 Apple Silicon macOS 15+。
-- 必需工具不存在。
+- 必需工具不存在或 sibling `qt-faststart` 不可执行，返回 `ENV_TOOL_MISSING`。
 - 字体缺失。
 - Voice 缺失且没有分段 WAV。
 - 最小渲染或编解码失败。
@@ -796,28 +799,37 @@ Gate：
 执行：
 
 1. Remotion 使用最终画布渲染无声 H.264 视频。
-2. `release` Preset 必经 Draft；读取 Draft Stage outputs，重新校验 `audio/filter-graph.txt` 和 `audio/mixed-normalized.wav` 的路径与 SHA-256，并将这两个 Hash 纳入 Release 指纹和输入溯源。
+2. `release` Preset 必经 Draft；读取 Draft Stage outputs，重新校验 `audio/filter-graph.txt` 和 `audio/mixed-normalized.wav` 的路径与 SHA-256，并将这两个 Hash 及 Preflight 的 FFmpeg/`qt-faststart` 环境指纹纳入 Release 指纹和输入溯源。
 3. 直接复用 Draft 生成且已裁剪/归一化的 `audio/mixed-normalized.wav`；Release 不重新执行 Filter Graph、不创建 Audio Mix Stage，也不覆盖任何 write-once Draft artifact。
-4. 将复用的 PCM 音频编码为 48kHz 立体声 AAC。
-5. 使用视频流复制方式将 H.264 视频和 AAC 音频合流。
-6. 写入 `faststart` MP4。
-7. 从已批准的非黑关键帧生成 1280 × 720 缩略图。
-8. 生成 SRT、校验和和最终报告。
+4. Step A 使用视频流复制方式将 H.264 视频和 AAC 音频合流到 Run Scope 的 write-once 中间 MP4，不使用 `+faststart`。
+5. Step B 使用 Preflight 记录的 `qt-faststart` 真实路径，从 fresh Run-scope read handle 读取中间 MP4，并向 fresh exclusive Output-scope read-write handle 写入最终 MP4。
+6. 从已批准的非黑关键帧生成 1280 × 720 缩略图。
+7. 生成 SRT、校验和和最终报告。
 
-最终合流命令固定为：
+Step A 固定命令：
 
 ```text
 ffmpeg -y -i /dev/fd/3 -i /dev/fd/4 \
   -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -ar 48000 -ac 2 \
-  -movflags +faststart -f mp4 /dev/fd/5
+  -f mp4 /dev/fd/5
 ```
 
-FD 3/4 分别来自 Run Scope 的全新只读 Handle；FD 5 必须来自 Output Scope 的 no-follow/exclusive **read-write new-file capability**，以支持 MP4 muxer 的 seek/readback。所有 Handle 均为 borrowed，`runProcess()` settle 后由调用方在 `finally` 关闭。这里不新增 Stage。
+FD 3/4 分别来自 Run Scope 的全新只读 Handle；FD 5 来自 Run Scope 的 no-follow/exclusive **read-write new-file capability**，写入固定 write-once 中间文件 `release/final-intermediate.mp4`。第一次 `runProcess()` settle 后，调用方在 `finally` 关闭三个 borrowed Handle，并验证中间文件非空。
+
+Step B 固定命令：
+
+```text
+qt-faststart /dev/fd/3 /dev/fd/4
+```
+
+FD 3 是重新打开的 fresh Run-scope intermediate read handle；FD 4 是 fresh exclusive Output-scope read-write handle，目标为 `releases/<runId>/final.mp4`。两者不得与 Step A 复用 Handle，且中间/最终路径必须不同。第二次 `runProcess()` settle 后，调用方在 `finally` 关闭两个 borrowed Handle。这里不新增 Stage。
+
+Darwin 上禁止把 FFmpeg `-movflags +faststart` 直接写到单个 `/dev/fd/N`：FFmpeg 内部重开该 descriptor path 时会共享同一 open-file-description offset，可能静默损坏 MP4。最终 atom 重排只能通过上述独立输入/输出 FD 的 `qt-faststart` 步骤完成。
 
 发布硬性验证：
 
-- 对最终 MP4 执行从头到尾的完整解码。
-- 最终 MP4 非空，解析 top-level atoms 后 `moov` 必须位于 `mdat` 之前。
+- FFmpeg 中间 MP4 非空；`qt-faststart` 最终 MP4 非空，且二者不是同一 Handle 或同一路径。
+- 最终 MP4 可从头到尾完整解码，解析 top-level atoms 后 `moov` 必须位于 `mdat` 之前。
 - 仅包含一个视频流和一个音频流。
 - 分辨率为 1920 × 1080。
 - 帧率为 30 FPS。
@@ -844,7 +856,7 @@ output/<project-id>/
     └── checksums.sha256
 ```
 
-输出目录 `current.json` 只保存当前成功发布的 `runId` 和相对目录。Release 完整验证通过后才使用与工作目录相同的临时文件、同步和原子重命名协议更新该指针，因此失败发布不会替换上一次成功版本。
+输出目录 `current.json` 只保存当前成功发布的 `runId` 和相对目录。只有 Step A、Step B 和 Release 完整验证全部通过后，才使用与工作目录相同的临时文件、同步和原子重命名协议更新该指针。FFmpeg/`qt-faststart` 失败不得发布；Run cleanup 可清理失败阶段的中间文件，Release cleanup 可清理未被 output `current.json` 引用的 release 目录，但两者都不得删除当前引用的 Run 或成功 release。
 
 ## 12. Remotion 与 FFmpeg 的职责划分
 
@@ -859,7 +871,7 @@ Remotion 负责：
 
 所有视频组件在 Remotion 中必须静音。Remotion 不输出最终音频 Track。
 
-### 12.2 FFmpeg
+### 12.2 FFmpeg 与 `qt-faststart`
 
 FFmpeg 负责：
 
@@ -868,12 +880,13 @@ FFmpeg 负责：
 - 旁白拼接。
 - BGM Trim、增益和 Ducking。
 - 响度和 True Peak 控制。
-- 音视频合流和 MP4 `faststart`。
+- FFmpeg 将视频流复制和 AAC 音频合流为 Run-local 中间 MP4，不使用 `+faststart`。
+- `qt-faststart` 使用独立 fresh input/output FD 将中间 MP4 转为最终 faststart MP4。
 - 黑帧、静音和完整解码检查。
 
 ### 12.3 避免重复编码
 
-最终 Remotion 输出已经是目标 H.264 视频。FFmpeg 合流时使用视频流复制，只重新编码音频，从而避免第二次视频有损编码。
+最终 Remotion 输出已经是目标 H.264 视频。FFmpeg Step A 合流时使用视频流复制，只重新编码音频；`qt-faststart` Step B 只重排 MP4 atoms，从而避免第二次视频有损编码。
 
 ## 13. Provider 设计
 
@@ -983,7 +996,7 @@ MVP 不建设通用内容寻址 Artifact Store，只使用阶段指纹。
 - 上游 Manifest Hash。
 - Schema 版本。
 - Provider 指纹。
-- Remotion 和 FFmpeg 版本。
+- Remotion 版本，以及 resolved FFmpeg/`qt-faststart` 真实路径和二进制 SHA-256 环境指纹。
 - 对该阶段有影响的代码版本标识。
 
 ### 16.2 旁白段级缓存
@@ -1010,6 +1023,7 @@ segment-id
 - `--resume` 优先继续该 Run，不创建新的 `runId`；输入指纹发生变化时才创建新 Run。
 - 更新指针时先写入 `current.json.tmp`，执行文件和父目录同步后，在同一文件系统内原子重命名为 `current.json`。
 - 指针写入、同步或重命名任一步骤失败时，删除临时指针并保留原 `current.json`，不得删除上一次成功 Run。
+- Release Step A/Step B 失败时不得更新 output `current.json`。Run cleanup 只可删除失败/未引用 Run 内的中间 MP4；Release cleanup 只可删除未被 output `current.json` 引用的 release 目录。
 - 中断运行不得覆盖上一次成功产物。
 - 同一项目同一时间只允许一个写入型流水线，通过 `pipeline.lock` 实现。
 - 锁文件记录 PID、主机名、进程启动标识、创建时间和 `runId`；只有确认同主机进程已经不存在时才允许显式清理陈旧锁。
@@ -1102,7 +1116,7 @@ CLI 必须支持：
 - 原素材在 Ingest 和 Release 分别计算 Hash。
 - 输出使用临时文件和原子重命名。
 - Project Scope 不授权 `.work` 或 `output`；P02 必须提供 opaque `RunDirectoryScope` 和 `OutputDirectoryScope`。三种 Scope 各自带不同的 private 实例 brand，禁止 `{}` 伪造和 Project/Run/Output 之间的结构化互赋值。Run/Output Scope 只能由可信 canonical workspace root 与 app-owned 相对根异步创建，canonical 根保持私有，API 只接收各自根内相对路径，并在每次 existing/new open 前重新验证 containment、使用 Darwin `O_NOFOLLOW_ANY`、拒绝 symlink traversal/substitution。
-- Run/Output Scope 除 existing read 与 exclusive write-only new-file 外，还必须提供 exclusive read-write new-file capability：`O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW_ANY`、mode `0o600`。该能力用于需要 seek/readback 的容器写入；每个独立消费者仍从所属 Project/Run/Output Scope 打开新 `FileHandle`，FD 为 borrowed，调用方在 Promise settle 后 `finally` 关闭。
+- Run/Output Scope 除 existing read 与 exclusive write-only new-file 外，还必须提供 exclusive read-write new-file capability：`O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW_ANY`、mode `0o600`。Run Scope 的该能力用于 FFmpeg seekable intermediate；Output Scope 的该能力用于 `qt-faststart` final output。每个独立消费者仍从所属 Project/Run/Output Scope 打开新 `FileHandle`，FD 为 borrowed，调用方在对应 Promise settle 后 `finally` 关闭。
 
 ### 18.3 运行时代码
 
@@ -1206,12 +1220,13 @@ ATOMIC_PUBLISH_FAILED
 - 素材入库和兼容性分类。
 - Mock TTS 生成旁白清单。
 - Remotion 渲染 10 秒无声视频。
-- FFmpeg 混音、合流和完整解码。
+- FFmpeg 混音、Step A 中间合流、`qt-faststart` Step B 最终 atom 重排和完整解码。
 - 使用至少 100 个旁白区间生成并执行固定 artifact `audio/filter-graph.txt`，验证不会依赖超长命令行，并校验它与 `audio/mixed-normalized.wav` 的路径和 SHA-256 已进入 Draft Stage outputs。
 - 在包含空格的项目目录运行 Narration，验证 `-safe 1` concat 清单只使用受控相对文件名。
 - 修改一个脚本段后验证另一个语音段命中缓存。
 - 先执行 `assets`、再执行 `draft`、最后执行 `release`，验证共同 Stage 复用已有产物，且 Release 复用 Draft 的 Filter Graph/混音 Hash 而不重复混音或覆盖 write-once artifact。
-- 用 Output Scope 的 exclusive read-write new-file Handle 执行固定 `-movflags +faststart -f mp4 /dev/fd/5` 命令；验证输出非空、可由 FFmpeg 完整解码，并用全新的 Output-scope read Handle 解析 32-bit、extended 64-bit 和 size-zero top-level atom，确认 `moov` 在 `mdat` 前。
+- 精确执行两步 scoped-FD 命令：Step A 用 fresh Run read/read/read-write Handles 执行不含 `+faststart` 的 FFmpeg `... -f mp4 /dev/fd/5`，验证中间 MP4 非空；Step B 用新的 Run read/Output read-write Handles 执行 `qt-faststart /dev/fd/3 /dev/fd/4`，验证 final 非空、完整解码，并用另一个 fresh Output read Handle 解析 32-bit、extended 64-bit 和 size-zero top-level atom，确认 `moov` 在 `mdat` 前。
+- 验证中间与 final 不是同一 Handle 或路径，Draft Filter Graph/归一化混音 bytes/hashes 不变；模拟 `qt-faststart` 缺失/失败，确认 output pointer 不发布且已有 `current.json` 保持不变。
 - `--plan` 不创建 Run、不获取项目锁且不启动子进程。
 - 中断 Release 后验证上一次成功输出未被覆盖。
 
@@ -1227,6 +1242,7 @@ ATOMIC_PUBLISH_FAILED
 - 创建一个指向项目外文件的可写目标符号链接，验证安全创建 API 拒绝写入且项目外文件内容保持不变。
 - 用 `@ts-expect-error` 覆盖 `{}` 伪造以及 Project/Run/Output Scope 全部双向互赋，证明三种 authority nominally distinct。
 - 对 Run/Output Scope 分别覆盖读写逃逸、factory 后 lexical/canonical root substitution、write-only/read-write exclusive create、read-write seek/readback 权限和 work/output pointer symlink，验证所有情况 fail closed 且 borrowed FD 所有权仍归调用方。
+- 模拟 resolved FFmpeg 同目录缺少或存在不可执行 `qt-faststart`，验证 Preflight 返回 `ENV_TOOL_MISSING`；改变任一工具二进制 Hash 必须改变环境指纹。
 - 同时启动两个写入型命令，验证第二个命令返回 `PROJECT_LOCKED`，且第一个命令的锁不会被覆盖。
 - 构造已退出进程留下的锁，验证系统只在确认同主机 PID 不存在后将其报告为 `PROJECT_LOCK_STALE`，并要求显式清理。
 - 分别向运行进程发送 `SIGINT` 和 `SIGTERM`，验证子进程被终止、临时文件被清理、锁被释放、旧 `current.json` 保持不变。
@@ -1240,8 +1256,8 @@ ATOMIC_PUBLISH_FAILED
 
 - 初始化最小 Remotion 工程。
 - 使用本地视频渲染 10 秒无声 H.264。
-- 使用 FFmpeg 生成旁白加 BGM，并与视频流复制合流。
-- 验证最终 MP4 可完整解码。
+- 使用 FFmpeg 生成旁白加 BGM，并通过 fresh scoped FDs 与视频流复制合流到中间 MP4。
+- 使用 sibling `qt-faststart` 从独立 input/output FDs 生成最终 MP4，验证完整解码且 `moov` 位于 `mdat` 前。
 
 通过标准：完整链路可以在目标 Mac 上运行，且没有二次视频编码。
 
@@ -1272,7 +1288,7 @@ ATOMIC_PUBLISH_FAILED
 
 必须同时满足以下条件：
 
-1. 在目标 Apple Silicon Mac 上完成安装和 Preflight。
+1. 在目标 Apple Silicon Mac 上完成安装和 Preflight；resolved FFmpeg 同目录存在可执行 `qt-faststart`，两者真实路径和二进制 SHA-256 已进入环境指纹。
 2. 导入至少三个本地视频或图片素材和一条 BGM。
 3. 输入至少三个中文脚本段落。
 4. 使用 macOS `say` 或分段 WAV 生成旁白。
@@ -1283,7 +1299,7 @@ ATOMIC_PUBLISH_FAILED
 9. 输出 1920 × 1080、30 FPS、H.264、`yuv420p` 的最终 MP4。
 10. 最终音频为 AAC、48kHz、立体声，并满足项目响度策略。
 11. 输出与脚本段落一致的 SRT。
-12. 最终 MP4 非空、可以从头到尾完整解码，并且 top-level `moov` atom 位于 `mdat` 之前。
+12. FFmpeg 无 `+faststart` 的 Run-local 中间 MP4 非空；独立 `qt-faststart` input/output FDs 生成的最终 MP4 非空、可以从头到尾完整解码，并且 top-level `moov` atom 位于 `mdat` 之前。
 13. 原始素材 Hash 在运行前后保持一致。
 14. 修改一个脚本段落后，未修改段落的语音缓存继续命中。
 15. 任一阶段失败后，`--resume` 从第一个失效阶段继续。
@@ -1319,6 +1335,7 @@ MVP 稳定后按以下顺序扩展：
 | `say` 音质不足 | 成片质量有限 | 支持用户 WAV；高质量 TTS Provider 后置 |
 | 项目 JSON 引入执行能力 | 安全风险 | 固定组件注册表和 Props Schema |
 | 中断写坏产物 | 无法恢复 | Run 临时目录、原子切换和项目锁 |
+| Darwin 单 FD 上 FFmpeg `+faststart` 共享 open-file-description offset | MP4 可能静默损坏 | 禁止该命令；FFmpeg 写 Run intermediate，`qt-faststart` 使用独立 fresh Run-input/Output-output FDs |
 | Remotion 授权不适用于组织场景 | 法务风险 | 实施前根据组织规模和用途确认当前许可证 |
 
 ## 25. 许可证与依赖注意事项
@@ -1350,7 +1367,7 @@ edit.json 负责明确的剪辑决策。
 compiled-timeline.json 是只读生成物。
 
 Remotion 只渲染无声画面。
-FFmpeg 独占最终音频混合和封装。
+FFmpeg 独占最终音频混合并生成中间 MP4；`qt-faststart` 从独立输入/输出 FD 生成最终 MP4。
 
 首版使用段级旁白和段级字幕。
 首版使用固定 1080p、30 FPS、H.264 输出。

@@ -945,7 +945,7 @@ Use `open(lockPath, 'wx', 0o600)` for acquisition. Record `hostname()`, PID, run
 
 Define opaque `RunDirectoryScope` and `OutputDirectoryScope` values created only by async factories from a trusted canonical `workspaceRoot` plus an app-owned relative root. Each class has its own true private instance brand (`#private` or `declare private`), not merely a private constructor. Strict `@ts-expect-error` regressions reject `{}` forgery and all six cross-assignments among Project, Run, and Output scopes. The factory rejects an initial canonical root outside the canonical workspace. Store the canonical scope root only in a class `#private` field or module-private `WeakMap`; scope APIs accept only Run- or Output-relative paths and never expose/reaccept the root string as authority.
 
-Both app-owned scopes expose existing-file read, exclusive write-only new-file, and exclusive read-write new-file capabilities. The read-write form opens with `O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW_ANY` and mode `0o600` for seek/readback consumers such as MP4 muxers. Table-driven tests cover an initial canonical root outside the workspace, read/write escape through symlinks, lexical-root substitution after scope creation, canonical-root replacement with an external symlink, write-only and read-write exclusive create, read-write seek/readback permissions, and symbolic links at work/output pointer paths. Existing/new opens canonicalize the target or real parent, re-check containment against the saved canonical root, and use Darwin `O_NOFOLLOW_ANY`. FDs remain borrowed: each consumer opens a fresh handle from its owning scope and closes it in `finally` after success, failure, abort, or timeout.
+Both app-owned scopes expose existing-file read, exclusive write-only new-file, and exclusive read-write new-file capabilities. The read-write form opens with `O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW_ANY` and mode `0o600`. Release uses it through `RunDirectoryScope` for FFmpeg's seekable write-once intermediate MP4 and through `OutputDirectoryScope` for `qt-faststart`'s exclusive final output. Table-driven tests cover an initial canonical root outside the workspace, read/write escape through symlinks, lexical-root substitution after scope creation, canonical-root replacement with an external symlink, write-only and read-write exclusive create, read-write seek/readback permissions, and symbolic links at work/output pointer paths. Existing/new opens canonicalize the target or real parent, re-check containment against the saved canonical root, and use Darwin `O_NOFOLLOW_ANY`. FDs remain borrowed: each consumer opens a fresh handle from its owning scope and closes it in `finally` after success, failure, abort, or timeout.
 
 Use an injected `FileOps` interface to force failures in temporary-file write, sync, and rename. Each test begins with an existing `current.json` and asserts its contents remain unchanged after the simulated failure.
 
@@ -963,7 +963,7 @@ export interface CurrentPointer {
 
 - [ ] **Step 6: Implement immutable runs and atomic pointer publication**
 
-`RunStore.createRun()` creates `.work/<project>/runs/<runId>` and returns its opaque `RunDirectoryScope`, never a root string. Add a safe `RunStore.openExistingRun()` that recreates authority only through the trusted workspace/app-root factory. `RunStore` retains module-private authority for `.work/<project>/current.json` and `pipeline.lock` without exposing that app-owned root as a string or per-Run scope. Stage output files are write-once; later stages append new files without overwriting earlier artifacts. Release creation/publication uses a separate `OutputDirectoryScope` rooted at `output/<project>`. Project, Run, and Output scopes are not interchangeable. Seekable container outputs use the owning scope's exclusive read-write new-file capability; ordinary immutable files may use write-only creation. `publishCurrent()` opens a new same-directory `current.json.tmp` with no-follow/exclusive flags, writes and calls `sync()` on the file handle, atomically renames it, syncs the parent directory, and removes the temporary file on failure. Reject a symbolic link at either pointer path instead of following it.
+`RunStore.createRun()` creates `.work/<project>/runs/<runId>` and returns its opaque `RunDirectoryScope`, never a root string. Add a safe `RunStore.openExistingRun()` that recreates authority only through the trusted workspace/app-root factory. `RunStore` retains module-private authority for `.work/<project>/current.json` and `pipeline.lock` without exposing that app-owned root as a string or per-Run scope. Stage output files are write-once; later stages append new files without overwriting earlier artifacts. Release creation/publication uses a separate `OutputDirectoryScope` rooted at `output/<project>`. Project, Run, and Output scopes are not interchangeable. FFmpeg's intermediate MP4 uses the Run scope's exclusive read-write capability; `qt-faststart` final output uses the Output scope's exclusive read-write capability; ordinary immutable files may use write-only creation. `publishCurrent()` opens a new same-directory `current.json.tmp` with no-follow/exclusive flags, writes and calls `sync()` on the file handle, atomically renames it, syncs the parent directory, and removes the temporary file on failure. Reject a symbolic link at either pointer path instead of following it.
 
 Use the same helper for `output/<project>/current.json`, whose `relativePath` points at `releases/<runId>` and whose `completedStage` is always `release`.
 
@@ -1007,6 +1007,8 @@ it('fails before creating a run when disk space is below the estimate', async ()
 });
 ```
 
+Also cover canonical resolution of the configured/PATH-selected FFmpeg executable, sibling lookup of `<ffmpeg-real-dir>/qt-faststart`, regular-file/executable checks, and binary hashing. Missing, non-regular, or non-executable `qt-faststart` must return `ENV_TOOL_MISSING`. `doctor --json` exposes resolved FFmpeg/`qt-faststart` real paths and SHA-256 values, and changing either binary hash changes the environment fingerprint.
+
 - [ ] **Step 2: Implement Preflight checks**
 
 Run and parse:
@@ -1022,7 +1024,9 @@ ffmpeg -hide_banner -filters
 /usr/bin/say -v ?
 ```
 
-Require `process.platform === 'darwin'`, `process.arch === 'arm64'`, macOS 15 or newer, H.264 encoding, AAC encoding, `loudnorm`, `silencedetect`, and `blackdetect`. Hash every configured font. Estimate required bytes as `max(sourceBytes * 3, 2 GiB)` and compare with `statfs()` before `RunStore.createRun()`.
+Resolve FFmpeg once through the injected executable resolver, canonicalize it with `realpath`, and execute every FFmpeg probe through that path. Derive only `<ffmpeg-real-dir>/qt-faststart`, require it to be a regular executable through the injected filesystem adapter, canonicalize it, and compute SHA-256 for both binaries. Persist their `{realPath, sha256}` records in Preflight outputs/`doctor --json` and include both in the environment fingerprint consumed by downstream provenance and cache decisions. Missing or unusable `qt-faststart` maps to `ENV_TOOL_MISSING` before `RunStore.createRun()`.
+
+Require `process.platform === 'darwin'`, `process.arch === 'arm64'`, macOS 15 or newer, H.264 encoding, AAC encoding, `loudnorm`, `silencedetect`, and `blackdetect`. Hash every configured font. Estimate required bytes as `max(sourceBytes * 3, 2 GiB)` and compare with `statfs()` before `RunStore.createRun()`. Keep sibling resolution and hashing in `src/pipeline/stages/preflight.ts`; MVP does not add a separate probe helper or expand the file/test whitelist.
 
 - [ ] **Step 3: Implement CLI output and exit codes**
 
@@ -1036,7 +1040,7 @@ export const EXIT_CODES = {
 } as const;
 ```
 
-`videoctl doctor <project>` loads the project, runs Preflight, prints a table by default or JSON with `--json`, and exits with `environmentFailed` for errors.
+`videoctl doctor <project>` loads the project, runs Preflight, prints a table by default or JSON with `--json`, including FFmpeg/`qt-faststart` real paths, binary hashes, and the environment fingerprint, and exits with `environmentFailed` for errors. Missing or non-executable `qt-faststart` reports `ENV_TOOL_MISSING`.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -1552,23 +1556,34 @@ Checkpoint B is complete: a narrated, captioned draft can be explicitly approved
 
 Generate one valid release and fixtures with missing audio, wrong dimensions, excessive A/V duration difference, and truncated MP4. Assert the exact errors `RELEASE_DECODE_FAILED` or `RELEASE_DURATION_MISMATCH`. Pre-create the Draft filter graph and normalized mixed audio, run Release, and prove their bytes/hashes remain unchanged.
 
+Execute both commands in Step 2 through borrowed FDs. Assert FFmpeg's Run-scope intermediate is non-empty; `qt-faststart` receives a fresh Run-scope read handle and a fresh exclusive Output-scope read-write handle on a different path; the final output is non-empty, fully decodes, and has top-level `moov` before `mdat`. The atom parser covers bounded 32-bit sizes, extended 64-bit sizes, and size-zero-to-EOF atoms. Missing/failing `qt-faststart` must not publish a pointer and must preserve an existing output `current.json` byte-for-byte.
+
 - [ ] **Step 2: Implement final rendering and muxing**
 
 1. Render final muted H.264 video at 1920×1080 into the Run scope.
-2. Read and verify the Draft Stage output references for `audio/filter-graph.txt` and `audio/mixed-normalized.wav`; include both hashes in Release fingerprint/provenance and reuse the normalized mixed audio without executing the graph or writing either artifact again.
-3. Open fresh Run-scope input handles and an Output-scope exclusive read-write new-file handle for `releases/<runId>/final.mp4`, then mux with borrowed FDs:
+2. Read and verify the Draft Stage output references for `audio/filter-graph.txt` and `audio/mixed-normalized.wav`; include both hashes and P02's persisted FFmpeg/`qt-faststart` environment fingerprint in Release fingerprint/provenance and reuse the normalized mixed audio without executing the graph or writing either artifact again.
+3. **Step A:** open fresh Run-scope read handles for final video and normalized mixed audio plus a fresh Run-scope exclusive read-write new-file handle for write-once `release/final-intermediate.mp4`, then mux with borrowed FDs and no `+faststart`:
 
 ```text
 ffmpeg -y -i /dev/fd/3 -i /dev/fd/4 \
   -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -ar 48000 -ac 2 \
-  -movflags +faststart -f mp4 /dev/fd/5
+  -f mp4 /dev/fd/5
 ```
 
-Do not use `-shortest`. FD 5 must be seekable because `+faststart` reads and rewrites MP4 metadata; a write-only handle is invalid. Draft already trims and normalizes the reusable audio to Composition duration; Release verifies that duration/hash contract before muxing and closes all handles in `finally` after `runProcess()` settles.
+4. After Step A's `runProcess()` settles, close all three handles in `finally` and require the intermediate to be non-empty.
+5. **Step B:** reopen the intermediate through a fresh Run-scope read handle, open `releases/<runId>/final.mp4` through a fresh Output-scope exclusive read-write new-file handle, and invoke the exact `qt-faststart` real path recorded by Preflight:
+
+```text
+qt-faststart /dev/fd/3 /dev/fd/4
+```
+
+After Step B's `runProcess()` settles, close both handles in `finally`. Do not use `-shortest`; Draft already trims and normalizes the reusable audio to Composition duration, and Release verifies that duration/hash contract before Step A. The intermediate and final must never share a handle or scope-relative path.
+
+On Darwin, direct FFmpeg `-movflags +faststart` output to one `/dev/fd/N` is forbidden: FFmpeg's internal rewrite reopens the descriptor path, and the resulting descriptors share one open-file-description offset, which can silently corrupt the MP4. The separate `qt-faststart` process keeps input and output offsets independent.
 
 - [ ] **Step 3: Implement full release verification**
 
-The integration test executes the exact mux command above, asserts the Output-scope file is non-empty, fully decodes it through a fresh Output-scope read handle, and parses top-level MP4 atoms through another fresh handle. The parser handles bounded 32-bit sizes, extended 64-bit sizes, and size-zero-to-EOF atoms and requires `moov` to precede `mdat`. Open a fresh Output-scope read handle for each full-decode, probe, atom-parse, and checksum consumer; run the equivalent of `ffmpeg -v error -xerror -i /dev/fd/3 -f null -` and require exit 0. Probe streams and require one H.264 `yuv420p` 1920×1080 30FPS stream and one AAC 48kHz stereo stream. Require A/V duration difference ≤50ms, parseable SRT within video duration, valid loudness metrics, and unchanged source hashes. Each borrowed FD is consumed once and closed by the caller in `finally`.
+Open a fresh Output-scope read handle for each final full-decode, probe, atom-parse, and checksum consumer; run the equivalent of `ffmpeg -v error -xerror -i /dev/fd/3 -f null -` and require exit 0. Probe streams and require one H.264 `yuv420p` 1920×1080 30FPS stream and one AAC 48kHz stereo stream. Parse top-level atoms with bounds checks for 32-bit, extended 64-bit, and size-zero forms and require `moov` before `mdat`. Require A/V duration difference ≤50ms, parseable SRT within video duration, valid loudness metrics, unchanged source hashes, and unchanged Draft filter-graph/mixed-audio bytes and hashes. Each borrowed FD is consumed once and closed by the caller in `finally`.
 
 - [ ] **Step 4: Generate remaining artifacts**
 
@@ -1576,7 +1591,7 @@ Create a 1280×720 padded thumbnail from an approved non-black review frame. Wri
 
 - [ ] **Step 5: Publish atomically**
 
-Write all release artifacts through `OutputDirectoryScope` under `releases/<runId>`, verify them there, then atomically update scoped `current.json`. Inject failures at pointer write, sync, and rename in integration tests and prove the old release pointer remains intact. Release never overwrites Draft-owned Run artifacts.
+Write all release artifacts through `OutputDirectoryScope` under `releases/<runId>`, verify them there, then atomically update scoped `current.json`. Step A/Step B failures never publish the pointer. Run cleanup owns failed-stage intermediates; Release cleanup owns release directories not referenced by output `current.json`; neither may delete the currently referenced Run or release. Inject missing/failing `qt-faststart` plus pointer write, sync, and rename failures and prove the old release pointer remains intact. Release never overwrites Draft-owned Run artifacts or existing release files.
 
 - [ ] **Step 6: Verify and commit**
 
@@ -1692,7 +1707,7 @@ export interface ExecutionPlan {
 6. Apply `--force <stage>` to that Stage and all downstream registered Stages.
 7. Number only the selected plan as `1/N`, `2/N`, and so on while retaining stable `StageId` values.
 
-Tests must cover full, prefix, and sliced plans; cached and resume actions; forced invalidation; missing prerequisites; and insertion of a fake Stage without changing Runner code. Draft fingerprint fixtures include the complete P04 audio sub-fingerprint (`targetLufs` and `truePeakDb` included). Release fingerprint fixtures consume the exact Draft output hashes for `audio/filter-graph.txt` and `audio/mixed-normalized.wav`; there is no Audio Mix Stage. `--plan` prints this object and exits without creating a Run, acquiring a write lock, writing a pointer, or starting a subprocess.
+Tests must cover full, prefix, and sliced plans; cached and resume actions; forced invalidation; missing prerequisites; and insertion of a fake Stage without changing Runner code. Draft fingerprint fixtures include the complete P04 audio sub-fingerprint (`targetLufs` and `truePeakDb` included). Release fingerprint fixtures consume the exact Draft output hashes for `audio/filter-graph.txt` and `audio/mixed-normalized.wav` plus the persisted FFmpeg/`qt-faststart` environment fingerprint; there is no Audio Mix Stage. `--plan` prints this object and exits without creating a Run, acquiring a write lock, writing a pointer, or starting a subprocess.
 
 - [ ] **Step 4: Implement the Execution Plan Runner and resume behavior**
 
@@ -1702,7 +1717,7 @@ The Runner receives an already validated `ExecutionPlan` and has no Preset-speci
 
 - [ ] **Step 5: Implement signal behavior**
 
-Create one `AbortController`, map `SIGINT` and `SIGTERM` to `abort()`, wait for child termination, remove temporary files owned by the current Run, preserve prior pointers, and return exit code 130 for SIGINT. Integration tests send real signals to a child CLI process and assert the lock is released.
+Create one `AbortController`, map `SIGINT` and `SIGTERM` to `abort()`, wait for child termination, then clean failed Run-local intermediates through Run authority and unpublished release files through Output authority. Preserve prior pointers and return exit code 130 for SIGINT. Integration tests send real signals to a child CLI process and assert the lock is released and the previously published release remains current.
 
 - [ ] **Step 6: Implement runtime disk-exhaustion behavior**
 
@@ -1726,7 +1741,7 @@ videoctl clean <project>
 
 The convenience commands `doctor`, `ingest`, `run`, `compile`, and `release` translate into the same Stage IDs and call the same Execution Plan builder; they must not contain a second orchestration path. Remove the obsolete `render --preset draft` command in favor of `pipeline --preset draft`. Reject unknown Presets, unknown Stage IDs, invalid ranges, and missing prerequisites with the specification error codes.
 
-`clean` may remove failed and unreferenced work Runs only; it must never remove source assets, the Run referenced by work `current.json`, or the release referenced by output `current.json`.
+`clean` may remove failed/unreferenced work Runs and unpublished release directories not referenced by output `current.json`. It must never remove source assets, the Run referenced by work `current.json`, or the release referenced by output `current.json`. Failed Release intermediates are cleaned only through Run authority; partial final files/directories are cleaned only through Output authority.
 
 - [ ] **Step 8: Verify and commit**
 
@@ -1804,7 +1819,7 @@ expect(await sourceHashesAfter()).toEqual(await sourceHashesBefore());
 
 It also verifies `subtitles.srt`, `thumbnail.jpg`, `review.json`, `validation-report.json`, and `checksums.sha256` exist under the release referenced by `output/<project>/current.json`. Stage reports must retain stable IDs while displaying the correct `position/total` for each selected Preset.
 
-Both final-MP4 helpers must open their own fresh `OutputDirectoryScope` read handle rather than reopening a resolved path, proving the exact seekable `+faststart -f mp4 /dev/fd/5` contract executed.
+The acceptance test also inspects process results and scoped artifact references: Step A is the exact FFmpeg command ending in `-f mp4 /dev/fd/5` with no `+faststart`, writing a non-empty Run-scope intermediate; Step B is `qt-faststart /dev/fd/3 /dev/fd/4`, reading that intermediate through a fresh Run-scope handle and writing the final through a fresh Output-scope handle on a different path. Both final-MP4 helpers open their own fresh Output-scope read handle. Missing/failing `qt-faststart` leaves the previous output pointer unchanged.
 
 - [ ] **Step 4: Write cache invalidation acceptance test**
 
@@ -1812,7 +1827,7 @@ Run the `release` Preset twice, change only the second script segment, and asser
 
 - [ ] **Step 5: Document exact local usage**
 
-`README.md` must include prerequisites, installation, fixture generation, the seven stable Stage IDs, built-in Presets, Execution Plan numbering, `--plan`/`--from`/`--to`/`--force`, authoring-file roles, commands, review workflow, output pointer resolution, common error codes, and the statement that source video audio is muted in MVP.
+`README.md` must include prerequisites—including an executable `qt-faststart` sibling beside the resolved FFmpeg binary—installation, fixture generation, the seven stable Stage IDs, built-in Presets, Execution Plan numbering, `--plan`/`--from`/`--to`/`--force`, authoring-file roles, commands, review workflow, output pointer resolution, common error codes, the two-step scoped-FD publication flow, and the statement that source video audio is muted in MVP.
 
 - [ ] **Step 6: Run the complete verification suite**
 
@@ -1834,12 +1849,12 @@ Expected:
 
 - All unit and integration tests pass.
 - TypeScript exits 0.
-- Doctor reports no errors on the target Mac.
+- Doctor reports no errors on the target Mac and records FFmpeg/`qt-faststart` real paths, SHA-256 values, and the environment fingerprint.
 - Plan mode reports numbered Stage IDs and performs no writes or subprocess calls.
 - `assets`, `draft`, and `release` reuse all matching shared Stage artifacts; Release references the Draft filter-graph/mixed-audio hashes without rerunning audio mixing.
 - The first release run stops when Review returns `needs_review` before approval.
 - The explicit review command succeeds, and the resumed `release` Preset publishes a new output pointer without changing `runId`.
-- The current release fully decodes and matches the fixed media profile.
+- The current release was produced by the two-step FFmpeg-intermediate/`qt-faststart` flow, fully decodes, has `moov` before `mdat`, and matches the fixed media profile.
 
 - [ ] **Step 7: Commit**
 
@@ -1865,8 +1880,10 @@ Checkpoint C is complete when all nineteen MVP acceptance criteria in the specif
 - [ ] A 100-interval `audio/filter-graph.txt` executes; it and `audio/mixed-normalized.wav` appear with path/SHA-256 in Draft Stage outputs, every frozen Audio Mix input independently changes the fingerprint, and Release reuses both hashes without overwriting either artifact.
 - [ ] Narration concat succeeds from a project path containing spaces while retaining `-safe 1`.
 - [ ] Remotion output contains no audio stream.
-- [ ] Final mux copies H.264 video and encodes AAC audio only through an Output-scope `O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW_ANY` handle.
-- [ ] Exact `-movflags +faststart -f mp4 /dev/fd/5` output is non-empty, passes full FFmpeg decode, and has top-level `moov` before `mdat`.
+- [ ] Preflight requires the executable `qt-faststart` sibling, records FFmpeg/`qt-faststart` real paths and binary hashes, and returns `ENV_TOOL_MISSING` when unavailable.
+- [ ] Step A copies H.264 video and encodes AAC audio into a distinct non-empty Run-scope read-write intermediate with exact `-f mp4 /dev/fd/5` and no `+faststart`.
+- [ ] Step B runs `qt-faststart /dev/fd/3 /dev/fd/4` with fresh Run-input/Output-output handles; the non-empty final passes full FFmpeg decode and has top-level `moov` before `mdat`.
+- [ ] Direct Darwin FFmpeg `-movflags +faststart` output through one `/dev/fd/N` is absent from implementation and tests.
 - [ ] Failed publication preserves previous work and release pointers.
 - [ ] Changing one script segment reuses all unchanged segment audio.
 - [ ] Stage registry IDs are unique and every Preset references a contiguous registered sequence.
