@@ -27,7 +27,7 @@
 - P02 Preflight has recorded an executable sibling `qt-faststart` real path, binary SHA-256, and environment fingerprint for the resolved FFmpeg toolchain.
 - A fixture Run can provide muted final/draft video, narration master, caption data, BGM, and compiled timeline.
 - Output publication tests begin with an existing successful pointer to prove rollback behavior.
-- Project inputs, Run artifacts, and release files/pointers are opened through fresh `ProjectDirectoryScope`, `RunDirectoryScope`, and `OutputDirectoryScope` handles respectively. Scope kinds are never substituted; borrowed FDs are closed by the caller in `finally` after each consumer settles.
+- Project inputs, work pointers, Run artifacts, and release files/pointers are opened through their owning `ProjectDirectoryScope`, fixed `.work/<projectId>` `WorkDirectoryScope`, `RunDirectoryScope`, and `OutputDirectoryScope` respectively. Scope kinds are never substituted; borrowed FDs are closed by the caller in `finally` after each consumer settles.
 
 ---
 ## Task 13: Build Draft, Contact Sheet, and Explicit Review Gate
@@ -68,7 +68,7 @@ it('rejects approval for another run', async () => {
 
 - [ ] **Step 5: Implement review recording**
 
-`videoctl review <project> --approve --reason <text>` resolves the current work pointer through `RunStore.openExistingRun()`, receives its opaque `RunDirectoryScope`, verifies every evidence path through that scope, writes strict `review.json`, and never edits programmatic checks. A rejected review records `status: rejected` and blocks Release.
+`videoctl review <project> --approve --reason <text>` resolves the current pointer through the fixed `.work/<projectId>` `WorkDirectoryScope`, obtains its `runId`, then calls `RunStore.openExistingRun(projectId, runId)`. It receives the opaque `RunDirectoryScope`, verifies every evidence path through that scope, writes strict `review.json`, and never edits programmatic checks. A rejected review records `status: rejected` and blocks Release.
 
 - [ ] **Step 6: Verify and commit**
 

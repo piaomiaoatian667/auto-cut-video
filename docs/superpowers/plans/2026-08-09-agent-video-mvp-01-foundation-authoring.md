@@ -692,7 +692,7 @@ Use Darwin `O_NOFOLLOW_ANY = 0x20000000` as a numeric Node 22 open flag. Path-on
 
 Never call `writeFile()` directly on a user-derived writable target. Immutable artifacts use `openNewProjectFile()`. Pointer replacement uses a same-directory temporary capability, sync, and atomic rename.
 
-Threat boundary: this prevents symlink traversal and symlink substitution between canonicalization and open. It does not claim to prevent hard-link substitution, replacement with ordinary directories or mount points, or concurrent modification of an already opened file's contents. Project Scope never authorizes `.work` or `output`; P02 owns separate application-controlled Run/Output scopes whose public factories likewise derive their own fixed app-owned prefixes and never accept an arbitrary authority root.
+Threat boundary: this prevents symlink traversal and symlink substitution between canonicalization and open. It does not claim to prevent hard-link substitution, replacement with ordinary directories or mount points, or concurrent modification of an already opened file's contents. Project Scope never authorizes `.work` or `output`; P02 owns separate nominal `WorkDirectoryScope`, `RunDirectoryScope`, and `OutputDirectoryScope` authorities. Their generic low-level minters remain module-private, while high-level APIs derive only the fixed `.work/<projectId>`, `.work/<projectId>/runs/<runId>`, and `output/<projectId>` prefixes.
 
 - [ ] **Step 4: Implement JSON loading and project context**
 

@@ -38,7 +38,7 @@ flowchart LR
 | ID | Project | Master Tasks | Depends On | Primary Deliverable | Executable Plan |
 | --- | --- | --- | --- | --- | --- |
 | P01 | Foundation and Authoring Core | 1–4 | None | Strict inputs, opaque project-directory scopes, process-group completion, borrowed FD and Gate contracts | [P01 Plan](2026-08-09-agent-video-mvp-01-foundation-authoring.md) |
-| P02 | Run State and Preflight | 5–6 | P01 | Opaque Run/Output scopes, fingerprints, immutable Runs, locks, atomic pointers, FFmpeg/`qt-faststart` toolchain fingerprint, `doctor` | [P02 Plan](2026-08-09-agent-video-mvp-02-run-state-preflight.md) |
+| P02 | Run State and Preflight | 5–6 | P01 | Opaque Work/Run/Output scopes with fixed-prefix authority, fingerprints, immutable Runs, locks, atomic pointers, FFmpeg/`qt-faststart` toolchain fingerprint, `doctor` | [P02 Plan](2026-08-09-agent-video-mvp-02-run-state-preflight.md) |
 | P03 | Media and Visual Pipeline | 7, 10, 11 | P01, P02 | Ingest, EDL compile, fixed components, muted Remotion render | [P03 Plan](2026-08-09-agent-video-mvp-03-media-visual-pipeline.md) |
 | P04 | Narration and Audio | 8, 9, 12 | P01, P02 | TTS cache, narration master, captions, BGM mix and loudness | [P04 Plan](2026-08-09-agent-video-mvp-04-narration-audio.md) |
 | P05 | Review and Release | 13–14 | P03, P04 | Draft evidence, explicit Review Gate, two-step scoped-FD faststart publication, verified release package | [P05 Plan](2026-08-09-agent-video-mvp-05-review-release.md) |
@@ -55,7 +55,7 @@ flowchart LR
 ## Shared Contract Freeze Points
 
 - **After P01:** Authoring Schemas, generated Manifest shapes, opaque `ProjectDirectoryScope` APIs, borrowed `extraStdioFds`, `ProcessResult`, `CheckResult`, and Gate states are frozen. Later projects may extend through versioned changes only.
-- **After P02:** Opaque `RunDirectoryScope`/`OutputDirectoryScope` APIs, fingerprint format, Run directory layout, project lock record, and `current.json` publication protocol are frozen.
+- **After P02:** Opaque nominal `WorkDirectoryScope`/`RunDirectoryScope`/`OutputDirectoryScope` APIs, fixed `.work/<projectId>`, `.work/<projectId>/runs/<runId>`, and `output/<projectId>` authority prefixes, fingerprint format, Run directory layout, project lock record, and `current.json` publication protocol are frozen.
 - **After P03:** `asset-manifest.json`, `compiled-timeline.json` containing narration intervals plus BGM metadata (not Ducking envelopes), registered component IDs, and muted-render contract are frozen.
 - **After P04:** `narration-manifest.json`, caption cue semantics, SRT formatting, deterministic Audio Mix fingerprint inputs (including loudness/True Peak), algorithm version, and fixed Draft artifact paths `audio/filter-graph.txt`/`audio/mixed-normalized.wav` are frozen.
 - **After P05:** Draft outputs own `audio/filter-graph.txt` and `audio/mixed-normalized.wav` path/SHA-256 references; Release reuses those hashes without overwrite. Review evidence, release directory layout, validation report, and final media profile are frozen.

@@ -4,7 +4,7 @@
 
 **Goal:** Build segment-level TTS/file narration caching, exact caption/SRT generation, scalable BGM ducking, and deterministic loudness-normalized audio output.
 
-**Architecture:** P04 consumes P01 Schemas/process contracts and P02 opaque Run/Output scopes without modifying them. Each script segment has an independent cache key and WAV, captions join by stable segment ID, and FFmpeg receives fresh borrowed FDs from the owning Project or Run scope rather than user paths or unbounded command-line expressions; any later publication remains exclusively Output-scoped.
+**Architecture:** P04 consumes P01 Schemas/process contracts and the P02 opaque Work/Run/Output scope contract without modifying it. P04 directly uses Project and Run authorities; Work metadata remains Work-scoped, and any later publication remains exclusively Output-scoped. Each script segment has an independent cache key and WAV, captions join by stable segment ID, and FFmpeg receives fresh borrowed FDs from the owning Project or Run scope rather than user paths or unbounded command-line expressions.
 
 **Tech Stack:** TypeScript, macOS `say`, FFmpeg/ffprobe, Zod, Vitest.
 
@@ -27,7 +27,7 @@
 - P01 and P02 exit verification passes.
 - Unit and generic integration tests use Mock/File providers; the macOS `say` test is an explicit target-Mac smoke check.
 - Generated concat and filter graph files are stored only under immutable Run directories.
-- Every independent consumer opens a fresh handle from exactly one owner: project-supplied media via `ProjectDirectoryScope`, `.work` artifacts via `RunDirectoryScope`, and release files/pointers via `OutputDirectoryScope`. Handles/FDs are one-shot and caller-owned, and close in `finally` after `runProcess()` settles.
+- Every independent consumer opens a fresh handle from exactly one owner: project-supplied media via `ProjectDirectoryScope`, current Run artifacts beneath `.work/<projectId>/runs/<runId>` via `RunDirectoryScope`, and release files/pointers via `OutputDirectoryScope`. Work lock/current authority remains a separate `WorkDirectoryScope` and is not widened into Run scope. Handles/FDs are one-shot and caller-owned, and close in `finally` after `runProcess()` settles.
 
 ---
 ## Task 8: Implement TTS Providers and Narration Segment Caching
@@ -237,7 +237,7 @@ Freeze an explicit Audio Mix algorithm version such as `audio-mix-v1`. `audioMix
 
 Create a `volume=<globalGain>*<piecewiseExpression>:eval=frame` filter for BGM, delay it by `backgroundMusic.startMs`, and mix with narration using `amix=inputs=2:normalize=0`. When P05 Draft invokes this implementation, serialize the complete graph once to the fixed write-once Run artifact `audio/filter-graph.txt`. Return its `{path, sha256}` reference for inclusion in Draft Stage outputs, then pass a fresh Run-scope read handle for that artifact to FFmpeg rather than placing the growing expression directly on the command line. Do not create or name an Audio Mix Stage.
 
-Every independent project-supplied source-WAV/BGM consumer opens a fresh `ProjectDirectoryScope` handle; every narration-master/concat/filter/intermediate/final-mix consumer opens a separate fresh `RunDirectoryScope` handle. P04 opens no Output scope; P05 release publication must use `OutputDirectoryScope`. Scope kinds are not interchangeable. Map read and write descriptors with `extraStdioFds` (`/dev/fd/3`, `pipe:4`, and so on), consume each FD/pipe once, and close every caller-owned handle in `finally` after `runProcess()` settles. Trim the result to Composition duration, resample to 48kHz, and output stereo PCM WAV. The integration test must execute a graph generated from at least 100 narration intervals.
+Every independent project-supplied source-WAV/BGM consumer opens a fresh `ProjectDirectoryScope` handle; every narration-master/concat/filter/intermediate/final-mix consumer opens a separate fresh `RunDirectoryScope` handle. P04 opens no Work or Output scope; Work lock/current operations remain with `WorkDirectoryScope`, and P05 release publication must use `OutputDirectoryScope`. Scope kinds are not interchangeable. Map read and write descriptors with `extraStdioFds` (`/dev/fd/3`, `pipe:4`, and so on), consume each FD/pipe once, and close every caller-owned handle in `finally` after `runProcess()` settles. Trim the result to Composition duration, resample to 48kHz, and output stereo PCM WAV. The integration test must execute a graph generated from at least 100 narration intervals.
 
 - [ ] **Step 4: Implement two-pass loudnorm**
 

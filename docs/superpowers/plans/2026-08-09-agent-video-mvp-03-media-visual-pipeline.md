@@ -4,7 +4,7 @@
 
 **Goal:** Build local media ingest, explicit EDL compilation, fixed Remotion components, and deterministic muted-video rendering.
 
-**Architecture:** P03 consumes P01 Schemas/process contracts and P02 opaque Run/Output scopes without modifying them. Project inputs, Run artifacts, and any future release outputs remain separated by scope; Ingest produces an immutable asset Manifest, Compile produces a strict read-only timeline, and Remotion renders only muted visual output from registered components and project-local render assets.
+**Architecture:** P03 consumes P01 Schemas/process contracts and the P02 opaque Work/Run/Output scope contract without modifying it. P03 directly uses Project and Run authorities; Work metadata remains Work-scoped, and any future release output remains Output-scoped. Ingest produces an immutable asset Manifest, Compile produces a strict read-only timeline, and Remotion renders only muted visual output from registered components and project-local render assets.
 
 **Tech Stack:** TypeScript, FFmpeg/ffprobe, Remotion, React, Zod, Vitest.
 
@@ -27,7 +27,7 @@
 - P01 and P02 exit verification passes.
 - Fixture Narration and Captions Manifests are permitted for Compile/Remotion tests; P03 must not implement P04 business logic.
 - FFmpeg and ffprobe target capabilities pass P02 Preflight.
-- Files under `projects/<id>` are opened only through `ProjectDirectoryScope`, files under the current immutable Run only through `RunDirectoryScope`, and files under `output/<project>` only through `OutputDirectoryScope`. P03 currently writes Project/Run artifacts only and must not substitute one scope for another or reopen a scoped file from a resolved string.
+- Files under `projects/<id>` are opened only through `ProjectDirectoryScope`, files under the current immutable Run only through `RunDirectoryScope`, and files under `output/<projectId>` only through `OutputDirectoryScope`. P03 currently writes Project/Run artifacts only and must not substitute one scope for another or reopen a scoped file from a resolved string.
 
 ---
 ## Task 7: Implement ffprobe Ingest and Conditional Transcoding

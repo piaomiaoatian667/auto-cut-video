@@ -139,7 +139,7 @@ Tests must cover full, prefix, and sliced plans; cached and resume actions; forc
 
 Use fake stages with deterministic fingerprints. Verify an unchanged second run reports `cached`, changing any one frozen audio-mix input invalidates Draft and Release, changing one narration segment invalidates Narration and every downstream Stage, switching from `draft` to `release` reuses the matching Draft filter-graph/mixed-audio hashes without creating or overwriting an Audio Mix Stage, and `--force compile` reruns Compile through Release while reusing Preflight, Ingest, and Narration.
 
-The Runner receives an already validated `ExecutionPlan` and has no Preset-specific branches. It carries the opaque `ProjectDirectoryScope` returned by project loading, obtains `RunDirectoryScope` only from `RunStore.createRun()`/`openExistingRun()`, and obtains `OutputDirectoryScope` only for release publication; no Stage receives raw root strings or may substitute one scope for another. It acquires the project lock only for an executable plan and reads work `current.json` through the app-owned scope protocol. With `--resume`, it continues the same `runId` while recorded fingerprints match; otherwise it creates a new Run only after successful Preflight. After every materialized `passed` Stage and when Review enters `needs_review`, update work `current.json` with `preset`, the selected `stageIds` snapshot, `completedStage`, and `state`. Reports include `preset`, stable Stage ID, `position`, and `total`. Release records the reused Draft artifact hashes as inputs/provenance and does not claim or rewrite them as Release outputs. Stop on `failed` or `needs_review`, write reports after every Stage, and release the lock in `finally`.
+The Runner receives an already validated `ExecutionPlan` and has no Preset-specific branches. For an executable plan it first obtains the fixed `.work/<projectId>` `WorkDirectoryScope`, then uses that authority for the project lock, work `current.json`, and Run creation/opening. It carries the opaque `ProjectDirectoryScope` returned by project loading, obtains `RunDirectoryScope` only from `RunStore.createRun(projectId, runId)` or `RunStore.openExistingRun(projectId, runId)`, and obtains `OutputDirectoryScope` only from the output/release store; no Stage receives raw root strings or may substitute one scope for another. With `--resume`, it continues the same `runId` while recorded fingerprints match; otherwise it creates a new Run only after successful Preflight. After every materialized `passed` Stage and when Review enters `needs_review`, update work `current.json` with `preset`, the selected `stageIds` snapshot, `completedStage`, and `state`. Reports include `preset`, stable Stage ID, `position`, and `total`. Release records the reused Draft artifact hashes as inputs/provenance and does not claim or rewrite them as Release outputs. Stop on `failed` or `needs_review`, write reports after every Stage, and release the lock in `finally`.
 
 - [ ] **Step 5: Implement signal behavior**
 
@@ -244,7 +244,7 @@ expect(atoms.moov.offset).toBeLessThan(atoms.mdat.offset);
 expect(await sourceHashesAfter()).toEqual(await sourceHashesBefore());
 ```
 
-It also verifies `subtitles.srt`, `thumbnail.jpg`, `review.json`, `validation-report.json`, and `checksums.sha256` exist under the release referenced by `output/<project>/current.json`. Stage reports must retain stable IDs while displaying the correct `position/total` for each selected Preset.
+It also verifies `subtitles.srt`, `thumbnail.jpg`, `review.json`, `validation-report.json`, and `checksums.sha256` exist under the release referenced by `output/<projectId>/current.json`. Stage reports must retain stable IDs while displaying the correct `position/total` for each selected Preset.
 
 Inspect Release process results and scoped artifact references: Step A is FFmpeg ending in `-f mp4 /dev/fd/5` without `+faststart`, with a non-empty Run-scope intermediate; Step B is `qt-faststart /dev/fd/3 /dev/fd/4`, using a new Run read handle and a distinct Output read-write handle/path. Missing/failing `qt-faststart` must leave the pre-existing output pointer unchanged. Each decode/atom helper opens its own fresh Output-scope read handle.
 
@@ -299,7 +299,7 @@ Checkpoint C is complete when all nineteen MVP acceptance criteria in the specif
 - [ ] Every JSON authoring file rejects unknown fields.
 - [ ] Script display limits use the project setting and Unicode grapheme counting.
 - [ ] Reversed and out-of-bounds Trim tests pass before rendering.
-- [ ] Project/Run/Output read/write escape, scope substitution, exclusive-create, and atomic pointer-symlink tests pass.
+- [ ] Project/Work/Run/Output scope forgery and cross-assignment tests prove nominal incompatibility; fixed-prefix Work/Run/Output authority, escape/substitution, exclusive-create, and pointer-symlink tests pass.
 - [ ] Lock contention, stale lock, SIGINT, and SIGTERM tests pass.
 - [ ] Preflight and runtime disk exhaustion remain distinct failures.
 - [ ] Exact-frame and non-aligned caption boundary tests pass.
