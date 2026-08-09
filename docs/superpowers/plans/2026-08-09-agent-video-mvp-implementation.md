@@ -871,12 +871,14 @@ pnpm typecheck
 git diff --check
 ```
 
-## Task 5: Add Fingerprints, Immutable Runs, Atomic Pointers, and Project Locks
+## Task 5: Add App-Owned Scopes, Fingerprints, Immutable Runs, Atomic Pointers, and Project Locks
 
 **Files:**
+- Create: `src/fs/app-directory-scopes.ts`
 - Create: `src/pipeline/fingerprint.ts`
 - Create: `src/pipeline/project-lock.ts`
 - Create: `src/pipeline/run-store.ts`
+- Test: `tests/unit/fs/app-directory-scopes.test.ts`
 - Test: `tests/unit/pipeline/fingerprint.test.ts`
 - Test: `tests/integration/pipeline/project-lock.test.ts`
 - Test: `tests/integration/pipeline/run-store.test.ts`
@@ -939,7 +941,11 @@ export interface ProjectLockRecord {
 
 Use `open(lockPath, 'wx', 0o600)` for acquisition. Record `hostname()`, PID, run ID, ISO timestamp, and a process-start marker read through `ps -o lstart= -p <pid>` on macOS. On conflict, compare host, PID liveness via `process.kill(pid, 0)`, and process-start marker to avoid PID reuse. Return a release function that only unlinks a lock still owned by the same `runId`.
 
-- [ ] **Step 5: Write atomic pointer tests**
+- [ ] **Step 5: Write app-owned scope and atomic pointer tests**
+
+Define opaque `RunDirectoryScope` and `OutputDirectoryScope` values created only by async factories from a trusted canonical `workspaceRoot` plus an app-owned relative root. The factory rejects an initial canonical root outside the canonical workspace. Store the canonical scope root only in a class `#private` field or module-private `WeakMap`; scope APIs accept only Run- or Output-relative paths and never expose/reaccept the root string as authority.
+
+Table-driven tests cover an initial canonical root outside the workspace, read/write escape through symlinks, lexical-root substitution after scope creation, canonical-root replacement with an external symlink, exclusive create, and symbolic links at work/output pointer paths. Existing/new opens canonicalize the target or real parent, re-check containment against the saved canonical root, and use Darwin `O_NOFOLLOW_ANY`. FDs remain borrowed: each consumer opens a fresh handle from its owning scope and closes it in `finally` after success, failure, abort, or timeout.
 
 Use an injected `FileOps` interface to force failures in temporary-file write, sync, and rename. Each test begins with an existing `current.json` and asserts its contents remain unchanged after the simulated failure.
 
@@ -957,16 +963,16 @@ export interface CurrentPointer {
 
 - [ ] **Step 6: Implement immutable runs and atomic pointer publication**
 
-`RunStore.createRun()` creates `.work/<project>/runs/<runId>`. Stage output files are write-once; later stages append new files without overwriting earlier artifacts. `publishCurrent()` opens a new same-directory `current.json.tmp` with no-follow/exclusive flags, writes and calls `sync()` on the file handle, atomically renames it, syncs the parent directory, and removes the temporary file on failure. Reject a symbolic link at either pointer path instead of following it.
+`RunStore.createRun()` creates `.work/<project>/runs/<runId>` and returns its opaque `RunDirectoryScope`, never a root string. Add a safe `RunStore.openExistingRun()` that recreates authority only through the trusted workspace/app-root factory. `RunStore` retains module-private authority for `.work/<project>/current.json` and `pipeline.lock` without exposing that app-owned root as a string or per-Run scope. Stage output files are write-once; later stages append new files without overwriting earlier artifacts. Release creation/publication uses a separate `OutputDirectoryScope` rooted at `output/<project>`. Project, Run, and Output scopes are not interchangeable. `publishCurrent()` opens a new same-directory `current.json.tmp` with no-follow/exclusive flags, writes and calls `sync()` on the file handle, atomically renames it, syncs the parent directory, and removes the temporary file on failure. Reject a symbolic link at either pointer path instead of following it.
 
 Use the same helper for `output/<project>/current.json`, whose `relativePath` points at `releases/<runId>` and whose `completedStage` is always `release`.
 
 - [ ] **Step 7: Verify and commit**
 
 ```bash
-pnpm test tests/unit/pipeline/fingerprint.test.ts tests/integration/pipeline/project-lock.test.ts tests/integration/pipeline/run-store.test.ts
+pnpm test tests/unit/fs/app-directory-scopes.test.ts tests/unit/pipeline/fingerprint.test.ts tests/integration/pipeline/project-lock.test.ts tests/integration/pipeline/run-store.test.ts
 pnpm typecheck
-git add src/pipeline/fingerprint.ts src/pipeline/project-lock.ts src/pipeline/run-store.ts tests/unit/pipeline/fingerprint.test.ts tests/integration/pipeline
+git add src/fs/app-directory-scopes.ts src/pipeline/fingerprint.ts src/pipeline/project-lock.ts src/pipeline/run-store.ts tests/unit/fs/app-directory-scopes.test.ts tests/unit/pipeline/fingerprint.test.ts tests/integration/pipeline
 git commit -m "feat: add resumable run storage and locks"
 ```
 
@@ -1101,7 +1107,7 @@ Write to the current immutable run directory, never next to the source.
 
 - [ ] **Step 5: Implement Ingest**
 
-Open each source through `openExistingProjectFile(projectDirectory, projectRelativePath)`. Hashing, ffprobe, sample-decode, transcode, and final hash verification each open a fresh scoped handle and close it in `finally` after that consumer settles. Child processes map every read and write FD through `extraStdioFds`; for example source child FD 3 is `/dev/fd/3` and a Run-scope output child FD 4 is `pipe:4` or `/dev/fd/4`. Each FD/pipe is one-shot. Never resolve a path string and later reopen it. Transcode only when required and write `asset-manifest.json` through the Run scope.
+Open each source through `openExistingProjectFile(projectDirectory, projectRelativePath)`. Hashing, ffprobe, sample-decode, transcode, and final hash verification each open a fresh handle from `ProjectDirectoryScope`; generated manifests/render copies open fresh handles from `RunDirectoryScope`; any release publication opens fresh handles from `OutputDirectoryScope`. Scope kinds are not interchangeable. Child processes map every read and write FD through `extraStdioFds`; for example source child FD 3 is `/dev/fd/3` and a Run-scope output child FD 4 is `pipe:4` or `/dev/fd/4`. Each FD/pipe is one-shot and caller-owned, closes in `finally`, and is never reopened from a resolved string.
 
 - [ ] **Step 6: Verify and commit**
 
@@ -1152,7 +1158,7 @@ export interface TtsProvider {
 }
 ```
 
-Run the same contract tests against Mock and File providers. Verify cancellation, deterministic fingerprinting, missing input failure, and non-empty output. `FileTtsProvider` must require `sourceAudioPath`, open a fresh read handle through `ProjectDirectoryScope`, pass it through `extraStdioFds`, close it in `finally`, copy into the Run scope, and never modify the source WAV.
+Run the same contract tests against Mock and File providers. Verify cancellation, deterministic fingerprinting, missing input failure, and non-empty output. `FileTtsProvider` must require `sourceAudioPath`, open a fresh read handle through `ProjectDirectoryScope`, pass it through `extraStdioFds`, close it in `finally`, and copy through a separate fresh `RunDirectoryScope` handle. Project inputs, Run artifacts, and Output publications always use their owning scope and are never reopened from resolved strings.
 
 - [ ] **Step 2: Implement MacOsSayProvider**
 
@@ -1415,7 +1421,7 @@ Checkpoint A is complete: a validated EDL can render a muted draft.
 - [ ] **Step 1: Write Ducking envelope tests**
 
 ```ts
-it('clamps final release to composition duration', () => {
+it('clamps mixed audio to composition duration', () => {
   expect(buildDuckingIntervals({
     narration: [{startMs: 9_500, endMs: 10_000}],
     attackMs: 120,
@@ -1438,8 +1444,25 @@ it('serializes a large set of narration intervals into a filter graph file', () 
   expect(buildAudioFilterGraph({narration: intervals}).script).toContain('volume=');
 });
 
-it('fingerprints every deterministic audio-mix input', () => {
-  expect(audioMixFingerprint(fixture())).toMatch(/^sha256:/);
+const fingerprintMutations: Array<[
+  string,
+  (input: AudioMixFingerprintInput) => AudioMixFingerprintInput,
+]> = [
+  ['narration intervals', input => ({...input, narrationIntervals: input.narrationIntervals.map((value, index) => index === 0 ? {...value, endMs: value.endMs + 1} : value)})],
+  ['composition duration', input => ({...input, compositionDurationMs: input.compositionDurationMs + 1})],
+  ['BGM metadata', input => ({...input, backgroundMusic: {...input.backgroundMusic, startMs: input.backgroundMusic.startMs + 1}})],
+  ['backgroundMusicGainDb', input => ({...input, backgroundMusicGainDb: input.backgroundMusicGainDb - 1})],
+  ['duckDuringNarrationDb', input => ({...input, duckDuringNarrationDb: input.duckDuringNarrationDb - 1})],
+  ['duckAttackMs', input => ({...input, duckAttackMs: input.duckAttackMs + 1})],
+  ['duckReleaseMs', input => ({...input, duckReleaseMs: input.duckReleaseMs + 1})],
+  ['targetLufs', input => ({...input, targetLufs: input.targetLufs - 1})],
+  ['truePeakDb', input => ({...input, truePeakDb: input.truePeakDb - 0.1})],
+  ['algorithm version', input => ({...input, algorithmVersion: 'audio-mix-v2'})],
+];
+
+it.each(fingerprintMutations)('changes when %s changes', (_label, mutate) => {
+  const baseline = fixture();
+  expect(audioMixFingerprint(mutate(baseline))).not.toBe(audioMixFingerprint(baseline));
 });
 ```
 
@@ -1447,15 +1470,15 @@ it('fingerprints every deterministic audio-mix input', () => {
 
 Represent gain as a piecewise function: unity before attack, linear ramp to `10 ** (duckDb / 20)`, hold during narration, linear release, unity afterward. Merge intervals whose attack begins before the previous release ends. Clamp every endpoint to `[0, compositionDurationMs]`. Do not persist the derived envelope in the compiled timeline.
 
-Freeze an algorithm version such as `audio-mix-v1`. The fingerprint covers narration intervals, Composition duration, BGM metadata, `backgroundMusicGainDb`, `duckDuringNarrationDb`, `duckAttackMs`, `duckReleaseMs`, and the algorithm version.
+Freeze an algorithm version such as `audio-mix-v1`. `audioMixFingerprint()` covers narration intervals, Composition duration, BGM metadata, `backgroundMusicGainDb`, `duckDuringNarrationDb`, `duckAttackMs`, `duckReleaseMs`, `targetLufs`, `truePeakDb`, and the algorithm version. Draft includes this sub-fingerprint; there is no separate Audio Mix Stage.
 
 - [ ] **Step 3: Build the FFmpeg mix graph**
 
-Create a `volume=<globalGain>*<piecewiseExpression>:eval=frame` filter for BGM, delay it by `backgroundMusic.startMs`, and mix with narration using `amix=inputs=2:normalize=0`. Serialize the complete graph to fixed Run artifact `audio/filter-graph.txt`, record its path and SHA-256 in Audio Mix Stage outputs, and pass a fresh read FD to FFmpeg rather than placing the growing expression on the command line. Every independent input/output opens a fresh Project or Run/Output handle, maps both read and write FDs through `extraStdioFds`, consumes each FD/pipe once, and closes in `finally`. Trim to Composition duration, resample to 48kHz, and output stereo PCM WAV. The integration test executes at least 100 narration intervals.
+Create a `volume=<globalGain>*<piecewiseExpression>:eval=frame` filter for BGM, delay it by `backgroundMusic.startMs`, and mix with narration using `amix=inputs=2:normalize=0`. When Draft invokes this implementation, serialize the complete graph once to fixed write-once Run artifact `audio/filter-graph.txt`, return its path/SHA-256 for Draft Stage outputs, and pass a fresh Run-scope read FD to FFmpeg rather than placing the growing expression on the command line. Every independent input/output opens a fresh handle from its owning `ProjectDirectoryScope`, `RunDirectoryScope`, or `OutputDirectoryScope`, maps both read and write FDs through `extraStdioFds`, consumes each FD/pipe once, and closes in `finally`. Trim to Composition duration and resample to 48kHz stereo PCM. The integration test executes at least 100 narration intervals. Do not create an Audio Mix Stage.
 
 - [ ] **Step 4: Implement two-pass loudnorm**
 
-First pass uses `loudnorm=I=<target>:TP=<peak>:LRA=11:print_format=json` to null output and parses measured values from stderr. Second pass supplies `measured_I`, `measured_LRA`, `measured_TP`, `measured_thresh`, and `offset`, then writes normalized WAV. Both passes use fresh scoped handles and borrowed `extraStdioFds`; reject non-finite measurements.
+First pass uses `loudnorm=I=<target>:TP=<peak>:LRA=11:print_format=json` to null output and parses measured values from stderr. Second pass supplies `measured_I`, `measured_LRA`, `measured_TP`, `measured_thresh`, and `offset`, then writes fixed write-once Run artifact `audio/mixed-normalized.wav`. Return its path/SHA-256 beside the filter-graph reference so Draft records both outputs. Both passes use fresh scoped handles and borrowed `extraStdioFds`; reject non-finite measurements.
 
 - [ ] **Step 5: Verify and commit**
 
@@ -1479,15 +1502,15 @@ git commit -m "feat: mix and normalize narration audio"
 
 - [ ] **Step 1: Write frame-selection tests**
 
-The selector must include frame 0, final frame, every visual start/end boundary, every caption midpoint, and evenly spaced coverage frames. Deduplicate and sort the result, then cap at 24 frames while preserving boundaries.
+The selector must include frame 0, final frame, every visual start/end boundary, every caption midpoint, and evenly spaced coverage frames. Deduplicate and sort the result, then cap at 24 frames while preserving boundaries. Draft integration tests also assert outputs contain path/SHA-256 references for both `audio/filter-graph.txt` and `audio/mixed-normalized.wav`.
 
 - [ ] **Step 2: Implement contact sheet generation**
 
-Extract selected frames with FFmpeg and tile them into a labeled JPEG. Store individual review frames and `contact-sheet.jpg` under the run's draft directory.
+Extract selected frames with FFmpeg and tile them into a labeled JPEG. Each decode/extract/tile input and output opens a fresh `RunDirectoryScope` handle and closes it after the consumer settles. Store individual review frames and `contact-sheet.jpg` under the Run's draft directory.
 
 - [ ] **Step 3: Implement Draft stage**
 
-Render 960×540 muted video, mix non-normalized guide audio using the same envelope, mux draft MP4, fully decode it, verify one video and one audio stream, then generate review frames and the draft report.
+Render 960×540 muted video, invoke P04 Audio Mix once to create write-once `audio/filter-graph.txt` and loudness-normalized `audio/mixed-normalized.wav`, record both path/SHA-256 references in Draft Stage outputs, mux that normalized audio into the draft MP4, fully decode it, verify one video and one audio stream, then generate review frames and the draft report. Draft fingerprint includes `audioMixFingerprint()`; no Audio Mix Stage exists.
 
 - [ ] **Step 4: Write Review Gate tests**
 
@@ -1504,7 +1527,7 @@ it('rejects approval for another run', async () => {
 
 - [ ] **Step 5: Implement review recording**
 
-`videoctl review <project> --approve --reason <text>` loads the current Run whose Review Stage is `needs_review`, verifies every evidence path is inside that Run, writes strict `review.json`, and never edits programmatic checks. A rejected review records `status: rejected` and blocks Release.
+`videoctl review <project> --approve --reason <text>` resolves the work pointer through `RunStore.openExistingRun()`, uses the returned opaque `RunDirectoryScope` to verify every evidence path, writes strict `review.json`, and never edits programmatic checks. A rejected review records `status: rejected` and blocks Release.
 
 - [ ] **Step 6: Verify and commit**
 
@@ -1527,25 +1550,25 @@ Checkpoint B is complete: a narrated, captioned draft can be explicitly approved
 
 - [ ] **Step 1: Write release validation tests**
 
-Generate one valid release and fixtures with missing audio, wrong dimensions, excessive A/V duration difference, and truncated MP4. Assert the exact errors `RELEASE_DECODE_FAILED` or `RELEASE_DURATION_MISMATCH`.
+Generate one valid release and fixtures with missing audio, wrong dimensions, excessive A/V duration difference, and truncated MP4. Assert the exact errors `RELEASE_DECODE_FAILED` or `RELEASE_DURATION_MISMATCH`. Pre-create the Draft filter graph and normalized mixed audio, run Release, and prove their bytes/hashes remain unchanged.
 
 - [ ] **Step 2: Implement final rendering and muxing**
 
-1. Render final muted H.264 video at 1920×1080.
-2. Mix and loudness-normalize narration plus BGM.
-3. Mux with:
+1. Render final muted H.264 video at 1920×1080 into the Run scope.
+2. Read and verify the Draft Stage output references for `audio/filter-graph.txt` and `audio/mixed-normalized.wav`; include both hashes in Release fingerprint/provenance and reuse the normalized mixed audio without executing the graph or writing either artifact again.
+3. Open fresh Run-scope input handles and an Output-scope final file handle, then mux with borrowed FDs:
 
 ```text
-ffmpeg -y -i final-video.mp4 -i master.wav \
+ffmpeg -y -i /dev/fd/3 -i /dev/fd/4 \
   -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -ar 48000 -ac 2 \
-  -movflags +faststart final.mp4
+  -movflags +faststart /dev/fd/5
 ```
 
-Do not use `-shortest`; validate and explicitly trim audio to Composition duration before muxing.
+Do not use `-shortest`. Draft already trims and normalizes the reusable audio to Composition duration; Release verifies that duration/hash contract before muxing and closes all handles in `finally`.
 
 - [ ] **Step 3: Implement full release verification**
 
-Run `ffmpeg -v error -xerror -i final.mp4 -f null -` and require exit 0. Probe streams and require one H.264 `yuv420p` 1920×1080 30FPS stream and one AAC 48kHz stereo stream. Require A/V duration difference ≤50ms, parseable SRT within video duration, valid loudness metrics, and unchanged source hashes.
+Open a fresh Output-scope read handle for each full-decode, probe, and checksum consumer; run the equivalent of `ffmpeg -v error -xerror -i /dev/fd/3 -f null -` and require exit 0. Probe streams and require one H.264 `yuv420p` 1920×1080 30FPS stream and one AAC 48kHz stereo stream. Require A/V duration difference ≤50ms, parseable SRT within video duration, valid loudness metrics, and unchanged source hashes. Each borrowed FD is consumed once and closed by the caller in `finally`.
 
 - [ ] **Step 4: Generate remaining artifacts**
 
@@ -1553,7 +1576,7 @@ Create a 1280×720 padded thumbnail from an approved non-black review frame. Wri
 
 - [ ] **Step 5: Publish atomically**
 
-Write all artifacts to `output/<project>/releases/<runId>`, verify them there, then atomically update `output/<project>/current.json`. Inject failures at pointer write, sync, and rename in integration tests and prove the old release pointer remains intact.
+Write all release artifacts through `OutputDirectoryScope` under `releases/<runId>`, verify them there, then atomically update scoped `current.json`. Inject failures at pointer write, sync, and rename in integration tests and prove the old release pointer remains intact. Release never overwrites Draft-owned Run artifacts.
 
 - [ ] **Step 6: Verify and commit**
 
@@ -1669,13 +1692,13 @@ export interface ExecutionPlan {
 6. Apply `--force <stage>` to that Stage and all downstream registered Stages.
 7. Number only the selected plan as `1/N`, `2/N`, and so on while retaining stable `StageId` values.
 
-Tests must cover full, prefix, and sliced plans; cached and resume actions; forced invalidation; missing prerequisites; and insertion of a fake Stage without changing Runner code. `--plan` prints this object and exits without creating a Run, acquiring a write lock, writing a pointer, or starting a subprocess.
+Tests must cover full, prefix, and sliced plans; cached and resume actions; forced invalidation; missing prerequisites; and insertion of a fake Stage without changing Runner code. Draft fingerprint fixtures include the complete P04 audio sub-fingerprint (`targetLufs` and `truePeakDb` included). Release fingerprint fixtures consume the exact Draft output hashes for `audio/filter-graph.txt` and `audio/mixed-normalized.wav`; there is no Audio Mix Stage. `--plan` prints this object and exits without creating a Run, acquiring a write lock, writing a pointer, or starting a subprocess.
 
 - [ ] **Step 4: Implement the Execution Plan Runner and resume behavior**
 
-Use fake stages with deterministic fingerprints. Verify an unchanged second run reports `cached`, changing one narration segment invalidates Narration and every downstream Stage, switching from `draft` to `release` reuses matching shared Stage artifacts, and `--force compile` reruns Compile through Release while reusing Preflight, Ingest, and Narration.
+Use fake stages with deterministic fingerprints. Verify an unchanged second run reports `cached`, changing any one frozen audio-mix input invalidates Draft and Release, changing one narration segment invalidates Narration and every downstream Stage, switching from `draft` to `release` reuses the matching Draft filter-graph/mixed-audio hashes without creating or overwriting an Audio Mix Stage, and `--force compile` reruns Compile through Release while reusing Preflight, Ingest, and Narration.
 
-The Runner receives an already validated `ExecutionPlan` and has no Preset-specific branches. It acquires the project lock only for an executable plan and reads work `current.json`. With `--resume`, it continues the same `runId` while recorded fingerprints match; otherwise it creates a new Run only after successful Preflight. After every materialized `passed` Stage and when Review enters `needs_review`, update work `current.json` with `preset`, the selected `stageIds` snapshot, `completedStage`, and `state`. Reports include `preset`, stable Stage ID, `position`, and `total`. Stop on `failed` or `needs_review`, write reports after every Stage, and release the lock in `finally`.
+The Runner receives an already validated `ExecutionPlan` and has no Preset-specific branches. It carries the opaque `ProjectDirectoryScope` returned by project loading, obtains `RunDirectoryScope` only from `RunStore.createRun()`/`openExistingRun()`, and obtains `OutputDirectoryScope` only for release publication; no Stage receives raw root strings or may substitute one scope for another. It acquires the project lock only for an executable plan and reads work `current.json` through the app-owned scope protocol. With `--resume`, it continues the same `runId` while recorded fingerprints match; otherwise it creates a new Run only after successful Preflight. After every materialized `passed` Stage and when Review enters `needs_review`, update work `current.json` with `preset`, the selected `stageIds` snapshot, `completedStage`, and `state`. Reports include `preset`, stable Stage ID, `position`, and `total`. Release records the reused Draft artifact hashes as inputs/provenance and does not claim or rewrite them as Release outputs. Stop on `failed` or `needs_review`, write reports after every Stage, and release the lock in `finally`.
 
 - [ ] **Step 5: Implement signal behavior**
 
@@ -1781,7 +1804,7 @@ It also verifies `subtitles.srt`, `thumbnail.jpg`, `review.json`, `validation-re
 
 - [ ] **Step 4: Write cache invalidation acceptance test**
 
-Run the `release` Preset twice, change only the second script segment, and assert the first segment WAV hash is reused, the second changes, and Narration plus all downstream Stages receive new fingerprints. Insert a fake registered Stage in the unit fixture and prove Runner behavior does not require modification.
+Run the `release` Preset twice, change only the second script segment, and assert the first segment WAV hash is reused, the second changes, and Narration plus all downstream Stages receive new fingerprints. Also assert Draft regenerates new filter-graph/mixed-audio hashes, while an unchanged `draft` followed by `release` reuses the exact Draft hashes and leaves the write-once files untouched. Insert a fake registered Stage in the unit fixture and prove Runner behavior does not require modification.
 
 - [ ] **Step 5: Document exact local usage**
 
@@ -1809,7 +1832,7 @@ Expected:
 - TypeScript exits 0.
 - Doctor reports no errors on the target Mac.
 - Plan mode reports numbered Stage IDs and performs no writes or subprocess calls.
-- `assets`, `draft`, and `release` reuse all matching shared Stage artifacts.
+- `assets`, `draft`, and `release` reuse all matching shared Stage artifacts; Release references the Draft filter-graph/mixed-audio hashes without rerunning audio mixing.
 - The first release run stops when Review returns `needs_review` before approval.
 - The explicit review command succeeds, and the resumed `release` Preset publishes a new output pointer without changing `runId`.
 - The current release fully decodes and matches the fixed media profile.
@@ -1830,12 +1853,12 @@ Checkpoint C is complete when all nineteen MVP acceptance criteria in the specif
 - [ ] Every JSON authoring file rejects unknown fields.
 - [ ] Script display limits use the project setting and Unicode grapheme counting.
 - [ ] Reversed and out-of-bounds Trim tests pass before rendering.
-- [ ] Read paths, writable target symlinks, and atomic pointer symlink tests pass.
+- [ ] Project/Run/Output read/write escape, scope substitution, exclusive-create, and atomic pointer-symlink tests pass.
 - [ ] Lock contention, stale lock, SIGINT, and SIGTERM tests pass.
 - [ ] Preflight and runtime disk exhaustion remain distinct failures.
 - [ ] Exact-frame and non-aligned caption boundary tests pass.
-- [ ] Final Ducking release is clamped to Composition duration.
-- [ ] A 100-interval `audio/filter-graph.txt` executes, its path/SHA-256 appears in Stage outputs, and its fingerprint covers every frozen Audio Mix input.
+- [ ] Draft-derived Ducking reused by Release is clamped to Composition duration.
+- [ ] A 100-interval `audio/filter-graph.txt` executes; it and `audio/mixed-normalized.wav` appear with path/SHA-256 in Draft Stage outputs, every frozen Audio Mix input independently changes the fingerprint, and Release reuses both hashes without overwriting either artifact.
 - [ ] Narration concat succeeds from a project path containing spaces while retaining `-safe 1`.
 - [ ] Remotion output contains no audio stream.
 - [ ] Final mux copies H.264 video and encodes AAC audio only.

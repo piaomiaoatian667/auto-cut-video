@@ -744,12 +744,15 @@ Runner、锁、报告协议和原子发布机制不应因新增普通 Stage 而�
 
 ### Stage 04：Draft
 
-输入：编译时间线。
+输入：编译时间线、旁白 Master、BGM 素材/元数据和 `project.audio` 配置。
 
 执行：
 
 - 使用 960 × 540 画布渲染无声草稿视频。
-- 使用 FFmpeg 将旁白和 BGM 合成草稿音频。
+- 调用 P04 Audio Mix，根据旁白区间、Composition 时长、BGM 元数据和 `project.audio` 确定性派生 Ducking；将完整 Filter Graph 一次性写入当前 Run 的 write-once `audio/filter-graph.txt`。
+- 执行两遍响度分析与归一化，将裁剪到 Composition 时长的 48kHz 立体声 PCM 写入 write-once `audio/mixed-normalized.wav`。
+- 将上述两个固定 artifact 的 Run 相对路径和 SHA-256 记录到 **Draft Stage outputs**；不存在独立的 Audio Mix Stage。
+- Draft 指纹包含完整 Audio Mix 子指纹；该子指纹覆盖旁白区间、Composition 时长、BGM 元数据、全部 Ducking/增益/响度参数和算法版本。
 - 将草稿视频和音频封装为草稿 MP4。
 - 在片段起止点、字幕区间和固定比例位置抽帧。
 - 生成联系表。
@@ -762,6 +765,7 @@ Runner、锁、报告协议和原子发布机制不应因新增普通 Stage 而�
 - 视频流或音频流缺失。
 - 分辨率、FPS 或总时长不匹配。
 - 字幕布局超出画布。
+- Filter Graph 或归一化混音 artifact 缺失、Hash 不匹配或被重复覆盖。
 
 ### Stage 05：Review
 
@@ -792,15 +796,13 @@ Gate：
 执行：
 
 1. Remotion 使用最终画布渲染无声 H.264 视频。
-2. P04 Audio Mix 根据编译后的旁白区间、Composition 时长、BGM 元数据和 `project.audio` 配置确定性派生 BGM 音量自动化；完整 Filter Graph 固定写入当前 Run 的 `audio/filter-graph.txt`，其 Run 相对路径和 SHA-256 进入该 Stage 的 `outputs`，再通过参数数组传给 FFmpeg，不把随段落数量线性增长的表达式直接拼进命令行。
-3. BGM 在旁白期间降低配置的 dB 值，并使用短 Attack/Release 避免突变。
-4. Ducking 包络始终裁剪到 `[0, compositionDurationMs]`；最后一段旁白的 Release 不得延长 Composition 或最终音频。
-5. 旁白和 BGM 混合后执行两遍响度分析与归一化。
-6. 输出 48kHz 立体声 AAC。
-7. 使用视频流复制方式将 H.264 视频和 AAC 音频合流。
-8. 写入 `faststart` MP4。
-9. 从已批准的非黑关键帧生成 1280 × 720 缩略图。
-10. 生成 SRT、校验和和最终报告。
+2. `release` Preset 必经 Draft；读取 Draft Stage outputs，重新校验 `audio/filter-graph.txt` 和 `audio/mixed-normalized.wav` 的路径与 SHA-256，并将这两个 Hash 纳入 Release 指纹和输入溯源。
+3. 直接复用 Draft 生成且已裁剪/归一化的 `audio/mixed-normalized.wav`；Release 不重新执行 Filter Graph、不创建 Audio Mix Stage，也不覆盖任何 write-once Draft artifact。
+4. 将复用的 PCM 音频编码为 48kHz 立体声 AAC。
+5. 使用视频流复制方式将 H.264 视频和 AAC 音频合流。
+6. 写入 `faststart` MP4。
+7. 从已批准的非黑关键帧生成 1280 × 720 缩略图。
+8. 生成 SRT、校验和和最终报告。
 
 发布硬性验证：
 
@@ -1084,10 +1086,10 @@ CLI 必须支持：
 - 所有项目文件操作必须持有由 canonical workspace root 与项目相对目录建立的 opaque `ProjectDirectoryScope`；Scope API 只接收项目相对路径，并在每次打开前验证目标或真实父目录仍位于 Scope 保存的 canonical project root 内。
 - 禁止符号链接逃逸项目目录。
 - 可写目标必须先解析并验证其真实父目录；若目标已存在且是符号链接则拒绝。
-- 新文件使用 `O_CREAT | O_EXCL | O_NOFOLLOW` 创建；已有指针或发布文件只能通过同目录安全临时文件和原子重命名替换，禁止直接跟随目标路径写入。
+- Darwin 新文件使用 `O_CREAT | O_EXCL | O_NOFOLLOW_ANY` 创建；已有指针或发布文件只能通过同目录安全临时文件和原子重命名替换，禁止直接跟随目标路径写入。
 - 原素材在 Ingest 和 Release 分别计算 Hash。
 - 输出使用临时文件和原子重命名。
-- Project Scope 不授权 `.work` 或 `output`；两者由独立的应用所有 Run/Output Scope 管理，并与源素材目录严格分离。
+- Project Scope 不授权 `.work` 或 `output`；P02 必须提供 opaque `RunDirectoryScope` 和 `OutputDirectoryScope`。两者只能由可信 canonical workspace root 与 app-owned 相对根异步创建，canonical 根保持私有，API 只接收各自根内相对路径，并在每次 existing/new open 前重新验证 containment、使用 Darwin `O_NOFOLLOW_ANY`、拒绝 symlink traversal/substitution。每个独立消费者从所属 Project/Run/Output Scope 打开新 `FileHandle`；FD 为 borrowed，调用方在 Promise settle 后 `finally` 关闭。
 
 ### 18.3 运行时代码
 
@@ -1122,7 +1124,7 @@ interface StageReport {
 }
 ```
 
-`ArtifactReference` 至少包含项目/Run 相对 `path` 与内容 `sha256`。Audio Mix 的 Stage outputs 必须包含 `{path: 'audio/filter-graph.txt', sha256: 'sha256:...'}`。
+`ArtifactReference` 至少包含所属 Scope 相对 `path` 与内容 `sha256`。Draft Stage outputs 必须包含 `{path: 'audio/filter-graph.txt', sha256: 'sha256:...'}` 和 `{path: 'audio/mixed-normalized.wav', sha256: 'sha256:...'}`；Release 将二者作为输入/溯源复用，不得把它们重新声明为 Release outputs。
 
 错误代码首版至少包括：
 
@@ -1167,7 +1169,7 @@ ATOMIC_PUBLISH_FAILED
 - EDL Trim 边界，包括 `sourceInMs >= sourceOutMs` 和素材时长越界。
 - Composition 总时长计算。
 - 字幕 Cue 生成。
-- P04 根据旁白区间、Composition 时长、BGM 元数据、音频配置和算法版本确定性派生 BGM Ducking 包络。
+- P04 根据旁白区间、Composition 时长、BGM 元数据、音频配置和算法版本确定性派生 BGM Ducking 包络；表驱动测试必须分别改变旁白区间、Composition 时长、BGM 元数据、`backgroundMusicGainDb`、`duckDuringNarrationDb`、`duckAttackMs`、`duckReleaseMs`、`targetLufs`、`truePeakDb` 和算法版本，并逐项证明 Audio Mix 指纹变化。
 - 阶段和语音段指纹。
 - Gate 状态聚合。
 - Stage 注册表 ID 唯一性。
@@ -1192,10 +1194,10 @@ ATOMIC_PUBLISH_FAILED
 - Mock TTS 生成旁白清单。
 - Remotion 渲染 10 秒无声视频。
 - FFmpeg 混音、合流和完整解码。
-- 使用至少 100 个旁白区间生成并执行固定 artifact `audio/filter-graph.txt`，验证不会依赖超长命令行，并校验其路径和 SHA-256 已进入 Audio Mix Stage outputs。
+- 使用至少 100 个旁白区间生成并执行固定 artifact `audio/filter-graph.txt`，验证不会依赖超长命令行，并校验它与 `audio/mixed-normalized.wav` 的路径和 SHA-256 已进入 Draft Stage outputs。
 - 在包含空格的项目目录运行 Narration，验证 `-safe 1` concat 清单只使用受控相对文件名。
 - 修改一个脚本段后验证另一个语音段命中缓存。
-- 先执行 `assets`、再执行 `draft`、最后执行 `release`，验证共同 Stage 复用已有产物。
+- 先执行 `assets`、再执行 `draft`、最后执行 `release`，验证共同 Stage 复用已有产物，且 Release 复用 Draft 的 Filter Graph/混音 Hash 而不重复混音或覆盖 write-once artifact。
 - `--plan` 不创建 Run、不获取项目锁且不启动子进程。
 - 中断 Release 后验证上一次成功输出未被覆盖。
 
@@ -1209,6 +1211,7 @@ ATOMIC_PUBLISH_FAILED
 
 - 在项目内创建指向项目外文件和目录的符号链接，验证读取路径在打开前返回 `ASSET_PATH_OUTSIDE_PROJECT`。
 - 创建一个指向项目外文件的可写目标符号链接，验证安全创建 API 拒绝写入且项目外文件内容保持不变。
+- 对 Run/Output Scope 分别覆盖读写逃逸、factory 后 lexical/canonical root substitution、exclusive create 和 work/output pointer symlink，验证所有情况 fail closed 且 borrowed FD 所有权仍归调用方。
 - 同时启动两个写入型命令，验证第二个命令返回 `PROJECT_LOCKED`，且第一个命令的锁不会被覆盖。
 - 构造已退出进程留下的锁，验证系统只在确认同主机 PID 不存在后将其报告为 `PROJECT_LOCK_STALE`，并要求显式清理。
 - 分别向运行进程发送 `SIGINT` 和 `SIGTERM`，验证子进程被终止、临时文件被清理、锁被释放、旧 `current.json` 保持不变。
@@ -1260,7 +1263,7 @@ ATOMIC_PUBLISH_FAILED
 4. 使用 macOS `say` 或分段 WAV 生成旁白。
 5. Codex 生成包含明确素材 ID、入点、出点和时间线帧位置的 EDL。
 6. 时间线编译阶段能在渲染前发现反向或越界 Trim，以及未注册组件。
-7. 输出 960 × 540 草稿、联系表和结构化报告。
+7. 输出 960 × 540 草稿、联系表和结构化报告，且 Draft outputs 包含固定 Filter Graph 与归一化混音 artifact 的路径/SHA-256。
 8. 未批准 Review 时，Release 必须拒绝执行。
 9. 输出 1920 × 1080、30 FPS、H.264、`yuv420p` 的最终 MP4。
 10. 最终音频为 AAC、48kHz、立体声，并满足项目响度策略。
@@ -1271,7 +1274,7 @@ ATOMIC_PUBLISH_FAILED
 15. 任一阶段失败后，`--resume` 从第一个失效阶段继续。
 16. 中断运行不会破坏上一次成功发布文件。
 17. `--plan` 能显示带稳定 ID 的第一步、第二步、第三步及缓存动作，且不创建任何运行产物。
-18. `assets`、`draft` 和 `release` Preset 能按预期选择连续 Stage，并安全复用共同阶段产物。
+18. `assets`、`draft` 和 `release` Preset 能按预期选择连续 Stage；Release 安全复用 Draft 的 Filter Graph/归一化混音 Hash，不创建虚构 Audio Mix Stage，也不覆盖 write-once artifact。
 19. 新增普通 Stage 时只需实现接口、注册并更新 Preset，不需要修改 Runner、锁和报告协议。
 
 ## 23. 后续演进顺序

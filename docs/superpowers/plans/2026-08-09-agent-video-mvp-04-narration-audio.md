@@ -4,7 +4,7 @@
 
 **Goal:** Build segment-level TTS/file narration caching, exact caption/SRT generation, scalable BGM ducking, and deterministic loudness-normalized audio output.
 
-**Architecture:** P04 consumes P01 Schemas/scopes and P02 immutable Run storage without modifying their contracts. Each script segment has an independent cache key and WAV, captions join by stable segment ID, and FFmpeg receives fresh borrowed FDs for Run-local concat/filter artifacts rather than user paths or unbounded command-line expressions.
+**Architecture:** P04 consumes P01 Schemas/process contracts and P02 opaque Run/Output scopes without modifying them. Each script segment has an independent cache key and WAV, captions join by stable segment ID, and FFmpeg receives fresh borrowed FDs from the owning Project or Run scope rather than user paths or unbounded command-line expressions; any later publication remains exclusively Output-scoped.
 
 **Tech Stack:** TypeScript, macOS `say`, FFmpeg/ffprobe, Zod, Vitest.
 
@@ -20,13 +20,14 @@
 - **May Run In Parallel With:** P03 after P02.
 - **Primary Write Set:** `src/providers/**`, `src/narration/**`, `src/captions/**`, Narration Stage, `src/media/audio-mix.ts`, `src/media/loudness.ts`, and audio tests.
 - **Must Not Modify:** Ingest/Compile/Remotion visual files, Review/Release, Stage registry, Presets, or Runner.
-- **Exit Artifact:** Validated Narration and Captions Manifests, deterministic SRT, reusable segment WAVs, fixed `audio/filter-graph.txt` with SHA-256 in Stage outputs, and decodable normalized stereo PCM master.
+- **Exit Artifact:** Validated Narration and Captions Manifests, deterministic SRT, reusable segment WAVs, deterministic Audio Mix fingerprint/algorithm contracts, and fixed Draft-output contracts for `audio/filter-graph.txt` plus `audio/mixed-normalized.wav`.
 
 ## Entry Criteria
 
 - P01 and P02 exit verification passes.
 - Unit and generic integration tests use Mock/File providers; the macOS `say` test is an explicit target-Mac smoke check.
 - Generated concat and filter graph files are stored only under immutable Run directories.
+- Every independent consumer opens a fresh handle from exactly one owner: project-supplied media via `ProjectDirectoryScope`, `.work` artifacts via `RunDirectoryScope`, and release files/pointers via `OutputDirectoryScope`. Handles/FDs are one-shot and caller-owned, and close in `finally` after `runProcess()` settles.
 
 ---
 ## Task 8: Implement TTS Providers and Narration Segment Caching
@@ -67,7 +68,7 @@ export interface TtsProvider {
 }
 ```
 
-Run the same contract tests against Mock and File providers. Verify cancellation, deterministic fingerprinting, missing input failure, and non-empty output. `FileTtsProvider` must require `sourceAudioPath`, open a fresh read `FileHandle` through `ProjectDirectoryScope`, pass it to each child consumer with `extraStdioFds`, and close it in `finally` after the Promise settles. Write the normalized copy through the app-owned Run scope and never modify the source WAV.
+Run the same contract tests against Mock and File providers. Verify cancellation, deterministic fingerprinting, missing input failure, and non-empty output. `FileTtsProvider` must require `sourceAudioPath`, open a fresh read `FileHandle` through `ProjectDirectoryScope`, pass it to each child consumer with `extraStdioFds`, and close it in `finally` after the Promise settles. Write the normalized copy through a fresh handle from the app-owned `RunDirectoryScope`; never modify the source WAV or reopen either file from a resolved string.
 
 - [ ] **Step 2: Implement MacOsSayProvider**
 
@@ -181,7 +182,7 @@ git commit -m "feat: generate segment captions and srt"
 - [ ] **Step 1: Write Ducking envelope tests**
 
 ```ts
-it('clamps final release to composition duration', () => {
+it('clamps mixed audio to composition duration', () => {
   expect(buildDuckingIntervals({
     narration: [{startMs: 9_500, endMs: 10_000}],
     attackMs: 120,
@@ -204,8 +205,25 @@ it('serializes a large set of narration intervals into a filter graph file', () 
   expect(buildAudioFilterGraph({narration: intervals}).script).toContain('volume=');
 });
 
-it('fingerprints every deterministic audio-mix input', () => {
-  expect(audioMixFingerprint(fixture())).toMatch(/^sha256:/);
+const fingerprintMutations: Array<[
+  string,
+  (input: AudioMixFingerprintInput) => AudioMixFingerprintInput,
+]> = [
+  ['narration intervals', input => ({...input, narrationIntervals: input.narrationIntervals.map((value, index) => index === 0 ? {...value, endMs: value.endMs + 1} : value)})],
+  ['composition duration', input => ({...input, compositionDurationMs: input.compositionDurationMs + 1})],
+  ['BGM metadata', input => ({...input, backgroundMusic: {...input.backgroundMusic, startMs: input.backgroundMusic.startMs + 1}})],
+  ['backgroundMusicGainDb', input => ({...input, backgroundMusicGainDb: input.backgroundMusicGainDb - 1})],
+  ['duckDuringNarrationDb', input => ({...input, duckDuringNarrationDb: input.duckDuringNarrationDb - 1})],
+  ['duckAttackMs', input => ({...input, duckAttackMs: input.duckAttackMs + 1})],
+  ['duckReleaseMs', input => ({...input, duckReleaseMs: input.duckReleaseMs + 1})],
+  ['targetLufs', input => ({...input, targetLufs: input.targetLufs - 1})],
+  ['truePeakDb', input => ({...input, truePeakDb: input.truePeakDb - 0.1})],
+  ['algorithm version', input => ({...input, algorithmVersion: 'audio-mix-v2'})],
+];
+
+it.each(fingerprintMutations)('changes when %s changes', (_label, mutate) => {
+  const baseline = fixture();
+  expect(audioMixFingerprint(mutate(baseline))).not.toBe(audioMixFingerprint(baseline));
 });
 ```
 
@@ -213,17 +231,17 @@ it('fingerprints every deterministic audio-mix input', () => {
 
 Represent gain as a piecewise function: unity before attack, linear ramp to `10 ** (duckDb / 20)`, hold during narration, linear release, unity afterward. Merge intervals whose attack begins before the previous release ends. Clamp every endpoint to `[0, compositionDurationMs]`. The envelope is derived at P04 runtime and is never persisted in `compiled-timeline.json`.
 
-Freeze an explicit Audio Mix algorithm version such as `audio-mix-v1`. The Stage fingerprint must cover, in deterministic order: narration intervals, Composition duration, BGM metadata, `backgroundMusicGainDb`, `duckDuringNarrationDb`, `duckAttackMs`, `duckReleaseMs`, and the algorithm version.
+Freeze an explicit Audio Mix algorithm version such as `audio-mix-v1`. `audioMixFingerprint()` must cover, in deterministic order: narration intervals, Composition duration, BGM metadata, `backgroundMusicGainDb`, `duckDuringNarrationDb`, `duckAttackMs`, `duckReleaseMs`, `targetLufs`, `truePeakDb`, and the algorithm version. P05 includes this sub-fingerprint in the Draft Stage fingerprint; there is no separate Audio Mix Stage.
 
 - [ ] **Step 3: Build the FFmpeg mix graph**
 
-Create a `volume=<globalGain>*<piecewiseExpression>:eval=frame` filter for BGM, delay it by `backgroundMusic.startMs`, and mix with narration using `amix=inputs=2:normalize=0`. Serialize the complete graph to the fixed write-once Run artifact `audio/filter-graph.txt`. Record both `path: 'audio/filter-graph.txt'` and its SHA-256 in the Audio Mix Stage outputs, then pass a fresh read handle for that artifact to FFmpeg rather than placing the growing expression directly on the command line.
+Create a `volume=<globalGain>*<piecewiseExpression>:eval=frame` filter for BGM, delay it by `backgroundMusic.startMs`, and mix with narration using `amix=inputs=2:normalize=0`. When P05 Draft invokes this implementation, serialize the complete graph once to the fixed write-once Run artifact `audio/filter-graph.txt`. Return its `{path, sha256}` reference for inclusion in Draft Stage outputs, then pass a fresh Run-scope read handle for that artifact to FFmpeg rather than placing the growing expression directly on the command line. Do not create or name an Audio Mix Stage.
 
-Every independent narration/BGM/filter-graph input and every output consumer must open its own fresh handle from the appropriate Project or Run/Output Scope. Map read and write descriptors with `extraStdioFds` (`/dev/fd/3`, `pipe:4`, and so on), consume each FD/pipe once, and close every caller-owned handle in `finally` after `runProcess()` settles. Trim the result to Composition duration, resample to 48kHz, and output stereo PCM WAV. The integration test must execute a graph generated from at least 100 narration intervals.
+Every independent project-supplied source-WAV/BGM consumer opens a fresh `ProjectDirectoryScope` handle; every narration-master/concat/filter/intermediate/final-mix consumer opens a separate fresh `RunDirectoryScope` handle. P04 opens no Output scope; P05 release publication must use `OutputDirectoryScope`. Scope kinds are not interchangeable. Map read and write descriptors with `extraStdioFds` (`/dev/fd/3`, `pipe:4`, and so on), consume each FD/pipe once, and close every caller-owned handle in `finally` after `runProcess()` settles. Trim the result to Composition duration, resample to 48kHz, and output stereo PCM WAV. The integration test must execute a graph generated from at least 100 narration intervals.
 
 - [ ] **Step 4: Implement two-pass loudnorm**
 
-First pass uses `loudnorm=I=<target>:TP=<peak>:LRA=11:print_format=json` to null output and parses measured values from stderr. Second pass supplies `measured_I`, `measured_LRA`, `measured_TP`, `measured_thresh`, and `offset`, then writes normalized WAV. Both passes use fresh scoped handles and borrowed read/write `extraStdioFds`; reject non-finite measurements.
+First pass uses `loudnorm=I=<target>:TP=<peak>:LRA=11:print_format=json` to null output and parses measured values from stderr. Second pass supplies `measured_I`, `measured_LRA`, `measured_TP`, `measured_thresh`, and `offset`, then writes the fixed write-once Run artifact `audio/mixed-normalized.wav`. Return its `{path, sha256}` reference beside the filter-graph reference so P05 records both in Draft Stage outputs. Both passes use fresh scoped handles and borrowed read/write `extraStdioFds`; reject non-finite measurements.
 
 - [ ] **Step 5: Verify and commit**
 
@@ -245,7 +263,7 @@ pnpm typecheck
 git diff --check
 ```
 
-Expected: all tests pass, unchanged narration segments reuse their WAVs, caption boundaries obey the reviewed rounding rules, and the 100-interval `audio/filter-graph.txt` executes successfully with its path/SHA-256 present in Stage outputs and its fingerprint changing for every listed deterministic input.
+Expected: all tests pass, unchanged narration segments reuse their WAVs, caption boundaries obey the reviewed rounding rules, the 100-interval `audio/filter-graph.txt` executes successfully, both fixed Draft artifact references are returned, and every listed deterministic input independently changes `audioMixFingerprint()`.
 
 - [ ] **Step 2: Run the target-Mac TTS smoke test**
 

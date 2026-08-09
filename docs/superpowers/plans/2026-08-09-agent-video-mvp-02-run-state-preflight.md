@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add deterministic fingerprints, immutable Run storage, project locking, atomic pointers, and a target-Mac Preflight/`doctor` command without implementing media business logic.
+**Goal:** Add deterministic fingerprints, opaque app-owned Run/Output directory scopes, immutable Run storage, project locking, atomic pointers, and a target-Mac Preflight/`doctor` command without implementing media business logic.
 
-**Architecture:** P02 consumes P01 filesystem, process, Schema, and Gate contracts. It establishes the durable execution-state protocol used by all Stages and performs environment capability checks before any Run is created.
+**Architecture:** P02 consumes P01 filesystem, process, Schema, and Gate contracts. It establishes opaque app-owned filesystem scopes plus the durable execution-state protocol used by all Stages, and performs environment capability checks before any Run is created.
 
 **Tech Stack:** Node.js filesystem and crypto APIs, TypeScript, Commander, Vitest, macOS process metadata, FFmpeg capability probes.
 
@@ -17,9 +17,9 @@
 - **Project Index:** `2026-08-09-agent-video-mvp-project-index.md`
 - **Master Tasks:** 5–6
 - **Depends On:** P01 completed and merged.
-- **Primary Write Set:** `src/pipeline/fingerprint.ts`, `src/pipeline/project-lock.ts`, `src/pipeline/run-store.ts`, Preflight Stage, CLI bootstrap/output/exit codes, and their tests.
+- **Primary Write Set:** `src/fs/app-directory-scopes.ts`, `src/pipeline/fingerprint.ts`, `src/pipeline/project-lock.ts`, `src/pipeline/run-store.ts`, Preflight Stage, CLI bootstrap/output/exit codes, and their tests.
 - **Must Not Implement:** Ingest, narration, compile, render, review, release, Presets, Execution Plan, or Runner sequencing.
-- **Exit Artifact:** Stable fingerprint format, immutable Run layout, lock protocol, atomic `current.json`, and passing `doctor` behavior.
+- **Exit Artifact:** Opaque `RunDirectoryScope`/`OutputDirectoryScope` APIs, stable fingerprint format, immutable Run layout, lock protocol, atomic `current.json`, and passing `doctor` behavior.
 
 ## Entry Criteria
 
@@ -28,12 +28,14 @@
 - Implementation runs on Apple Silicon macOS 15+ for the target smoke check; unit tests may use injected platform fixtures elsewhere.
 
 ---
-## Task 5: Add Fingerprints, Immutable Runs, Atomic Pointers, and Project Locks
+## Task 5: Add App-Owned Scopes, Fingerprints, Immutable Runs, Atomic Pointers, and Project Locks
 
 **Files:**
+- Create: `src/fs/app-directory-scopes.ts`
 - Create: `src/pipeline/fingerprint.ts`
 - Create: `src/pipeline/project-lock.ts`
 - Create: `src/pipeline/run-store.ts`
+- Test: `tests/unit/fs/app-directory-scopes.test.ts`
 - Test: `tests/unit/pipeline/fingerprint.test.ts`
 - Test: `tests/integration/pipeline/project-lock.test.ts`
 - Test: `tests/integration/pipeline/run-store.test.ts`
@@ -96,7 +98,13 @@ export interface ProjectLockRecord {
 
 Use `open(lockPath, 'wx', 0o600)` for acquisition. Record `hostname()`, PID, run ID, ISO timestamp, and a process-start marker read through `ps -o lstart= -p <pid>` on macOS. On conflict, compare host, PID liveness via `process.kill(pid, 0)`, and process-start marker to avoid PID reuse. Return a release function that only unlinks a lock still owned by the same `runId`.
 
-- [ ] **Step 5: Write atomic pointer tests**
+- [ ] **Step 5: Write app-owned scope and atomic pointer tests**
+
+Define opaque `RunDirectoryScope` and `OutputDirectoryScope` values that can only be created asynchronously from a trusted canonical `workspaceRoot` plus an app-owned relative root. The factory must reject an initial canonical root outside the canonical workspace root. Keep each canonical scope root in a class `#private` field or module-private `WeakMap`; do not expose it as a string or accept a downstream string as a containment root. Every scope file API accepts only a path relative to that Run or Output root.
+
+Add table-driven tests for both scopes covering an initial canonical root outside the workspace, read and write escape through internal symlinks, replacement of the lexical scope path after factory creation, replacement of the original canonical root with an external symlink, exclusive create against an existing target, and symbolic links at work/output pointer paths. Scope substitution must fail closed rather than widening authority. Existing-file and new-file opens must use Darwin `O_NOFOLLOW_ANY` after canonicalizing the target or real parent and confirming it is still contained by the canonical root saved in the opaque scope.
+
+File descriptors returned by these APIs are borrowed when passed to `runProcess()`: the scope/runner never seeks or closes them. Each independent consumer opens its own handle from the correct scope and closes it in `finally` after the consumer promise settles. Tests must prove ownership remains with the caller across successful, failed, aborted, and timed-out consumers.
 
 Use an injected `FileOps` interface to force failures in temporary-file write, sync, and rename. Each test begins with an existing `current.json` and asserts its contents remain unchanged after the simulated failure.
 
@@ -114,16 +122,18 @@ export interface CurrentPointer {
 
 - [ ] **Step 6: Implement immutable runs and atomic pointer publication**
 
-`RunStore.createRun()` creates `.work/<project>/runs/<runId>`. Stage output files are write-once; later stages append new files without overwriting earlier artifacts. `publishCurrent()` opens a new same-directory `current.json.tmp` with no-follow/exclusive flags, writes and calls `sync()` on the file handle, atomically renames it, syncs the parent directory, and removes the temporary file on failure. Reject a symbolic link at either pointer path instead of following it.
+`RunStore.createRun()` creates `.work/<project>/runs/<runId>` and returns its opaque `RunDirectoryScope`, never a public root string. Add a safe `RunStore.openExistingRun()` API that recreates a Run scope only through the trusted workspace/app-root factory and rejects traversal or root substitution. `RunStore` may retain module-private authority for `.work/<project>/current.json` and `pipeline.lock`, but must not expose that app-owned root or misrepresent it as a per-Run scope. Stage output files are write-once; later stages append new files without overwriting earlier artifacts.
 
-Use the same helper for `output/<project>/current.json`, whose `relativePath` points at `releases/<runId>` and whose `completedStage` is always `release`.
+Create one `OutputDirectoryScope` rooted at the app-owned `output/<project>` tree for release artifact creation and publication. Run artifacts must be opened only through `RunDirectoryScope`; release files and the output pointer must be opened only through `OutputDirectoryScope`; neither may be opened through `ProjectDirectoryScope` or a raw path. `publishCurrent()` opens a new same-directory `current.json.tmp` with no-follow/exclusive flags, writes and calls `sync()` on the file handle, atomically renames it, syncs the parent directory, and removes the temporary file on failure. Reject a symbolic link at either pointer path instead of following it.
+
+Use the same scoped publication protocol for `output/<project>/current.json`, whose `relativePath` points at `releases/<runId>` and whose `completedStage` is always `release`.
 
 - [ ] **Step 7: Verify and commit**
 
 ```bash
-pnpm test tests/unit/pipeline/fingerprint.test.ts tests/integration/pipeline/project-lock.test.ts tests/integration/pipeline/run-store.test.ts
+pnpm test tests/unit/fs/app-directory-scopes.test.ts tests/unit/pipeline/fingerprint.test.ts tests/integration/pipeline/project-lock.test.ts tests/integration/pipeline/run-store.test.ts
 pnpm typecheck
-git add src/pipeline/fingerprint.ts src/pipeline/project-lock.ts src/pipeline/run-store.ts tests/unit/pipeline/fingerprint.test.ts tests/integration/pipeline
+git add src/fs/app-directory-scopes.ts src/pipeline/fingerprint.ts src/pipeline/project-lock.ts src/pipeline/run-store.ts tests/unit/fs/app-directory-scopes.test.ts tests/unit/pipeline/fingerprint.test.ts tests/integration/pipeline
 git commit -m "feat: add resumable run storage and locks"
 ```
 
@@ -205,12 +215,12 @@ git commit -m "feat: add environment doctor command"
 - [ ] **Step 1: Run the complete P02 test set**
 
 ```bash
-pnpm test tests/unit/pipeline/fingerprint.test.ts tests/integration/pipeline/project-lock.test.ts tests/integration/pipeline/run-store.test.ts tests/unit/pipeline/preflight.test.ts tests/unit/cli/doctor.test.ts
+pnpm test tests/unit/fs/app-directory-scopes.test.ts tests/unit/pipeline/fingerprint.test.ts tests/integration/pipeline/project-lock.test.ts tests/integration/pipeline/run-store.test.ts tests/unit/pipeline/preflight.test.ts tests/unit/cli/doctor.test.ts
 pnpm typecheck
 git diff --check
 ```
 
-Expected: all tests pass, pointer-failure tests preserve the previous pointer, lock tests never delete a live lock, and TypeScript exits 0.
+Expected: all tests pass, Run/Output scope escape and substitution fail closed, exclusive create and pointer-symlink tests pass, pointer-failure tests preserve the previous pointer, lock tests never delete a live lock, and TypeScript exits 0.
 
 - [ ] **Step 2: Run the target-Mac environment smoke check**
 

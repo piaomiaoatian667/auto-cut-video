@@ -133,13 +133,13 @@ export interface ExecutionPlan {
 6. Apply `--force <stage>` to that Stage and all downstream registered Stages.
 7. Number only the selected plan as `1/N`, `2/N`, and so on while retaining stable `StageId` values.
 
-Tests must cover full, prefix, and sliced plans; cached and resume actions; forced invalidation; missing prerequisites; and insertion of a fake Stage without changing Runner code. `--plan` prints this object and exits without creating a Run, acquiring a write lock, writing a pointer, or starting a subprocess.
+Tests must cover full, prefix, and sliced plans; cached and resume actions; forced invalidation; missing prerequisites; and insertion of a fake Stage without changing Runner code. Draft fingerprint fixtures include the complete P04 audio sub-fingerprint (`targetLufs` and `truePeakDb` included). Release fingerprint fixtures consume the exact Draft output hashes for `audio/filter-graph.txt` and `audio/mixed-normalized.wav`; there is no Audio Mix Stage. `--plan` prints this object and exits without creating a Run, acquiring a write lock, writing a pointer, or starting a subprocess.
 
 - [ ] **Step 4: Implement the Execution Plan Runner and resume behavior**
 
-Use fake stages with deterministic fingerprints. Verify an unchanged second run reports `cached`, changing one narration segment invalidates Narration and every downstream Stage, switching from `draft` to `release` reuses matching shared Stage artifacts, and `--force compile` reruns Compile through Release while reusing Preflight, Ingest, and Narration.
+Use fake stages with deterministic fingerprints. Verify an unchanged second run reports `cached`, changing any one frozen audio-mix input invalidates Draft and Release, changing one narration segment invalidates Narration and every downstream Stage, switching from `draft` to `release` reuses the matching Draft filter-graph/mixed-audio hashes without creating or overwriting an Audio Mix Stage, and `--force compile` reruns Compile through Release while reusing Preflight, Ingest, and Narration.
 
-The Runner receives an already validated `ExecutionPlan` and has no Preset-specific branches. It acquires the project lock only for an executable plan and reads work `current.json`. With `--resume`, it continues the same `runId` while recorded fingerprints match; otherwise it creates a new Run only after successful Preflight. After every materialized `passed` Stage and when Review enters `needs_review`, update work `current.json` with `preset`, the selected `stageIds` snapshot, `completedStage`, and `state`. Reports include `preset`, stable Stage ID, `position`, and `total`. Stop on `failed` or `needs_review`, write reports after every Stage, and release the lock in `finally`.
+The Runner receives an already validated `ExecutionPlan` and has no Preset-specific branches. It carries the opaque `ProjectDirectoryScope` returned by project loading, obtains `RunDirectoryScope` only from `RunStore.createRun()`/`openExistingRun()`, and obtains `OutputDirectoryScope` only for release publication; no Stage receives raw root strings or may substitute one scope for another. It acquires the project lock only for an executable plan and reads work `current.json` through the app-owned scope protocol. With `--resume`, it continues the same `runId` while recorded fingerprints match; otherwise it creates a new Run only after successful Preflight. After every materialized `passed` Stage and when Review enters `needs_review`, update work `current.json` with `preset`, the selected `stageIds` snapshot, `completedStage`, and `state`. Reports include `preset`, stable Stage ID, `position`, and `total`. Release records the reused Draft artifact hashes as inputs/provenance and does not claim or rewrite them as Release outputs. Stop on `failed` or `needs_review`, write reports after every Stage, and release the lock in `finally`.
 
 - [ ] **Step 5: Implement signal behavior**
 
@@ -246,7 +246,7 @@ It also verifies `subtitles.srt`, `thumbnail.jpg`, `review.json`, `validation-re
 
 - [ ] **Step 4: Write cache invalidation acceptance test**
 
-Run the `release` Preset twice, change only the second script segment, and assert the first segment WAV hash is reused, the second changes, and Narration plus all downstream Stages receive new fingerprints. Insert a fake registered Stage in the unit fixture and prove Runner behavior does not require modification.
+Run the `release` Preset twice, change only the second script segment, and assert the first segment WAV hash is reused, the second changes, and Narration plus all downstream Stages receive new fingerprints. Also assert Draft regenerates new filter-graph/mixed-audio hashes, while an unchanged `draft` followed by `release` reuses the exact Draft hashes and leaves the write-once files untouched. Insert a fake registered Stage in the unit fixture and prove Runner behavior does not require modification.
 
 - [ ] **Step 5: Document exact local usage**
 
@@ -274,7 +274,7 @@ Expected:
 - TypeScript exits 0.
 - Doctor reports no errors on the target Mac.
 - Plan mode reports numbered Stage IDs and performs no writes or subprocess calls.
-- `assets`, `draft`, and `release` reuse all matching shared Stage artifacts.
+- `assets`, `draft`, and `release` reuse all matching shared Stage artifacts; Release references the Draft filter-graph/mixed-audio hashes without rerunning audio mixing.
 - The first release run stops when Review returns `needs_review` before approval.
 - The explicit review command succeeds, and the resumed `release` Preset publishes a new output pointer without changing `runId`.
 - The current release fully decodes and matches the fixed media profile.
@@ -295,12 +295,11 @@ Checkpoint C is complete when all nineteen MVP acceptance criteria in the specif
 - [ ] Every JSON authoring file rejects unknown fields.
 - [ ] Script display limits use the project setting and Unicode grapheme counting.
 - [ ] Reversed and out-of-bounds Trim tests pass before rendering.
-- [ ] Read paths, writable target symlinks, and atomic pointer symlink tests pass.
+- [ ] Project/Run/Output read/write escape, scope substitution, exclusive-create, and atomic pointer-symlink tests pass.
 - [ ] Lock contention, stale lock, SIGINT, and SIGTERM tests pass.
 - [ ] Preflight and runtime disk exhaustion remain distinct failures.
 - [ ] Exact-frame and non-aligned caption boundary tests pass.
-- [ ] Final Ducking release is clamped to Composition duration.
-- [ ] A 100-interval audio Filter Graph executes from a Run-local script file.
+- [ ] Draft-derived Ducking is clamped to Composition duration; a 100-interval Run-local `audio/filter-graph.txt` executes, both fixed audio path/SHA-256 references appear in Draft Stage outputs, and Release reuses those hashes without overwriting either write-once artifact.
 - [ ] Narration concat succeeds from a project path containing spaces while retaining `-safe 1`.
 - [ ] Remotion output contains no audio stream.
 - [ ] Final mux copies H.264 video and encodes AAC audio only.

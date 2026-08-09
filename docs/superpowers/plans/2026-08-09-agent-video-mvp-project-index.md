@@ -38,7 +38,7 @@ flowchart LR
 | ID | Project | Master Tasks | Depends On | Primary Deliverable | Executable Plan |
 | --- | --- | --- | --- | --- | --- |
 | P01 | Foundation and Authoring Core | 1–4 | None | Strict inputs, opaque project-directory scopes, process-group completion, borrowed FD and Gate contracts | [P01 Plan](2026-08-09-agent-video-mvp-01-foundation-authoring.md) |
-| P02 | Run State and Preflight | 5–6 | P01 | Fingerprints, immutable Runs, locks, atomic pointers, `doctor` | [P02 Plan](2026-08-09-agent-video-mvp-02-run-state-preflight.md) |
+| P02 | Run State and Preflight | 5–6 | P01 | Opaque Run/Output scopes, fingerprints, immutable Runs, locks, atomic pointers, `doctor` | [P02 Plan](2026-08-09-agent-video-mvp-02-run-state-preflight.md) |
 | P03 | Media and Visual Pipeline | 7, 10, 11 | P01, P02 | Ingest, EDL compile, fixed components, muted Remotion render | [P03 Plan](2026-08-09-agent-video-mvp-03-media-visual-pipeline.md) |
 | P04 | Narration and Audio | 8, 9, 12 | P01, P02 | TTS cache, narration master, captions, BGM mix and loudness | [P04 Plan](2026-08-09-agent-video-mvp-04-narration-audio.md) |
 | P05 | Review and Release | 13–14 | P03, P04 | Draft evidence, explicit Review Gate, verified release package | [P05 Plan](2026-08-09-agent-video-mvp-05-review-release.md) |
@@ -55,10 +55,10 @@ flowchart LR
 ## Shared Contract Freeze Points
 
 - **After P01:** Authoring Schemas, generated Manifest shapes, opaque `ProjectDirectoryScope` APIs, borrowed `extraStdioFds`, `ProcessResult`, `CheckResult`, and Gate states are frozen. Later projects may extend through versioned changes only.
-- **After P02:** Fingerprint format, Run directory layout, project lock record, and `current.json` publication protocol are frozen.
+- **After P02:** Opaque `RunDirectoryScope`/`OutputDirectoryScope` APIs, fingerprint format, Run directory layout, project lock record, and `current.json` publication protocol are frozen.
 - **After P03:** `asset-manifest.json`, `compiled-timeline.json` containing narration intervals plus BGM metadata (not Ducking envelopes), registered component IDs, and muted-render contract are frozen.
-- **After P04:** `narration-manifest.json`, caption cue semantics, SRT formatting, deterministic Audio Mix fingerprint inputs, fixed `audio/filter-graph.txt` path/SHA-256 Stage output, and mixed-audio contract are frozen.
-- **After P05:** Review evidence, release directory layout, validation report, and final media profile are frozen.
+- **After P04:** `narration-manifest.json`, caption cue semantics, SRT formatting, deterministic Audio Mix fingerprint inputs (including loudness/True Peak), algorithm version, and fixed Draft artifact paths `audio/filter-graph.txt`/`audio/mixed-normalized.wav` are frozen.
+- **After P05:** Draft outputs own `audio/filter-graph.txt` and `audio/mixed-normalized.wav` path/SHA-256 references; Release reuses those hashes without overwrite. Review evidence, release directory layout, validation report, and final media profile are frozen.
 - **P06 rule:** Runner and CLI consume these contracts; they must not duplicate Stage business logic or introduce a second artifact format.
 
 ## Parallel Work Rules
@@ -77,7 +77,7 @@ Each project handoff must include:
 3. A list of frozen artifact schemas or interfaces introduced by the project.
 4. Any target-Mac-only smoke test that was skipped in generic CI.
 5. Confirmation that no later-project files were implemented early.
-6. For P04, evidence that `audio/filter-graph.txt` is recorded with SHA-256 in Stage outputs and invalidates on every frozen Audio Mix fingerprint input.
+6. For P04/P05, table-driven evidence that every frozen Audio Mix input changes the fingerprint, plus evidence that Draft records both fixed audio artifacts with SHA-256 and Release reuses their hashes without overwrite.
 
 ## Completion Definition
 

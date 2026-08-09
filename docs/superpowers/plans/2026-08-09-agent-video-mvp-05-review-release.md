@@ -4,7 +4,7 @@
 
 **Goal:** Integrate muted visual output and narration/audio output into a reviewable draft, explicit approval Gate, and atomically published verified release package.
 
-**Architecture:** P05 consumes the frozen P03 visual and P04 audio contracts. Draft creates evidence without publishing, Review records an explicit decision for the same Run, and Release renders/mixes the final profile, performs full decode and metadata checks, then atomically advances the output pointer.
+**Architecture:** P05 consumes the frozen P03 visual and P04 audio contracts. Draft materializes the write-once filter graph and normalized mixed-audio artifacts while creating review evidence, Review records an explicit decision for the same Run, and Release renders the final visual profile, reuses the exact Draft audio artifact hashes, performs full decode and metadata checks, then atomically advances the output pointer.
 
 **Tech Stack:** TypeScript, FFmpeg/ffprobe, Remotion, Commander, Vitest.
 
@@ -19,13 +19,14 @@
 - **Depends On:** P03 and P04 completed and merged.
 - **Primary Write Set:** contact-sheet generation, Draft/Review/Release Stages, review CLI command, release verification, and integration tests.
 - **Must Not Modify:** Frozen authoring/Manifest formats, TTS/visual business logic, Stage registry, Presets, Execution Plan, or Runner.
-- **Exit Artifact:** Decodable review draft, contact sheet/evidence, strict `review.json`, verified final release directory, checksums, and atomic output pointer.
+- **Exit Artifact:** Decodable review draft, Draft-owned `audio/filter-graph.txt` and `audio/mixed-normalized.wav` references, contact sheet/evidence, strict `review.json`, verified final release directory, checksums, and atomic output pointer.
 
 ## Entry Criteria
 
 - P03 and P04 exit verification passes against the same P01/P02 contract versions.
 - A fixture Run can provide muted final/draft video, narration master, caption data, BGM, and compiled timeline.
 - Output publication tests begin with an existing successful pointer to prove rollback behavior.
+- Project inputs, Run artifacts, and release files/pointers are opened through fresh `ProjectDirectoryScope`, `RunDirectoryScope`, and `OutputDirectoryScope` handles respectively. Scope kinds are never substituted; borrowed FDs are closed by the caller in `finally` after each consumer settles.
 
 ---
 ## Task 13: Build Draft, Contact Sheet, and Explicit Review Gate
@@ -41,15 +42,15 @@
 
 - [ ] **Step 1: Write frame-selection tests**
 
-The selector must include frame 0, final frame, every visual start/end boundary, every caption midpoint, and evenly spaced coverage frames. Deduplicate and sort the result, then cap at 24 frames while preserving boundaries.
+The selector must include frame 0, final frame, every visual start/end boundary, every caption midpoint, and evenly spaced coverage frames. Deduplicate and sort the result, then cap at 24 frames while preserving boundaries. Draft integration tests must also assert its outputs contain `{path, sha256}` references for both `audio/filter-graph.txt` and `audio/mixed-normalized.wav`.
 
 - [ ] **Step 2: Implement contact sheet generation**
 
-Extract selected frames with FFmpeg and tile them into a labeled JPEG. Store individual review frames and `contact-sheet.jpg` under the run's draft directory.
+Extract selected frames with FFmpeg and tile them into a labeled JPEG. Each decode/extract/tile input and output opens a fresh `RunDirectoryScope` handle and closes it after the consumer settles. Store individual review frames and `contact-sheet.jpg` under the Run's draft directory.
 
 - [ ] **Step 3: Implement Draft stage**
 
-Render 960×540 muted video, mix non-normalized guide audio using the same envelope, mux draft MP4, fully decode it, verify one video and one audio stream, then generate review frames and the draft report.
+Render 960×540 muted video, invoke P04 Audio Mix once to create the write-once `audio/filter-graph.txt` and loudness-normalized `audio/mixed-normalized.wav`, record both path/SHA-256 references in Draft Stage outputs, mux that normalized audio into the draft MP4, fully decode it, verify one video and one audio stream, then generate review frames and the draft report. The Draft fingerprint includes `audioMixFingerprint()`; no Audio Mix Stage exists.
 
 - [ ] **Step 4: Write Review Gate tests**
 
@@ -66,7 +67,7 @@ it('rejects approval for another run', async () => {
 
 - [ ] **Step 5: Implement review recording**
 
-`videoctl review <project> --approve --reason <text>` loads the current Run whose Review Stage is `needs_review`, verifies every evidence path is inside that Run, writes strict `review.json`, and never edits programmatic checks. A rejected review records `status: rejected` and blocks Release.
+`videoctl review <project> --approve --reason <text>` resolves the current work pointer through `RunStore.openExistingRun()`, receives its opaque `RunDirectoryScope`, verifies every evidence path through that scope, writes strict `review.json`, and never edits programmatic checks. A rejected review records `status: rejected` and blocks Release.
 
 - [ ] **Step 6: Verify and commit**
 
@@ -90,25 +91,25 @@ Checkpoint B is complete: a narrated, captioned draft can be explicitly approved
 
 - [ ] **Step 1: Write release validation tests**
 
-Generate one valid release and fixtures with missing audio, wrong dimensions, excessive A/V duration difference, and truncated MP4. Assert the exact errors `RELEASE_DECODE_FAILED` or `RELEASE_DURATION_MISMATCH`.
+Generate one valid release and fixtures with missing audio, wrong dimensions, excessive A/V duration difference, and truncated MP4. Assert the exact errors `RELEASE_DECODE_FAILED` or `RELEASE_DURATION_MISMATCH`. Add a regression test that pre-creates the Draft filter graph and normalized mixed audio, runs Release, and proves their bytes/hashes remain unchanged.
 
 - [ ] **Step 2: Implement final rendering and muxing**
 
-1. Render final muted H.264 video at 1920×1080.
-2. Mix and loudness-normalize narration plus BGM.
-3. Mux with:
+1. Render final muted H.264 video at 1920×1080 into the Run scope.
+2. Read and verify the Draft Stage output references for `audio/filter-graph.txt` and `audio/mixed-normalized.wav`. Include both hashes in the Release fingerprint/provenance, then reuse the normalized mixed audio without executing the graph or writing either Draft artifact again.
+3. Open fresh Run-scope handles for final video and normalized mixed audio plus a fresh Output-scope handle for `releases/<runId>/final.mp4`, then mux with borrowed FDs:
 
 ```text
-ffmpeg -y -i final-video.mp4 -i master.wav \
+ffmpeg -y -i /dev/fd/3 -i /dev/fd/4 \
   -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -ar 48000 -ac 2 \
-  -movflags +faststart final.mp4
+  -movflags +faststart /dev/fd/5
 ```
 
-Do not use `-shortest`; validate and explicitly trim audio to Composition duration before muxing.
+Do not use `-shortest`. Draft already trims and normalizes the reusable mixed audio to Composition duration; Release verifies that duration/hash contract before muxing. Close every caller-owned handle in `finally` after `runProcess()` settles.
 
 - [ ] **Step 3: Implement full release verification**
 
-Run `ffmpeg -v error -xerror -i final.mp4 -f null -` and require exit 0. Probe streams and require one H.264 `yuv420p` 1920×1080 30FPS stream and one AAC 48kHz stereo stream. Require A/V duration difference ≤50ms, parseable SRT within video duration, valid loudness metrics, and unchanged source hashes.
+Open a fresh Output-scope read handle for each full-decode, probe, and checksum consumer; run the equivalent of `ffmpeg -v error -xerror -i /dev/fd/3 -f null -` and require exit 0. Probe streams and require one H.264 `yuv420p` 1920×1080 30FPS stream and one AAC 48kHz stereo stream. Require A/V duration difference ≤50ms, parseable SRT within video duration, valid loudness metrics, and unchanged source hashes. Each borrowed FD is consumed once and closed by the caller in `finally`.
 
 - [ ] **Step 4: Generate remaining artifacts**
 
@@ -116,7 +117,7 @@ Create a 1280×720 padded thumbnail from an approved non-black review frame. Wri
 
 - [ ] **Step 5: Publish atomically**
 
-Write all artifacts to `output/<project>/releases/<runId>`, verify them there, then atomically update `output/<project>/current.json`. Inject failures at pointer write, sync, and rename in integration tests and prove the old release pointer remains intact.
+Write all release artifacts through `OutputDirectoryScope` under `releases/<runId>`, verify them there, then atomically update scoped `current.json`. Inject failures at pointer write, sync, and rename in integration tests and prove the old release pointer remains intact. Release must never overwrite the Draft-owned Run artifacts.
 
 - [ ] **Step 6: Verify and commit**
 
@@ -138,7 +139,7 @@ pnpm typecheck
 git diff --check
 ```
 
-Expected: all tests pass, Release is blocked without approval, the final MP4 fully decodes, and injected pointer failures preserve the previous successful release.
+Expected: all tests pass, Draft owns both fixed audio artifact references, Release is blocked without approval, Release reuses their exact hashes without overwriting either artifact, the final MP4 fully decodes, and injected pointer failures preserve the previous successful release.
 
 - [ ] **Step 2: Re-run the release artifact contract test verbosely**
 
@@ -146,7 +147,7 @@ Expected: all tests pass, Release is blocked without approval, the final MP4 ful
 pnpm test tests/integration/pipeline/release.test.ts --reporter=verbose
 ```
 
-Expected: the integration assertions confirm all six required artifacts exist under `releases/<runId>`, the release is reachable through `output/<project>/current.json`, and failed publication preserves the previous pointer.
+Expected: the integration assertions confirm all six required artifacts exist under the Output scope's `releases/<runId>`, the release is reachable through its scoped `current.json`, and failed publication preserves the previous pointer.
 
 - [ ] **Step 3: Verify the orchestration boundary**
 
