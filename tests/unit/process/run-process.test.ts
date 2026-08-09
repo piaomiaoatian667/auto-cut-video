@@ -1,4 +1,4 @@
-import {access, mkdtemp, readFile, rm} from 'node:fs/promises';
+import {access, mkdtemp, open, readFile, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
@@ -24,6 +24,10 @@ type _TimeoutOptionIsReadonly = Assert<IsEqual<
 type _SignalOptionIsReadonly = Assert<IsEqual<
   Pick<RunProcessOptions, 'signal'>,
   Readonly<Pick<RunProcessOptions, 'signal'>>
+>>;
+type _ExtraStdioOptionIsReadonly = Assert<IsEqual<
+  Pick<RunProcessOptions, 'extraStdioFds'>,
+  Readonly<Pick<RunProcessOptions, 'extraStdioFds'>>
 >>;
 type Mutable<T> = {-readonly [Key in keyof T]: T[Key]};
 
@@ -155,6 +159,145 @@ describe('runProcess', () => {
       args: ['-e', 'console.log(process.argv[1])', 'original'],
       stdout: 'original\n',
     });
+  });
+
+  it('maps borrowed read and write descriptors starting at child fd 3', async () => {
+    const tempDirectory = await mkdtemp(path.join(tmpdir(), 'run-process-fd-'));
+    onTestFinished(() => rm(tempDirectory, {recursive: true, force: true}));
+    const inputPath = path.join(tempDirectory, 'input.txt');
+    const outputPath = path.join(tempDirectory, 'output.txt');
+    await writeFile(inputPath, 'borrowed input');
+    const inputHandle = await open(inputPath, 'r');
+    const outputHandle = await open(outputPath, 'wx');
+    onTestFinished(async () => {
+      await inputHandle.close().catch(() => undefined);
+      await outputHandle.close().catch(() => undefined);
+    });
+
+    try {
+      const result = await runProcess(
+        process.execPath,
+        [
+          '-e',
+          [
+            'const fs = require("node:fs")',
+            'const input = fs.readFileSync(3, "utf8")',
+            'fs.writeFileSync(4, "borrowed output")',
+            'console.log(input)',
+          ].join(';'),
+        ],
+        {extraStdioFds: [inputHandle.fd, outputHandle.fd]},
+      );
+
+      expect(result.stdout).toBe('borrowed input\n');
+      expect((await inputHandle.stat()).isFile()).toBe(true);
+      expect((await outputHandle.stat()).isFile()).toBe(true);
+    } finally {
+      await inputHandle.close().catch(() => undefined);
+      await outputHandle.close().catch(() => undefined);
+    }
+    await expect(readFile(outputPath, 'utf8')).resolves.toBe('borrowed output');
+  });
+
+  it('snapshots the borrowed descriptor array before caller mutation', async () => {
+    const tempDirectory = await mkdtemp(path.join(tmpdir(), 'run-process-fd-snapshot-'));
+    onTestFinished(() => rm(tempDirectory, {recursive: true, force: true}));
+    const firstPath = path.join(tempDirectory, 'first.txt');
+    const secondPath = path.join(tempDirectory, 'second.txt');
+    await writeFile(firstPath, 'first');
+    await writeFile(secondPath, 'second');
+    const firstHandle = await open(firstPath, 'r');
+    const secondHandle = await open(secondPath, 'r');
+    onTestFinished(async () => {
+      await firstHandle.close().catch(() => undefined);
+      await secondHandle.close().catch(() => undefined);
+    });
+    try {
+      const extraStdioFds = [firstHandle.fd];
+      const pending = runProcess(
+        process.execPath,
+        ['-e', 'console.log(require("node:fs").readFileSync(3, "utf8"))'],
+        {extraStdioFds},
+      );
+      extraStdioFds[0] = secondHandle.fd;
+
+      await expect(pending).resolves.toMatchObject({stdout: 'first\n'});
+    } finally {
+      await firstHandle.close().catch(() => undefined);
+      await secondHandle.close().catch(() => undefined);
+    }
+  });
+
+  it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    'rejects invalid borrowed descriptor %s',
+    async (descriptor) => {
+      await expect(runProcess(
+        process.execPath,
+        ['-e', 'process.exit(0)'],
+        {extraStdioFds: [descriptor]},
+      )).rejects.toBeInstanceOf(RangeError);
+    },
+  );
+
+  it.each([
+    {
+      name: 'normal exit',
+      run: (fd: number) => runProcess(
+        process.execPath,
+        ['-e', 'process.exit(0)'],
+        {extraStdioFds: [fd]},
+      ),
+    },
+    {
+      name: 'nonzero exit',
+      run: (fd: number) => runProcess(
+        process.execPath,
+        ['-e', 'process.exit(7)'],
+        {extraStdioFds: [fd]},
+      ),
+    },
+    {
+      name: 'spawn failure',
+      run: (fd: number) => runProcess(
+        path.join(tmpdir(), `missing-fd-process-${Date.now()}`),
+        [],
+        {extraStdioFds: [fd]},
+      ),
+    },
+    {
+      name: 'abort',
+      run: (fd: number) => {
+        const controller = new AbortController();
+        const pending = runProcess(
+          process.execPath,
+          ['-e', 'setInterval(() => {}, 1000)'],
+          {signal: controller.signal, extraStdioFds: [fd]},
+        );
+        controller.abort('fd ownership abort');
+        return pending;
+      },
+    },
+    {
+      name: 'timeout',
+      run: (fd: number) => runProcess(
+        process.execPath,
+        ['-e', 'setInterval(() => {}, 1000)'],
+        {timeoutMs: 20, extraStdioFds: [fd]},
+      ),
+    },
+  ])('keeps borrowed descriptor ownership with the caller after $name', async ({run}) => {
+    const tempDirectory = await mkdtemp(path.join(tmpdir(), 'run-process-fd-owner-'));
+    onTestFinished(() => rm(tempDirectory, {recursive: true, force: true}));
+    const inputPath = path.join(tempDirectory, 'input.txt');
+    await writeFile(inputPath, 'owned');
+    const handle = await open(inputPath, 'r');
+
+    try {
+      await observeProcess(run(handle.fd));
+      expect((await handle.stat()).isFile()).toBe(true);
+    } finally {
+      await handle.close();
+    }
   });
 
   it('snapshots options and cleans up the original AbortSignal listener', async () => {
@@ -415,6 +558,49 @@ describe('runProcess', () => {
     },
   );
 
+  it.skipIf(process.platform !== 'darwin')(
+    'reports unexpected process-group probe failures with the original abort code',
+    async () => {
+      const tempDirectory = await mkdtemp(path.join(tmpdir(), 'run-process-probe-failure-'));
+      const pidFile = path.join(tempDirectory, 'pid');
+      const controller = new AbortController();
+      let outcome: Promise<ProcessOutcome> | undefined;
+      let pids: TrackedPids | undefined;
+      const probeFailure = Object.assign(new Error('probe failed'), {code: 'EIO'});
+      const killSpy = vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+        if (signal === 0 && pid < 0) throw probeFailure;
+        return nativeProcessKill(pid, signal);
+      });
+      onTestFinished(async () => {
+        killSpy.mockRestore();
+        await cleanupTrackedProcess({
+          controller,
+          outcome,
+          pids,
+          tempDirectory,
+        });
+      });
+
+      outcome = observeProcess(runProcess(
+        process.execPath,
+        ['-e', createPidScript(true), pidFile],
+        {signal: controller.signal},
+      ));
+      pids = {parent: Number(await readWhenReady(pidFile))};
+      controller.abort('probe failure abort');
+
+      const result = await waitForOutcome(outcome, 1500);
+      expect(result).toMatchObject({
+        status: 'rejected',
+        error: {
+          code: 'PROCESS_ABORTED',
+          reason: expect.stringContaining('process group probe failed'),
+          cause: probeFailure,
+        },
+      });
+    },
+  );
+
   it('caps output at an exact UTF-8 boundary without full-size concatenation', async () => {
     const tempDirectory = await mkdtemp(path.join(tmpdir(), 'run-process-output-'));
     onTestFinished(() => rm(tempDirectory, {recursive: true, force: true}));
@@ -531,4 +717,62 @@ describe('runProcess', () => {
       ).toEqual([false, false]);
     },
   );
+
+  describe.skipIf(process.platform !== 'darwin')('Darwin process-group completion', () => {
+    it.each([
+      {trigger: 'abort', expectedCode: 'PROCESS_ABORTED'},
+      {trigger: 'timeout', expectedCode: 'PROCESS_TIMEOUT'},
+    ] as const)(
+      'waits for a SIGTERM-resistant grandchild before settling $trigger',
+      async ({trigger, expectedCode}) => {
+        const tempDirectory = await mkdtemp(path.join(tmpdir(), `run-process-group-${trigger}-`));
+        const pidFile = path.join(tempDirectory, 'pids.json');
+        const readyFile = path.join(tempDirectory, 'child-ready');
+        const controller = new AbortController();
+        let outcome: Promise<ProcessOutcome> | undefined;
+        let processPids: TrackedPids | undefined;
+        onTestFinished(async () => {
+          await cleanupTrackedProcess({
+            controller,
+            outcome,
+            pids: processPids,
+            tempDirectory,
+          });
+        });
+        const childScript = [
+          'const {writeFileSync} = require("node:fs")',
+          'process.on("SIGTERM", () => {})',
+          'writeFileSync(process.argv[1], "ready")',
+          'setInterval(() => {}, 1000)',
+        ].join(';');
+        const parentScript = [
+          'const {spawn} = require("node:child_process")',
+          'const {writeFileSync} = require("node:fs")',
+          `const child = spawn(process.execPath, ['-e', ${JSON.stringify(childScript)}, process.argv[2]], {stdio: 'ignore'})`,
+          'writeFileSync(process.argv[1], JSON.stringify({parent: process.pid, child: child.pid}))',
+          'setInterval(() => {}, 1000)',
+        ].join(';');
+        outcome = observeProcess(runProcess(
+          process.execPath,
+          ['-e', parentScript, pidFile, readyFile],
+          {
+            signal: controller.signal,
+            ...(trigger === 'timeout' ? {timeoutMs: 1000} : {}),
+          },
+        ));
+
+        processPids = JSON.parse(await readWhenReady(pidFile)) as TrackedPids;
+        await readWhenReady(readyFile);
+        if (trigger === 'abort') controller.abort('stop process group');
+
+        const result = await waitForOutcome(outcome, 2000);
+        expect(result).toMatchObject({
+          status: 'rejected',
+          error: {code: expectedCode},
+        });
+        expect(isProcessAlive(processPids.parent)).toBe(false);
+        expect(isProcessAlive(processPids.child!)).toBe(false);
+      },
+    );
+  });
 });

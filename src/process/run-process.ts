@@ -9,7 +9,8 @@ import {
 export const PROCESS_OUTPUT_LIMIT_BYTES = 1024 * 1024;
 
 const PROCESS_KILL_GRACE_MS = 100;
-const PROCESS_FINAL_SETTLE_MS = 100;
+const PROCESS_GROUP_POLL_MS = 10;
+const PROCESS_FINAL_SETTLE_MS = 500;
 const OUTPUT_TRUNCATED_MARKER = Buffer.from('\n[output truncated]\n');
 const OUTPUT_CONTENT_LIMIT_BYTES = (
   PROCESS_OUTPUT_LIMIT_BYTES - OUTPUT_TRUNCATED_MARKER.byteLength
@@ -30,6 +31,8 @@ export interface ProcessResult {
 export interface RunProcessOptions {
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
+  /** Borrowed parent FDs mapped to child FDs 3 + index; ownership stays with the caller. */
+  readonly extraStdioFds?: readonly number[];
 }
 
 interface TerminationReason {
@@ -156,6 +159,16 @@ const validateTimeout = (timeoutMs: number | undefined): void => {
   }
 };
 
+const validateExtraStdioFds = (extraStdioFds: readonly number[]): void => {
+  for (const [index, descriptor] of extraStdioFds.entries()) {
+    if (!Number.isInteger(descriptor) || descriptor < 0) {
+      throw new RangeError(
+        `extraStdioFds[${index}] must be a non-negative integer`,
+      );
+    }
+  }
+};
+
 const sendSignal = (
   child: ChildProcess,
   signal: NodeJS.Signals,
@@ -205,7 +218,9 @@ export async function runProcess(
 ): Promise<ProcessResult> {
   const timeoutMs = options.timeoutMs;
   const signal = options.signal;
+  const extraStdioFds = [...(options.extraStdioFds ?? [])];
   validateTimeout(timeoutMs);
+  validateExtraStdioFds(extraStdioFds);
 
   const processArgs = [...args];
   const startedAt = performance.now();
@@ -236,10 +251,16 @@ export async function runProcess(
   const useProcessGroup = process.platform === 'darwin';
   let child: ChildProcess;
   try {
+    const stdio: Array<'ignore' | 'pipe' | number> = [
+      'ignore',
+      'pipe',
+      'pipe',
+      ...extraStdioFds,
+    ];
     child = spawn(command, processArgs, {
       shell: false,
       detached: useProcessGroup,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio,
     });
   } catch (error) {
     throw new ProcessExecutionError(
@@ -255,7 +276,12 @@ export async function runProcess(
     let termination: TerminationReason | undefined;
     let timeoutTimer: NodeJS.Timeout | undefined;
     let forceKillTimer: NodeJS.Timeout | undefined;
+    let groupPollTimer: NodeJS.Timeout | undefined;
     let finalSettleTimer: NodeJS.Timeout | undefined;
+    let leaderCloseSeen = false;
+    let leaderResult: ProcessResult | undefined;
+    let groupGone = !useProcessGroup;
+    let groupProbeFailureRecorded = false;
 
     const onStdout = (chunk: Buffer | string): void => stdout.append(chunk);
     const onStderr = (chunk: Buffer | string): void => stderr.append(chunk);
@@ -263,12 +289,18 @@ export async function runProcess(
     const cleanup = (): void => {
       if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
       if (forceKillTimer !== undefined) clearTimeout(forceKillTimer);
+      if (groupPollTimer !== undefined) clearInterval(groupPollTimer);
       if (finalSettleTimer !== undefined) clearTimeout(finalSettleTimer);
       signal?.removeEventListener('abort', onAbort);
       child.stdout?.removeListener('data', onStdout);
       child.stderr?.removeListener('data', onStderr);
       child.removeListener('error', onError);
       child.removeListener('close', onClose);
+    };
+
+    const stopOutputCapture = (): void => {
+      child.stdout?.removeListener('data', onStdout);
+      child.stderr?.removeListener('data', onStderr);
     };
 
     const settle = (callback: () => void): void => {
@@ -279,8 +311,7 @@ export async function runProcess(
     };
 
     const detachAfterFailedTermination = (): void => {
-      child.stdout?.removeListener('data', onStdout);
-      child.stderr?.removeListener('data', onStderr);
+      stopOutputCapture();
       child.stdout?.once('error', NOOP);
       child.stderr?.once('error', NOOP);
       child.stdout?.destroy();
@@ -290,38 +321,130 @@ export async function runProcess(
       child.unref();
     };
 
-    const settleTerminatedWithoutClose = (): void => {
+    const recordGroupProbeFailure = (error: unknown): void => {
+      if (termination === undefined || groupProbeFailureRecorded) return;
+      groupProbeFailureRecorded = true;
+      termination = {
+        code: termination.code,
+        reason: `${termination.reason}; process group probe failed: ${String(error)}`,
+        cause: error,
+      };
+    };
+
+    const probeProcessGroup = (): void => {
+      if (!useProcessGroup || child.pid === undefined) {
+        groupGone = true;
+        return;
+      }
+
+      try {
+        process.kill(-child.pid, 0);
+        groupGone = false;
+      } catch (error) {
+        if (isNodeError(error) && error.code === 'ESRCH') {
+          groupGone = true;
+          return;
+        }
+        if (isNodeError(error) && error.code === 'EPERM') {
+          groupGone = false;
+          return;
+        }
+        groupGone = false;
+        recordGroupProbeFailure(error);
+      }
+    };
+
+    const rejectForTermination = (reasonSuffix?: string): void => {
       if (settled || termination === undefined) return;
       const finalTermination = termination;
-      const result = createResult(-1, null);
-      detachAfterFailedTermination();
+      const result = leaderResult ?? createResult(-1, null);
       settle(() => reject(new ProcessExecutionError(
         finalTermination.code,
-        `${finalTermination.reason}; process did not close after SIGKILL`,
+        reasonSuffix === undefined
+          ? finalTermination.reason
+          : `${finalTermination.reason}; ${reasonSuffix}`,
         result,
         finalTermination.cause,
       )));
     };
 
+    const maybeSettleTermination = (): void => {
+      if (
+        termination === undefined
+        || !leaderCloseSeen
+        || (useProcessGroup && !groupGone)
+      ) return;
+      rejectForTermination();
+    };
+
+    const pollProcessGroup = (): void => {
+      if (settled || termination === undefined || !useProcessGroup) return;
+      probeProcessGroup();
+      if (groupGone && groupPollTimer !== undefined) {
+        clearInterval(groupPollTimer);
+        groupPollTimer = undefined;
+      }
+      maybeSettleTermination();
+    };
+
+    const startGroupPolling = (): void => {
+      if (!useProcessGroup || groupGone || groupPollTimer !== undefined) return;
+      groupPollTimer = setInterval(pollProcessGroup, PROCESS_GROUP_POLL_MS);
+    };
+
+    const settleAfterTerminationDeadline = (): void => {
+      if (settled || termination === undefined) return;
+      if (useProcessGroup) probeProcessGroup();
+      maybeSettleTermination();
+      if (settled) return;
+
+      const unconfirmed: string[] = [];
+      if (!leaderCloseSeen) unconfirmed.push('leader close');
+      if (useProcessGroup && !groupGone) unconfirmed.push('process group exit');
+      detachAfterFailedTermination();
+      rejectForTermination(
+        `termination confirmation timed out waiting for ${unconfirmed.join(' and ')}`,
+      );
+    };
+
     const requestTermination = (nextTermination: TerminationReason): void => {
       if (settled || termination !== undefined) return;
       termination = nextTermination;
+      if (timeoutTimer !== undefined) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = undefined;
+      }
+      signal?.removeEventListener('abort', onAbort);
 
       try {
         sendSignal(child, 'SIGTERM', useProcessGroup);
       } catch (error) {
         termination = withSignalFailure(termination, 'SIGTERM', error);
       }
+      if (useProcessGroup) {
+        probeProcessGroup();
+        startGroupPolling();
+      }
+      maybeSettleTermination();
 
       forceKillTimer = setTimeout(() => {
         if (settled || termination === undefined) return;
-        try {
-          sendSignal(child, 'SIGKILL', useProcessGroup);
-        } catch (error) {
-          termination = withSignalFailure(termination, 'SIGKILL', error);
+        if (useProcessGroup) probeProcessGroup();
+        if (!useProcessGroup || !groupGone) {
+          try {
+            sendSignal(child, 'SIGKILL', useProcessGroup);
+          } catch (error) {
+            termination = withSignalFailure(termination, 'SIGKILL', error);
+          }
         }
+        if (useProcessGroup) {
+          probeProcessGroup();
+          startGroupPolling();
+        }
+        maybeSettleTermination();
+        if (settled) return;
         finalSettleTimer = setTimeout(
-          settleTerminatedWithoutClose,
+          settleAfterTerminationDeadline,
           PROCESS_FINAL_SETTLE_MS,
         );
       }, PROCESS_KILL_GRACE_MS);
@@ -348,14 +471,15 @@ export async function runProcess(
       exitSignal: NodeJS.Signals | null,
     ): void {
       const result = createResult(exitCode ?? -1, exitSignal);
+      leaderCloseSeen = true;
+      leaderResult = result;
+      stopOutputCapture();
       if (termination !== undefined) {
-        const finalTermination = termination;
-        settle(() => reject(new ProcessExecutionError(
-          finalTermination.code,
-          finalTermination.reason,
-          result,
-          finalTermination.cause,
-        )));
+        if (useProcessGroup) {
+          probeProcessGroup();
+          startGroupPolling();
+        }
+        maybeSettleTermination();
         return;
       }
 
