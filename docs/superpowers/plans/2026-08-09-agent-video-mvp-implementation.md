@@ -668,114 +668,49 @@ git commit -m "feat: define strict video project schemas"
 - Create: `src/domain/validate-authoring.ts`
 - Create: `tests/helpers/temp-project.ts`
 - Test: `tests/unit/fs/project-paths.test.ts`
+- Test: `tests/unit/fs/json-files.test.ts`
 - Test: `tests/unit/domain/load-project.test.ts`
+- Test: `tests/unit/domain/load-project-root.test.ts`
 - Test: `tests/unit/domain/validate-authoring.test.ts`
+- Test: `tests/unit/helpers/temp-project.test.ts`
 
-- [ ] **Step 1: Write path escape tests**
+- [ ] **Step 1: Write handle-based path race tests**
 
-```ts
-import {mkdtemp, mkdir, readFile, symlink, writeFile} from 'node:fs/promises';
-import {tmpdir} from 'node:os';
-import path from 'node:path';
-import {describe, expect, it} from 'vitest';
-import {openNewProjectFile, resolveExistingProjectPath} from '../../../src/fs/project-paths';
+Target macOS 15+ only. Tests must exercise real `fs.open()` behavior rather than assert a numeric constant:
 
-describe('resolveExistingProjectPath', () => {
-  it('accepts a regular file inside the project', async () => {
-    const root = await mkdtemp(path.join(tmpdir(), 'video-project-'));
-    await mkdir(path.join(root, 'assets'), {recursive: true});
-    await writeFile(path.join(root, 'assets', 'clip.mp4'), 'fixture');
-    await expect(resolveExistingProjectPath(root, 'assets/clip.mp4')).resolves.toBe(path.join(root, 'assets', 'clip.mp4'));
-  });
-
-  it('rejects a symlink that resolves outside the project', async () => {
-    const root = await mkdtemp(path.join(tmpdir(), 'video-project-'));
-    const outside = await mkdtemp(path.join(tmpdir(), 'outside-'));
-    await writeFile(path.join(outside, 'secret.mp4'), 'fixture');
-    await symlink(path.join(outside, 'secret.mp4'), path.join(root, 'escape.mp4'));
-    await expect(resolveExistingProjectPath(root, 'escape.mp4')).rejects.toMatchObject({code: 'ASSET_PATH_OUTSIDE_PROJECT'});
-  });
-
-  it('does not follow a writable target symlink outside the project', async () => {
-    const root = await mkdtemp(path.join(tmpdir(), 'video-project-'));
-    const outside = await mkdtemp(path.join(tmpdir(), 'outside-'));
-    const secret = path.join(outside, 'secret.txt');
-    await writeFile(secret, 'unchanged');
-    await symlink(secret, path.join(root, 'report.json'));
-
-    await expect(openNewProjectFile(root, 'report.json')).rejects.toMatchObject({code: 'ASSET_PATH_OUTSIDE_PROJECT'});
-    await expect(readFile(secret, 'utf8')).resolves.toBe('unchanged');
-  });
-});
-```
+- canonical in-root reads and exclusive creates succeed through `FileHandle` APIs;
+- final and ancestor symlinks resolving outside containment fail;
+- a stable internal symlink is canonicalized and can be opened safely;
+- after canonicalization, replacing the canonical parent with an external symlink makes the final open fail and does not create the external file;
+- static writable target symlinks become `ProjectPathError`, while a regular target appearing after preparation preserves `EEXIST`;
+- non-Darwin calls fail before filesystem access with `ENV_PLATFORM_UNSUPPORTED`;
+- every opened handle is closed in `finally`, and every temporary directory is registered with `onTestFinished()` or cleaned in `finally`.
 
 - [ ] **Step 2: Run and verify failure**
 
 Run: `pnpm test tests/unit/fs/project-paths.test.ts`
 
-Expected: FAIL because the resolver does not exist.
+Expected: FAIL because the handle/capability API and open-time substitution defense do not exist.
 
-- [ ] **Step 3: Implement safe path resolution**
+- [ ] **Step 3: Implement Darwin no-follow handle capabilities**
 
-```ts
-import {constants} from 'node:fs';
-import {lstat, open, realpath, type FileHandle} from 'node:fs/promises';
-import path from 'node:path';
+Use Darwin `O_NOFOLLOW_ANY = 0x20000000` as a numeric Node 22 open flag. Path-only canonicalization helpers remain module-private and never authorize production I/O.
 
-export class ProjectPathError extends Error {
-  readonly code = 'ASSET_PATH_OUTSIDE_PROJECT';
-}
+- `openExistingProjectFile(containmentRoot, relativePath)` canonicalizes root and target, verifies containment, then opens the canonical target with `O_RDONLY | O_NOFOLLOW_ANY`.
+- `openNewProjectFile(containmentRoot, relativePath)` canonicalizes the real parent, checks a static final symlink with `lstat`, then opens `parentReal + basename` with `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW_ANY` and mode `0o600`.
+- Safe prepared capabilities may be exposed for staged operations and deterministic race tests, but they expose only `open()` and never a path string.
+- Map canonicalization/open `ELOOP` to `ProjectPathError`; preserve ordinary `EEXIST` from exclusive create races.
+- Reject non-Darwin platforms with `ENV_PLATFORM_UNSUPPORTED` before any path lookup.
 
-const isWithin = (root: string, target: string): boolean => target === root || target.startsWith(`${root}${path.sep}`);
-const isNodeError = (error: unknown): error is NodeJS.ErrnoException => error instanceof Error && 'code' in error;
+Never call `writeFile()` directly on a user-derived writable target. Immutable artifacts use `openNewProjectFile()`. Pointer replacement uses a same-directory temporary capability, sync, and atomic rename.
 
-export async function resolveExistingProjectPath(projectRoot: string, relativePath: string): Promise<string> {
-  if (path.isAbsolute(relativePath)) throw new ProjectPathError('absolute paths are not allowed');
-  const rootReal = await realpath(projectRoot);
-  const targetReal = await realpath(path.resolve(rootReal, relativePath));
-  if (!isWithin(rootReal, targetReal)) throw new ProjectPathError(`path escapes project: ${relativePath}`);
-  return targetReal;
-}
-
-export async function resolveWritableProjectPath(projectRoot: string, relativePath: string): Promise<string> {
-  if (path.isAbsolute(relativePath)) throw new ProjectPathError('absolute paths are not allowed');
-  const rootReal = await realpath(projectRoot);
-  const unresolvedTarget = path.resolve(rootReal, relativePath);
-  const parentReal = await realpath(path.dirname(unresolvedTarget));
-  if (!isWithin(rootReal, parentReal)) throw new ProjectPathError(`path escapes project: ${relativePath}`);
-  const target = path.join(parentReal, path.basename(unresolvedTarget));
-  try {
-    if ((await lstat(target)).isSymbolicLink()) throw new ProjectPathError(`writable target is a symlink: ${relativePath}`);
-  } catch (error) {
-    if (!isNodeError(error) || error.code !== 'ENOENT') throw error;
-  }
-  return target;
-}
-
-export async function openNewProjectFile(projectRoot: string, relativePath: string): Promise<FileHandle> {
-  const target = await resolveWritableProjectPath(projectRoot, relativePath);
-  const flags = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW;
-  return open(target, flags, 0o600);
-}
-```
-
-Never call `writeFile()` directly on a user-derived writable target. Immutable artifacts use `openNewProjectFile()`. Pointer replacement uses a new same-directory temporary file opened with the same no-follow/exclusive flags, followed by sync and atomic rename.
+Threat boundary: this prevents symlink traversal and symlink substitution between canonicalization and open. It does not claim to prevent hard-link substitution, replacement with ordinary directories or mount points, or concurrent modification of an already opened file's contents.
 
 - [ ] **Step 4: Implement JSON loading and project context**
 
-`src/fs/json-files.ts`:
+`readJson(containmentRoot, filePath, schema)` must obtain a `FileHandle` from `openExistingProjectFile()`, read from that same handle, and always close it in `finally`. The function owns the handle. Wrap open, JSON, and Zod failures in `JsonFileError` containing `filePath` and `cause`.
 
-```ts
-import {readFile} from 'node:fs/promises';
-import type {ZodType} from 'zod';
-
-export async function readJson<T>(filePath: string, schema: ZodType<T>): Promise<T> {
-  const source = await readFile(filePath, 'utf8');
-  return schema.parse(JSON.parse(source));
-}
-```
-
-`src/domain/load-project.ts` must resolve `projects/<id>`, reject invalid IDs, read `project.json`, `script.json`, and `edit.json` with the schemas, and return:
+`src/domain/load-project.ts` rejects invalid IDs and reads all authoring files with `workspaceRootReal` as the only containment root and `projects/<id>/<file>` as relative paths. Never re-root trust at a previously resolved `projectRoot`.
 
 ```ts
 export interface ProjectInputs {
@@ -787,16 +722,18 @@ export interface ProjectInputs {
 }
 ```
 
-After independent Schema parsing, call `validateAuthoringInputs()` from `src/domain/validate-authoring.ts`. Count `segment.text` with `Intl.Segmenter('zh-CN', {granularity: 'grapheme'})`; throw `SCRIPT_SEGMENT_TEXT_TOO_LONG` when a segment exceeds `project.captions.maximumChineseCharacters`. Tests must cover a project limit lower than 28, a permitted limit above 28, and mixed CJK, ASCII, combining marks, and Emoji.
+`projectRoot` is informational only and must never be reused as a containment root or filesystem capability.
+
+Check `project.json` ID mismatch immediately after its Schema parse, before reading `script.json` or `edit.json`. After all three Schemas pass, call `validateAuthoringInputs()`. Count `segment.text` with `Intl.Segmenter('zh-CN', {granularity: 'grapheme'})`; throw `SCRIPT_SEGMENT_TEXT_TOO_LONG` when a segment exceeds `project.captions.maximumChineseCharacters`.
 
 - [ ] **Step 5: Add loader tests and verify**
 
-The loader test must prove valid files load, malformed JSON fails, unknown fields fail, project IDs cannot contain `/` or `..`, and cross-file authoring validation runs after all three Schemas parse.
+Tests must prove valid files load, malformed JSON and unknown fields retain their causes through `JsonFileError`, project IDs cannot contain `/` or `..`, ID mismatch wins over damaged later files, every authoring read keeps `workspaceRootReal` as containment root, and cross-file validation runs only after all three Schemas pass. Verify handle closure on success, JSON failure, and Zod failure. `createTempProject()` must remove a partially initialized workspace before rethrowing.
 
 Run:
 
 ```bash
-pnpm test tests/unit/fs/project-paths.test.ts tests/unit/domain/load-project.test.ts tests/unit/domain/validate-authoring.test.ts
+pnpm test tests/unit/fs/project-paths.test.ts tests/unit/fs/json-files.test.ts tests/unit/domain/load-project.test.ts tests/unit/domain/load-project-root.test.ts tests/unit/domain/validate-authoring.test.ts tests/unit/helpers/temp-project.test.ts
 pnpm typecheck
 ```
 
@@ -805,8 +742,8 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/fs src/domain/load-project.ts src/domain/validate-authoring.ts tests/helpers tests/unit/fs tests/unit/domain/load-project.test.ts tests/unit/domain/validate-authoring.test.ts
-git commit -m "feat: load projects through safe paths"
+git add src/fs src/domain/load-project.ts src/domain/validate-authoring.ts tests/helpers tests/unit/fs tests/unit/domain/load-project.test.ts tests/unit/domain/load-project-root.test.ts tests/unit/domain/validate-authoring.test.ts
+git commit -m "fix: close project path race windows"
 ```
 
 ## Task 4: Build the Abortable Process Runner and Gate Protocol
@@ -1145,7 +1082,7 @@ Write to the current immutable run directory, never next to the source.
 
 - [ ] **Step 5: Implement Ingest**
 
-Hash source files, resolve paths through `resolveExistingProjectPath()`, probe them, decode beginning/middle/end samples, transcode only when required, and write `asset-manifest.json`. Verify source hashes again after processing.
+Open each source through `openExistingProjectFile(workspaceRootReal, projectRelativePath)` and keep the returned handle/FD as the I/O authority. Hash, ffprobe, sample-decode, and transcode through that controlled FD: explicitly map the FD into the child process `stdio` and reference the inherited descriptor (for example `/dev/fd/3`), or use a controlled pipe. Never resolve a path string and later reopen it. Transcode only when required, write `asset-manifest.json`, and verify the source hash again through the same handle/FD strategy after processing.
 
 - [ ] **Step 6: Verify and commit**
 

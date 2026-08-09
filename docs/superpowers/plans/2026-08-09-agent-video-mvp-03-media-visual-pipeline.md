@@ -89,7 +89,7 @@ Write to the current immutable run directory, never next to the source.
 
 - [ ] **Step 5: Implement Ingest**
 
-Hash source files, resolve paths through `resolveExistingProjectPath()`, probe them, decode beginning/middle/end samples, transcode only when required, and write `asset-manifest.json`. Verify source hashes again after processing.
+Open each source through `openExistingProjectFile(workspaceRootReal, projectRelativePath)` and keep the returned handle/FD as the I/O authority. Hash, ffprobe, sample-decode, and transcode through that controlled FD: explicitly map the FD into the child process `stdio` and reference the inherited descriptor (for example `/dev/fd/3`), or use a controlled pipe. Never resolve a path string and later reopen it. Transcode only when required, write `asset-manifest.json`, and verify the source hash again through the same handle/FD strategy after processing.
 
 - [ ] **Step 6: Verify and commit**
 
