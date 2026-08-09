@@ -1,9 +1,9 @@
 import {z} from 'zod';
+import {StableIdSchema} from './schema-primitives';
 
-const IdSchema = z.string().regex(/^[a-z][a-z0-9-]*$/);
-const AssetIdSchema = IdSchema;
+const AssetIdSchema = StableIdSchema;
 const TimelineBaseSchema = z.object({
-  id: IdSchema,
+  id: StableIdSchema,
   assetId: AssetIdSchema,
   startFrame: z.number().int().nonnegative(),
   durationInFrames: z.number().int().positive(),
@@ -19,8 +19,8 @@ const TimelineBaseSchema = z.object({
 export const VisualClipSchema = z.discriminatedUnion('kind', [
   TimelineBaseSchema.extend({
     kind: z.literal('video'),
-    sourceInMs: z.number().int().nonnegative(),
-    sourceOutMs: z.number().int().positive(),
+    sourceInMs: z.number().nonnegative(),
+    sourceOutMs: z.number().positive(),
   }).strict(),
   TimelineBaseSchema.extend({kind: z.literal('image')}).strict(),
 ]).superRefine((clip, context) => {
@@ -37,8 +37,8 @@ export const EditSchema = z.object({
   version: z.literal(1),
   visualClips: z.array(VisualClipSchema).min(1),
   overlays: z.array(z.object({
-    id: IdSchema,
-    component: IdSchema,
+    id: StableIdSchema,
+    component: StableIdSchema,
     startFrame: z.number().int().nonnegative(),
     durationInFrames: z.number().int().positive(),
     props: z.record(z.string(), z.unknown()),
@@ -46,13 +46,27 @@ export const EditSchema = z.object({
   }).strict()),
   backgroundMusic: z.object({
     assetId: AssetIdSchema,
-    startMs: z.number().int().nonnegative(),
+    startMs: z.number().nonnegative(),
   }).strict().optional(),
 }).strict().superRefine((edit, context) => {
   const ids = new Set<string>();
-  for (const item of [...edit.visualClips, ...edit.overlays]) {
+  for (const [index, item] of edit.visualClips.entries()) {
     if (ids.has(item.id)) {
-      context.addIssue({code: 'custom', message: `duplicate timeline id: ${item.id}`});
+      context.addIssue({
+        code: 'custom',
+        path: ['visualClips', index, 'id'],
+        message: `duplicate timeline id: ${item.id}`,
+      });
+    }
+    ids.add(item.id);
+  }
+  for (const [index, item] of edit.overlays.entries()) {
+    if (ids.has(item.id)) {
+      context.addIssue({
+        code: 'custom',
+        path: ['overlays', index, 'id'],
+        message: `duplicate timeline id: ${item.id}`,
+      });
     }
     ids.add(item.id);
   }

@@ -1,13 +1,9 @@
 import {z} from 'zod';
-
-const RelativePathSchema = z.string().min(1).refine(
-  (value) => !value.startsWith('/') && !value.includes('..'),
-  'must be a project-relative path',
-);
+import {ProjectRelativePathSchema, StableIdSchema} from './schema-primitives';
 
 export const ProjectSchema = z.object({
   version: z.literal(1),
-  id: z.string().regex(/^[a-z][a-z0-9-]*$/),
+  id: StableIdSchema,
   composition: z.object({
     width: z.literal(1920),
     height: z.literal(1080),
@@ -21,7 +17,7 @@ export const ProjectSchema = z.object({
     rate: z.number().int().min(80).max(400),
   }).strict(),
   captions: z.object({
-    font: RelativePathSchema,
+    font: ProjectRelativePathSchema,
     fontSize: z.number().int().min(16).max(120),
     color: z.string().regex(/^#[0-9A-Fa-f]{6}$/),
     bottomMargin: z.number().int().min(0).max(400),
@@ -33,8 +29,8 @@ export const ProjectSchema = z.object({
     truePeakDb: z.number().min(-3).max(-0.1),
     backgroundMusicGainDb: z.number().min(-60).max(0),
     duckDuringNarrationDb: z.number().min(-30).max(0),
-    duckAttackMs: z.number().int().min(0).max(2_000),
-    duckReleaseMs: z.number().int().min(0).max(5_000),
+    duckAttackMs: z.number().min(0).max(2_000),
+    duckReleaseMs: z.number().min(0).max(5_000),
   }).strict(),
   render: z.object({
     draftWidth: z.literal(960),

@@ -17,7 +17,7 @@
 - **Project Index:** `2026-08-09-agent-video-mvp-project-index.md`
 - **Master Tasks:** 1–4
 - **Depends On:** None
-- **Primary Write Set:** `package.json`, `pnpm-lock.yaml`, package-manager configuration (`.npmrc`, `.pnpmfile.cjs`), TypeScript/test configuration, `src/domain/**`, `src/fs/**`, `src/process/**`, `src/pipeline/types.ts`, and `src/pipeline/gate.ts`.
+- **Primary Write Set:** `package.json`, `pnpm-lock.yaml`, package-manager configuration (`.npmrc`, `.pnpmfile.cjs`), TypeScript/test configuration, shared Schema primitives in `src/domain/schema-primitives.ts`, the remaining `src/domain/**`, `src/fs/**`, `src/process/**`, `src/pipeline/types.ts`, and `src/pipeline/gate.ts`.
 - **Must Not Implement:** Media probing, TTS, Remotion rendering, release packaging, Stage registry, Presets, or Runner behavior.
 - **Exit Artifact:** Frozen authoring Schemas, generated Manifest types, safe read/write path APIs, process protocol, and Gate aggregation.
 
@@ -188,6 +188,7 @@ git commit -m "chore: bootstrap agent video toolchain"
 ## Task 2: Define Strict Authoring and Generated Schemas
 
 **Files:**
+- Create: `src/domain/schema-primitives.ts`
 - Create: `src/domain/project-schema.ts`
 - Create: `src/domain/script-schema.ts`
 - Create: `src/domain/edit-schema.ts`
@@ -290,24 +291,49 @@ describe('authoring schemas', () => {
 });
 ```
 
+The regression suite must also cover lexical path rejection (URI schemes, Windows drives, backslashes, and exact `..` segments while allowing `font..otf`), fractional millisecond values, generated numeric and interval invariants, stable/generated ID uniqueness with precise issue paths, nested strictness, and the independent compiled-clip contract where either kind may omit or provide `sourceInMs`.
+
 - [ ] **Step 2: Run and verify failure**
 
 Run: `pnpm test tests/unit/domain/schemas.test.ts`
 
 Expected: FAIL because schema modules do not exist.
 
-- [ ] **Step 3: Implement the project and script schemas**
+- [ ] **Step 3: Implement shared primitives plus the project and script schemas**
+
+`src/domain/schema-primitives.ts` must export:
+
+```ts
+import {z} from 'zod';
+
+const URI_SCHEME_PATTERN = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+const WINDOWS_DRIVE_PATTERN = /^[A-Za-z]:/;
+
+export const StableIdSchema = z.string().regex(/^[a-z][a-z0-9-]*$/);
+
+export const ProjectRelativePathSchema = z.string().min(1).superRefine((value, context) => {
+  if (value.startsWith('/')) context.addIssue({code: 'custom', message: 'must not start with /'});
+  if (WINDOWS_DRIVE_PATTERN.test(value)) {
+    context.addIssue({code: 'custom', message: 'must not use a Windows drive path'});
+  } else if (URI_SCHEME_PATTERN.test(value)) {
+    context.addIssue({code: 'custom', message: 'must not use a URI scheme'});
+  }
+  if (value.includes('\\')) context.addIssue({code: 'custom', message: 'must use forward slashes'});
+  if (value.split('/').includes('..')) context.addIssue({code: 'custom', message: 'must not contain a parent-directory segment'});
+});
+```
+
+Use these shared primitives for every Task 2 stable ID and project-relative path field. Filesystem containment and symlink checks remain Task 3 responsibilities.
 
 `src/domain/project-schema.ts`:
 
 ```ts
 import {z} from 'zod';
-
-const RelativePathSchema = z.string().min(1).refine((value) => !value.startsWith('/') && !value.includes('..'), 'must be a project-relative path');
+import {ProjectRelativePathSchema, StableIdSchema} from './schema-primitives';
 
 export const ProjectSchema = z.object({
   version: z.literal(1),
-  id: z.string().regex(/^[a-z][a-z0-9-]*$/),
+  id: StableIdSchema,
   composition: z.object({
     width: z.literal(1920),
     height: z.literal(1080),
@@ -321,7 +347,7 @@ export const ProjectSchema = z.object({
     rate: z.number().int().min(80).max(400),
   }).strict(),
   captions: z.object({
-    font: RelativePathSchema,
+    font: ProjectRelativePathSchema,
     fontSize: z.number().int().min(16).max(120),
     color: z.string().regex(/^#[0-9A-Fa-f]{6}$/),
     bottomMargin: z.number().int().min(0).max(400),
@@ -333,8 +359,8 @@ export const ProjectSchema = z.object({
     truePeakDb: z.number().min(-3).max(-0.1),
     backgroundMusicGainDb: z.number().min(-60).max(0),
     duckDuringNarrationDb: z.number().min(-30).max(0),
-    duckAttackMs: z.number().int().min(0).max(2_000),
-    duckReleaseMs: z.number().int().min(0).max(5_000),
+    duckAttackMs: z.number().min(0).max(2_000),
+    duckReleaseMs: z.number().min(0).max(5_000),
   }).strict(),
   render: z.object({
     draftWidth: z.literal(960),
@@ -351,16 +377,15 @@ export type Project = z.infer<typeof ProjectSchema>;
 
 ```ts
 import {z} from 'zod';
-
-const RelativePathSchema = z.string().min(1).refine((value) => !value.startsWith('/') && !value.includes('..'));
+import {ProjectRelativePathSchema, StableIdSchema} from './schema-primitives';
 
 export const ScriptSegmentSchema = z.object({
-  id: z.string().regex(/^[a-z][a-z0-9-]*$/),
+  id: StableIdSchema,
   text: z.string().min(1),
   normalizedText: z.string().min(1),
-  pauseAfterMs: z.number().int().min(0).max(5_000),
+  pauseAfterMs: z.number().min(0).max(5_000),
   requiredTerms: z.array(z.string().min(1)),
-  audioPath: RelativePathSchema.optional(),
+  audioPath: ProjectRelativePathSchema.optional(),
   notes: z.object({visualHint: z.string().min(1)}).strict().optional(),
 }).strict();
 
@@ -369,8 +394,8 @@ export const ScriptSchema = z.object({
   language: z.literal('zh-CN'),
   segments: z.array(ScriptSegmentSchema).min(1).superRefine((segments, context) => {
     const ids = new Set<string>();
-    for (const segment of segments) {
-      if (ids.has(segment.id)) context.addIssue({code: 'custom', message: `duplicate segment id: ${segment.id}`});
+    for (const [index, segment] of segments.entries()) {
+      if (ids.has(segment.id)) context.addIssue({code: 'custom', path: [index, 'id'], message: `duplicate segment id: ${segment.id}`});
       ids.add(segment.id);
     }
   }),
@@ -386,11 +411,11 @@ export type ScriptSegment = z.infer<typeof ScriptSegmentSchema>;
 
 ```ts
 import {z} from 'zod';
+import {StableIdSchema} from './schema-primitives';
 
-const IdSchema = z.string().regex(/^[a-z][a-z0-9-]*$/);
-const AssetIdSchema = IdSchema;
+const AssetIdSchema = StableIdSchema;
 const TimelineBaseSchema = z.object({
-  id: IdSchema,
+  id: StableIdSchema,
   assetId: AssetIdSchema,
   startFrame: z.number().int().nonnegative(),
   durationInFrames: z.number().int().positive(),
@@ -401,13 +426,13 @@ const TimelineBaseSchema = z.object({
   fadeInFrames: z.number().int().nonnegative(),
   fadeOutFrames: z.number().int().nonnegative(),
   zIndex: z.number().int(),
-});
+}).strict();
 
 export const VisualClipSchema = z.discriminatedUnion('kind', [
   TimelineBaseSchema.extend({
     kind: z.literal('video'),
-    sourceInMs: z.number().int().nonnegative(),
-    sourceOutMs: z.number().int().positive(),
+    sourceInMs: z.number().nonnegative(),
+    sourceOutMs: z.number().positive(),
   }).strict(),
   TimelineBaseSchema.extend({kind: z.literal('image')}).strict(),
 ]).superRefine((clip, context) => {
@@ -424,18 +449,22 @@ export const EditSchema = z.object({
   version: z.literal(1),
   visualClips: z.array(VisualClipSchema).min(1),
   overlays: z.array(z.object({
-    id: IdSchema,
-    component: IdSchema,
+    id: StableIdSchema,
+    component: StableIdSchema,
     startFrame: z.number().int().nonnegative(),
     durationInFrames: z.number().int().positive(),
     props: z.record(z.string(), z.unknown()),
     zIndex: z.number().int(),
   }).strict()),
-  backgroundMusic: z.object({assetId: AssetIdSchema, startMs: z.number().int().nonnegative()}).strict().optional(),
+  backgroundMusic: z.object({assetId: AssetIdSchema, startMs: z.number().nonnegative()}).strict().optional(),
 }).strict().superRefine((edit, context) => {
   const ids = new Set<string>();
-  for (const item of [...edit.visualClips, ...edit.overlays]) {
-    if (ids.has(item.id)) context.addIssue({code: 'custom', message: `duplicate timeline id: ${item.id}`});
+  for (const [index, item] of edit.visualClips.entries()) {
+    if (ids.has(item.id)) context.addIssue({code: 'custom', path: ['visualClips', index, 'id'], message: `duplicate timeline id: ${item.id}`});
+    ids.add(item.id);
+  }
+  for (const [index, item] of edit.overlays.entries()) {
+    if (ids.has(item.id)) context.addIssue({code: 'custom', path: ['overlays', index, 'id'], message: `duplicate timeline id: ${item.id}`});
     ids.add(item.id);
   }
 });
@@ -510,6 +539,8 @@ export interface CaptionsManifest {
 
 Implement strict Zod objects corresponding to every interface above and export inferred types rather than maintaining separate handwritten runtime and compile-time shapes.
 
+Use `StableIdSchema` for asset record keys, generated segment/cue IDs and references. Use `ProjectRelativePathSchema` for every `sourcePath`, `renderPath`, and `audioPath`. Millisecond values may be fractional; starts are nonnegative, durations are positive, and narration/caption end fields must be greater than their starts with the issue path attached to the end field. Narration segments and caption cues are unique by their own `id`.
+
 `src/domain/timeline-schema.ts` must implement this exact compile-time shape as a strict Zod schema:
 
 ```ts
@@ -560,6 +591,8 @@ export interface CompiledTimeline {
 }
 ```
 
+Keep `kind: 'video' | 'image'` independent from `sourceInMs?: number`; do not replace this exact shape with a discriminated union. When present, `sourceInMs` is nonnegative. Frame and layer fields use integer constraints, frame starts are nonnegative, frame durations are positive, and scale/opacity/fade constraints match the authoring Schema. Visual clips and overlays share one timeline ID namespace; compiled captions are unique by their own ID. Narration interval `segmentId` references are not required to be unique.
+
 `src/domain/review-schema.ts`:
 
 ```ts
@@ -593,7 +626,15 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/domain tests/unit/domain/schemas.test.ts
+git add \
+  src/domain/schema-primitives.ts \
+  src/domain/project-schema.ts \
+  src/domain/script-schema.ts \
+  src/domain/edit-schema.ts \
+  src/domain/manifest-schema.ts \
+  src/domain/timeline-schema.ts \
+  src/domain/review-schema.ts \
+  tests/unit/domain/schemas.test.ts
 git commit -m "feat: define strict video project schemas"
 ```
 
