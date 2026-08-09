@@ -1115,7 +1115,7 @@ CLI 必须支持：
 - Darwin 新文件使用 `O_CREAT | O_EXCL | O_NOFOLLOW_ANY` 创建；已有指针或发布文件只能通过同目录安全临时文件和原子重命名替换，禁止直接跟随目标路径写入。
 - 原素材在 Ingest 和 Release 分别计算 Hash。
 - 输出使用临时文件和原子重命名。
-- Project Scope 不授权 `.work` 或 `output`；P02 必须提供 opaque `RunDirectoryScope` 和 `OutputDirectoryScope`。三种 Scope 各自带不同的 private 实例 brand，禁止 `{}` 伪造和 Project/Run/Output 之间的结构化互赋值。Run/Output Scope 的公开工厂必须分别从可信 canonical workspace root 与各自固定的 app-owned 前缀派生 authority，绝不接受任意相对根；canonical 根保持私有，API 只接收各自根内相对路径，并在每次 existing/new open 前重新验证 containment、使用 Darwin `O_NOFOLLOW_ANY`、拒绝 symlink traversal/substitution。
+- Project Scope 不授权 `.work` 或 `output`；P02 必须提供 opaque `WorkDirectoryScope`、`RunDirectoryScope` 和 `OutputDirectoryScope`。`app-directory-scopes.ts` 中任何接受或解析 app-owned relative root 的低层 constructor/minter 都必须 module-private，不得导出接受任意 relative root 的 class static 或通用 factory。高层先校验 `projectId`/`runId`，再固定派生 authority：Work Scope 只能是 `.work/<projectId>`，用于 lock、work `current.json` 与 Run 创建；Run Scope 只能由 `RunStore.createRun(projectId, runId)`/`openExistingRun(projectId, runId)` 返回，并固定为 `.work/<projectId>/runs/<runId>`；Output Scope 只能由 output/release store 返回，并固定为 `output/<projectId>`。Project/Work/Run/Output 四种 Scope 各自带不同的 private 实例 brand，禁止 `{}` 伪造和相互赋值；canonical 根保持私有，API 只接收各自根内相对路径，并在每次 existing/new open 前重新验证 containment、使用 Darwin `O_NOFOLLOW_ANY`、拒绝 symlink traversal/substitution。
 - Run/Output Scope 除 existing read 与 exclusive write-only new-file 外，还必须提供 exclusive read-write new-file capability：`O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW_ANY`、mode `0o600`。Run Scope 的该能力用于 FFmpeg seekable intermediate；Output Scope 的该能力用于 `qt-faststart` final output。每个独立消费者仍从所属 Project/Run/Output Scope 打开新 `FileHandle`，FD 为 borrowed，调用方在对应 Promise settle 后 `finally` 关闭。
 
 ### 18.3 运行时代码
@@ -1240,8 +1240,8 @@ ATOMIC_PUBLISH_FAILED
 
 - 在项目内创建指向项目外文件和目录的符号链接，验证读取路径在打开前返回 `ASSET_PATH_OUTSIDE_PROJECT`。
 - 创建一个指向项目外文件的可写目标符号链接，验证安全创建 API 拒绝写入且项目外文件内容保持不变。
-- 用 `@ts-expect-error` 覆盖 `{}` 伪造以及 Project/Run/Output Scope 全部双向互赋，证明三种 authority nominally distinct。
-- 对 Run/Output Scope 分别覆盖读写逃逸、factory 后 lexical/canonical root substitution、write-only/read-write exclusive create、read-write seek/readback 权限和 work/output pointer symlink，验证所有情况 fail closed 且 borrowed FD 所有权仍归调用方。
+- 用 `@ts-expect-error` 覆盖 `{}` 伪造以及 Project/Work/Run/Output Scope 全部双向互赋，证明四种 authority nominally distinct。
+- 对 Work/Run/Output Scope 覆盖固定前缀铸造、越界 symlink 与 authority 创建后的 lexical/canonical root substitution；Work 额外覆盖 lock/current pointer 与受限 Run 创建，Run/Output 额外覆盖读写逃逸、write-only/read-write exclusive create、read-write seek/readback 权限和 output pointer symlink，验证所有情况 fail closed 且 borrowed FD 所有权仍归调用方。
 - 模拟 resolved FFmpeg 同目录缺少或存在不可执行 `qt-faststart`，验证 Preflight 返回 `ENV_TOOL_MISSING`；改变任一工具二进制 Hash 必须改变环境指纹。
 - 同时启动两个写入型命令，验证第二个命令返回 `PROJECT_LOCKED`，且第一个命令的锁不会被覆盖。
 - 构造已退出进程留下的锁，验证系统只在确认同主机 PID 不存在后将其报告为 `PROJECT_LOCK_STALE`，并要求显式清理。
