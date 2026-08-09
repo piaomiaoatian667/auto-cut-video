@@ -1,4 +1,9 @@
-import {constants, type Stats} from 'node:fs';
+import {
+  constants,
+  lstatSync,
+  realpathSync,
+  type BigIntStats,
+} from 'node:fs';
 import {
   link,
   lstat,
@@ -33,9 +38,9 @@ export class AppDirectoryPlatformError extends Error {
 }
 
 interface DirectoryIdentity {
-  path: string;
-  dev: number;
-  ino: number;
+  readonly path: string;
+  readonly dev: bigint;
+  readonly ino: bigint;
 }
 
 interface ScopeState {
@@ -162,8 +167,8 @@ const parseRelativePath = (
 
 const identityFromStats = (
   canonicalPath: string,
-  stats: Stats,
-): DirectoryIdentity => ({
+  stats: BigIntStats,
+): DirectoryIdentity => Object.freeze({
   path: canonicalPath,
   dev: stats.dev,
   ino: stats.ino,
@@ -171,10 +176,10 @@ const identityFromStats = (
 
 const identityMatchesStats = (
   identity: DirectoryIdentity,
-  stats: Stats,
+  stats: BigIntStats,
 ): boolean => stats.dev === identity.dev && stats.ino === identity.ino;
 
-const volumePath = (dev: number, ino: number): string =>
+const volumePath = (dev: bigint, ino: bigint): string =>
   path.join('/.vol', String(dev), String(ino));
 
 const assertDirectoryIdentityStable = async (
@@ -182,7 +187,7 @@ const assertDirectoryIdentityStable = async (
   label: string,
 ): Promise<void> => {
   try {
-    const stats = await lstat(identity.path);
+    const stats = await lstat(identity.path, {bigint: true});
     if (
       stats.isSymbolicLink()
       || !stats.isDirectory()
@@ -207,12 +212,12 @@ const openDirectoryAnchor = async (
   await assertDirectoryIdentityStable(identity, label);
   const handle = await open(identity.path, constants.O_RDONLY | O_NOFOLLOW_ANY);
   try {
-    const stats = await handle.stat();
+    const stats = await handle.stat({bigint: true});
     if (!stats.isDirectory() || !identityMatchesStats(identity, stats)) {
       throw securityError(`app-owned directory changed while opening: ${label}`);
     }
     const anchoredPath = volumePath(identity.dev, identity.ino);
-    const anchoredStats = await lstat(anchoredPath);
+    const anchoredStats = await lstat(anchoredPath, {bigint: true});
     if (!anchoredStats.isDirectory() || !identityMatchesStats(identity, anchoredStats)) {
       throw securityError(`Darwin directory anchor changed: ${label}`);
     }
@@ -228,16 +233,16 @@ const closeDirectoryAnchor = async (anchor: DirectoryAnchor): Promise<void> => {
   await anchor.handle.close();
 };
 
-const inspectPlainDirectory = async (
+const inspectPlainDirectory = (
   canonicalPath: string,
   label: string,
-): Promise<DirectoryIdentity> => {
+): DirectoryIdentity => {
   try {
-    const stats = await lstat(canonicalPath);
+    const stats = lstatSync(canonicalPath, {bigint: true});
     if (stats.isSymbolicLink() || !stats.isDirectory()) {
       throw securityError(`${label} must be a plain directory`);
     }
-    const resolved = await realpath(canonicalPath);
+    const resolved = realpathSync(canonicalPath);
     if (resolved !== canonicalPath) {
       throw securityError(`${label} must not be redirected`);
     }
@@ -256,7 +261,7 @@ const inspectPlainChildDirectory = async (
   const anchor = await openDirectoryAnchor(parent, label);
   try {
     const target = path.join(anchor.volumePath, name);
-    const stats = await lstat(target);
+    const stats = await lstat(target, {bigint: true});
     if (stats.isSymbolicLink() || !stats.isDirectory()) {
       throw securityError(`${label} must be a plain directory`);
     }
@@ -290,7 +295,7 @@ const ensurePlainDirectory = async (
       }
     }
     await assertDirectoryIdentityStable(parent, name);
-    const stats = await lstat(target);
+    const stats = await lstat(target, {bigint: true});
     if (stats.isSymbolicLink() || !stats.isDirectory()) {
       throw securityError(`app-owned directory is not a plain directory: ${name}`);
     }
@@ -300,7 +305,7 @@ const ensurePlainDirectory = async (
   } catch (error) {
     if (error instanceof AppDirectoryScopeError) throw error;
     if (isNodeError(error) && error.code === 'EEXIST') {
-      const stats = await lstat(target).catch(() => undefined);
+      const stats = await lstat(target, {bigint: true}).catch(() => undefined);
       if (stats?.isSymbolicLink() || (stats !== undefined && !stats.isDirectory())) {
         throw securityError(`app-owned directory is not a plain directory: ${target}`);
       }
@@ -311,10 +316,10 @@ const ensurePlainDirectory = async (
   }
 };
 
-const createWorkspaceState = async (workspaceRoot: string): Promise<DirectoryIdentity> => {
+const createWorkspaceState = (workspaceRoot: string): DirectoryIdentity => {
   assertDarwin();
-  const canonicalWorkspace = await realpath(workspaceRoot);
-  return await inspectPlainDirectory(canonicalWorkspace, 'workspace root');
+  const canonicalWorkspace = realpathSync(workspaceRoot);
+  return inspectPlainDirectory(canonicalWorkspace, 'workspace root');
 };
 
 const stateFor = <T extends object>(
@@ -333,7 +338,7 @@ const assertScopeStable = async (
 ): Promise<void> => {
   try {
     for (const identity of state.ancestors) {
-      const stats = await lstat(identity.path);
+      const stats = await lstat(identity.path, {bigint: true});
       if (
         stats.isSymbolicLink()
         || !stats.isDirectory()
@@ -377,7 +382,7 @@ export const createWorkDirectoryScope = async (
   workspaceRoot: string,
   projectId: string,
 ): Promise<WorkDirectoryScope> => await createWorkScope(
-  await createWorkspaceState(workspaceRoot),
+  createWorkspaceState(workspaceRoot),
   projectId,
 );
 
@@ -494,7 +499,7 @@ const canonicalExistingTarget = async (
   await assertScopeStable(state, relativePath);
   const unresolved = path.join(state.root, ...segments);
   try {
-    const unresolvedStats = await lstat(unresolved);
+    const unresolvedStats = await lstat(unresolved, {bigint: true});
     if (unresolvedStats.isSymbolicLink()) {
       throw securityError(`app-owned target is a symlink: ${relativePath}`);
     }
@@ -524,7 +529,7 @@ const canonicalWritableTarget = async (
     }
     const target = path.join(parent, path.basename(unresolved));
     try {
-      if ((await lstat(target)).isSymbolicLink()) {
+      if ((await lstat(target, {bigint: true})).isSymbolicLink()) {
         throw securityError(`app-owned target is a symlink: ${relativePath}`);
       }
     } catch (error) {
@@ -654,7 +659,10 @@ const inspectScopedEntry = async (
     if (!isWithin(state.root, parent)) {
       throw securityError(`path escapes app-owned scope: ${relativePath}`);
     }
-    const stats = await lstat(path.join(parent, path.basename(unresolved)));
+    const stats = await lstat(
+      path.join(parent, path.basename(unresolved)),
+      {bigint: true},
+    );
     if (stats.isSymbolicLink()) return 'symlink';
     if (stats.isFile()) return 'file';
     if (stats.isDirectory()) return 'directory';
@@ -684,7 +692,7 @@ const openScopedPathAnchor = async (
   try {
     for (const segment of parentSegments) {
       const childPath = path.join(parent.volumePath, segment);
-      const childStats = await lstat(childPath);
+      const childStats = await lstat(childPath, {bigint: true});
       if (childStats.isSymbolicLink() || !childStats.isDirectory()) {
         throw securityError(`app-owned parent is not a plain directory: ${relativePath}`);
       }
@@ -716,11 +724,11 @@ const assertScopedPathAnchorStable = async (
 ): Promise<void> => {
   await assertScopeStable(state, relativePath);
   await assertDirectoryIdentityStable(anchor.parent.identity, relativePath);
-  const stats = await anchor.parent.handle.stat();
+  const stats = await anchor.parent.handle.stat({bigint: true});
   if (!stats.isDirectory() || !identityMatchesStats(anchor.parent.identity, stats)) {
     throw securityError(`app-owned parent changed while held open: ${relativePath}`);
   }
-  const anchoredStats = await lstat(anchor.parent.volumePath);
+  const anchoredStats = await lstat(anchor.parent.volumePath, {bigint: true});
   if (
     !anchoredStats.isDirectory()
     || !identityMatchesStats(anchor.parent.identity, anchoredStats)
@@ -732,9 +740,12 @@ const assertScopedPathAnchorStable = async (
 const inspectAnchoredEntry = async (
   anchor: ScopedPathAnchor,
   relativePath: string,
-): Promise<{kind: AppDirectoryEntryKind; stats?: Stats}> => {
+): Promise<{kind: AppDirectoryEntryKind; stats?: BigIntStats}> => {
   try {
-    const stats = await lstat(path.join(anchor.parent.volumePath, anchor.basename));
+    const stats = await lstat(
+      path.join(anchor.parent.volumePath, anchor.basename),
+      {bigint: true},
+    );
     if (stats.isSymbolicLink()) return {kind: 'symlink', stats};
     if (stats.isFile()) return {kind: 'file', stats};
     if (stats.isDirectory()) return {kind: 'directory', stats};
@@ -851,7 +862,7 @@ const syncScopedDirectory = async (
   if (!isWithin(state.root, target)) {
     throw securityError(`directory escapes app-owned scope: ${relativePath}`);
   }
-  const stats = await lstat(target);
+  const stats = await lstat(target, {bigint: true});
   if (stats.isSymbolicLink() || !stats.isDirectory()) {
     throw securityError(`directory sync target is not plain: ${relativePath}`);
   }
@@ -975,7 +986,7 @@ export const unlinkProjectLockFile = async (
   expectedHandle: FileHandle,
 ): Promise<ProjectLockUnlinkResult> => {
   const state = stateFor(workStates, scope, 'WorkDirectoryScope');
-  const expected = await expectedHandle.stat();
+  const expected = await expectedHandle.stat({bigint: true});
   if (!expected.isFile()) {
     throw securityError('project lock removal requires a regular-file handle');
   }
@@ -990,12 +1001,12 @@ export const unlinkProjectLockFile = async (
       return 'changed';
     }
     await assertScopedPathAnchorStable(state, anchor, PROJECT_LOCK_PATH);
-    const held = await expectedHandle.stat();
+    const held = await expectedHandle.stat({bigint: true});
     if (held.dev !== expected.dev || held.ino !== expected.ino) {
       throw securityError('project lock file handle identity changed');
     }
-    if (held.nlink === 0) return 'missing';
-    if (held.nlink !== 1) {
+    if (held.nlink === 0n) return 'missing';
+    if (held.nlink !== 1n) {
       throw securityError('project lock has unexpected hard links');
     }
     try {
@@ -1425,7 +1436,7 @@ const OUTPUT_POINTER_AUTHORITY: PointerScopeAuthority<OutputDirectoryScope> = {
 };
 
 export class RunStore {
-  readonly #workspace: Promise<DirectoryIdentity>;
+  readonly #workspace: DirectoryIdentity;
   readonly #fileOps: FileOps;
 
   constructor(workspaceRoot: string, options: RunStoreOptions = {}) {
@@ -1435,22 +1446,22 @@ export class RunStore {
   }
 
   async createWork(projectId: string): Promise<WorkDirectoryScope> {
-    return await createWorkScope(await this.#workspace, projectId);
+    return await createWorkScope(this.#workspace, projectId);
   }
 
   async createRun(projectId: string, runId: string): Promise<RunDirectoryScope> {
-    return await mintRunScope(await this.#workspace, projectId, runId, 'create');
+    return await mintRunScope(this.#workspace, projectId, runId, 'create');
   }
 
   async openExistingRun(
     projectId: string,
     runId: string,
   ): Promise<RunDirectoryScope> {
-    return await mintRunScope(await this.#workspace, projectId, runId, 'existing');
+    return await mintRunScope(this.#workspace, projectId, runId, 'existing');
   }
 
   async readCurrent(projectId: string): Promise<CurrentPointer | null> {
-    const work = await createWorkScope(await this.#workspace, projectId);
+    const work = await createWorkScope(this.#workspace, projectId);
     const raw = await readPointerRaw(work, WORK_POINTER_AUTHORITY);
     return raw === null ? null : parsePointer(raw, 'work');
   }
@@ -1460,7 +1471,7 @@ export class RunStore {
     value: CurrentPointer,
   ): Promise<void> {
     const pointer = validatePointer(value, 'work');
-    const workspace = await this.#workspace;
+    const workspace = this.#workspace;
     await mintRunScope(workspace, projectId, pointer.runId, 'existing');
     const work = await createWorkScope(workspace, projectId);
     await publishPointer(work, WORK_POINTER_AUTHORITY, pointer, this.#fileOps);
@@ -1468,7 +1479,7 @@ export class RunStore {
 }
 
 export class OutputStore {
-  readonly #workspace: Promise<DirectoryIdentity>;
+  readonly #workspace: DirectoryIdentity;
   readonly #fileOps: FileOps;
 
   constructor(workspaceRoot: string, options: RunStoreOptions = {}) {
@@ -1478,7 +1489,7 @@ export class OutputStore {
   }
 
   async openProject(projectId: string): Promise<OutputDirectoryScope> {
-    return await mintOutputScope(await this.#workspace, projectId);
+    return await mintOutputScope(this.#workspace, projectId);
   }
 
   async createRelease(
@@ -1486,7 +1497,7 @@ export class OutputStore {
     runId: string,
   ): Promise<OutputDirectoryScope> {
     const validatedRunId = StableIdSchema.parse(runId);
-    const scope = await mintOutputScope(await this.#workspace, projectId);
+    const scope = await mintOutputScope(this.#workspace, projectId);
     const state = stateFor(outputStates, scope, 'OutputDirectoryScope');
     await ensureScopedDirectory(state, 'releases');
     await ensureScopedDirectory(state, `releases/${validatedRunId}`, true);
@@ -1494,7 +1505,7 @@ export class OutputStore {
   }
 
   async readCurrent(projectId: string): Promise<CurrentPointer | null> {
-    const output = await mintOutputScope(await this.#workspace, projectId);
+    const output = await mintOutputScope(this.#workspace, projectId);
     const raw = await readPointerRaw(output, OUTPUT_POINTER_AUTHORITY);
     return raw === null ? null : parsePointer(raw, 'output');
   }
@@ -1505,7 +1516,7 @@ export class OutputStore {
   ): Promise<void> {
     const pointer = validatePointer(value, 'output');
     const output = await openOutputRelease(
-      await this.#workspace,
+      this.#workspace,
       projectId,
       pointer.runId,
     );

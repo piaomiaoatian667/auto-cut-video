@@ -1,8 +1,9 @@
-import {constants} from 'node:fs';
+import {constants, type BigIntStats} from 'node:fs';
 import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rename,
   rm,
   symlink,
@@ -137,6 +138,7 @@ const makeTempDirectory = async (prefix: string): Promise<string> => {
 };
 
 afterEach(async () => {
+  vi.doUnmock('node:fs');
   vi.doUnmock('node:fs/promises');
   vi.resetModules();
   await Promise.all(tempDirectories.splice(0).map((directory) =>
@@ -179,6 +181,87 @@ const importScopesWithMutationProbe = async (
   return await import('../../../src/fs/app-directory-scopes');
 };
 
+const importScopesWithDelayedRealpath = async (
+  gate: Promise<void>,
+): Promise<typeof import('../../../src/fs/app-directory-scopes')> => {
+  vi.resetModules();
+  vi.doMock('node:fs/promises', async () => {
+    const actual = await vi.importActual<typeof import('node:fs/promises')>(
+      'node:fs/promises',
+    );
+    return {
+      ...actual,
+      realpath: async (...args: Parameters<typeof actual.realpath>) => {
+        await gate;
+        return await Reflect.apply(actual.realpath, undefined, args);
+      },
+    };
+  });
+  return await import('../../../src/fs/app-directory-scopes');
+};
+
+const withInode = (stats: BigIntStats, ino: bigint): BigIntStats => {
+  Object.defineProperty(stats, 'ino', {
+    configurable: true,
+    enumerable: true,
+    value: ino,
+  });
+  return stats;
+};
+
+const importScopesWithWorkspaceInodes = async (
+  canonicalWorkspace: string,
+  capturedIno: bigint,
+  observedIno: bigint,
+): Promise<typeof import('../../../src/fs/app-directory-scopes')> => {
+  vi.resetModules();
+  vi.doMock('node:fs', async () => {
+    const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+    return {
+      ...actual,
+      lstatSync: (target: string) => {
+        const stats = actual.lstatSync(target, {bigint: true});
+        return path.resolve(target) === canonicalWorkspace
+          ? withInode(stats, capturedIno)
+          : stats;
+      },
+    };
+  });
+  vi.doMock('node:fs/promises', async () => {
+    const actual = await vi.importActual<typeof import('node:fs/promises')>(
+      'node:fs/promises',
+    );
+    return {
+      ...actual,
+      lstat: async (target: string) => {
+        const stats = await actual.lstat(target, {bigint: true});
+        return path.resolve(target) === canonicalWorkspace
+          ? withInode(stats, observedIno)
+          : stats;
+      },
+      open: async (...args: Parameters<typeof actual.open>) => {
+        const handle = await Reflect.apply(actual.open, undefined, args);
+        const openedPath = path.resolve(String(args[0]));
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === 'stat') {
+              return async () => {
+                const stats = await target.stat({bigint: true});
+                return openedPath === canonicalWorkspace
+                  ? withInode(stats, observedIno)
+                  : stats;
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
+    };
+  });
+  return await import('../../../src/fs/app-directory-scopes');
+};
+
 const writeAndClose = async (
   handle: FileHandle,
   value: string,
@@ -216,6 +299,82 @@ describe('app-owned directory scopes', () => {
     )).rejects.toMatchObject({code: 'EISDIR'});
     await expect(readFile(path.join(workspaceRoot, 'output', 'demo'), 'utf8'))
       .rejects.toMatchObject({code: 'EISDIR'});
+  });
+
+  it.each(['run', 'output'] as const)(
+    'captures %s Store workspace authority before returning',
+    async (owner) => {
+      const workspaceRoot = await makeTempDirectory(`app-scopes-${owner}-capture-`);
+      const outsideRoot = await makeTempDirectory('app-scopes-outside-');
+      const displacedWorkspace = `${workspaceRoot}-original`;
+      tempDirectories.push(displacedWorkspace);
+      let releaseRealpath!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        releaseRealpath = resolve;
+      });
+      const scopes = await importScopesWithDelayedRealpath(gate);
+      let useStore: () => Promise<unknown>;
+      if (owner === 'run') {
+        const store = scopes.createRunStore(workspaceRoot);
+        useStore = async () => await store.createRun('demo', 'run-one');
+      } else {
+        const store = scopes.createOutputStore(workspaceRoot);
+        useStore = async () => await store.openProject('demo');
+      }
+
+      await rename(workspaceRoot, displacedWorkspace);
+      await symlink(outsideRoot, workspaceRoot);
+      releaseRealpath();
+
+      await expect(useStore()).rejects.toMatchObject({
+        code: 'APP_PATH_OUTSIDE_SCOPE',
+      });
+      const escapedPath = owner === 'run'
+        ? path.join(outsideRoot, '.work', 'demo', 'runs', 'run-one')
+        : path.join(outsideRoot, 'output', 'demo');
+      await expect(readFile(escapedPath)).rejects.toMatchObject({code: 'ENOENT'});
+    },
+  );
+
+  it.each(['run', 'output'] as const)(
+    'rejects an invalid %s Store workspace synchronously',
+    async (owner) => {
+      const workspaceParent = await makeTempDirectory('app-scopes-invalid-');
+      const missingWorkspace = path.join(workspaceParent, 'missing');
+      let constructionError: unknown;
+      let consumeRejectedAuthority: (() => Promise<unknown>) | undefined;
+      try {
+        if (owner === 'run') {
+          const store = createRunStore(missingWorkspace);
+          consumeRejectedAuthority = async () => await store.createWork('demo');
+        } else {
+          const store = createOutputStore(missingWorkspace);
+          consumeRejectedAuthority = async () => await store.openProject('demo');
+        }
+      } catch (error) {
+        constructionError = error;
+      }
+      await consumeRejectedAuthority?.().catch(() => undefined);
+
+      expect(constructionError).toMatchObject({code: 'ENOENT'});
+    },
+  );
+
+  it('distinguishes adjacent bigint workspace inodes above MAX_SAFE_INTEGER', async () => {
+    const workspaceRoot = await makeTempDirectory('app-scopes-bigint-');
+    const canonicalWorkspace = await realpath(workspaceRoot);
+    const firstIno = BigInt(Number.MAX_SAFE_INTEGER) + 1n;
+    const secondIno = firstIno + 1n;
+    const scopes = await importScopesWithWorkspaceInodes(
+      canonicalWorkspace,
+      firstIno,
+      secondIno,
+    );
+    const store = scopes.createRunStore(workspaceRoot);
+
+    await expect(store.createWork('demo')).rejects.toMatchObject({
+      code: 'APP_PATH_OUTSIDE_SCOPE',
+    });
   });
 
   it.each([

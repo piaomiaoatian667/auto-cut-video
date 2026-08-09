@@ -310,6 +310,28 @@ describe('project lock', () => {
     await expect(readFile(lockPath)).rejects.toMatchObject({code: 'ENOENT'});
   });
 
+  it('rejects a different valid record on the owner inode and remains retryable', async () => {
+    const {workspaceRoot, work} = await makeWorkScope();
+    const lease = await acquireProjectLock(work, 'run-one', runtime());
+    const lockPath = path.join(workspaceRoot, '.work', 'demo', 'pipeline.lock');
+    const replacement = lockRecord({
+      pid: 4202,
+      processStart: 'Sun Aug 10 08:01:00 2026',
+      runId: 'run-two',
+    });
+    await writeFile(lockPath, `${JSON.stringify(replacement, null, 2)}\n`);
+
+    await expect(lease.release()).rejects.toMatchObject({
+      code: 'PROJECT_LOCK_INVALID',
+      record: expect.objectContaining({runId: 'run-two'}),
+    });
+    await expect(readFile(lockPath, 'utf8')).resolves.toContain('run-two');
+
+    await writeFile(lockPath, `${JSON.stringify(lease.record, null, 2)}\n`);
+    await lease.release();
+    await expect(readFile(lockPath)).rejects.toMatchObject({code: 'ENOENT'});
+  });
+
   it('does not delete a new owner installed at the release remove boundary', async () => {
     const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'project-lock-race-'));
     tempDirectories.push(workspaceRoot);

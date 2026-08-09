@@ -166,15 +166,15 @@ const serializeRecord = (record: ProjectLockRecord): string =>
 interface ProjectLockSnapshot {
   handle: FileHandle;
   record: ProjectLockRecord;
-  dev: number;
-  ino: number;
+  dev: bigint;
+  ino: bigint;
 }
 
 interface ProjectLockOwnerToken {
   handle: FileHandle;
   record: Readonly<ProjectLockRecord>;
-  dev: number;
-  ino: number;
+  dev: bigint;
+  ino: bigint;
 }
 
 const openLockSnapshot = async (
@@ -196,7 +196,7 @@ const openLockSnapshot = async (
     throw error;
   }
   try {
-    const stats = await handle.stat();
+    const stats = await handle.stat({bigint: true});
     if (!stats.isFile()) {
       throw new ProjectLockError(
         'PROJECT_LOCK_INVALID',
@@ -259,7 +259,7 @@ const writeNewLock = async (
   try {
     await handle.writeFile(serializeRecord(record));
     await handle.sync();
-    const stats = await handle.stat();
+    const stats = await handle.stat({bigint: true});
     if (!stats.isFile()) {
       throw new ProjectLockError(
         'PROJECT_LOCK_INVALID',
@@ -340,7 +340,13 @@ export async function acquireProjectLock(
           await markReleased();
           return;
         }
-        if (!recordsEqual(snapshot.record, owner.record)) return;
+        if (!recordsEqual(snapshot.record, owner.record)) {
+          throw new ProjectLockError(
+            'PROJECT_LOCK_INVALID',
+            'project lock contents changed while the owner lease was active',
+            snapshot.record,
+          );
+        }
         const result = await unlinkProjectLockFile(work, snapshot.handle);
         if (result === 'removed' || result === 'missing' || result === 'changed') {
           await markReleased();
