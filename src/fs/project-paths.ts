@@ -36,6 +36,8 @@ const projectDirectoryStates = new WeakMap<
 >();
 
 export class ProjectDirectoryScope {
+  readonly #projectDirectoryScopeBrand = undefined;
+
   private constructor() {
     Object.freeze(this);
   }

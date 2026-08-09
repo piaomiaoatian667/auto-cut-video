@@ -1,4 +1,5 @@
 import {spawn, type ChildProcess} from 'node:child_process';
+import {fstatSync} from 'node:fs';
 import {performance} from 'node:perf_hooks';
 import {StringDecoder} from 'node:string_decoder';
 import {
@@ -251,6 +252,7 @@ export async function runProcess(
   const useProcessGroup = process.platform === 'darwin';
   let child: ChildProcess;
   try {
+    for (const descriptor of extraStdioFds) fstatSync(descriptor);
     const stdio: Array<'ignore' | 'pipe' | number> = [
       'ignore',
       'pipe',

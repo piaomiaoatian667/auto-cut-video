@@ -16,8 +16,10 @@ import {JsonFileError, readJson} from '../../../src/fs/json-files';
 const schema = z.object({value: z.string()}).strict();
 const projectDirectory = {} as ProjectDirectoryScope;
 
-const createHandle = (source: string) => {
-  const close = vi.fn().mockResolvedValue(undefined);
+const createHandle = (source: string, closeCause?: unknown) => {
+  const close = closeCause === undefined
+    ? vi.fn().mockResolvedValue(undefined)
+    : vi.fn().mockRejectedValue(closeCause);
   const handle = {
     readFile: vi.fn().mockResolvedValue(source),
     close,
@@ -58,6 +60,22 @@ describe('readJson', () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
+  it('preserves malformed JSON as primary when close also fails', async () => {
+    const closeCause = Object.assign(new Error('close failed'), {code: 'EIO'});
+    const {handle, close} = createHandle('{', closeCause);
+    pathMocks.openExistingProjectFile.mockResolvedValue(handle);
+
+    await expect(
+      readJson(projectDirectory, 'script.json', schema),
+    ).rejects.toMatchObject({
+      name: 'JsonFileError',
+      filePath: 'script.json',
+      cause: expect.any(SyntaxError),
+      closeCause,
+    });
+    expect(close).toHaveBeenCalledOnce();
+  });
+
   it('wraps Zod failures and still closes its handle', async () => {
     const {handle, close} = createHandle('{"value":42}');
     pathMocks.openExistingProjectFile.mockResolvedValue(handle);
@@ -68,6 +86,38 @@ describe('readJson', () => {
       name: 'JsonFileError',
       filePath: 'edit.json',
       cause: expect.objectContaining({name: 'ZodError'}),
+    });
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('preserves Zod failure as primary when close also fails', async () => {
+    const closeCause = Object.assign(new Error('close failed'), {code: 'EIO'});
+    const {handle, close} = createHandle('{"value":42}', closeCause);
+    pathMocks.openExistingProjectFile.mockResolvedValue(handle);
+
+    await expect(
+      readJson(projectDirectory, 'edit.json', schema),
+    ).rejects.toMatchObject({
+      name: 'JsonFileError',
+      filePath: 'edit.json',
+      cause: expect.objectContaining({name: 'ZodError'}),
+      closeCause,
+    });
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('wraps a close-only failure with the JSON file path', async () => {
+    const closeCause = Object.assign(new Error('close failed'), {code: 'EIO'});
+    const {handle, close} = createHandle('{"value":"ok"}', closeCause);
+    pathMocks.openExistingProjectFile.mockResolvedValue(handle);
+
+    await expect(
+      readJson(projectDirectory, 'project.json', schema),
+    ).rejects.toMatchObject({
+      name: 'JsonFileError',
+      filePath: 'project.json',
+      cause: closeCause,
+      closeCause,
     });
     expect(close).toHaveBeenCalledOnce();
   });

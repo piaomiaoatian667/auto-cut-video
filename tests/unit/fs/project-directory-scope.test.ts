@@ -16,6 +16,7 @@ import {
   createProjectDirectoryScope,
   openExistingProjectFile,
   openNewProjectFile,
+  type ProjectDirectoryScope,
 } from '../../../src/fs/project-paths';
 
 const makeTempDirectory = async (prefix: string): Promise<string> => {
@@ -33,6 +34,13 @@ const readAndClose = async (handle: FileHandle): Promise<string> => {
 };
 
 describe('ProjectDirectoryScope', () => {
+  it('is nominal under strict TypeScript', () => {
+    const acceptScope = (_scope: ProjectDirectoryScope): void => undefined;
+
+    // @ts-expect-error empty objects must not forge ProjectDirectoryScope authority
+    acceptScope({});
+  });
+
   it('is opaque and accepts project-relative file operations only', async () => {
     const workspaceRoot = await makeTempDirectory('project-scope-workspace-');
     const projectRoot = path.join(workspaceRoot, 'projects', 'demo');

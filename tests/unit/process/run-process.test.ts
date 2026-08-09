@@ -239,6 +239,49 @@ describe('runProcess', () => {
     },
   );
 
+  it('rejects a closed borrowed descriptor before spawning the command', async () => {
+    const tempDirectory = await mkdtemp(path.join(tmpdir(), 'run-process-fd-closed-'));
+    onTestFinished(() => rm(tempDirectory, {recursive: true, force: true}));
+    const inputPath = path.join(tempDirectory, 'input.txt');
+    const markerPath = path.join(tempDirectory, 'spawned');
+    await writeFile(inputPath, 'closed');
+    const handle = await open(inputPath, 'r');
+    const closedFd = handle.fd;
+    await handle.close();
+
+    await expect(runProcess(
+      process.execPath,
+      ['-e', 'require("node:fs").writeFileSync(process.argv[1], "spawned")', markerPath],
+      {extraStdioFds: [closedFd]},
+    )).rejects.toMatchObject({
+      name: 'ProcessExecutionError',
+      code: 'PROCESS_SPAWN_FAILED',
+      cause: expect.objectContaining({code: 'EBADF'}),
+    });
+    await expect(access(markerPath)).rejects.toMatchObject({code: 'ENOENT'});
+  });
+
+  it('inherits borrowed descriptors before returning to a caller that closes immediately', async () => {
+    const tempDirectory = await mkdtemp(path.join(tmpdir(), 'run-process-fd-close-after-'));
+    onTestFinished(() => rm(tempDirectory, {recursive: true, force: true}));
+    const inputPath = path.join(tempDirectory, 'input.txt');
+    await writeFile(inputPath, 'inherited');
+    const handle = await open(inputPath, 'r');
+    onTestFinished(() => handle.close().catch(() => undefined));
+
+    const pending = runProcess(
+      process.execPath,
+      [
+        '-e',
+        'setTimeout(() => console.log(require("node:fs").readFileSync(3, "utf8")), 25)',
+      ],
+      {extraStdioFds: [handle.fd]},
+    );
+    await handle.close();
+
+    await expect(pending).resolves.toMatchObject({stdout: 'inherited\n'});
+  });
+
   it.each([
     {
       name: 'normal exit',
