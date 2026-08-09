@@ -1,9 +1,10 @@
-import {realpath, rename, symlink} from 'node:fs/promises';
+import {rename, symlink} from 'node:fs/promises';
 import path from 'node:path';
 import {expect, it, onTestFinished, vi} from 'vitest';
+import type {ProjectDirectoryScope} from '../../../src/fs/project-paths';
 
 const openCalls = vi.hoisted(() => [] as Array<{
-  containmentRoot: string;
+  projectDirectory: ProjectDirectoryScope;
   relativePath: string;
 }>);
 
@@ -12,11 +13,11 @@ vi.mock('../../../src/fs/project-paths', async (importOriginal) => {
   return {
     ...actual,
     openExistingProjectFile: async (
-      containmentRoot: string,
+      projectDirectory: ProjectDirectoryScope,
       relativePath: string,
     ) => {
-      openCalls.push({containmentRoot, relativePath});
-      return actual.openExistingProjectFile(containmentRoot, relativePath);
+      openCalls.push({projectDirectory, relativePath});
+      return await actual.openExistingProjectFile(projectDirectory, relativePath);
     },
   };
 });
@@ -24,21 +25,23 @@ vi.mock('../../../src/fs/project-paths', async (importOriginal) => {
 import {loadProject} from '../../../src/domain/load-project';
 import {createTempProject} from '../../helpers/temp-project';
 
-it('keeps workspaceRootReal as the containment root for every authoring file', async () => {
+it('uses one opaque project scope and project-relative authoring paths', async () => {
   const temp = await createTempProject();
   onTestFinished(temp.cleanup);
   const storedProject = path.join(temp.workspaceRoot, 'stored-demo');
   await rename(temp.projectRoot, storedProject);
   await symlink('../stored-demo', temp.projectRoot);
 
-  await expect(loadProject(temp.workspaceRoot, 'demo')).resolves.toMatchObject({
-    project: {id: 'demo'},
-  });
+  const inputs = await loadProject(temp.workspaceRoot, 'demo');
 
-  const workspaceRootReal = await realpath(temp.workspaceRoot);
-  expect(openCalls).toEqual([
-    {containmentRoot: workspaceRootReal, relativePath: 'projects/demo/project.json'},
-    {containmentRoot: workspaceRootReal, relativePath: 'projects/demo/script.json'},
-    {containmentRoot: workspaceRootReal, relativePath: 'projects/demo/edit.json'},
+  expect(inputs).toMatchObject({project: {id: 'demo'}});
+  expect(Object.keys(inputs.projectDirectory)).toEqual([]);
+  expect(openCalls.map(({relativePath}) => relativePath)).toEqual([
+    'project.json',
+    'script.json',
+    'edit.json',
   ]);
+  expect(openCalls.every(({projectDirectory}) => (
+    projectDirectory === inputs.projectDirectory
+  ))).toBe(true);
 });

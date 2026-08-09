@@ -1,6 +1,10 @@
 import {realpath} from 'node:fs/promises';
 import path from 'node:path';
 import {readJson} from '../fs/json-files';
+import {
+  createProjectDirectoryScope,
+  type ProjectDirectoryScope,
+} from '../fs/project-paths';
 import {EditSchema, type Edit} from './edit-schema';
 import {ProjectSchema, type Project} from './project-schema';
 import {StableIdSchema} from './schema-primitives';
@@ -9,7 +13,7 @@ import {validateAuthoringInputs} from './validate-authoring';
 
 export interface ProjectInputs {
   workspaceRoot: string;
-  projectRoot: string;
+  projectDirectory: ProjectDirectoryScope;
   project: Project;
   script: Script;
   edit: Edit;
@@ -37,11 +41,14 @@ export async function loadProject(
   const validatedProjectId = StableIdSchema.parse(projectId);
   const workspaceRootReal = await realpath(workspaceRoot);
   const projectRelativeRoot = path.join('projects', validatedProjectId);
-  const projectRoot = path.join(workspaceRootReal, projectRelativeRoot);
+  const projectDirectory = await createProjectDirectoryScope(
+    workspaceRootReal,
+    projectRelativeRoot,
+  );
 
   const project = await readJson(
-    workspaceRootReal,
-    path.join(projectRelativeRoot, 'project.json'),
+    projectDirectory,
+    'project.json',
     ProjectSchema,
   );
   if (project.id !== validatedProjectId) {
@@ -49,20 +56,20 @@ export async function loadProject(
   }
 
   const script = await readJson(
-    workspaceRootReal,
-    path.join(projectRelativeRoot, 'script.json'),
+    projectDirectory,
+    'script.json',
     ScriptSchema,
   );
   const edit = await readJson(
-    workspaceRootReal,
-    path.join(projectRelativeRoot, 'edit.json'),
+    projectDirectory,
+    'edit.json',
     EditSchema,
   );
   validateAuthoringInputs({project, script, edit});
 
   return {
     workspaceRoot: workspaceRootReal,
-    projectRoot,
+    projectDirectory,
     project,
     script,
     edit,

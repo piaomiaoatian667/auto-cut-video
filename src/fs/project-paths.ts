@@ -26,6 +26,61 @@ export interface PreparedProjectFile {
   open(): Promise<FileHandle>;
 }
 
+interface ProjectDirectoryState {
+  canonicalProjectRoot: string;
+}
+
+const projectDirectoryStates = new WeakMap<
+  ProjectDirectoryScope,
+  ProjectDirectoryState
+>();
+
+export class ProjectDirectoryScope {
+  private constructor() {
+    Object.freeze(this);
+  }
+
+  static async create(
+    workspaceRoot: string,
+    projectRelativeRoot: string,
+  ): Promise<ProjectDirectoryScope> {
+    assertDarwin();
+    assertRelativePath(projectRelativeRoot);
+    if (projectRelativeRoot.length === 0 || projectRelativeRoot === '.') {
+      throw new ProjectPathError('project directory must be below the workspace root');
+    }
+
+    try {
+      const workspaceRootReal = await realpath(workspaceRoot);
+      const projectRootReal = await realpath(path.resolve(
+        workspaceRootReal,
+        projectRelativeRoot,
+      ));
+      if (
+        projectRootReal === workspaceRootReal
+        || !isWithin(workspaceRootReal, projectRootReal)
+      ) {
+        throw new ProjectPathError(
+          `project directory escapes workspace: ${projectRelativeRoot}`,
+        );
+      }
+
+      const scope = new ProjectDirectoryScope();
+      projectDirectoryStates.set(scope, {canonicalProjectRoot: projectRootReal});
+      return scope;
+    } catch (error) {
+      if (error instanceof ProjectPathError) throw error;
+      return mapSymlinkLoop(error, projectRelativeRoot);
+    }
+  }
+}
+
+export const createProjectDirectoryScope = async (
+  workspaceRoot: string,
+  projectRelativeRoot: string,
+): Promise<ProjectDirectoryScope> =>
+  await ProjectDirectoryScope.create(workspaceRoot, projectRelativeRoot);
+
 const isNodeError = (error: unknown): error is NodeJS.ErrnoException =>
   error instanceof Error && 'code' in error;
 
@@ -53,6 +108,31 @@ const assertRelativePath = (relativePath: string): void => {
   }
 };
 
+const canonicalProjectRoot = (scope: ProjectDirectoryScope): string => {
+  const state = projectDirectoryStates.get(scope);
+  if (!state) throw new TypeError('invalid ProjectDirectoryScope');
+  return state.canonicalProjectRoot;
+};
+
+const assertCanonicalProjectRootStable = async (
+  scope: ProjectDirectoryScope,
+  relativePath: string,
+): Promise<string> => {
+  const savedProjectRoot = canonicalProjectRoot(scope);
+  try {
+    const currentProjectRoot = await realpath(savedProjectRoot);
+    if (currentProjectRoot !== savedProjectRoot) {
+      throw new ProjectPathError(
+        `project directory changed after scope creation: ${relativePath}`,
+      );
+    }
+    return savedProjectRoot;
+  } catch (error) {
+    if (error instanceof ProjectPathError) throw error;
+    return mapSymlinkLoop(error, relativePath);
+  }
+};
+
 const mapSymlinkLoop = (error: unknown, relativePath: string): never => {
   if (isNodeError(error) && error.code === 'ELOOP') {
     throw new ProjectPathError(
@@ -64,14 +144,14 @@ const mapSymlinkLoop = (error: unknown, relativePath: string): never => {
 };
 
 const canonicalizeExistingTarget = async (
-  containmentRoot: string,
+  scope: ProjectDirectoryScope,
   relativePath: string,
 ): Promise<string> => {
   assertRelativePath(relativePath);
   try {
-    const rootReal = await realpath(containmentRoot);
-    const targetReal = await realpath(path.resolve(rootReal, relativePath));
-    if (!isWithin(rootReal, targetReal)) {
+    const projectRoot = await assertCanonicalProjectRootStable(scope, relativePath);
+    const targetReal = await realpath(path.resolve(projectRoot, relativePath));
+    if (!isWithin(projectRoot, targetReal)) {
       throw new ProjectPathError(`path escapes project: ${relativePath}`);
     }
     return targetReal;
@@ -82,15 +162,15 @@ const canonicalizeExistingTarget = async (
 };
 
 const canonicalizeWritableTarget = async (
-  containmentRoot: string,
+  scope: ProjectDirectoryScope,
   relativePath: string,
 ): Promise<string> => {
   assertRelativePath(relativePath);
   try {
-    const rootReal = await realpath(containmentRoot);
-    const unresolvedTarget = path.resolve(rootReal, relativePath);
+    const projectRoot = await assertCanonicalProjectRootStable(scope, relativePath);
+    const unresolvedTarget = path.resolve(projectRoot, relativePath);
     const parentReal = await realpath(path.dirname(unresolvedTarget));
-    if (!isWithin(rootReal, parentReal)) {
+    if (!isWithin(projectRoot, parentReal)) {
       throw new ProjectPathError(`path escapes project: ${relativePath}`);
     }
 
@@ -155,37 +235,37 @@ class PreparedNewProjectFile implements PreparedProjectFile {
 }
 
 export async function prepareExistingProjectFile(
-  containmentRoot: string,
+  scope: ProjectDirectoryScope,
   relativePath: string,
 ): Promise<PreparedProjectFile> {
   assertDarwin();
   return new PreparedExistingProjectFile(
-    await canonicalizeExistingTarget(containmentRoot, relativePath),
+    await canonicalizeExistingTarget(scope, relativePath),
     relativePath,
   );
 }
 
 export async function openExistingProjectFile(
-  containmentRoot: string,
+  scope: ProjectDirectoryScope,
   relativePath: string,
 ): Promise<FileHandle> {
-  return (await prepareExistingProjectFile(containmentRoot, relativePath)).open();
+  return (await prepareExistingProjectFile(scope, relativePath)).open();
 }
 
 export async function prepareNewProjectFile(
-  containmentRoot: string,
+  scope: ProjectDirectoryScope,
   relativePath: string,
 ): Promise<PreparedProjectFile> {
   assertDarwin();
   return new PreparedNewProjectFile(
-    await canonicalizeWritableTarget(containmentRoot, relativePath),
+    await canonicalizeWritableTarget(scope, relativePath),
     relativePath,
   );
 }
 
 export async function openNewProjectFile(
-  containmentRoot: string,
+  scope: ProjectDirectoryScope,
   relativePath: string,
 ): Promise<FileHandle> {
-  return (await prepareNewProjectFile(containmentRoot, relativePath)).open();
+  return (await prepareNewProjectFile(scope, relativePath)).open();
 }

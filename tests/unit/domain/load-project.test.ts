@@ -2,6 +2,7 @@ import {realpath, symlink, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {describe, expect, it, onTestFinished} from 'vitest';
 import {loadProject} from '../../../src/domain/load-project';
+import {ProjectDirectoryScope} from '../../../src/fs/project-paths';
 import {
   createEditFixture,
   createProjectFixture,
@@ -18,11 +19,12 @@ describe('loadProject', () => {
 
     expect(inputs).toMatchObject({
       workspaceRoot: await realpath(temp.workspaceRoot),
-      projectRoot: await realpath(temp.projectRoot),
+      projectDirectory: expect.any(ProjectDirectoryScope),
       project: {id: 'demo'},
       script: {segments: [{id: 'intro'}]},
       edit: {visualClips: [{id: 'opening'}]},
     });
+    expect('projectRoot' in inputs).toBe(false);
   });
 
   it('fails when an authoring file contains malformed JSON', async () => {
@@ -32,7 +34,7 @@ describe('loadProject', () => {
 
     await expect(loadProject(temp.workspaceRoot, 'demo')).rejects.toMatchObject({
       name: 'JsonFileError',
-      filePath: 'projects/demo/script.json',
+      filePath: 'script.json',
       cause: expect.any(SyntaxError),
     });
   });
@@ -47,7 +49,7 @@ describe('loadProject', () => {
 
     await expect(loadProject(temp.workspaceRoot, 'demo')).rejects.toMatchObject({
       name: 'JsonFileError',
-      filePath: 'projects/demo/project.json',
+      filePath: 'project.json',
       cause: expect.objectContaining({
         name: 'ZodError',
         issues: expect.arrayContaining([
@@ -79,9 +81,7 @@ describe('loadProject', () => {
     );
 
     await expect(loadProject(workspace.workspaceRoot, 'escape')).rejects.toMatchObject({
-      name: 'JsonFileError',
-      filePath: 'projects/escape/project.json',
-      cause: expect.objectContaining({code: 'ASSET_PATH_OUTSIDE_PROJECT'}),
+      code: 'ASSET_PATH_OUTSIDE_PROJECT',
     });
   });
 
@@ -114,7 +114,7 @@ describe('loadProject', () => {
 
     await expect(loadProject(temp.workspaceRoot, 'demo')).rejects.toMatchObject({
       name: 'JsonFileError',
-      filePath: 'projects/demo/edit.json',
+      filePath: 'edit.json',
       cause: expect.objectContaining({
         name: 'ZodError',
         issues: expect.arrayContaining([

@@ -1,6 +1,7 @@
 import type {FileHandle} from 'node:fs/promises';
 import {beforeEach, describe, expect, it, vi} from 'vitest';
 import {z} from 'zod';
+import type {ProjectDirectoryScope} from '../../../src/fs/project-paths';
 
 const pathMocks = vi.hoisted(() => ({
   openExistingProjectFile: vi.fn(),
@@ -13,6 +14,7 @@ vi.mock('../../../src/fs/project-paths', () => ({
 import {JsonFileError, readJson} from '../../../src/fs/json-files';
 
 const schema = z.object({value: z.string()}).strict();
+const projectDirectory = {} as ProjectDirectoryScope;
 
 const createHandle = (source: string) => {
   const close = vi.fn().mockResolvedValue(undefined);
@@ -33,11 +35,11 @@ describe('readJson', () => {
     pathMocks.openExistingProjectFile.mockResolvedValue(handle);
 
     await expect(
-      readJson('/workspace', 'projects/demo/project.json', schema),
+      readJson(projectDirectory, 'project.json', schema),
     ).resolves.toEqual({value: 'ok'});
     expect(pathMocks.openExistingProjectFile).toHaveBeenCalledWith(
-      '/workspace',
-      'projects/demo/project.json',
+      projectDirectory,
+      'project.json',
     );
     expect(close).toHaveBeenCalledOnce();
   });
@@ -47,10 +49,10 @@ describe('readJson', () => {
     pathMocks.openExistingProjectFile.mockResolvedValue(handle);
 
     await expect(
-      readJson('/workspace', 'projects/demo/script.json', schema),
+      readJson(projectDirectory, 'script.json', schema),
     ).rejects.toMatchObject({
       name: 'JsonFileError',
-      filePath: 'projects/demo/script.json',
+      filePath: 'script.json',
       cause: expect.any(SyntaxError),
     });
     expect(close).toHaveBeenCalledOnce();
@@ -61,10 +63,10 @@ describe('readJson', () => {
     pathMocks.openExistingProjectFile.mockResolvedValue(handle);
 
     await expect(
-      readJson('/workspace', 'projects/demo/edit.json', schema),
+      readJson(projectDirectory, 'edit.json', schema),
     ).rejects.toMatchObject({
       name: 'JsonFileError',
-      filePath: 'projects/demo/edit.json',
+      filePath: 'edit.json',
       cause: expect.objectContaining({name: 'ZodError'}),
     });
     expect(close).toHaveBeenCalledOnce();
@@ -77,10 +79,10 @@ describe('readJson', () => {
     pathMocks.openExistingProjectFile.mockRejectedValue(cause);
 
     await expect(
-      readJson('/workspace', 'projects/demo/project.json', schema),
+      readJson(projectDirectory, 'project.json', schema),
     ).rejects.toEqual(expect.objectContaining({
       name: 'JsonFileError',
-      filePath: 'projects/demo/project.json',
+      filePath: 'project.json',
       cause,
     }));
     expect(pathMocks.openExistingProjectFile).toHaveBeenCalledOnce();
