@@ -1,7 +1,10 @@
 import {
   mkdtemp,
   readFile,
+  rename,
   rm,
+  symlink,
+  writeFile,
 } from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
@@ -10,9 +13,11 @@ import {
   describe,
   expect,
   it,
+  vi,
 } from 'vitest';
 import {
   createWorkDirectoryScope,
+  openExistingProjectLockFile,
   openNewProjectLockFile,
   unlinkProjectLockFile,
   type WorkDirectoryScope,
@@ -40,6 +45,8 @@ const makeWorkScope = async (): Promise<{
 };
 
 afterEach(async () => {
+  vi.doUnmock('../../../src/fs/app-directory-scopes');
+  vi.resetModules();
   await Promise.all(tempDirectories.splice(0).map((directory) =>
     rm(directory, {recursive: true, force: true})));
 });
@@ -68,6 +75,15 @@ const writeLock = async (
   }
 };
 
+const removeLock = async (work: WorkDirectoryScope): Promise<void> => {
+  const handle = await openExistingProjectLockFile(work);
+  try {
+    await unlinkProjectLockFile(work, handle);
+  } finally {
+    await handle.close();
+  }
+};
+
 const lockRecord = (
   overrides: Partial<ProjectLockRecord> = {},
 ): ProjectLockRecord => ({
@@ -78,6 +94,58 @@ const lockRecord = (
   runId: 'run-one',
   ...overrides,
 });
+
+const importLockModulesWithReplacementAtRemove = async (
+  replacement: ProjectLockRecord,
+): Promise<{
+  locks: typeof import('../../../src/pipeline/project-lock');
+  scopes: typeof import('../../../src/fs/app-directory-scopes');
+  replacementCount: () => number;
+}> => {
+  let replacementCount = 0;
+  vi.resetModules();
+  vi.doMock('../../../src/fs/app-directory-scopes', async () => {
+    const actual = await vi.importActual<
+      typeof import('../../../src/fs/app-directory-scopes')
+    >('../../../src/fs/app-directory-scopes');
+    return {
+      ...actual,
+      unlinkProjectLockFile: async (...args: unknown[]) => {
+        if (replacementCount === 0) {
+          replacementCount += 1;
+          const work = args[0] as WorkDirectoryScope;
+          const oldHandle = await actual.openExistingProjectLockFile(work);
+          try {
+            await Reflect.apply(
+              actual.unlinkProjectLockFile,
+              undefined,
+              [work, oldHandle],
+            );
+          } finally {
+            await oldHandle.close();
+          }
+          const replacementHandle = await actual.openNewProjectLockFile(work);
+          try {
+            await replacementHandle.writeFile(
+              `${JSON.stringify(replacement, null, 2)}\n`,
+            );
+            await replacementHandle.sync();
+          } finally {
+            await replacementHandle.close();
+          }
+        }
+        return await Reflect.apply(
+          actual.unlinkProjectLockFile,
+          undefined,
+          args,
+        );
+      },
+    };
+  });
+  const scopes = await import('../../../src/fs/app-directory-scopes');
+  const locks = await import('../../../src/pipeline/project-lock');
+  return {locks, scopes, replacementCount: () => replacementCount};
+};
 
 describe('project lock', () => {
   it('rejects a second owner with PROJECT_LOCKED', async () => {
@@ -175,11 +243,116 @@ describe('project lock', () => {
   it('does not release a replacement lock owned by another runId', async () => {
     const {workspaceRoot, work} = await makeWorkScope();
     const lease = await acquireProjectLock(work, 'run-one', runtime());
-    await unlinkProjectLockFile(work);
+    await removeLock(work);
     await writeLock(work, lockRecord({runId: 'run-two'}));
 
     await lease.release();
 
+    await expect(readFile(
+      path.join(workspaceRoot, '.work', 'demo', 'pipeline.lock'),
+      'utf8',
+    )).resolves.toContain('run-two');
+  });
+
+  it('keeps release ownership private from lease.record mutation', async () => {
+    const {workspaceRoot, work} = await makeWorkScope();
+    const lease = await acquireProjectLock(work, 'run-one', runtime());
+    expect(Object.isFrozen(lease.record)).toBe(true);
+    const mutableRecord = lease.record as {
+      pid: number;
+      runId: string;
+    };
+    expect(Reflect.set(mutableRecord, 'pid', 999_999)).toBe(false);
+    expect(Reflect.set(mutableRecord, 'runId', 'run-two')).toBe(false);
+
+    await lease.release();
+
+    await expect(readFile(
+      path.join(workspaceRoot, '.work', 'demo', 'pipeline.lock'),
+      'utf8',
+    )).rejects.toMatchObject({code: 'ENOENT'});
+  });
+
+  it('propagates release scope errors and remains retryable', async () => {
+    const {workspaceRoot, work} = await makeWorkScope();
+    const outsideRoot = await mkdtemp(path.join(tmpdir(), 'project-lock-outside-'));
+    tempDirectories.push(outsideRoot);
+    const workRoot = path.join(workspaceRoot, '.work', 'demo');
+    const displacedWorkRoot = `${workRoot}-original`;
+    const lease = await acquireProjectLock(work, 'run-one', runtime());
+    await rename(workRoot, displacedWorkRoot);
+    await symlink(outsideRoot, workRoot);
+
+    await expect(lease.release()).rejects.toMatchObject({
+      code: 'APP_PATH_OUTSIDE_SCOPE',
+    });
+
+    await rm(workRoot);
+    await rename(displacedWorkRoot, workRoot);
+    await lease.release();
+    await expect(readFile(path.join(workRoot, 'pipeline.lock')))
+      .rejects.toMatchObject({code: 'ENOENT'});
+  });
+
+  it('propagates an invalid lock record and remains retryable', async () => {
+    const {workspaceRoot, work} = await makeWorkScope();
+    const lease = await acquireProjectLock(work, 'run-one', runtime());
+    const lockPath = path.join(workspaceRoot, '.work', 'demo', 'pipeline.lock');
+    await writeFile(lockPath, '{invalid json');
+
+    await expect(lease.release()).rejects.toMatchObject({
+      code: 'PROJECT_LOCK_INVALID',
+    });
+    await expect(readFile(lockPath, 'utf8')).resolves.toBe('{invalid json');
+
+    await writeFile(lockPath, `${JSON.stringify(lease.record, null, 2)}\n`);
+    await lease.release();
+    await expect(readFile(lockPath)).rejects.toMatchObject({code: 'ENOENT'});
+  });
+
+  it('does not delete a new owner installed at the release remove boundary', async () => {
+    const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'project-lock-race-'));
+    tempDirectories.push(workspaceRoot);
+    const replacement = lockRecord({pid: 4202, runId: 'run-two'});
+    const {locks, scopes, replacementCount} =
+      await importLockModulesWithReplacementAtRemove(replacement);
+    const work = await scopes.createWorkDirectoryScope(workspaceRoot, 'demo');
+    const lease = await locks.acquireProjectLock(work, 'run-one', runtime());
+
+    await lease.release();
+
+    expect(replacementCount()).toBe(1);
+    await expect(readFile(
+      path.join(workspaceRoot, '.work', 'demo', 'pipeline.lock'),
+      'utf8',
+    )).resolves.toContain('run-two');
+  });
+
+  it('does not delete a new owner installed at the stale-clear remove boundary', async () => {
+    const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'project-lock-race-'));
+    tempDirectories.push(workspaceRoot);
+    const replacement = lockRecord({pid: 4202, runId: 'run-two'});
+    const {locks, scopes, replacementCount} =
+      await importLockModulesWithReplacementAtRemove(replacement);
+    const work = await scopes.createWorkDirectoryScope(workspaceRoot, 'demo');
+    const staleHandle = await scopes.openNewProjectLockFile(work);
+    try {
+      await staleHandle.writeFile(`${JSON.stringify(
+        lockRecord({pid: 999_999}),
+        null,
+        2,
+      )}\n`);
+      await staleHandle.sync();
+    } finally {
+      await staleHandle.close();
+    }
+
+    await expect(locks.clearStaleLock(
+      work,
+      runtime({isProcessAlive: async () => false}),
+    )).rejects.toMatchObject({code: 'PROJECT_LOCKED'});
+
+    expect(replacementCount()).toBe(1);
     await expect(readFile(
       path.join(workspaceRoot, '.work', 'demo', 'pipeline.lock'),
       'utf8',
@@ -194,7 +367,7 @@ describe('project lock', () => {
       isProcessAlive: async () => {
         probes += 1;
         if (probes === 1) {
-          await unlinkProjectLockFile(work);
+          await removeLock(work);
           await writeLock(work, lockRecord({runId: 'run-two'}));
           return false;
         }

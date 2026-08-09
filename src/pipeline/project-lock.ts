@@ -1,4 +1,5 @@
 import {hostname as nodeHostname} from 'node:os';
+import type {FileHandle} from 'node:fs/promises';
 import {StableIdSchema} from '../domain/schema-primitives';
 import {
   inspectProjectLockFile,
@@ -44,7 +45,7 @@ export interface ProjectLockRuntime {
 }
 
 export interface ProjectLockLease {
-  readonly record: ProjectLockRecord;
+  readonly record: Readonly<ProjectLockRecord>;
   release(): Promise<void>;
 }
 
@@ -162,9 +163,23 @@ const parseRecord = (raw: string): ProjectLockRecord => {
 const serializeRecord = (record: ProjectLockRecord): string =>
   `${JSON.stringify(record, null, 2)}\n`;
 
-const readRawLock = async (
+interface ProjectLockSnapshot {
+  handle: FileHandle;
+  record: ProjectLockRecord;
+  dev: number;
+  ino: number;
+}
+
+interface ProjectLockOwnerToken {
+  handle: FileHandle;
+  record: Readonly<ProjectLockRecord>;
+  dev: number;
+  ino: number;
+}
+
+const openLockSnapshot = async (
   work: WorkDirectoryScope,
-): Promise<string | undefined> => {
+): Promise<ProjectLockSnapshot | undefined> => {
   const kind = await inspectProjectLockFile(work);
   if (kind === 'missing') return undefined;
   if (kind !== 'file') {
@@ -173,11 +188,30 @@ const readRawLock = async (
       'project lock path is not a regular file',
     );
   }
-  const handle = await openExistingProjectLockFile(work);
+  let handle: FileHandle;
   try {
-    return await handle.readFile('utf8');
-  } finally {
-    await handle.close();
+    handle = await openExistingProjectLockFile(work);
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ENOENT') return undefined;
+    throw error;
+  }
+  try {
+    const stats = await handle.stat();
+    if (!stats.isFile()) {
+      throw new ProjectLockError(
+        'PROJECT_LOCK_INVALID',
+        'project lock handle is not a regular file',
+      );
+    }
+    return {
+      handle,
+      record: parseRecord(await handle.readFile('utf8')),
+      dev: stats.dev,
+      ino: stats.ino,
+    };
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
   }
 };
 
@@ -219,16 +253,31 @@ const recordsEqual = (
 const writeNewLock = async (
   work: WorkDirectoryScope,
   record: ProjectLockRecord,
-): Promise<void> => {
+): Promise<ProjectLockOwnerToken> => {
   const handle = await openNewProjectLockFile(work);
   let complete = false;
   try {
     await handle.writeFile(serializeRecord(record));
     await handle.sync();
+    const stats = await handle.stat();
+    if (!stats.isFile()) {
+      throw new ProjectLockError(
+        'PROJECT_LOCK_INVALID',
+        'new project lock is not a regular file',
+      );
+    }
     complete = true;
+    return {
+      handle,
+      record: Object.freeze({...record}),
+      dev: stats.dev,
+      ino: stats.ino,
+    };
   } finally {
-    await handle.close().catch(() => undefined);
-    if (!complete) await unlinkProjectLockFile(work).catch(() => undefined);
+    if (!complete) {
+      await unlinkProjectLockFile(work, handle).catch(() => undefined);
+      await handle.close().catch(() => undefined);
+    }
   }
 };
 
@@ -257,35 +306,48 @@ export async function acquireProjectLock(
     runId: validatedRunId,
   };
 
+  let owner: ProjectLockOwnerToken;
   try {
-    await writeNewLock(work, record);
+    owner = await writeNewLock(work, record);
   } catch (error) {
     if (!isNodeError(error) || error.code !== 'EEXIST') throw error;
-    const raw = await readRawLock(work);
-    if (raw === undefined) return await acquireProjectLock(work, runId, runtime);
-    const existing = parseRecord(raw);
-    throw await conflictError(existing, runtime);
+    const snapshot = await openLockSnapshot(work);
+    if (snapshot === undefined) return await acquireProjectLock(work, runId, runtime);
+    try {
+      throw await conflictError(snapshot.record, runtime);
+    } finally {
+      await snapshot.handle.close();
+    }
   }
 
   let released = false;
+  const publicRecord = Object.freeze({...owner.record});
+  const markReleased = async (): Promise<void> => {
+    released = true;
+    await owner.handle.close();
+  };
   return {
-    record,
+    record: publicRecord,
     release: async () => {
       if (released) return;
-      const raw = await readRawLock(work).catch(() => undefined);
-      if (raw === undefined) {
-        released = true;
+      const snapshot = await openLockSnapshot(work);
+      if (snapshot === undefined) {
+        await markReleased();
         return;
       }
-      let current: ProjectLockRecord;
       try {
-        current = parseRecord(raw);
-      } catch {
-        return;
+        if (snapshot.dev !== owner.dev || snapshot.ino !== owner.ino) {
+          await markReleased();
+          return;
+        }
+        if (!recordsEqual(snapshot.record, owner.record)) return;
+        const result = await unlinkProjectLockFile(work, snapshot.handle);
+        if (result === 'removed' || result === 'missing' || result === 'changed') {
+          await markReleased();
+        }
+      } finally {
+        await snapshot.handle.close();
       }
-      if (!recordsEqual(current, record) || current.runId !== record.runId) return;
-      await unlinkProjectLockFile(work);
-      released = true;
     },
   };
 }
@@ -294,26 +356,32 @@ export async function clearStaleLock(
   work: WorkDirectoryScope,
   runtime: ProjectLockRuntime = defaultRuntime,
 ): Promise<void> {
-  const initialRaw = await readRawLock(work);
-  if (initialRaw === undefined) return;
-  const initial = parseRecord(initialRaw);
-  if (await classifyRecord(initial, runtime) !== 'stale') {
-    throw new ProjectLockError(
-      'PROJECT_LOCKED',
-      `project is locked by run ${initial.runId}`,
-      initial,
-    );
+  const snapshot = await openLockSnapshot(work);
+  if (snapshot === undefined) return;
+  try {
+    if (await classifyRecord(snapshot.record, runtime) !== 'stale') {
+      throw new ProjectLockError(
+        'PROJECT_LOCKED',
+        `project is locked by run ${snapshot.record.runId}`,
+        snapshot.record,
+      );
+    }
+    const result = await unlinkProjectLockFile(work, snapshot.handle);
+    if (result === 'changed') {
+      const replacement = await openLockSnapshot(work);
+      try {
+        throw new ProjectLockError(
+          'PROJECT_LOCKED',
+          replacement === undefined
+            ? 'project lock changed while clearing'
+            : `project lock changed to run ${replacement.record.runId} while clearing`,
+          replacement?.record,
+        );
+      } finally {
+        await replacement?.handle.close();
+      }
+    }
+  } finally {
+    await snapshot.handle.close();
   }
-
-  const currentRaw = await readRawLock(work);
-  if (currentRaw === undefined) return;
-  const current = parseRecord(currentRaw);
-  if (!recordsEqual(initial, current)) {
-    throw new ProjectLockError(
-      'PROJECT_LOCKED',
-      `project lock changed to run ${current.runId} while clearing`,
-      current,
-    );
-  }
-  await unlinkProjectLockFile(work);
 }

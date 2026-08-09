@@ -43,6 +43,12 @@ interface ScopeState {
   ancestors: DirectoryIdentity[];
 }
 
+interface DirectoryAnchor {
+  identity: DirectoryIdentity;
+  handle: FileHandle;
+  volumePath: string;
+}
+
 export type AppDirectoryEntryKind =
   | 'missing'
   | 'file'
@@ -163,6 +169,65 @@ const identityFromStats = (
   ino: stats.ino,
 });
 
+const identityMatchesStats = (
+  identity: DirectoryIdentity,
+  stats: Stats,
+): boolean => stats.dev === identity.dev && stats.ino === identity.ino;
+
+const volumePath = (dev: number, ino: number): string =>
+  path.join('/.vol', String(dev), String(ino));
+
+const assertDirectoryIdentityStable = async (
+  identity: DirectoryIdentity,
+  label: string,
+): Promise<void> => {
+  try {
+    const stats = await lstat(identity.path);
+    if (
+      stats.isSymbolicLink()
+      || !stats.isDirectory()
+      || !identityMatchesStats(identity, stats)
+      || await realpath(identity.path) !== identity.path
+    ) {
+      throw securityError(`app-owned directory changed after validation: ${label}`);
+    }
+  } catch (error) {
+    if (error instanceof AppDirectoryScopeError) throw error;
+    if (isNodeError(error) && error.code === 'ENOENT') {
+      throw securityError(`app-owned directory disappeared: ${label}`, error);
+    }
+    return mapSymlinkError(error, label);
+  }
+};
+
+const openDirectoryAnchor = async (
+  identity: DirectoryIdentity,
+  label: string,
+): Promise<DirectoryAnchor> => {
+  await assertDirectoryIdentityStable(identity, label);
+  const handle = await open(identity.path, constants.O_RDONLY | O_NOFOLLOW_ANY);
+  try {
+    const stats = await handle.stat();
+    if (!stats.isDirectory() || !identityMatchesStats(identity, stats)) {
+      throw securityError(`app-owned directory changed while opening: ${label}`);
+    }
+    const anchoredPath = volumePath(identity.dev, identity.ino);
+    const anchoredStats = await lstat(anchoredPath);
+    if (!anchoredStats.isDirectory() || !identityMatchesStats(identity, anchoredStats)) {
+      throw securityError(`Darwin directory anchor changed: ${label}`);
+    }
+    return {identity, handle, volumePath: anchoredPath};
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    if (error instanceof AppDirectoryScopeError) throw error;
+    return mapSymlinkError(error, label);
+  }
+};
+
+const closeDirectoryAnchor = async (anchor: DirectoryAnchor): Promise<void> => {
+  await anchor.handle.close();
+};
+
 const inspectPlainDirectory = async (
   canonicalPath: string,
   label: string,
@@ -183,12 +248,37 @@ const inspectPlainDirectory = async (
   }
 };
 
+const inspectPlainChildDirectory = async (
+  parent: DirectoryIdentity,
+  name: string,
+  label: string,
+): Promise<DirectoryIdentity> => {
+  const anchor = await openDirectoryAnchor(parent, label);
+  try {
+    const target = path.join(anchor.volumePath, name);
+    const stats = await lstat(target);
+    if (stats.isSymbolicLink() || !stats.isDirectory()) {
+      throw securityError(`${label} must be a plain directory`);
+    }
+    const identity = identityFromStats(path.join(parent.path, name), stats);
+    await assertDirectoryIdentityStable(parent, label);
+    await assertDirectoryIdentityStable(identity, label);
+    return identity;
+  } catch (error) {
+    if (error instanceof AppDirectoryScopeError) throw error;
+    return mapSymlinkError(error, label);
+  } finally {
+    await closeDirectoryAnchor(anchor);
+  }
+};
+
 const ensurePlainDirectory = async (
-  parent: string,
+  parent: DirectoryIdentity,
   name: string,
   options: {exclusive?: boolean} = {},
 ): Promise<DirectoryIdentity> => {
-  const target = path.join(parent, name);
+  const anchor = await openDirectoryAnchor(parent, name);
+  const target = path.join(anchor.volumePath, name);
   try {
     if (options.exclusive) {
       await mkdir(target, {mode: 0o700});
@@ -199,7 +289,14 @@ const ensurePlainDirectory = async (
         if (!isNodeError(error) || error.code !== 'EEXIST') throw error;
       }
     }
-    return await inspectPlainDirectory(target, target);
+    await assertDirectoryIdentityStable(parent, name);
+    const stats = await lstat(target);
+    if (stats.isSymbolicLink() || !stats.isDirectory()) {
+      throw securityError(`app-owned directory is not a plain directory: ${name}`);
+    }
+    const identity = identityFromStats(path.join(parent.path, name), stats);
+    await assertDirectoryIdentityStable(identity, name);
+    return identity;
   } catch (error) {
     if (error instanceof AppDirectoryScopeError) throw error;
     if (isNodeError(error) && error.code === 'EEXIST') {
@@ -208,7 +305,9 @@ const ensurePlainDirectory = async (
         throw securityError(`app-owned directory is not a plain directory: ${target}`);
       }
     }
-    return mapSymlinkError(error, target);
+    return mapSymlinkError(error, name);
+  } finally {
+    await closeDirectoryAnchor(anchor);
   }
 };
 
@@ -259,13 +358,13 @@ const assertScopeStable = async (
 };
 
 const createWorkScope = async (
-  workspaceRoot: string,
+  workspace: DirectoryIdentity,
   projectId: string,
 ): Promise<WorkDirectoryScope> => {
   const validatedProjectId = StableIdSchema.parse(projectId);
-  const workspace = await createWorkspaceState(workspaceRoot);
-  const workContainer = await ensurePlainDirectory(workspace.path, '.work');
-  const workRoot = await ensurePlainDirectory(workContainer.path, validatedProjectId);
+  await assertDirectoryIdentityStable(workspace, 'workspace root');
+  const workContainer = await ensurePlainDirectory(workspace, '.work');
+  const workRoot = await ensurePlainDirectory(workContainer, validatedProjectId);
   const scope = mintWorkDirectoryScope();
   workStates.set(scope, {
     root: workRoot.path,
@@ -277,23 +376,28 @@ const createWorkScope = async (
 export const createWorkDirectoryScope = async (
   workspaceRoot: string,
   projectId: string,
-): Promise<WorkDirectoryScope> => await createWorkScope(workspaceRoot, projectId);
+): Promise<WorkDirectoryScope> => await createWorkScope(
+  await createWorkspaceState(workspaceRoot),
+  projectId,
+);
 
 const mintRunScope = async (
-  workspaceRoot: string,
+  workspace: DirectoryIdentity,
   projectId: string,
   runId: string,
   mode: 'create' | 'existing',
 ): Promise<RunDirectoryScope> => {
   const validatedRunId = StableIdSchema.parse(runId);
-  const work = await createWorkScope(workspaceRoot, projectId);
+  const work = await createWorkScope(workspace, projectId);
   const workState = stateFor(workStates, work, 'WorkDirectoryScope');
   await assertScopeStable(workState, `runs/${validatedRunId}`);
-  const runsRoot = await ensurePlainDirectory(workState.root, 'runs');
+  const workRoot = workState.ancestors.at(-1)!;
+  const runsRoot = await ensurePlainDirectory(workRoot, 'runs');
   const runRoot = mode === 'create'
-    ? await ensurePlainDirectory(runsRoot.path, validatedRunId, {exclusive: true})
-    : await inspectPlainDirectory(
-      path.join(runsRoot.path, validatedRunId),
+    ? await ensurePlainDirectory(runsRoot, validatedRunId, {exclusive: true})
+    : await inspectPlainChildDirectory(
+      runsRoot,
+      validatedRunId,
       `runs/${validatedRunId}`,
     );
   const scope = mintRunDirectoryScope();
@@ -305,13 +409,13 @@ const mintRunScope = async (
 };
 
 const mintOutputScope = async (
-  workspaceRoot: string,
+  workspace: DirectoryIdentity,
   projectId: string,
 ): Promise<OutputDirectoryScope> => {
   const validatedProjectId = StableIdSchema.parse(projectId);
-  const workspace = await createWorkspaceState(workspaceRoot);
-  const outputContainer = await ensurePlainDirectory(workspace.path, 'output');
-  const outputRoot = await ensurePlainDirectory(outputContainer.path, validatedProjectId);
+  await assertDirectoryIdentityStable(workspace, 'workspace root');
+  const outputContainer = await ensurePlainDirectory(workspace, 'output');
+  const outputRoot = await ensurePlainDirectory(outputContainer, validatedProjectId);
   const scope = mintOutputDirectoryScope();
   outputStates.set(scope, {
     root: outputRoot.path,
@@ -321,20 +425,23 @@ const mintOutputScope = async (
 };
 
 const openOutputRelease = async (
-  workspaceRoot: string,
+  workspace: DirectoryIdentity,
   projectId: string,
   runId: string,
 ): Promise<OutputDirectoryScope> => {
   const validatedRunId = StableIdSchema.parse(runId);
-  const scope = await mintOutputScope(workspaceRoot, projectId);
+  const scope = await mintOutputScope(workspace, projectId);
   const state = stateFor(outputStates, scope, 'OutputDirectoryScope');
   await assertScopeStable(state, `releases/${validatedRunId}`);
-  const releases = await inspectPlainDirectory(
-    path.join(state.root, 'releases'),
+  const outputRoot = state.ancestors.at(-1)!;
+  const releases = await inspectPlainChildDirectory(
+    outputRoot,
+    'releases',
     'output releases directory',
   );
-  const release = await inspectPlainDirectory(
-    path.join(releases.path, validatedRunId),
+  const release = await inspectPlainChildDirectory(
+    releases,
+    validatedRunId,
     `release ${validatedRunId}`,
   );
   if (!isWithin(state.root, release.path)) {
@@ -350,7 +457,7 @@ const ensureScopedDirectory = async (
 ): Promise<void> => {
   const segments = parseRelativePath(relativePath);
   await assertScopeStable(state, relativePath);
-  let parent = state.root;
+  let parent = state.ancestors.at(-1)!;
   for (const [index, segment] of segments.entries()) {
     const identity = await ensurePlainDirectory(parent, segment, {
       exclusive: exclusiveFinal && index === segments.length - 1,
@@ -358,7 +465,7 @@ const ensureScopedDirectory = async (
     if (!isWithin(state.root, identity.path)) {
       throw securityError(`directory escapes app-owned scope: ${relativePath}`);
     }
-    parent = identity.path;
+    parent = identity;
   }
   await assertScopeStable(state, relativePath);
 };
@@ -559,17 +666,103 @@ const inspectScopedEntry = async (
   }
 };
 
+interface ScopedPathAnchor {
+  parent: DirectoryAnchor;
+  basename: string;
+}
+
+const openScopedPathAnchor = async (
+  state: ScopeState,
+  relativePath: string,
+): Promise<ScopedPathAnchor> => {
+  const segments = parseRelativePath(relativePath);
+  await assertScopeStable(state, relativePath);
+  const basename = segments.at(-1)!;
+  const parentSegments = segments.slice(0, -1);
+  const rootIdentity = state.ancestors.at(-1)!;
+  let parent = await openDirectoryAnchor(rootIdentity, relativePath);
+  try {
+    for (const segment of parentSegments) {
+      const childPath = path.join(parent.volumePath, segment);
+      const childStats = await lstat(childPath);
+      if (childStats.isSymbolicLink() || !childStats.isDirectory()) {
+        throw securityError(`app-owned parent is not a plain directory: ${relativePath}`);
+      }
+      const childIdentity = identityFromStats(
+        path.join(parent.identity.path, segment),
+        childStats,
+      );
+      if (!isWithin(state.root, childIdentity.path)) {
+        throw securityError(`path escapes app-owned scope: ${relativePath}`);
+      }
+      await assertDirectoryIdentityStable(childIdentity, relativePath);
+      const child = await openDirectoryAnchor(childIdentity, relativePath);
+      await closeDirectoryAnchor(parent);
+      parent = child;
+    }
+    await assertScopeStable(state, relativePath);
+    return {parent, basename};
+  } catch (error) {
+    await closeDirectoryAnchor(parent).catch(() => undefined);
+    if (error instanceof AppDirectoryScopeError) throw error;
+    return mapSymlinkError(error, relativePath);
+  }
+};
+
+const assertScopedPathAnchorStable = async (
+  state: ScopeState,
+  anchor: ScopedPathAnchor,
+  relativePath: string,
+): Promise<void> => {
+  await assertScopeStable(state, relativePath);
+  await assertDirectoryIdentityStable(anchor.parent.identity, relativePath);
+  const stats = await anchor.parent.handle.stat();
+  if (!stats.isDirectory() || !identityMatchesStats(anchor.parent.identity, stats)) {
+    throw securityError(`app-owned parent changed while held open: ${relativePath}`);
+  }
+  const anchoredStats = await lstat(anchor.parent.volumePath);
+  if (
+    !anchoredStats.isDirectory()
+    || !identityMatchesStats(anchor.parent.identity, anchoredStats)
+  ) {
+    throw securityError(`Darwin parent anchor changed: ${relativePath}`);
+  }
+};
+
+const inspectAnchoredEntry = async (
+  anchor: ScopedPathAnchor,
+  relativePath: string,
+): Promise<{kind: AppDirectoryEntryKind; stats?: Stats}> => {
+  try {
+    const stats = await lstat(path.join(anchor.parent.volumePath, anchor.basename));
+    if (stats.isSymbolicLink()) return {kind: 'symlink', stats};
+    if (stats.isFile()) return {kind: 'file', stats};
+    if (stats.isDirectory()) return {kind: 'directory', stats};
+    return {kind: 'other', stats};
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ENOENT') return {kind: 'missing'};
+    return mapSymlinkError(error, relativePath);
+  }
+};
+
 const unlinkScopedFile = async (
   state: ScopeState,
   relativePath: string,
 ): Promise<void> => {
-  const kind = await inspectScopedEntry(state, relativePath);
-  if (kind === 'missing') return;
-  if (kind !== 'file') {
-    throw securityError(`refusing to unlink non-file app entry: ${relativePath}`);
+  const anchor = await openScopedPathAnchor(state, relativePath);
+  try {
+    const {kind} = await inspectAnchoredEntry(anchor, relativePath);
+    if (kind === 'missing') return;
+    if (kind !== 'file') {
+      throw securityError(`refusing to unlink non-file app entry: ${relativePath}`);
+    }
+    await assertScopedPathAnchorStable(state, anchor, relativePath);
+    await unlink(path.join(anchor.parent.volumePath, anchor.basename));
+    await assertScopeStable(state, relativePath);
+    await assertDirectoryIdentityStable(anchor.parent.identity, relativePath);
+  } finally {
+    await closeDirectoryAnchor(anchor.parent);
   }
-  const target = await canonicalExistingTarget(state, relativePath);
-  await unlink(target);
 };
 
 const renameScopedFile = async (
@@ -577,16 +770,37 @@ const renameScopedFile = async (
   sourceRelativePath: string,
   targetRelativePath: string,
 ): Promise<void> => {
-  if (await inspectScopedEntry(state, sourceRelativePath) !== 'file') {
-    throw securityError(`rename source must be a regular file: ${sourceRelativePath}`);
+  const source = await openScopedPathAnchor(state, sourceRelativePath);
+  let target: ScopedPathAnchor;
+  try {
+    target = await openScopedPathAnchor(state, targetRelativePath);
+  } catch (error) {
+    await closeDirectoryAnchor(source.parent).catch(() => undefined);
+    throw error;
   }
-  const targetKind = await inspectScopedEntry(state, targetRelativePath);
-  if (targetKind !== 'missing' && targetKind !== 'file') {
-    throw securityError(`rename target must be absent or regular: ${targetRelativePath}`);
+  try {
+    if ((await inspectAnchoredEntry(source, sourceRelativePath)).kind !== 'file') {
+      throw securityError(`rename source must be a regular file: ${sourceRelativePath}`);
+    }
+    const targetKind = (await inspectAnchoredEntry(target, targetRelativePath)).kind;
+    if (targetKind !== 'missing' && targetKind !== 'file') {
+      throw securityError(`rename target must be absent or regular: ${targetRelativePath}`);
+    }
+    await assertScopedPathAnchorStable(state, source, sourceRelativePath);
+    await assertScopedPathAnchorStable(state, target, targetRelativePath);
+    await rename(
+      path.join(source.parent.volumePath, source.basename),
+      path.join(target.parent.volumePath, target.basename),
+    );
+    await assertScopeStable(state, sourceRelativePath);
+    await assertDirectoryIdentityStable(source.parent.identity, sourceRelativePath);
+    await assertDirectoryIdentityStable(target.parent.identity, targetRelativePath);
+  } finally {
+    await Promise.all([
+      closeDirectoryAnchor(source.parent),
+      closeDirectoryAnchor(target.parent),
+    ]);
   }
-  const source = await canonicalExistingTarget(state, sourceRelativePath);
-  const target = await canonicalWritableTarget(state, targetRelativePath);
-  await rename(source, target);
 };
 
 const linkScopedFile = async (
@@ -594,15 +808,36 @@ const linkScopedFile = async (
   sourceRelativePath: string,
   targetRelativePath: string,
 ): Promise<void> => {
-  if (await inspectScopedEntry(state, sourceRelativePath) !== 'file') {
-    throw securityError(`link source must be a regular file: ${sourceRelativePath}`);
+  const source = await openScopedPathAnchor(state, sourceRelativePath);
+  let target: ScopedPathAnchor;
+  try {
+    target = await openScopedPathAnchor(state, targetRelativePath);
+  } catch (error) {
+    await closeDirectoryAnchor(source.parent).catch(() => undefined);
+    throw error;
   }
-  if (await inspectScopedEntry(state, targetRelativePath) !== 'missing') {
-    throw securityError(`link target must be absent: ${targetRelativePath}`);
+  try {
+    if ((await inspectAnchoredEntry(source, sourceRelativePath)).kind !== 'file') {
+      throw securityError(`link source must be a regular file: ${sourceRelativePath}`);
+    }
+    if ((await inspectAnchoredEntry(target, targetRelativePath)).kind !== 'missing') {
+      throw securityError(`link target must be absent: ${targetRelativePath}`);
+    }
+    await assertScopedPathAnchorStable(state, source, sourceRelativePath);
+    await assertScopedPathAnchorStable(state, target, targetRelativePath);
+    await link(
+      path.join(source.parent.volumePath, source.basename),
+      path.join(target.parent.volumePath, target.basename),
+    );
+    await assertScopeStable(state, sourceRelativePath);
+    await assertDirectoryIdentityStable(source.parent.identity, sourceRelativePath);
+    await assertDirectoryIdentityStable(target.parent.identity, targetRelativePath);
+  } finally {
+    await Promise.all([
+      closeDirectoryAnchor(source.parent),
+      closeDirectoryAnchor(target.parent),
+    ]);
   }
-  const source = await canonicalExistingTarget(state, sourceRelativePath);
-  const target = await canonicalWritableTarget(state, targetRelativePath);
-  await link(source, target);
 };
 
 const syncScopedDirectory = async (
@@ -733,9 +968,51 @@ export const openNewProjectLockFile = async (
   scope: WorkDirectoryScope,
 ): Promise<FileHandle> => await openNewWorkFile(scope, PROJECT_LOCK_PATH);
 
+type ProjectLockUnlinkResult = 'removed' | 'missing' | 'changed';
+
 export const unlinkProjectLockFile = async (
   scope: WorkDirectoryScope,
-): Promise<void> => await unlinkWorkFile(scope, PROJECT_LOCK_PATH);
+  expectedHandle: FileHandle,
+): Promise<ProjectLockUnlinkResult> => {
+  const state = stateFor(workStates, scope, 'WorkDirectoryScope');
+  const expected = await expectedHandle.stat();
+  if (!expected.isFile()) {
+    throw securityError('project lock removal requires a regular-file handle');
+  }
+  const anchor = await openScopedPathAnchor(state, PROJECT_LOCK_PATH);
+  try {
+    const current = await inspectAnchoredEntry(anchor, PROJECT_LOCK_PATH);
+    if (current.kind === 'missing') return 'missing';
+    if (current.kind !== 'file' || current.stats === undefined) {
+      throw securityError('project lock path is not a regular file');
+    }
+    if (current.stats.dev !== expected.dev || current.stats.ino !== expected.ino) {
+      return 'changed';
+    }
+    await assertScopedPathAnchorStable(state, anchor, PROJECT_LOCK_PATH);
+    const held = await expectedHandle.stat();
+    if (held.dev !== expected.dev || held.ino !== expected.ino) {
+      throw securityError('project lock file handle identity changed');
+    }
+    if (held.nlink === 0) return 'missing';
+    if (held.nlink !== 1) {
+      throw securityError('project lock has unexpected hard links');
+    }
+    try {
+      await unlink(volumePath(expected.dev, expected.ino));
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== 'ENOENT') throw error;
+      const replacement = await inspectAnchoredEntry(anchor, PROJECT_LOCK_PATH);
+      return replacement.kind === 'missing' ? 'missing' : 'changed';
+    }
+    await assertScopeStable(state, PROJECT_LOCK_PATH);
+    await assertDirectoryIdentityStable(anchor.parent.identity, PROJECT_LOCK_PATH);
+    const replacement = await inspectAnchoredEntry(anchor, PROJECT_LOCK_PATH);
+    return replacement.kind === 'missing' ? 'removed' : 'changed';
+  } finally {
+    await closeDirectoryAnchor(anchor.parent);
+  }
+};
 
 
 const CURRENT_PATH = 'current.json';
@@ -785,7 +1062,7 @@ export class RunStoreError extends Error {
   }
 }
 
-export type FileOpsPhase = 'publish';
+export type FileOpsPhase = 'publish' | 'cleanup';
 
 export interface FileOps {
   writeFile(handle: FileHandle, data: string): Promise<void>;
@@ -982,29 +1259,40 @@ const readPointerRaw = async <Scope>(
   }
 };
 
-const assertScratchPathAbsent = async <Scope>(
-  scope: Scope,
-  authority: PointerScopeAuthority<Scope>,
-  relativePath: string,
-): Promise<void> => {
-  const kind = await authority.inspect(scope, relativePath);
-  if (kind === 'missing') return;
-  if (kind === 'symlink' || kind === 'directory' || kind === 'other') {
-    return unsafePointer(relativePath);
-  }
-  throw new RunStoreError(
-    'RUN_POINTER_TEMP_EXISTS',
-    `pointer scratch file already exists: ${relativePath}`,
-  );
-};
-
 const cleanupRegularFile = async <Scope>(
   scope: Scope,
   authority: PointerScopeAuthority<Scope>,
   relativePath: string,
+  fileOps: FileOps,
 ): Promise<void> => {
-  const kind = await authority.inspect(scope, relativePath).catch(() => 'missing' as const);
-  if (kind === 'file') await authority.unlink(scope, relativePath).catch(() => undefined);
+  const kind = await authority.inspect(scope, relativePath);
+  if (kind === 'missing') return;
+  if (kind !== 'file') return unsafePointer(relativePath);
+  await authority.unlink(scope, relativePath);
+  await fileOps.syncDirectory(
+    async () => await authority.syncDirectory(scope),
+    'cleanup',
+  );
+};
+
+const prepareScratchPath = async <Scope>(
+  scope: Scope,
+  authority: PointerScopeAuthority<Scope>,
+  relativePath: string,
+  cleanupRegular: boolean,
+  fileOps: FileOps,
+): Promise<void> => {
+  const kind = await authority.inspect(scope, relativePath);
+  if (kind === 'missing') return;
+  if (kind === 'file' && cleanupRegular) {
+    await cleanupRegularFile(scope, authority, relativePath, fileOps);
+    return;
+  }
+  if (kind !== 'file') return unsafePointer(relativePath);
+  throw new RunStoreError(
+    'RUN_POINTER_TEMP_EXISTS',
+    `pointer scratch file already exists: ${relativePath}`,
+  );
 };
 
 const publishPointer = async <Scope>(
@@ -1014,13 +1302,20 @@ const publishPointer = async <Scope>(
   fileOps: FileOps,
 ): Promise<void> => {
   const oldRaw = await readPointerRaw(scope, authority);
-  await assertScratchPathAbsent(scope, authority, TEMP_PATH);
-  await assertScratchPathAbsent(scope, authority, ROLLBACK_PATH);
+  await prepareScratchPath(scope, authority, TEMP_PATH, true, fileOps);
+  await prepareScratchPath(
+    scope,
+    authority,
+    ROLLBACK_PATH,
+    oldRaw !== null,
+    fileOps,
+  );
 
   let tempHandle: FileHandle | undefined;
   let tempCreated = false;
   let backupCreated = false;
   let published = false;
+  let committed = false;
   try {
     if (oldRaw !== null) {
       await authority.link(scope, CURRENT_PATH, ROLLBACK_PATH);
@@ -1048,15 +1343,20 @@ const publishPointer = async <Scope>(
       async () => await authority.syncDirectory(scope),
       'publish',
     );
+    committed = true;
 
     if (backupCreated) {
       await authority.unlink(scope, ROLLBACK_PATH);
       backupCreated = false;
+      await fileOps.syncDirectory(
+        async () => await authority.syncDirectory(scope),
+        'cleanup',
+      );
     }
   } catch (error) {
     await tempHandle?.close().catch(() => undefined);
     let rollbackError: unknown;
-    if (published) {
+    if (published && !committed) {
       try {
         if (oldRaw === null) {
           await authority.unlink(scope, CURRENT_PATH);
@@ -1072,13 +1372,32 @@ const publishPointer = async <Scope>(
         rollbackError = caught;
       }
     }
-    if (tempCreated) await cleanupRegularFile(scope, authority, TEMP_PATH);
-    if (backupCreated) await cleanupRegularFile(scope, authority, ROLLBACK_PATH);
-    if (rollbackError !== undefined) {
+    const cleanupErrors: unknown[] = [];
+    if (tempCreated) {
+      try {
+        await cleanupRegularFile(scope, authority, TEMP_PATH, fileOps);
+      } catch (caught) {
+        cleanupErrors.push(caught);
+      }
+    }
+    if (backupCreated) {
+      try {
+        await cleanupRegularFile(scope, authority, ROLLBACK_PATH, fileOps);
+      } catch (caught) {
+        cleanupErrors.push(caught);
+      }
+    }
+    if (rollbackError !== undefined || cleanupErrors.length > 0) {
       throw new RunStoreError(
         'RUN_POINTER_ROLLBACK_FAILED',
-        'pointer publication failed and the old pointer could not be restored',
-        {cause: new AggregateError([error, rollbackError])},
+        'pointer publication failed and rollback or cleanup did not complete',
+        {
+          cause: new AggregateError([
+            error,
+            ...(rollbackError === undefined ? [] : [rollbackError]),
+            ...cleanupErrors,
+          ]),
+        },
       );
     }
     throw error;
@@ -1106,32 +1425,32 @@ const OUTPUT_POINTER_AUTHORITY: PointerScopeAuthority<OutputDirectoryScope> = {
 };
 
 export class RunStore {
-  readonly #workspaceRoot: string;
+  readonly #workspace: Promise<DirectoryIdentity>;
   readonly #fileOps: FileOps;
 
   constructor(workspaceRoot: string, options: RunStoreOptions = {}) {
-    this.#workspaceRoot = workspaceRoot;
+    this.#workspace = createWorkspaceState(workspaceRoot);
     this.#fileOps = mergeFileOps(options);
     Object.freeze(this);
   }
 
   async createWork(projectId: string): Promise<WorkDirectoryScope> {
-    return await createWorkScope(this.#workspaceRoot, projectId);
+    return await createWorkScope(await this.#workspace, projectId);
   }
 
   async createRun(projectId: string, runId: string): Promise<RunDirectoryScope> {
-    return await mintRunScope(this.#workspaceRoot, projectId, runId, 'create');
+    return await mintRunScope(await this.#workspace, projectId, runId, 'create');
   }
 
   async openExistingRun(
     projectId: string,
     runId: string,
   ): Promise<RunDirectoryScope> {
-    return await mintRunScope(this.#workspaceRoot, projectId, runId, 'existing');
+    return await mintRunScope(await this.#workspace, projectId, runId, 'existing');
   }
 
   async readCurrent(projectId: string): Promise<CurrentPointer | null> {
-    const work = await createWorkScope(this.#workspaceRoot, projectId);
+    const work = await createWorkScope(await this.#workspace, projectId);
     const raw = await readPointerRaw(work, WORK_POINTER_AUTHORITY);
     return raw === null ? null : parsePointer(raw, 'work');
   }
@@ -1141,24 +1460,25 @@ export class RunStore {
     value: CurrentPointer,
   ): Promise<void> {
     const pointer = validatePointer(value, 'work');
-    await mintRunScope(this.#workspaceRoot, projectId, pointer.runId, 'existing');
-    const work = await createWorkScope(this.#workspaceRoot, projectId);
+    const workspace = await this.#workspace;
+    await mintRunScope(workspace, projectId, pointer.runId, 'existing');
+    const work = await createWorkScope(workspace, projectId);
     await publishPointer(work, WORK_POINTER_AUTHORITY, pointer, this.#fileOps);
   }
 }
 
 export class OutputStore {
-  readonly #workspaceRoot: string;
+  readonly #workspace: Promise<DirectoryIdentity>;
   readonly #fileOps: FileOps;
 
   constructor(workspaceRoot: string, options: RunStoreOptions = {}) {
-    this.#workspaceRoot = workspaceRoot;
+    this.#workspace = createWorkspaceState(workspaceRoot);
     this.#fileOps = mergeFileOps(options);
     Object.freeze(this);
   }
 
   async openProject(projectId: string): Promise<OutputDirectoryScope> {
-    return await mintOutputScope(this.#workspaceRoot, projectId);
+    return await mintOutputScope(await this.#workspace, projectId);
   }
 
   async createRelease(
@@ -1166,7 +1486,7 @@ export class OutputStore {
     runId: string,
   ): Promise<OutputDirectoryScope> {
     const validatedRunId = StableIdSchema.parse(runId);
-    const scope = await mintOutputScope(this.#workspaceRoot, projectId);
+    const scope = await mintOutputScope(await this.#workspace, projectId);
     const state = stateFor(outputStates, scope, 'OutputDirectoryScope');
     await ensureScopedDirectory(state, 'releases');
     await ensureScopedDirectory(state, `releases/${validatedRunId}`, true);
@@ -1174,7 +1494,7 @@ export class OutputStore {
   }
 
   async readCurrent(projectId: string): Promise<CurrentPointer | null> {
-    const output = await mintOutputScope(this.#workspaceRoot, projectId);
+    const output = await mintOutputScope(await this.#workspace, projectId);
     const raw = await readPointerRaw(output, OUTPUT_POINTER_AUTHORITY);
     return raw === null ? null : parsePointer(raw, 'output');
   }
@@ -1185,7 +1505,7 @@ export class OutputStore {
   ): Promise<void> {
     const pointer = validatePointer(value, 'output');
     const output = await openOutputRelease(
-      this.#workspaceRoot,
+      await this.#workspace,
       projectId,
       pointer.runId,
     );

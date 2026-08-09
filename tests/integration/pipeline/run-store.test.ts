@@ -3,6 +3,7 @@ import {
   mkdtemp,
   readFile,
   readdir,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -177,6 +178,37 @@ describe('RunStore', () => {
     await expect(createRunStore(workspaceRoot).openExistingRun('demo', 'missing'))
       .rejects.toMatchObject({code: 'ENOENT'});
   });
+
+  it.each(['run', 'output'] as const)(
+    'pins the original workspace identity for later %s scopes',
+    async (owner) => {
+      const workspaceRoot = await makeWorkspace();
+      const outsideRoot = await makeWorkspace();
+      const displacedWorkspace = `${workspaceRoot}-original`;
+      tempDirectories.push(displacedWorkspace);
+      let createLater: () => Promise<unknown>;
+      if (owner === 'run') {
+        const store = createRunStore(workspaceRoot);
+        await store.createRun('alpha', 'run-alpha');
+        createLater = async () => await store.createRun('beta', 'run-beta');
+      } else {
+        const store = createOutputStore(workspaceRoot);
+        await store.openProject('alpha');
+        createLater = async () => await store.openProject('beta');
+      }
+
+      await rename(workspaceRoot, displacedWorkspace);
+      await symlink(outsideRoot, workspaceRoot);
+
+      await expect(createLater()).rejects.toMatchObject({
+        code: 'APP_PATH_OUTSIDE_SCOPE',
+      });
+      const escapedPath = owner === 'run'
+        ? path.join(outsideRoot, '.work', 'beta', 'runs', 'run-beta')
+        : path.join(outsideRoot, 'output', 'beta');
+      await expect(lstat(escapedPath)).rejects.toMatchObject({code: 'ENOENT'});
+    },
+  );
 
   it('validates projectId and runId before deriving authority', async () => {
     const workspaceRoot = await makeWorkspace();
@@ -395,6 +427,78 @@ describe('RunStore', () => {
       await expect(normalStore.readCurrent('demo')).resolves.toEqual(pointer('run-one'));
     },
   );
+
+  it('syncs the parent directory after successful rollback cleanup', async () => {
+    const workspaceRoot = await makeWorkspace();
+    const normalStore = createRunStore(workspaceRoot);
+    await normalStore.createRun('demo', 'run-one');
+    await normalStore.publishCurrent('demo', pointer('run-one'));
+    await normalStore.createRun('demo', 'run-two');
+    const phases: string[] = [];
+    const store = createRunStore(workspaceRoot, {
+      fileOps: {
+        syncDirectory: async (operation, phase) => {
+          phases.push(phase);
+          await operation();
+        },
+      },
+    });
+
+    await store.publishCurrent(
+      'demo',
+      pointer('run-two', {publishedAt: '2026-08-10T00:01:00.000Z'}),
+    );
+
+    expect(phases).toEqual(['publish', 'cleanup']);
+  });
+
+  it('syncs the parent directory after failed temporary-file cleanup', async () => {
+    const workspaceRoot = await makeWorkspace();
+    const normalStore = createRunStore(workspaceRoot);
+    await normalStore.createRun('demo', 'run-one');
+    const failure = new Error('injected write failure');
+    const phases: string[] = [];
+    const store = createRunStore(workspaceRoot, {
+      fileOps: {
+        writeFile: async () => { throw failure; },
+        syncDirectory: async (operation, phase) => {
+          phases.push(phase);
+          await operation();
+        },
+      },
+    });
+
+    await expect(store.publishCurrent('demo', pointer('run-one')))
+      .rejects.toThrow(failure);
+
+    expect(phases).toContain('cleanup');
+    expect(await readdir(path.join(workspaceRoot, '.work', 'demo')))
+      .not.toContain('current.json.tmp');
+  });
+
+  it('recovers regular pointer scratch files before a later publication', async () => {
+    const workspaceRoot = await makeWorkspace();
+    const store = createRunStore(workspaceRoot);
+    await store.createRun('demo', 'run-one');
+    await store.publishCurrent('demo', pointer('run-one'));
+    await store.createRun('demo', 'run-two');
+    const workRoot = path.join(workspaceRoot, '.work', 'demo');
+    await writeFile(path.join(workRoot, 'current.json.tmp'), 'stale-temp');
+    await writeFile(path.join(workRoot, 'current.json.rollback'), 'stale-rollback');
+
+    await store.publishCurrent(
+      'demo',
+      pointer('run-two', {publishedAt: '2026-08-10T00:01:00.000Z'}),
+    );
+
+    await expect(store.readCurrent('demo')).resolves.toEqual(pointer(
+      'run-two',
+      {publishedAt: '2026-08-10T00:01:00.000Z'},
+    ));
+    const entries = await readdir(workRoot);
+    expect(entries).not.toContain('current.json.tmp');
+    expect(entries).not.toContain('current.json.rollback');
+  });
 
   it('preserves an absent pointer when directory sync fails after rename', async () => {
     const workspaceRoot = await makeWorkspace();

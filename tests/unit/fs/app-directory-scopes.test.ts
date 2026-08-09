@@ -16,6 +16,7 @@ import {
   describe,
   expect,
   it,
+  vi,
 } from 'vitest';
 import type {ProjectDirectoryScope} from '../../../src/fs/project-paths';
 import {
@@ -136,9 +137,47 @@ const makeTempDirectory = async (prefix: string): Promise<string> => {
 };
 
 afterEach(async () => {
+  vi.doUnmock('node:fs/promises');
+  vi.resetModules();
   await Promise.all(tempDirectories.splice(0).map((directory) =>
     rm(directory, {recursive: true, force: true})));
 });
+
+type ScopedMutation = 'link' | 'rename' | 'unlink';
+
+const importScopesWithMutationProbe = async (
+  mutation: ScopedMutation,
+  beforeMutation: () => Promise<void>,
+): Promise<typeof import('../../../src/fs/app-directory-scopes')> => {
+  vi.resetModules();
+  vi.doMock('node:fs/promises', async () => {
+    const actual = await vi.importActual<typeof import('node:fs/promises')>(
+      'node:fs/promises',
+    );
+    return {
+      ...actual,
+      link: mutation === 'link'
+        ? async (source: string, target: string) => {
+          await beforeMutation();
+          await actual.link(source, target);
+        }
+        : actual.link,
+      rename: mutation === 'rename'
+        ? async (source: string, target: string) => {
+          await beforeMutation();
+          await actual.rename(source, target);
+        }
+        : actual.rename,
+      unlink: mutation === 'unlink'
+        ? async (target: string) => {
+          await beforeMutation();
+          await actual.unlink(target);
+        }
+        : actual.unlink,
+    };
+  });
+  return await import('../../../src/fs/app-directory-scopes');
+};
 
 const writeAndClose = async (
   handle: FileHandle,
@@ -383,6 +422,66 @@ describe('app-owned directory scopes', () => {
       await expect(pending).rejects.toMatchObject({
         code: 'APP_PATH_OUTSIDE_SCOPE',
       });
+    },
+  );
+
+  it.each(['link', 'rename', 'unlink'] as const)(
+    'anchors the final %s syscall when the Work root is replaced',
+    async (mutation) => {
+      const workspaceRoot = await makeTempDirectory(`app-scopes-${mutation}-`);
+      const outsideRoot = await makeTempDirectory('app-scopes-outside-');
+      const workRoot = path.join(workspaceRoot, '.work', 'demo');
+      const displacedWorkRoot = `${workRoot}-original`;
+      let armed = false;
+      let replaced = false;
+      const scopes = await importScopesWithMutationProbe(mutation, async () => {
+        if (!armed || replaced) return;
+        replaced = true;
+        await rename(workRoot, displacedWorkRoot);
+        await symlink(outsideRoot, workRoot);
+      });
+      const store = scopes.createRunStore(workspaceRoot);
+      await store.createRun('demo', 'run-one');
+      await store.publishCurrent('demo', {
+        runId: 'run-one',
+        relativePath: 'runs/run-one',
+        preset: 'release',
+        stageIds: ['preflight', 'release'],
+        completedStage: 'release',
+        state: 'passed',
+        publishedAt: '2026-08-10T00:00:00.000Z',
+      });
+      await store.createRun('demo', 'run-two');
+
+      const outsideCurrent = path.join(outsideRoot, 'current.json');
+      const outsideTemp = path.join(outsideRoot, 'current.json.tmp');
+      const outsideRollback = path.join(outsideRoot, 'current.json.rollback');
+      await writeFile(outsideCurrent, 'outside-current');
+      if (mutation === 'rename') await writeFile(outsideTemp, 'outside-temp');
+      if (mutation === 'unlink') await writeFile(outsideRollback, 'outside-rollback');
+      armed = true;
+
+      await expect(store.publishCurrent('demo', {
+        runId: 'run-two',
+        relativePath: 'runs/run-two',
+        preset: 'release',
+        stageIds: ['preflight', 'release'],
+        completedStage: 'release',
+        state: 'passed',
+        publishedAt: '2026-08-10T00:01:00.000Z',
+      })).rejects.toBeInstanceOf(Error);
+
+      expect(replaced).toBe(true);
+      await expect(readFile(outsideCurrent, 'utf8')).resolves.toBe('outside-current');
+      if (mutation === 'rename') {
+        await expect(readFile(outsideTemp, 'utf8')).resolves.toBe('outside-temp');
+      }
+      if (mutation === 'link') {
+        await expect(readFile(outsideRollback, 'utf8'))
+          .rejects.toMatchObject({code: 'ENOENT'});
+      } else if (mutation === 'unlink') {
+        await expect(readFile(outsideRollback, 'utf8')).resolves.toBe('outside-rollback');
+      }
     },
   );
 
