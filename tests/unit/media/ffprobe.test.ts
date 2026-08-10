@@ -36,6 +36,25 @@ const audioStream = {
   duration: '2.002000',
 };
 
+const attachedPictureStream = {
+  index: 1,
+  codec_name: 'mjpeg',
+  profile: 'Baseline',
+  codec_type: 'video',
+  width: 64,
+  height: 48,
+  pix_fmt: 'yuvj444p',
+  color_range: 'pc',
+  color_space: 'bt470bg',
+  r_frame_rate: '90000/1',
+  avg_frame_rate: '0/0',
+  time_base: '1/90000',
+  duration_ts: 180_180,
+  duration: '2.002000',
+  bits_per_raw_sample: '8',
+  disposition: {attached_pic: 1},
+};
+
 const ffprobeDocument = (overrides: Record<string, unknown> = {}) => ({
   streams: [videoStream, audioStream],
   format: {
@@ -64,6 +83,7 @@ describe('parseFfprobeJson', () => {
         colorSpace: 'bt709',
         colorTransfer: 'bt709',
         colorPrimaries: 'bt709',
+        attachedPicture: false,
         rotation: 0,
         frameCount: 60,
         durationMs: 2002,
@@ -214,6 +234,23 @@ describe('parseFfprobeJson', () => {
     expect(result.audioStreams[0]?.durationMs).toBe(2000);
   });
 
+  it('preserves attached artwork without treating its zero frame rate as timed video', () => {
+    const result = parseFfprobeJson(JSON.stringify({
+      streams: [audioStream, attachedPictureStream],
+      format: {format_name: 'mp3', duration: '2.002000'},
+    }));
+
+    expect(result.durationMs).toBe(2002);
+    expect(result.audioStreams).toHaveLength(1);
+    expect(result.videoStreams).toEqual([expect.objectContaining({
+      index: 1,
+      codec: 'mjpeg',
+      attachedPicture: true,
+      width: 64,
+      height: 48,
+    })]);
+  });
+
   it.each([
     {name: 'malformed JSON', input: '{'},
     {name: 'missing streams', input: JSON.stringify({format: {duration: '1'}})},
@@ -240,6 +277,13 @@ describe('parseFfprobeJson', () => {
     {name: 'video side data without a type', input: JSON.stringify(ffprobeDocument({
       streams: [{...videoStream, side_data_list: [{}]}, audioStream],
     }))},
+    {name: 'malformed attached picture disposition', input: JSON.stringify({
+      streams: [audioStream, {
+        ...attachedPictureStream,
+        disposition: {attached_pic: 'cover'},
+      }],
+      format: {format_name: 'mp3', duration: '2.002000'},
+    })},
     {name: 'malformed display matrix', input: JSON.stringify(ffprobeDocument({
       streams: [{
         ...videoStream,

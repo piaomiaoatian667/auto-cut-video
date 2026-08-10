@@ -41,6 +41,25 @@ describe('video compatibility', () => {
     });
   });
 
+  it('ignores attached artwork when selecting the primary video stream', () => {
+    const probe = createProbe();
+    const primary = probe.videoStreams[0]!;
+    probe.videoStreams = [{
+      ...primary,
+      index: 0,
+      codec: 'mjpeg',
+      attachedPicture: true,
+      averageFrameRate: {numerator: 0, denominator: 0, value: 0},
+    }, {
+      ...primary,
+      index: 1,
+    }];
+
+    expect(decideVideoCompatibility(probe, {decodable: true})).toEqual({
+      compatibility: 'direct',
+    });
+  });
+
   it('does not mistake equivalent or near-nominal frame-rate rationals for VFR', () => {
     const equivalent = createProbe({
       avg_frame_rate: '60000/2002',
@@ -289,6 +308,7 @@ describe('transcodeVideo', () => {
       ffmpegExecutable: '/tools/ffmpeg',
       sourceFd: 41,
       outputFd: 42,
+      sourceStreamIndex: 2,
       sourceColor: {
         primaries: 'bt470bg',
         transfer: 'bt470bg',
@@ -313,7 +333,7 @@ describe('transcodeVideo', () => {
         '-y',
         '-v', 'error',
         '-i', '/dev/fd/3',
-        '-map', '0:v:0',
+        '-map', '0:2',
         '-an',
         '-vf', [
           'colorspace=space=bt709:trc=bt709:primaries=bt709:range=tv:ispace=bt470bg:itrc=bt470bg:iprimaries=bt470bg:irange=tv:fast=0',

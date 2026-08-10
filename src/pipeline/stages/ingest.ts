@@ -31,6 +31,7 @@ import {
   decideVideoCompatibility,
   isVariableFrameRate,
   parseFfprobeJson,
+  primaryVideoStream,
   type CompatibilityDecision,
   type MediaProbe,
   type VideoStreamProbe,
@@ -628,6 +629,7 @@ const decodeVideoHandle = async (
   input: IngestInput,
   dependencies: IngestDependencies,
   handle: FileHandle,
+  streamIndex: number,
   offsetMs: number,
 ): Promise<void> => {
   const result = await dependencies.runProcess(
@@ -638,7 +640,7 @@ const decodeVideoHandle = async (
       '-progress', 'pipe:1',
       '-ss', (offsetMs / 1000).toFixed(3),
       '-i', '/dev/fd/3',
-      '-map', '0:v:0',
+      '-map', `0:${streamIndex}`,
       '-frames:v', '1',
       '-an',
       '-f', 'null',
@@ -658,6 +660,7 @@ const decodeVideoSourceSamples = async (
   dependencies: IngestDependencies,
   asset: IngestAsset,
   authority: SourceAuthority,
+  streamIndex: number,
   durationMs: number,
 ): Promise<void> => {
   for (const offsetMs of videoSampleOffsets(durationMs)) {
@@ -671,6 +674,7 @@ const decodeVideoSourceSamples = async (
         input,
         dependencies,
         handle,
+        streamIndex,
         offsetMs,
       ),
     );
@@ -682,6 +686,7 @@ const decodeVideoRunSamples = async (
   dependencies: IngestDependencies,
   asset: IngestAsset,
   relativePath: string,
+  streamIndex: number,
   durationMs: number,
 ): Promise<void> => {
   for (const offsetMs of videoSampleOffsets(durationMs)) {
@@ -695,6 +700,7 @@ const decodeVideoRunSamples = async (
         input,
         dependencies,
         handle,
+        streamIndex,
         offsetMs,
       ),
     );
@@ -706,6 +712,7 @@ const decodeImageSource = async (
   dependencies: IngestDependencies,
   asset: IngestAsset,
   authority: SourceAuthority,
+  streamIndex: number,
 ): Promise<void> => await consumeSource(
   input,
   dependencies,
@@ -720,7 +727,7 @@ const decodeImageSource = async (
         '-nostats',
         '-progress', 'pipe:1',
         '-i', '/dev/fd/3',
-        '-map', '0:v:0',
+        '-map', `0:${streamIndex}`,
         '-frames:v', '1',
         '-an',
         '-f', 'null',
@@ -741,6 +748,7 @@ const decodeAudioSource = async (
   dependencies: IngestDependencies,
   asset: IngestAsset,
   authority: SourceAuthority,
+  streamIndex: number,
   durationMs: number,
 ): Promise<void> => await consumeSource(
   input,
@@ -755,7 +763,7 @@ const decodeAudioSource = async (
         '-v', 'error',
         '-nostats',
         '-i', '/dev/fd/3',
-        '-map', '0:a:0',
+        '-map', `0:${streamIndex}`,
         '-t', (durationMs / 1000).toFixed(3),
         '-frames:a', '1',
         '-vn',
@@ -866,6 +874,7 @@ const transcodeAsset = async (
               ffmpegExecutable: input.ffmpegExecutable,
               sourceFd: sourceHandle.fd,
               outputFd: outputHandle.fd,
+              sourceStreamIndex: sourceStream.index,
               sourceColor: {
                 primaries: colorPrimaries,
                 transfer: colorTransfer,
@@ -890,7 +899,7 @@ const transcodeAsset = async (
   );
 
   const outputProbe = await probeRun(input, dependencies, asset, renderPath);
-  const outputStream = outputProbe.videoStreams[0];
+  const outputStream = primaryVideoStream(outputProbe);
   if (outputStream === undefined) {
     throw new IngestError(
       'ASSET_DECODE_FAILED',
@@ -910,6 +919,7 @@ const transcodeAsset = async (
     dependencies,
     asset,
     renderPath,
+    outputStream.index,
     outputStream.durationMs,
   );
   await consumeRunFile(
@@ -973,7 +983,7 @@ const ingestVideo = async (
   sourceHash: string,
   probe: MediaProbe,
 ): Promise<IngestAssetRecord> => {
-  const stream = probe.videoStreams[0];
+  const stream = primaryVideoStream(probe);
   if (stream === undefined) {
     throw new IngestError(
       'ASSET_DECODE_FAILED',
@@ -993,6 +1003,7 @@ const ingestVideo = async (
     dependencies,
     asset,
     authority,
+    stream.index,
     stream.durationMs,
   );
   const decision = decideVideoCompatibility(probe, {decodable: true});
@@ -1041,7 +1052,14 @@ const ingestAudio = async (
       ['primary audio duration is missing'],
     );
   }
-  await decodeAudioSource(input, dependencies, asset, authority, stream.durationMs);
+  await decodeAudioSource(
+    input,
+    dependencies,
+    asset,
+    authority,
+    stream.index,
+    stream.durationMs,
+  );
   return {
     kind: 'audio',
     sourcePath: asset.sourcePath,
@@ -1069,7 +1087,7 @@ const ingestImage = async (
       ['image stream is missing'],
     );
   }
-  await decodeImageSource(input, dependencies, asset, authority);
+  await decodeImageSource(input, dependencies, asset, authority, stream.index);
   return {
     kind: 'image',
     sourcePath: asset.sourcePath,

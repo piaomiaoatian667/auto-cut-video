@@ -41,6 +41,7 @@ import {
 import {
   createTestImage,
   createTestMusic,
+  createTestMusicWithCover,
   createTestVideo,
   createZeroDurationAac,
 } from '../../helpers/media-fixtures';
@@ -223,6 +224,70 @@ describe('runIngest', () => {
       expect(snapshot.bytes).toEqual(before[index]!.bytes);
       expect(snapshot.stats.mtimeNs).toBe(before[index]!.stats.mtimeNs);
     }
+  });
+
+  it('accepts music with attached artwork and decodes only its audio stream', async () => {
+    const project = await makeProject('music-cover');
+    const coverPath = path.join(project.projectRoot, 'assets/source/cover.png');
+    const musicPath = path.join(project.projectRoot, 'assets/source/music.mp3');
+    await createTestImage(coverPath, 'purple');
+    await createTestMusicWithCover(musicPath, coverPath, 1);
+    const system = createSystemIngestDependencies();
+    const mappedStreams: string[] = [];
+    const dependencies: IngestDependencies = {
+      ...system,
+      runProcess: async (command, args, options) => {
+        const mapIndex = args.indexOf('-map');
+        if (command === FFMPEG_EXECUTABLE && mapIndex >= 0) {
+          mappedStreams.push(args[mapIndex + 1]!);
+        }
+        return await runProcess(command, args, options);
+      },
+    };
+
+    const {manifest} = await runIngest(inputFor(project, [{
+      assetId: 'music',
+      kind: 'audio',
+      sourcePath: 'assets/source/music.mp3',
+    }]), dependencies);
+
+    expect(manifest.assets.music).toMatchObject({
+      kind: 'audio',
+      durationMs: 1000,
+      compatibility: 'direct',
+    });
+    expect(mappedStreams).toEqual(['0:0']);
+  });
+
+  it('rejects attached artwork as the only video stream without sampling it', async () => {
+    const project = await makeProject('video-cover');
+    const coverPath = path.join(project.projectRoot, 'assets/source/cover.png');
+    const musicPath = path.join(project.projectRoot, 'assets/source/music.mp3');
+    await createTestImage(coverPath, 'purple');
+    await createTestMusicWithCover(musicPath, coverPath, 1);
+    const system = createSystemIngestDependencies();
+    let sampledVideo = false;
+    const dependencies: IngestDependencies = {
+      ...system,
+      runProcess: async (command, args, options) => {
+        if (command === FFMPEG_EXECUTABLE && args.includes('-frames:v')) {
+          sampledVideo = true;
+        }
+        return await runProcess(command, args, options);
+      },
+    };
+
+    await expect(runIngest(inputFor(project, [{
+      assetId: 'music-video',
+      kind: 'video',
+      sourcePath: 'assets/source/music.mp3',
+    }]), dependencies)).rejects.toMatchObject({
+      code: 'ASSET_DECODE_FAILED',
+      assetId: 'music-video',
+      reasons: ['video stream is missing'],
+    });
+    expect(sampledVideo).toBe(false);
+    await expectMissingManifest(project.runDirectory);
   });
 
   it('transcodes incompatible SDR video through fresh borrowed handles and validates the result', async () => {
@@ -747,7 +812,7 @@ describe('runIngest', () => {
     const dependencies: IngestDependencies = {
       ...system,
       runProcess: async (command, args, options) => {
-        if (command === FFMPEG_EXECUTABLE && args.includes('0:a:0')) {
+        if (command === FFMPEG_EXECUTABLE && args.includes('-frames:a')) {
           audioDecodeArgs = [...args];
         }
         return await runProcess(command, args, options);
@@ -772,7 +837,7 @@ describe('runIngest', () => {
     const dependencies: IngestDependencies = {
       ...system,
       runProcess: async (command, args, options) => {
-        if (command === FFMPEG_EXECUTABLE && args.includes('0:a:0')) {
+        if (command === FFMPEG_EXECUTABLE && args.includes('-frames:a')) {
           return {
             command,
             args: [...args],

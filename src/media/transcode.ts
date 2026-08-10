@@ -15,6 +15,7 @@ export interface TranscodeVideoInput {
   ffmpegExecutable: string;
   sourceFd: number;
   outputFd: number;
+  sourceStreamIndex: number;
   sourceColor: {
     primaries: string;
     transfer: string;
@@ -35,6 +36,9 @@ const colorToken = (value: string, field: string): string => {
 };
 
 const transcodeVideoArgs = (input: TranscodeVideoInput): readonly string[] => {
+  if (!Number.isSafeInteger(input.sourceStreamIndex) || input.sourceStreamIndex < 0) {
+    throw new TypeError('sourceStreamIndex must be a non-negative safe integer');
+  }
   const primaries = colorToken(input.sourceColor.primaries, 'sourceColor.primaries');
   const transfer = colorToken(input.sourceColor.transfer, 'sourceColor.transfer');
   const space = colorToken(input.sourceColor.space, 'sourceColor.space');
@@ -47,7 +51,7 @@ const transcodeVideoArgs = (input: TranscodeVideoInput): readonly string[] => {
     '-y',
     '-v', 'error',
     '-i', '/dev/fd/3',
-    '-map', '0:v:0',
+    '-map', `0:${input.sourceStreamIndex}`,
     '-an',
     '-vf', `${colorFilter},fps=30,format=yuv420p`,
     '-fps_mode', 'cfr',

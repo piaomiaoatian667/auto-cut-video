@@ -21,6 +21,7 @@ export interface VideoStreamProbe {
   pixelFormat: string;
   width: number;
   height: number;
+  attachedPicture: boolean;
   averageFrameRate: FrameRateRational;
   realFrameRate: FrameRateRational;
   colorPrimaries?: string;
@@ -203,6 +204,14 @@ const parseFrameRate = (value: unknown, field: string): FrameRateRational => {
   return {numerator, denominator, value: result};
 };
 
+const parseVideoFrameRate = (
+  value: unknown,
+  field: string,
+  attachedPicture: boolean,
+): FrameRateRational => attachedPicture && value === '0/0'
+  ? {numerator: 0, denominator: 0, value: 0}
+  : parseFrameRate(value, field);
+
 const normalizeRotation = (value: number): number => {
   const normalized = ((value % 360) + 360) % 360;
   if (Math.abs(normalized) < 0.000001 || Math.abs(normalized - 360) < 0.000001) {
@@ -324,7 +333,23 @@ const parseSideData = (stream: JsonRecord, path: string): JsonRecord[] => {
     asRecord(entry, `${path}.side_data_list[${index}]`));
 };
 
+const parseAttachedPicture = (stream: JsonRecord, path: string): boolean => {
+  if (stream.disposition === undefined) return false;
+  const disposition = asRecord(stream.disposition, `${path}.disposition`);
+  if (disposition.attached_pic === undefined) return false;
+  const value = parseInteger(
+    disposition.attached_pic,
+    `${path}.disposition.attached_pic`,
+    0,
+  );
+  if (value > 1) {
+    return fail(`${path}.disposition.attached_pic must be 0 or 1`);
+  }
+  return value === 1;
+};
+
 const parseVideoStream = (stream: JsonRecord, path: string): VideoStreamProbe => {
+  const attachedPicture = parseAttachedPicture(stream, path);
   const sideData = parseSideData(stream, path);
   const profile = optionalString(stream, 'profile', path);
   const codecTag = optionalString(stream, 'codec_tag_string', path);
@@ -345,13 +370,16 @@ const parseVideoStream = (stream: JsonRecord, path: string): VideoStreamProbe =>
     pixelFormat: requiredString(stream, 'pix_fmt', path),
     width: parseInteger(stream.width, `${path}.width`, 1),
     height: parseInteger(stream.height, `${path}.height`, 1),
-    averageFrameRate: parseFrameRate(
+    attachedPicture,
+    averageFrameRate: parseVideoFrameRate(
       stream.avg_frame_rate,
       `${path}.avg_frame_rate`,
+      attachedPicture,
     ),
-    realFrameRate: parseFrameRate(
+    realFrameRate: parseVideoFrameRate(
       stream.r_frame_rate,
       `${path}.r_frame_rate`,
+      attachedPicture,
     ),
     ...(colorPrimaries === undefined ? {} : {colorPrimaries}),
     ...(colorTransfer === undefined ? {} : {colorTransfer}),
@@ -411,15 +439,16 @@ const resolveDuration = (
   const formatDuration = format.duration === undefined
     ? undefined
     : durationMs(format.duration, 'format.duration');
-  if (videoStreams.length > 0) {
-    const primaryVideoDuration = videoStreams[0]?.durationMs;
+  const primaryVideo = videoStreams.find((stream) => !stream.attachedPicture);
+  if (primaryVideo !== undefined) {
+    const primaryVideoDuration = primaryVideo.durationMs;
     if (primaryVideoDuration !== undefined) {
       if (primaryVideoDuration === 0 && !STILL_IMAGE_FORMATS.has(formatName)) {
         return fail('primary video duration must be positive for timed media');
       }
       return primaryVideoDuration;
     }
-    if (STILL_IMAGE_FORMATS.has(formatName) && videoStreams.length === 1) return 0;
+    if (STILL_IMAGE_FORMATS.has(formatName)) return 0;
     return fail('ffprobe output is missing the primary video duration');
   }
 
@@ -438,6 +467,11 @@ const resolveDuration = (
   }
   return fail('ffprobe output is missing a valid duration');
 };
+
+export const primaryVideoStream = (
+  probe: Pick<MediaProbe, 'videoStreams'>,
+): VideoStreamProbe | undefined =>
+  probe.videoStreams.find((stream) => !stream.attachedPicture);
 
 export const parseFfprobeJson = (source: string): MediaProbe => {
   let parsed: unknown;
@@ -705,7 +739,7 @@ export const decideVideoCompatibility = (
     };
   }
 
-  const stream = probe.videoStreams[0];
+  const stream = primaryVideoStream(probe);
   if (stream === undefined) {
     return {
       compatibility: 'rejected',

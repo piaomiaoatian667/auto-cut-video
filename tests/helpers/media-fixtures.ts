@@ -100,6 +100,31 @@ export async function createTestMusic(
   ]);
 }
 
+export async function createTestMusicWithCover(
+  output: string,
+  coverImage: string,
+  seconds = 2,
+): Promise<void> {
+  await runProcess(FFMPEG_EXECUTABLE, [
+    '-v', 'error',
+    '-y',
+    '-fflags', '+bitexact',
+    '-f', 'lavfi',
+    '-i', `sine=frequency=880:sample_rate=48000:duration=${seconds}`,
+    '-i', coverImage,
+    '-map', '0:a:0',
+    '-map', '1:v:0',
+    '-c:a', 'libmp3lame',
+    '-ar', '48000',
+    '-ac', '1',
+    '-c:v', 'mjpeg',
+    '-disposition:v:0', 'attached_pic',
+    '-id3v2_version', '3',
+    '-map_metadata', '-1',
+    output,
+  ]);
+}
+
 export async function createZeroDurationAac(output: string): Promise<void> {
   await writeFile(output, Buffer.from('fff14c40039ffc', 'hex'));
 }
