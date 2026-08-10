@@ -2,7 +2,7 @@ import {createHash} from 'node:crypto';
 import {constants} from 'node:fs';
 import {
   access,
-  readFile,
+  open,
   realpath,
   stat,
   statfs,
@@ -11,7 +11,7 @@ import path from 'node:path';
 import type {Project} from '../../domain/project-schema';
 import type {Script} from '../../domain/script-schema';
 import {
-  prepareExistingProjectFile,
+  openExistingProjectFile,
   type ProjectDirectoryScope,
 } from '../../fs/project-paths';
 import {
@@ -23,14 +23,22 @@ import type {CheckResult} from '../types';
 
 const GIB = 1024 ** 3;
 const MINIMUM_REQUIRED_BYTES = 2 * GIB;
-const EXECUTABLE_BITS = 0o111;
+const HASH_CHUNK_BYTES = 64 * 1024;
+const O_NOFOLLOW_ANY = 0x20000000;
+const SAFE_READ_FLAGS = constants.O_RDONLY
+  | constants.O_NONBLOCK
+  | O_NOFOLLOW_ANY;
+
+export const MAX_FONT_BYTES = 64 * 1024 * 1024;
 
 export type PreflightErrorCode =
   | 'DISK_SPACE_EXHAUSTED'
   | 'ENV_CAPABILITY_MISSING'
+  | 'ENV_FONT_INVALID'
   | 'ENV_FONT_MISSING'
   | 'ENV_INPUT_INVALID'
   | 'ENV_PLATFORM_UNSUPPORTED'
+  | 'ENV_TOOL_CHANGED'
   | 'ENV_TOOL_MISSING'
   | 'ENV_VOICE_MISSING'
   | 'ENV_WORK_DIRECTORY_UNAVAILABLE';
@@ -49,9 +57,30 @@ export interface FontIdentity {
   sha256: string;
 }
 
-export interface PreflightFileStatus {
+export interface PreflightFileIdentity {
   kind: 'file' | 'directory' | 'other';
-  mode: number;
+  mode: bigint;
+  dev: bigint;
+  ino: bigint;
+  nlink: bigint;
+  size: bigint;
+}
+
+export interface PreflightExecutableSnapshot {
+  identity: PreflightFileIdentity;
+  sha256: string;
+}
+
+export interface PreflightExecutableAuthority {
+  executionPath: string;
+  snapshot: PreflightExecutableSnapshot;
+  revalidate(): Promise<boolean>;
+  close(): Promise<void>;
+}
+
+export interface PreflightHashedProjectFile {
+  identity: PreflightFileIdentity;
+  sha256: string;
 }
 
 export type PreflightProcessResult = ProcessResult;
@@ -64,12 +93,12 @@ export interface DirectoryInspection {
 
 export interface PreflightFileSystem {
   realpath(candidate: string): Promise<string>;
-  stat(candidate: string): Promise<PreflightFileStatus>;
-  readFile(candidate: string): Promise<Uint8Array>;
-  readProjectFile(
+  openExecutable(candidate: string): Promise<PreflightExecutableAuthority>;
+  hashProjectFile(
     scope: ProjectDirectoryScope,
     relativePath: string,
-  ): Promise<{data: Uint8Array; kind: PreflightFileStatus['kind']}>;
+    maxBytes: number,
+  ): Promise<PreflightHashedProjectFile>;
   inspectDirectory(candidate: string): Promise<DirectoryInspection>;
   statfsAvailableBytes(candidate: string): Promise<number>;
 }
@@ -139,14 +168,56 @@ interface ProbeOutput {
   stderr: string;
 }
 
+interface EncoderRecord {
+  name: string;
+  description: string;
+}
+
+interface ResolvedExecutable {
+  realPath: string;
+  authority: PreflightExecutableAuthority;
+}
+
+interface PreflightBigIntStat {
+  dev: bigint;
+  ino: bigint;
+  nlink: bigint;
+  size: bigint;
+  mode: bigint;
+  isFile(): boolean;
+  isDirectory(): boolean;
+}
+
+interface PreflightSystemFileHandle {
+  fd: number;
+  stat(options: {bigint: true}): Promise<PreflightBigIntStat>;
+  read(
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number,
+  ): Promise<{bytesRead: number}>;
+  close(): Promise<void>;
+}
+
+export interface SystemPreflightFileSystem {
+  access(candidate: string, mode: number): Promise<void>;
+  open(candidate: string, flags: number): Promise<PreflightSystemFileHandle>;
+  openExistingProjectFile(
+    scope: ProjectDirectoryScope,
+    relativePath: string,
+  ): Promise<PreflightSystemFileHandle>;
+}
+
+class ProjectFontError extends Error {
+  constructor(readonly code: 'ENV_FONT_INVALID' | 'ENV_FONT_MISSING') {
+    super('Configured font is unavailable or unsafe.');
+    this.name = 'ProjectFontError';
+  }
+}
+
 const isNodeError = (error: unknown): error is NodeJS.ErrnoException =>
   error instanceof Error && 'code' in error;
-
-const sha256 = (data: Uint8Array): string =>
-  `sha256:${createHash('sha256').update(data).digest('hex')}`;
-
-const executable = (status: PreflightFileStatus): boolean =>
-  status.kind === 'file' && (status.mode & EXECUTABLE_BITS) !== 0;
 
 const firstLine = (value: string): string =>
   value.trim().split(/\r?\n/u, 1)[0] ?? '';
@@ -165,20 +236,76 @@ const parseFfmpegVersion = (
   return match?.[1] ?? null;
 };
 
-const parseNames = (value: string): Set<string> => {
-  const names = new Set<string>();
+const parseMacosVersion = (value: string): string | null => {
+  const parsed = firstLine(value).trim();
+  return /^\d+(?:\.\d+){0,2}$/u.test(parsed) ? parsed : null;
+};
+
+const unavailableDescription = (description: string): boolean =>
+  /\b(?:disabled|unavailable|decoder[ -]?only)\b/iu.test(description);
+
+const parseEncoderTable = (value: string): EncoderRecord[] => {
+  const encoders: EncoderRecord[] = [];
+  let inEncoderTable = false;
   for (const line of value.split(/\r?\n/u)) {
-    const columns = line.trim().split(/\s+/u);
-    if (columns.length >= 2) names.add(columns[1]!);
+    const trimmed = line.trim();
+    if (trimmed === 'Encoders:') {
+      inEncoderTable = true;
+      continue;
+    }
+    if (/^[A-Za-z][A-Za-z ]+:$/u.test(trimmed)) {
+      inEncoderTable = false;
+      continue;
+    }
+    if (!inEncoderTable) continue;
+    const match = /^\s*[VAS][A-Z.]{5}\s+([A-Za-z0-9_]+)(?:\s+(.*))?$/u
+      .exec(line);
+    if (match === null) continue;
+    const name = match[1]!;
+    const description = match[2] ?? '';
+    if (unavailableDescription(description)) continue;
+    encoders.push({name, description});
+  }
+  return encoders;
+};
+
+const hasH264Encoder = (encoders: readonly EncoderRecord[]): boolean =>
+  encoders.some(({name, description}) => (
+    name === 'libx264'
+    || name === 'libx264rgb'
+    || /^h264(?:_|$)/u.test(name)
+    || /\(codec\s+h264\)/iu.test(description)
+  ));
+
+const hasAacEncoder = (encoders: readonly EncoderRecord[]): boolean =>
+  encoders.some(({name, description}) => (
+    name === 'aac'
+    || /^aac_/u.test(name)
+    || /_aac$/u.test(name)
+    || /\(codec\s+aac\)/iu.test(description)
+  ));
+
+const parseFilterTable = (value: string): Set<string> => {
+  const names = new Set<string>();
+  let inFilterTable = false;
+  for (const line of value.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (trimmed === 'Filters:') {
+      inFilterTable = true;
+      continue;
+    }
+    if (/^[A-Za-z][A-Za-z ]+:$/u.test(trimmed)) {
+      inFilterTable = false;
+      continue;
+    }
+    if (!inFilterTable) continue;
+    const match = /^\s*[TSC.]{2,3}\s+([A-Za-z0-9_]+)(?:\s+(.*))?$/u
+      .exec(line);
+    if (match === null || unavailableDescription(match[2] ?? '')) continue;
+    names.add(match[1]!);
   }
   return names;
 };
-
-const hasH264Encoder = (names: ReadonlySet<string>): boolean =>
-  [...names].some((name) => name.toLowerCase().includes('h264'));
-
-const hasAacEncoder = (names: ReadonlySet<string>): boolean =>
-  [...names].some((name) => name.toLowerCase().includes('aac'));
 
 const hasVoice = (output: string, configuredVoice: string): boolean =>
   output.split(/\r?\n/u).some((line) => (
@@ -228,39 +355,43 @@ const probe = async (
 const combinedOutput = (output: ProbeOutput | null): string =>
   output === null ? '' : `${output.stdout}\n${output.stderr}`;
 
-const resolveExecutablePath = async (
+const safeRevalidate = async (
+  authority: PreflightExecutableAuthority,
+): Promise<boolean> => {
+  try {
+    return await authority.revalidate();
+  } catch {
+    return false;
+  }
+};
+
+const probeExecutable = async (
+  dependencies: PreflightDependencies,
+  executable: ResolvedExecutable,
+  args: readonly string[],
+): Promise<{changed: boolean; output: ProbeOutput | null}> => {
+  if (!await safeRevalidate(executable.authority)) {
+    return {changed: true, output: null};
+  }
+  const output = await probe(
+    dependencies,
+    executable.authority.executionPath,
+    args,
+  );
+  if (!await safeRevalidate(executable.authority)) {
+    return {changed: true, output: null};
+  }
+  return {changed: false, output};
+};
+
+const resolveExecutableAuthority = async (
   selection: string,
   dependencies: PreflightDependencies,
-): Promise<string> => {
+): Promise<ResolvedExecutable> => {
   const selectedPath = await dependencies.resolveExecutable(selection);
   const realPath = await dependencies.fileSystem.realpath(selectedPath);
-  const status = await dependencies.fileSystem.stat(realPath);
-  if (!executable(status)) throw new Error('selected executable is unavailable');
-  return realPath;
-};
-
-const resolveBinaryIdentity = async (
-  selection: string,
-  dependencies: PreflightDependencies,
-): Promise<ToolIdentity> => {
-  const realPath = await resolveExecutablePath(selection, dependencies);
-  const data = await dependencies.fileSystem.readFile(realPath);
-  return {realPath, sha256: sha256(data)};
-};
-
-const resolveQtFaststartIdentity = async (
-  ffmpegRealPath: string,
-  dependencies: PreflightDependencies,
-): Promise<{identity: ToolIdentity; siblingPath: string}> => {
-  const siblingPath = path.join(path.dirname(ffmpegRealPath), 'qt-faststart');
-  const status = await dependencies.fileSystem.stat(siblingPath);
-  if (!executable(status)) throw new Error('qt-faststart is unavailable');
-  const realPath = await dependencies.fileSystem.realpath(siblingPath);
-  const data = await dependencies.fileSystem.readFile(realPath);
-  return {
-    identity: {realPath, sha256: sha256(data)},
-    siblingPath,
-  };
+  const authority = await dependencies.fileSystem.openExecutable(realPath);
+  return {realPath, authority};
 };
 
 const capabilityCheck = (
@@ -282,406 +413,787 @@ const capabilityCheck = (
   }
 };
 
+const closeAuthorities = async (
+  authorities: readonly PreflightExecutableAuthority[],
+): Promise<void> => {
+  await Promise.allSettled(authorities.map(async (authority) => authority.close()));
+};
+
 export async function runPreflight(
   input: PreflightInput,
   dependencies: PreflightDependencies,
 ): Promise<PreflightResult> {
-  const checks: PreflightCheck[] = [];
-  const {platform, arch} = dependencies.runtime;
-  const supportedPlatform = platform === 'darwin' && arch === 'arm64';
-  if (supportedPlatform) {
-    addInfo(checks, 'supported-platform', 'Platform is supported.', {
-      value: `${platform}/${arch}`,
-      expected: 'darwin/arm64',
-    });
-  } else {
-    addError(
-      checks,
-      'supported-platform',
-      'ENV_PLATFORM_UNSUPPORTED',
-      'Apple Silicon macOS is required.',
-      {value: `${platform}/${arch}`, expected: 'darwin/arm64'},
-    );
-  }
-
-  const validSourceBytes = Number.isFinite(input.sourceBytes)
-    && input.sourceBytes >= 0;
-  const sourceBytes = validSourceBytes ? input.sourceBytes : 0;
-  if (!validSourceBytes) {
-    addError(
-      checks,
-      'source-bytes',
-      'ENV_INPUT_INVALID',
-      'Source byte estimate must be a non-negative finite number.',
-    );
-  }
-  const requiredBytes = Math.max(sourceBytes * 3, MINIMUM_REQUIRED_BYTES);
-  const workDirectory = input.workDirectory
-    ?? path.join(input.workspaceRoot, '.work', input.project.id);
-
-  const versions: PreflightVersions = {
-    node: null,
-    pnpm: null,
-    macos: null,
-    ffmpeg: null,
-    ffprobe: null,
-  };
-
-  const nodeOutput = await probe(dependencies, 'node', ['--version']);
-  versions.node = nodeOutput === null
-    ? null
-    : parseSimpleVersion(combinedOutput(nodeOutput));
-  if (versions.node === null) {
-    addError(checks, 'node', 'ENV_TOOL_MISSING', 'Node.js is unavailable.');
-  } else {
-    addInfo(checks, 'node', 'Node.js is available.', {value: versions.node});
-  }
-
-  const pnpmOutput = await probe(dependencies, 'pnpm', ['--version']);
-  versions.pnpm = pnpmOutput === null
-    ? null
-    : parseSimpleVersion(combinedOutput(pnpmOutput));
-  if (versions.pnpm === null) {
-    addError(checks, 'pnpm', 'ENV_TOOL_MISSING', 'pnpm is unavailable.');
-  } else {
-    addInfo(checks, 'pnpm', 'pnpm is available.', {value: versions.pnpm});
-  }
-
-  const macosOutput = await probe(
-    dependencies,
-    '/usr/bin/sw_vers',
-    ['-productVersion'],
-  );
-  versions.macos = macosOutput === null
-    ? null
-    : parseSimpleVersion(combinedOutput(macosOutput));
-  const macosMajor = versions.macos === null
-    ? Number.NaN
-    : Number.parseInt(versions.macos.split('.')[0] ?? '', 10);
-  if (!Number.isFinite(macosMajor) || macosMajor < 15) {
-    addError(
-      checks,
-      'macos-version',
-      'ENV_PLATFORM_UNSUPPORTED',
-      'macOS 15 or newer is required.',
-      {value: versions.macos ?? 'unavailable', expected: '>=15'},
-    );
-  } else {
-    addInfo(checks, 'macos-version', 'macOS version is supported.', {
-      value: versions.macos!,
-      expected: '>=15',
-    });
-  }
-
-  const toolIdentities: PreflightResult['toolIdentities'] = {
-    ffmpeg: null,
-    qtFaststart: null,
-  };
-  const ffmpegSelection = input.ffmpegExecutable ?? 'ffmpeg';
+  const heldAuthorities: PreflightExecutableAuthority[] = [];
   try {
-    toolIdentities.ffmpeg = await resolveBinaryIdentity(
-      ffmpegSelection,
-      dependencies,
-    );
-  } catch {
-    addError(
-      checks,
-      'ffmpeg',
-      'ENV_TOOL_MISSING',
-      'The selected FFmpeg executable is missing or unusable.',
-      {affectedPaths: [ffmpegSelection]},
-    );
-  }
-
-  if (toolIdentities.ffmpeg !== null) {
-    const siblingPath = path.join(
-      path.dirname(toolIdentities.ffmpeg.realPath),
-      'qt-faststart',
-    );
-    try {
-      const resolved = await resolveQtFaststartIdentity(
-        toolIdentities.ffmpeg.realPath,
-        dependencies,
-      );
-      toolIdentities.qtFaststart = resolved.identity;
-      addInfo(checks, 'qt-faststart', 'qt-faststart is available.', {
-        affectedPaths: [resolved.identity.realPath],
+    const checks: PreflightCheck[] = [];
+    const {platform, arch} = dependencies.runtime;
+    const supportedPlatform = platform === 'darwin' && arch === 'arm64';
+    if (supportedPlatform) {
+      addInfo(checks, 'supported-platform', 'Platform is supported.', {
+        value: `${platform}/${arch}`,
+        expected: 'darwin/arm64',
       });
+    } else {
+      addError(
+        checks,
+        'supported-platform',
+        'ENV_PLATFORM_UNSUPPORTED',
+        'Apple Silicon macOS is required.',
+        {value: `${platform}/${arch}`, expected: 'darwin/arm64'},
+      );
+    }
+
+    const validSourceBytes = Number.isFinite(input.sourceBytes)
+      && input.sourceBytes >= 0;
+    const sourceBytes = validSourceBytes ? input.sourceBytes : 0;
+    if (!validSourceBytes) {
+      addError(
+        checks,
+        'source-bytes',
+        'ENV_INPUT_INVALID',
+        'Source byte estimate must be a non-negative finite number.',
+      );
+    }
+    const requiredBytes = Math.max(sourceBytes * 3, MINIMUM_REQUIRED_BYTES);
+    const workDirectory = input.workDirectory
+      ?? path.join(input.workspaceRoot, '.work', input.project.id);
+
+    const versions: PreflightVersions = {
+      node: null,
+      pnpm: null,
+      macos: null,
+      ffmpeg: null,
+      ffprobe: null,
+    };
+
+    const nodeOutput = await probe(dependencies, 'node', ['--version']);
+    versions.node = nodeOutput === null
+      ? null
+      : parseSimpleVersion(combinedOutput(nodeOutput));
+    if (versions.node === null) {
+      addError(checks, 'node', 'ENV_TOOL_MISSING', 'Node.js is unavailable.');
+    } else {
+      addInfo(checks, 'node', 'Node.js is available.', {value: versions.node});
+    }
+
+    const pnpmOutput = await probe(dependencies, 'pnpm', ['--version']);
+    versions.pnpm = pnpmOutput === null
+      ? null
+      : parseSimpleVersion(combinedOutput(pnpmOutput));
+    if (versions.pnpm === null) {
+      addError(checks, 'pnpm', 'ENV_TOOL_MISSING', 'pnpm is unavailable.');
+    } else {
+      addInfo(checks, 'pnpm', 'pnpm is available.', {value: versions.pnpm});
+    }
+
+    const macosOutput = await probe(
+      dependencies,
+      '/usr/bin/sw_vers',
+      ['-productVersion'],
+    );
+    const macosReported = macosOutput === null
+      ? null
+      : parseSimpleVersion(combinedOutput(macosOutput));
+    versions.macos = macosOutput === null
+      ? null
+      : parseMacosVersion(combinedOutput(macosOutput));
+    const macosMajor = versions.macos === null
+      ? Number.NaN
+      : Number.parseInt(versions.macos.split('.')[0] ?? '', 10);
+    if (!Number.isFinite(macosMajor) || macosMajor < 15) {
+      addError(
+        checks,
+        'macos-version',
+        'ENV_PLATFORM_UNSUPPORTED',
+        'macOS 15 or newer is required.',
+        {value: macosReported ?? 'unavailable', expected: '>=15'},
+      );
+    } else {
+      addInfo(checks, 'macos-version', 'macOS version is supported.', {
+        value: versions.macos!,
+        expected: '>=15',
+      });
+    }
+
+    const toolIdentities: PreflightResult['toolIdentities'] = {
+      ffmpeg: null,
+      qtFaststart: null,
+    };
+    let ffmpeg: ResolvedExecutable | null = null;
+    let ffprobe: ResolvedExecutable | null = null;
+    let qtFaststart: ResolvedExecutable | null = null;
+    let qtFaststartMissing = false;
+
+    const ffmpegSelection = input.ffmpegExecutable ?? 'ffmpeg';
+    try {
+      ffmpeg = await resolveExecutableAuthority(ffmpegSelection, dependencies);
+      heldAuthorities.push(ffmpeg.authority);
+      toolIdentities.ffmpeg = {
+        realPath: ffmpeg.realPath,
+        sha256: ffmpeg.authority.snapshot.sha256,
+      };
     } catch {
+      addError(
+        checks,
+        'ffmpeg',
+        'ENV_TOOL_MISSING',
+        'The selected FFmpeg executable is missing or unusable.',
+        {affectedPaths: [ffmpegSelection]},
+      );
+    }
+
+    const qtFaststartSibling = ffmpeg === null
+      ? null
+      : path.join(path.dirname(ffmpeg.realPath), 'qt-faststart');
+    if (qtFaststartSibling === null) {
+      qtFaststartMissing = true;
       addError(
         checks,
         'qt-faststart',
         'ENV_TOOL_MISSING',
-        'The FFmpeg sibling qt-faststart is missing or unusable.',
-        {affectedPaths: [siblingPath]},
+        'qt-faststart cannot be resolved without FFmpeg.',
       );
-    }
-  } else {
-    addError(
-      checks,
-      'qt-faststart',
-      'ENV_TOOL_MISSING',
-      'qt-faststart cannot be resolved without FFmpeg.',
-    );
-  }
-
-  let ffprobeRealPath: string | null = null;
-  try {
-    ffprobeRealPath = await resolveExecutablePath(
-      input.ffprobeExecutable ?? 'ffprobe',
-      dependencies,
-    );
-  } catch {
-    addError(
-      checks,
-      'ffprobe',
-      'ENV_TOOL_MISSING',
-      'The selected ffprobe executable is missing or unusable.',
-      {affectedPaths: [input.ffprobeExecutable ?? 'ffprobe']},
-    );
-  }
-
-  let ffmpegVersionOutput: ProbeOutput | null = null;
-  if (toolIdentities.ffmpeg !== null) {
-    ffmpegVersionOutput = await probe(
-      dependencies,
-      toolIdentities.ffmpeg.realPath,
-      ['-version'],
-    );
-    versions.ffmpeg = ffmpegVersionOutput === null
-      ? null
-      : parseFfmpegVersion(combinedOutput(ffmpegVersionOutput), 'ffmpeg');
-    if (versions.ffmpeg === null) {
-      addError(checks, 'ffmpeg-version', 'ENV_TOOL_MISSING', 'FFmpeg probe failed.');
     } else {
-      addInfo(checks, 'ffmpeg-version', 'FFmpeg is available.', {
-        value: versions.ffmpeg,
-      });
+      try {
+        const realPath = await dependencies.fileSystem.realpath(qtFaststartSibling);
+        const authority = await dependencies.fileSystem.openExecutable(realPath);
+        qtFaststart = {realPath, authority};
+        heldAuthorities.push(authority);
+        toolIdentities.qtFaststart = {
+          realPath,
+          sha256: authority.snapshot.sha256,
+        };
+      } catch {
+        qtFaststartMissing = true;
+        addError(
+          checks,
+          'qt-faststart',
+          'ENV_TOOL_MISSING',
+          'The FFmpeg sibling qt-faststart is missing or unusable.',
+          {affectedPaths: [qtFaststartSibling]},
+        );
+      }
     }
-  }
 
-  if (ffprobeRealPath !== null) {
-    const ffprobeOutput = await probe(
-      dependencies,
-      ffprobeRealPath,
-      ['-version'],
-    );
-    versions.ffprobe = ffprobeOutput === null
-      ? null
-      : parseFfmpegVersion(combinedOutput(ffprobeOutput), 'ffprobe');
-    if (versions.ffprobe === null) {
-      addError(checks, 'ffprobe-version', 'ENV_TOOL_MISSING', 'ffprobe probe failed.');
-    } else {
-      addInfo(checks, 'ffprobe-version', 'ffprobe is available.', {
-        value: versions.ffprobe,
-      });
-    }
-  }
-
-  let encoderNames = new Set<string>();
-  if (toolIdentities.ffmpeg !== null) {
-    const encoderOutput = await probe(
-      dependencies,
-      toolIdentities.ffmpeg.realPath,
-      ['-hide_banner', '-encoders'],
-    );
-    encoderNames = parseNames(combinedOutput(encoderOutput));
-  }
-  capabilityCheck(
-    checks,
-    'ffmpeg-encoder-h264',
-    hasH264Encoder(encoderNames),
-    'An H.264 encoder',
-  );
-  capabilityCheck(
-    checks,
-    'ffmpeg-encoder-aac',
-    hasAacEncoder(encoderNames),
-    'An AAC encoder',
-  );
-
-  let filterNames = new Set<string>();
-  if (toolIdentities.ffmpeg !== null) {
-    const filterOutput = await probe(
-      dependencies,
-      toolIdentities.ffmpeg.realPath,
-      ['-hide_banner', '-filters'],
-    );
-    filterNames = parseNames(combinedOutput(filterOutput));
-  }
-  for (const filter of ['loudnorm', 'silencedetect', 'blackdetect'] as const) {
-    capabilityCheck(
-      checks,
-      `ffmpeg-filter-${filter}`,
-      filterNames.has(filter),
-      `FFmpeg filter ${filter}`,
-    );
-  }
-
-  const sayOutput = await probe(dependencies, '/usr/bin/say', ['-v', '?']);
-  const segmentedWavFallback = allSegmentsHaveWav(input.script);
-  const voiceAvailable = sayOutput !== null && hasVoice(
-    combinedOutput(sayOutput),
-    input.project.tts.voice,
-  );
-  const voice: PreflightVoice = {
-    configured: input.project.tts.voice,
-    available: voiceAvailable,
-    segmentedWavFallback: !voiceAvailable && segmentedWavFallback,
-  };
-  if (voiceAvailable) {
-    addInfo(checks, 'macos-voice', 'Configured macOS voice is available.', {
-      value: input.project.tts.voice,
-    });
-  } else if (segmentedWavFallback) {
-    addInfo(
-      checks,
-      'macos-voice',
-      'Segmented WAV input makes the configured macOS voice optional.',
-      {value: input.project.tts.voice},
-    );
-  } else {
-    addError(
-      checks,
-      'macos-voice',
-      'ENV_VOICE_MISSING',
-      'Configured macOS voice is unavailable and no segmented WAV fallback exists.',
-      {value: input.project.tts.voice},
-    );
-  }
-
-  const fonts: FontIdentity[] = [];
-  const configuredFonts = [...new Set([input.project.captions.font])];
-  for (const configuredFont of configuredFonts) {
-    const checkId = `font:${configuredFont}`;
+    const ffprobeSelection = input.ffprobeExecutable ?? 'ffprobe';
     try {
-      const fontFile = await dependencies.fileSystem.readProjectFile(
-        input.projectDirectory,
-        configuredFont,
-      );
-      if (fontFile.kind !== 'file') throw new Error('font is not a regular file');
-      const identity = {path: configuredFont, sha256: sha256(fontFile.data)};
-      fonts.push(identity);
-      addInfo(checks, checkId, 'Configured font is available.', {
-        affectedPaths: [configuredFont],
-      });
+      ffprobe = await resolveExecutableAuthority(ffprobeSelection, dependencies);
+      heldAuthorities.push(ffprobe.authority);
     } catch {
       addError(
         checks,
-        checkId,
-        'ENV_FONT_MISSING',
-        'Configured font is missing or unusable.',
-        {affectedPaths: [configuredFont]},
+        'ffprobe',
+        'ENV_TOOL_MISSING',
+        'The selected ffprobe executable is missing or unusable.',
+        {affectedPaths: [ffprobeSelection]},
       );
     }
-  }
 
-  try {
-    const inspection = await dependencies.fileSystem.inspectDirectory(workDirectory);
-    if (inspection.usable) {
-      addInfo(checks, 'work-directory', 'Work directory is usable.', {
-        affectedPaths: [workDirectory],
+    let ffmpegChanged = false;
+    let ffmpegVersionOutput: ProbeOutput | null = null;
+    let encoderOutput: ProbeOutput | null = null;
+    let filterOutput: ProbeOutput | null = null;
+    if (ffmpeg !== null) {
+      const versionProbe = await probeExecutable(
+        dependencies,
+        ffmpeg,
+        ['-version'],
+      );
+      ffmpegChanged = versionProbe.changed;
+      ffmpegVersionOutput = versionProbe.output;
+    }
+
+    let ffprobeChanged = false;
+    let ffprobeOutput: ProbeOutput | null = null;
+    if (ffprobe !== null) {
+      const versionProbe = await probeExecutable(
+        dependencies,
+        ffprobe,
+        ['-version'],
+      );
+      ffprobeChanged = versionProbe.changed;
+      ffprobeOutput = versionProbe.output;
+    }
+
+    if (ffmpeg !== null && !ffmpegChanged) {
+      const encodersProbe = await probeExecutable(
+        dependencies,
+        ffmpeg,
+        ['-hide_banner', '-encoders'],
+      );
+      ffmpegChanged = encodersProbe.changed;
+      encoderOutput = encodersProbe.output;
+    }
+    if (ffmpeg !== null && !ffmpegChanged) {
+      const filtersProbe = await probeExecutable(
+        dependencies,
+        ffmpeg,
+        ['-hide_banner', '-filters'],
+      );
+      ffmpegChanged = filtersProbe.changed;
+      filterOutput = filtersProbe.output;
+    }
+    if (ffmpeg !== null && !ffmpegChanged) {
+      ffmpegChanged = !await safeRevalidate(ffmpeg.authority);
+    }
+
+    if (ffmpegChanged) {
+      toolIdentities.ffmpeg = null;
+      ffmpegVersionOutput = null;
+      encoderOutput = null;
+      filterOutput = null;
+      addError(
+        checks,
+        'ffmpeg',
+        'ENV_TOOL_CHANGED',
+        'FFmpeg changed while environment probes were running.',
+        {affectedPaths: ffmpeg === null ? [] : [ffmpeg.realPath]},
+      );
+    } else if (ffmpeg !== null) {
+      versions.ffmpeg = ffmpegVersionOutput === null
+        ? null
+        : parseFfmpegVersion(combinedOutput(ffmpegVersionOutput), 'ffmpeg');
+      if (versions.ffmpeg === null) {
+        addError(
+          checks,
+          'ffmpeg-version',
+          'ENV_TOOL_MISSING',
+          'FFmpeg probe failed.',
+        );
+      } else {
+        addInfo(checks, 'ffmpeg-version', 'FFmpeg is available.', {
+          value: versions.ffmpeg,
+        });
+      }
+    }
+
+    if (ffprobeChanged) {
+      addError(
+        checks,
+        'ffprobe',
+        'ENV_TOOL_CHANGED',
+        'ffprobe changed while environment probes were running.',
+        {affectedPaths: ffprobe === null ? [] : [ffprobe.realPath]},
+      );
+    } else if (ffprobe !== null) {
+      versions.ffprobe = ffprobeOutput === null
+        ? null
+        : parseFfmpegVersion(combinedOutput(ffprobeOutput), 'ffprobe');
+      if (versions.ffprobe === null) {
+        addError(
+          checks,
+          'ffprobe-version',
+          'ENV_TOOL_MISSING',
+          'ffprobe probe failed.',
+        );
+      } else {
+        addInfo(checks, 'ffprobe-version', 'ffprobe is available.', {
+          value: versions.ffprobe,
+        });
+      }
+    }
+
+    const encoders = parseEncoderTable(combinedOutput(encoderOutput));
+    capabilityCheck(
+      checks,
+      'ffmpeg-encoder-h264',
+      hasH264Encoder(encoders),
+      'An H.264 encoder',
+    );
+    capabilityCheck(
+      checks,
+      'ffmpeg-encoder-aac',
+      hasAacEncoder(encoders),
+      'An AAC encoder',
+    );
+
+    const filterNames = parseFilterTable(combinedOutput(filterOutput));
+    for (const filter of ['loudnorm', 'silencedetect', 'blackdetect'] as const) {
+      capabilityCheck(
+        checks,
+        `ffmpeg-filter-${filter}`,
+        filterNames.has(filter),
+        `FFmpeg filter ${filter}`,
+      );
+    }
+
+    const sayOutput = await probe(dependencies, '/usr/bin/say', ['-v', '?']);
+    const segmentedWavFallback = allSegmentsHaveWav(input.script);
+    const voiceAvailable = sayOutput !== null && hasVoice(
+      combinedOutput(sayOutput),
+      input.project.tts.voice,
+    );
+    const voice: PreflightVoice = {
+      configured: input.project.tts.voice,
+      available: voiceAvailable,
+      segmentedWavFallback: !voiceAvailable && segmentedWavFallback,
+    };
+    if (voiceAvailable) {
+      addInfo(checks, 'macos-voice', 'Configured macOS voice is available.', {
+        value: input.project.tts.voice,
       });
+    } else if (segmentedWavFallback) {
+      addInfo(
+        checks,
+        'macos-voice',
+        'Segmented WAV input makes the configured macOS voice optional.',
+        {value: input.project.tts.voice},
+      );
     } else {
+      addError(
+        checks,
+        'macos-voice',
+        'ENV_VOICE_MISSING',
+        'Configured macOS voice is unavailable and no segmented WAV fallback exists.',
+        {value: input.project.tts.voice},
+      );
+    }
+
+    const fonts: FontIdentity[] = [];
+    const configuredFonts = [...new Set([input.project.captions.font])];
+    for (const configuredFont of configuredFonts) {
+      const checkId = `font:${configuredFont}`;
+      try {
+        const fontFile = await dependencies.fileSystem.hashProjectFile(
+          input.projectDirectory,
+          configuredFont,
+          MAX_FONT_BYTES,
+        );
+        const identity = {path: configuredFont, sha256: fontFile.sha256};
+        fonts.push(identity);
+        addInfo(checks, checkId, 'Configured font is available.', {
+          affectedPaths: [configuredFont],
+        });
+      } catch (error) {
+        const code = error instanceof ProjectFontError
+          ? error.code
+          : (
+            error instanceof Error
+            && 'code' in error
+            && error.code === 'ENV_FONT_INVALID'
+          )
+            ? 'ENV_FONT_INVALID'
+            : 'ENV_FONT_MISSING';
+        addError(
+          checks,
+          checkId,
+          code,
+          code === 'ENV_FONT_INVALID'
+            ? 'Configured font is not a safe regular file.'
+            : 'Configured font is missing or unusable.',
+          {affectedPaths: [configuredFont]},
+        );
+      }
+    }
+
+    try {
+      const inspection = await dependencies.fileSystem
+        .inspectDirectory(workDirectory);
+      if (inspection.usable) {
+        addInfo(checks, 'work-directory', 'Work directory is usable.', {
+          affectedPaths: [workDirectory],
+        });
+      } else {
+        addError(
+          checks,
+          'work-directory',
+          'ENV_WORK_DIRECTORY_UNAVAILABLE',
+          'Work directory is unavailable or lacks required permissions.',
+          {affectedPaths: [workDirectory]},
+        );
+      }
+    } catch {
       addError(
         checks,
         'work-directory',
         'ENV_WORK_DIRECTORY_UNAVAILABLE',
-        'Work directory is unavailable or lacks required permissions.',
+        'Work directory could not be inspected.',
         {affectedPaths: [workDirectory]},
       );
     }
-  } catch {
-    addError(
-      checks,
-      'work-directory',
-      'ENV_WORK_DIRECTORY_UNAVAILABLE',
-      'Work directory could not be inspected.',
-      {affectedPaths: [workDirectory]},
-    );
-  }
 
-  let availableBytes: number | null = null;
-  try {
-    const measuredBytes = await dependencies.fileSystem
-      .statfsAvailableBytes(workDirectory);
-    if (!Number.isFinite(measuredBytes) || measuredBytes < 0) {
-      throw new Error('invalid statfs result');
-    }
-    availableBytes = measuredBytes;
-    if (availableBytes < requiredBytes) {
+    let availableBytes: number | null = null;
+    try {
+      const measuredBytes = await dependencies.fileSystem
+        .statfsAvailableBytes(workDirectory);
+      if (!Number.isFinite(measuredBytes) || measuredBytes < 0) {
+        throw new Error('invalid statfs result');
+      }
+      availableBytes = measuredBytes;
+      if (availableBytes < requiredBytes) {
+        addError(
+          checks,
+          'disk-space',
+          'DISK_SPACE_EXHAUSTED',
+          'Available disk space is below the preflight estimate.',
+          {value: availableBytes, expected: requiredBytes},
+        );
+      } else {
+        addInfo(checks, 'disk-space', 'Available disk space is sufficient.', {
+          value: availableBytes,
+          expected: requiredBytes,
+        });
+      }
+    } catch {
       addError(
         checks,
         'disk-space',
-        'DISK_SPACE_EXHAUSTED',
-        'Available disk space is below the preflight estimate.',
-        {value: availableBytes, expected: requiredBytes},
+        'ENV_WORK_DIRECTORY_UNAVAILABLE',
+        'Available disk space could not be inspected.',
+        {expected: requiredBytes},
       );
-    } else {
-      addInfo(checks, 'disk-space', 'Available disk space is sufficient.', {
-        value: availableBytes,
-        expected: requiredBytes,
+    }
+
+    if (
+      qtFaststart !== null
+      && !qtFaststartMissing
+      && !await safeRevalidate(qtFaststart.authority)
+    ) {
+      toolIdentities.qtFaststart = null;
+      addError(
+        checks,
+        'qt-faststart',
+        'ENV_TOOL_CHANGED',
+        'qt-faststart changed while environment probes were running.',
+        {affectedPaths: [qtFaststart.realPath]},
+      );
+    } else if (qtFaststart !== null && !qtFaststartMissing) {
+      addInfo(checks, 'qt-faststart', 'qt-faststart is available.', {
+        affectedPaths: [qtFaststart.realPath],
       });
     }
-  } catch {
-    addError(
-      checks,
-      'disk-space',
-      'ENV_WORK_DIRECTORY_UNAVAILABLE',
-      'Available disk space could not be inspected.',
-      {expected: requiredBytes},
-    );
-  }
 
-  const system: PreflightSystem = {
-    platform,
-    arch,
-    sourceBytes,
-    requiredBytes,
-    availableBytes,
-    workDirectory,
-  };
-  const environmentFingerprint = fingerprintValue({
-    schemaVersion: 1,
-    system: {
+    if (
+      ffmpeg !== null
+      && toolIdentities.ffmpeg !== null
+      && !await safeRevalidate(ffmpeg.authority)
+    ) {
+      toolIdentities.ffmpeg = null;
+      versions.ffmpeg = null;
+      addError(
+        checks,
+        'ffmpeg',
+        'ENV_TOOL_CHANGED',
+        'FFmpeg changed before its environment identity was finalized.',
+        {affectedPaths: [ffmpeg.realPath]},
+      );
+    }
+
+    const system: PreflightSystem = {
       platform,
       arch,
-      macosVersion: versions.macos,
-    },
-    versions: {
-      node: versions.node,
-      pnpm: versions.pnpm,
-      ffmpeg: versions.ffmpeg,
-      ffprobe: versions.ffprobe,
-    },
-    toolIdentities,
-    capabilities: {
-      h264Encoder: hasH264Encoder(encoderNames),
-      aacEncoder: hasAacEncoder(encoderNames),
-      loudnormFilter: filterNames.has('loudnorm'),
-      silencedetectFilter: filterNames.has('silencedetect'),
-      blackdetectFilter: filterNames.has('blackdetect'),
-    },
-    fonts,
-    voice,
-  });
+      sourceBytes,
+      requiredBytes,
+      availableBytes,
+      workDirectory,
+    };
+    const environmentFingerprint = fingerprintValue({
+      schemaVersion: 1,
+      system: {
+        platform,
+        arch,
+        macosVersion: versions.macos,
+      },
+      versions: {
+        node: versions.node,
+        pnpm: versions.pnpm,
+        ffmpeg: versions.ffmpeg,
+        ffprobe: versions.ffprobe,
+      },
+      toolIdentities,
+      capabilities: {
+        h264Encoder: toolIdentities.ffmpeg !== null && hasH264Encoder(encoders),
+        aacEncoder: toolIdentities.ffmpeg !== null && hasAacEncoder(encoders),
+        loudnormFilter: toolIdentities.ffmpeg !== null
+          && filterNames.has('loudnorm'),
+        silencedetectFilter: toolIdentities.ffmpeg !== null
+          && filterNames.has('silencedetect'),
+        blackdetectFilter: toolIdentities.ffmpeg !== null
+          && filterNames.has('blackdetect'),
+      },
+      fonts,
+      voice,
+    });
 
-  return {
-    checks,
-    toolIdentities,
-    fonts,
-    voice,
-    versions,
-    system,
-    environmentFingerprint,
-  };
+    return {
+      checks,
+      toolIdentities,
+      fonts,
+      voice,
+      versions,
+      system,
+      environmentFingerprint,
+    };
+  } finally {
+    await closeAuthorities(heldAuthorities);
+  }
 }
 
-const fileKind = (value: {isFile(): boolean; isDirectory(): boolean}): PreflightFileStatus['kind'] => {
-  if (value.isFile()) return 'file';
-  if (value.isDirectory()) return 'directory';
-  return 'other';
+const fileIdentity = (status: PreflightBigIntStat): PreflightFileIdentity => ({
+  kind: status.isFile()
+    ? 'file'
+    : status.isDirectory()
+      ? 'directory'
+      : 'other',
+  mode: status.mode,
+  dev: status.dev,
+  ino: status.ino,
+  nlink: status.nlink,
+  size: status.size,
+});
+
+const sameFileIdentity = (
+  left: PreflightFileIdentity,
+  right: PreflightFileIdentity,
+): boolean => (
+  left.kind === right.kind
+  && left.mode === right.mode
+  && left.dev === right.dev
+  && left.ino === right.ino
+  && left.nlink === right.nlink
+  && left.size === right.size
+);
+
+const hashHeldRegularFile = async (
+  handle: PreflightSystemFileHandle,
+  maxBytes?: number,
+): Promise<PreflightExecutableSnapshot> => {
+  const initial = fileIdentity(await handle.stat({bigint: true}));
+  if (initial.kind !== 'file' || initial.size < 0n) {
+    throw new ProjectFontError('ENV_FONT_INVALID');
+  }
+  if (
+    initial.size > BigInt(Number.MAX_SAFE_INTEGER)
+    || (maxBytes !== undefined && initial.size > BigInt(maxBytes))
+  ) {
+    throw new ProjectFontError('ENV_FONT_INVALID');
+  }
+
+  const hash = createHash('sha256');
+  const buffer = Buffer.allocUnsafe(HASH_CHUNK_BYTES);
+  let position = 0;
+  while (true) {
+    const {bytesRead} = await handle.read(
+      buffer,
+      0,
+      buffer.byteLength,
+      position,
+    );
+    if (bytesRead < 0 || bytesRead > buffer.byteLength) {
+      throw new ProjectFontError('ENV_FONT_INVALID');
+    }
+    if (bytesRead === 0) break;
+    position += bytesRead;
+    if (maxBytes !== undefined && position > maxBytes) {
+      throw new ProjectFontError('ENV_FONT_INVALID');
+    }
+    hash.update(buffer.subarray(0, bytesRead));
+  }
+
+  const finalIdentity = fileIdentity(await handle.stat({bigint: true}));
+  if (
+    !sameFileIdentity(initial, finalIdentity)
+    || BigInt(position) !== initial.size
+  ) {
+    throw new ProjectFontError('ENV_FONT_INVALID');
+  }
+  return {
+    identity: initial,
+    sha256: `sha256:${hash.digest('hex')}`,
+  };
 };
+
+const sameSnapshot = (
+  left: PreflightExecutableSnapshot,
+  right: PreflightExecutableSnapshot,
+): boolean => (
+  sameFileIdentity(left.identity, right.identity)
+  && left.sha256 === right.sha256
+);
+
+const closeHandles = async (
+  handles: readonly PreflightSystemFileHandle[],
+): Promise<void> => {
+  let closeError: unknown;
+  for (const handle of [...handles].reverse()) {
+    try {
+      await handle.close();
+    } catch (error) {
+      closeError ??= error;
+    }
+  }
+  if (closeError !== undefined) throw closeError;
+};
+
+const authorityPath = (
+  identity: Pick<PreflightFileIdentity, 'dev' | 'ino'>,
+  name?: string,
+): string => {
+  if (identity.dev < 0n || identity.ino < 0n) {
+    throw new ProjectFontError('ENV_FONT_INVALID');
+  }
+  const base = `/.vol/${identity.dev}/${identity.ino}`;
+  return name === undefined ? base : `${base}/${name}`;
+};
+
+const projectPathParts = (relativePath: string): string[] => {
+  if (
+    relativePath.length === 0
+    || path.isAbsolute(relativePath)
+    || path.win32.isAbsolute(relativePath)
+  ) {
+    throw new ProjectFontError('ENV_FONT_INVALID');
+  }
+  const parts = relativePath.split('/');
+  if (parts.some((part) => (
+    part.length === 0
+    || part === '.'
+    || part === '..'
+    || part.includes('\0')
+  ))) {
+    throw new ProjectFontError('ENV_FONT_INVALID');
+  }
+  return parts;
+};
+
+const openScopedProjectFile = async (
+  scope: ProjectDirectoryScope,
+  relativePath: string,
+  fileSystem: SystemPreflightFileSystem,
+): Promise<{
+  handles: PreflightSystemFileHandle[];
+  file: PreflightSystemFileHandle;
+}> => {
+  const parts = projectPathParts(relativePath);
+  const handles: PreflightSystemFileHandle[] = [];
+  try {
+    const root = await fileSystem.openExistingProjectFile(scope, '.');
+    handles.push(root);
+    let parentIdentity = fileIdentity(await root.stat({bigint: true}));
+    if (parentIdentity.kind !== 'directory') {
+      throw new ProjectFontError('ENV_FONT_INVALID');
+    }
+
+    let current = root;
+    for (const [index, part] of parts.entries()) {
+      const child = await fileSystem.open(
+        authorityPath(parentIdentity, part),
+        SAFE_READ_FLAGS,
+      );
+      handles.push(child);
+      const childIdentity = fileIdentity(await child.stat({bigint: true}));
+      const finalPart = index === parts.length - 1;
+      if (
+        (!finalPart && childIdentity.kind !== 'directory')
+        || (finalPart && childIdentity.kind !== 'file')
+      ) {
+        throw new ProjectFontError('ENV_FONT_INVALID');
+      }
+      current = child;
+      parentIdentity = childIdentity;
+    }
+    return {handles, file: current};
+  } catch (error) {
+    await closeHandles(handles);
+    throw error;
+  }
+};
+
+const mapProjectFontError = (error: unknown): ProjectFontError => {
+  if (error instanceof ProjectFontError) return error;
+  if (
+    isNodeError(error)
+    && (error.code === 'ENOENT' || error.code === 'EACCES')
+  ) {
+    return new ProjectFontError('ENV_FONT_MISSING');
+  }
+  return new ProjectFontError('ENV_FONT_INVALID');
+};
+
+const hashProjectFileOnce = async (
+  scope: ProjectDirectoryScope,
+  relativePath: string,
+  maxBytes: number,
+  fileSystem: SystemPreflightFileSystem,
+): Promise<PreflightExecutableSnapshot> => {
+  const opened = await openScopedProjectFile(scope, relativePath, fileSystem);
+  try {
+    return await hashHeldRegularFile(opened.file, maxBytes);
+  } finally {
+    await closeHandles(opened.handles);
+  }
+};
+
+const SYSTEM_PREFLIGHT_FILE_SYSTEM: SystemPreflightFileSystem = {
+  access: async (candidate, mode) => await access(candidate, mode),
+  open: async (candidate, flags) => await open(candidate, flags),
+  openExistingProjectFile: async (scope, relativePath) =>
+    await openExistingProjectFile(scope, relativePath),
+};
+
+export const createSystemPreflightFileSystem = (
+  fileSystem: SystemPreflightFileSystem = SYSTEM_PREFLIGHT_FILE_SYSTEM,
+): Pick<PreflightFileSystem, 'openExecutable' | 'hashProjectFile'> => ({
+  openExecutable: async (candidate) => {
+    await fileSystem.access(candidate, constants.X_OK);
+    const held = await fileSystem.open(candidate, SAFE_READ_FLAGS);
+    try {
+      const snapshot = await hashHeldRegularFile(held);
+      const executionPath = authorityPath(snapshot.identity);
+      await fileSystem.access(executionPath, constants.X_OK);
+      return {
+        executionPath,
+        snapshot,
+        revalidate: async () => {
+          let verification: PreflightSystemFileHandle | undefined;
+          try {
+            await fileSystem.access(candidate, constants.X_OK);
+            verification = await fileSystem.open(candidate, SAFE_READ_FLAGS);
+            const current = await hashHeldRegularFile(verification);
+            await fileSystem.access(
+              authorityPath(current.identity),
+              constants.X_OK,
+            );
+            return sameSnapshot(snapshot, current);
+          } catch {
+            return false;
+          } finally {
+            if (verification !== undefined) await verification.close();
+          }
+        },
+        close: async () => await held.close(),
+      };
+    } catch (error) {
+      await held.close();
+      throw error;
+    }
+  },
+  hashProjectFile: async (scope, relativePath, maxBytes) => {
+    try {
+      if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+        throw new ProjectFontError('ENV_FONT_INVALID');
+      }
+      const initial = await hashProjectFileOnce(
+        scope,
+        relativePath,
+        maxBytes,
+        fileSystem,
+      );
+      const verification = await hashProjectFileOnce(
+        scope,
+        relativePath,
+        maxBytes,
+        fileSystem,
+      );
+      if (!sameSnapshot(initial, verification)) {
+        throw new ProjectFontError('ENV_FONT_INVALID');
+      }
+      return initial;
+    } catch (error) {
+      throw mapProjectFontError(error);
+    }
+  },
+});
 
 const nearestExistingDirectory = async (candidate: string): Promise<string> => {
   let current = candidate;
@@ -716,7 +1228,7 @@ const resolveFromPath = async (
     const candidate = path.join(directory, selection);
     try {
       await access(candidate, constants.X_OK);
-      const status = await stat(candidate);
+      const status = await stat(candidate, {bigint: true});
       if (status.isFile()) return candidate;
     } catch {
       continue;
@@ -731,46 +1243,32 @@ export const createSystemPreflightDependencies = (
     arch: process.arch,
   },
   environment: NodeJS.ProcessEnv = process.env,
-): PreflightDependencies => ({
-  runtime,
-  runProcess: runSystemProcess,
-  resolveExecutable: async (selection) => resolveFromPath(selection, environment),
-  fileSystem: {
-    realpath,
-    stat: async (candidate) => {
-      const status = await stat(candidate);
-      return {kind: fileKind(status), mode: status.mode};
-    },
-    readFile,
-    readProjectFile: async (scope, relativePath) => {
-      const prepared = await prepareExistingProjectFile(scope, relativePath);
-      const handle = await prepared.open();
-      try {
-        const status = await handle.stat();
-        return {
-          data: await handle.readFile(),
-          kind: fileKind(status),
-        };
-      } finally {
-        await handle.close();
-      }
-    },
-    inspectDirectory: async (candidate) => {
-      try {
+): PreflightDependencies => {
+  const safeFiles = createSystemPreflightFileSystem();
+  return {
+    runtime,
+    runProcess: runSystemProcess,
+    resolveExecutable: async (selection) => resolveFromPath(selection, environment),
+    fileSystem: {
+      realpath,
+      ...safeFiles,
+      inspectDirectory: async (candidate) => {
+        try {
+          const inspectedPath = await nearestExistingDirectory(candidate);
+          await access(
+            inspectedPath,
+            constants.R_OK | constants.W_OK | constants.X_OK,
+          );
+          return {usable: true, inspectedPath};
+        } catch {
+          return {usable: false, inspectedPath: candidate};
+        }
+      },
+      statfsAvailableBytes: async (candidate) => {
         const inspectedPath = await nearestExistingDirectory(candidate);
-        await access(
-          inspectedPath,
-          constants.R_OK | constants.W_OK | constants.X_OK,
-        );
-        return {usable: true, inspectedPath};
-      } catch {
-        return {usable: false, inspectedPath: candidate};
-      }
+        const value = await statfs(inspectedPath);
+        return value.bavail * value.bsize;
+      },
     },
-    statfsAvailableBytes: async (candidate) => {
-      const inspectedPath = await nearestExistingDirectory(candidate);
-      const value = await statfs(inspectedPath);
-      return value.bavail * value.bsize;
-    },
-  },
-});
+  };
+};

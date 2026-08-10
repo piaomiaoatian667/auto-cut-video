@@ -241,6 +241,51 @@ describe('videoctl doctor', () => {
     expect(exitCode).toBe(EXIT_CODES.success);
   });
 
+  it('sanitizes table controls while preserving JSON string semantics', async () => {
+    const injectedId = 'font:assets/fonts/evil.otf\nERROR forged';
+    const injectedMessage = 'Missing font\u001b[31m\nSTATUS forged\u009b31m';
+    const result = successfulResult();
+    result.checks = [{
+      id: injectedId,
+      severity: 'error',
+      code: 'ENV_FONT_MISSING',
+      message: injectedMessage,
+    }];
+    result.fonts = [{
+      path: 'assets/fonts/evil.otf\nERROR forged\u001b[0m',
+      sha256: 'sha256:font',
+    }];
+    const tableRun = fixture(result);
+    const jsonRun = fixture(result);
+
+    const tableExit = await runVideoctl(
+      ['doctor', 'demo'],
+      tableRun.dependencies,
+    );
+    const jsonExit = await runVideoctl(
+      ['doctor', 'demo', '--json'],
+      jsonRun.dependencies,
+    );
+    const json = JSON.parse(jsonRun.stdout()) as PreflightResult & {
+      command: string;
+    };
+
+    expect(tableExit).toBe(EXIT_CODES.environmentFailed);
+    expect(tableRun.stdout()).not.toMatch(
+      /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/u,
+    );
+    expect(tableRun.stdout()).not.toContain('\u001b');
+    expect(tableRun.stdout().split('\n').filter((line) => (
+      line.includes('ERROR forged') || line.includes('STATUS forged')
+    ))).toHaveLength(1);
+    expect(jsonExit).toBe(EXIT_CODES.environmentFailed);
+    expect(json.checks[0]).toMatchObject({
+      id: injectedId,
+      message: injectedMessage,
+    });
+    expect(json.fonts[0]?.path).toBe(result.fonts[0]?.path);
+  });
+
   it('sanitizes unexpected preflight exceptions deterministically', async () => {
     const first = fixture();
     const second = fixture();

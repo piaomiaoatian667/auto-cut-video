@@ -1,4 +1,5 @@
 import {createHash} from 'node:crypto';
+import {constants} from 'node:fs';
 import path from 'node:path';
 import {describe, expect, it, vi} from 'vitest';
 import {
@@ -12,9 +13,12 @@ import {
   type ProjectDirectoryScope,
 } from '../../../src/fs/project-paths';
 import {
+  MAX_FONT_BYTES,
+  createSystemPreflightFileSystem,
   runPreflight,
   type PreflightDependencies,
-  type PreflightFileStatus,
+  type PreflightExecutableAuthority,
+  type PreflightFileIdentity,
   type PreflightInput,
   type PreflightProcessResult,
 } from '../../../src/pipeline/stages/preflight';
@@ -23,17 +27,37 @@ import {
   createSystemVideoctlDependencies,
   measureProjectSourceBytes,
   type SourceMeterDependencies,
+  type SourceMeterStat,
 } from '../../../src/cli/videoctl';
 
 const GIB = 1024 ** 3;
 const FFMPEG_SELECTION = '/configured/ffmpeg';
 const FFMPEG_LINK = '/opt/homebrew/bin/ffmpeg';
 const FFMPEG_REAL = '/opt/homebrew/Cellar/ffmpeg/8.0/bin/ffmpeg';
+const FFMPEG_AUTHORITY = '/.vol/1/101';
 const QT_FASTSTART_SIBLING = path.join(path.dirname(FFMPEG_REAL), 'qt-faststart');
 const QT_FASTSTART_REAL = '/opt/homebrew/Cellar/ffmpeg/8.0/bin/qt-faststart';
 const FFPROBE_LINK = '/opt/homebrew/bin/ffprobe';
 const FFPROBE_REAL = '/opt/homebrew/Cellar/ffmpeg/8.0/bin/ffprobe';
+const FFPROBE_AUTHORITY = '/.vol/1/103';
 const WORK_DIRECTORY = '/workspace/.work/demo';
+
+const encoderTable = (rows: readonly string[]): string => [
+  'Encoders:',
+  ' V..... = Video',
+  ' A..... = Audio',
+  ' ------',
+  ...rows,
+].join('\n');
+
+const filterTable = (rows: readonly string[]): string => [
+  'Filters:',
+  '  T.. = Timeline support',
+  '  .S. = Slice threading',
+  '  ..C = Command support',
+  '  ---',
+  ...rows,
+].join('\n');
 
 const processResult = (stdout: string): PreflightProcessResult => ({
   command: '',
@@ -54,17 +78,17 @@ const defaultProbeOutput = (
     ['node\0--version', 'v22.17.0\n'],
     ['pnpm\0--version', '10.14.0\n'],
     ['/usr/bin/sw_vers\0-productVersion', '15.6\n'],
-    [`${FFMPEG_REAL}\0-version`, 'ffmpeg version 8.0 Copyright\n'],
-    [`${FFMPEG_REAL}\0-hide_banner\0-encoders`, [
-      ' V....D libx264 H.264 / AVC / MPEG-4 AVC',
-      ' A....D aac AAC (Advanced Audio Coding)',
-    ].join('\n')],
-    [`${FFMPEG_REAL}\0-hide_banner\0-filters`, [
+    [`${FFMPEG_AUTHORITY}\0-version`, 'ffmpeg version 8.0 Copyright\n'],
+    [`${FFMPEG_AUTHORITY}\0-hide_banner\0-encoders`, encoderTable([
+      ' V....D libx264 libx264 H.264 / AVC / MPEG-4 AVC (codec h264)',
+      ' A....D aac AAC (Advanced Audio Coding) (codec aac)',
+    ])],
+    [`${FFMPEG_AUTHORITY}\0-hide_banner\0-filters`, filterTable([
       ' ... loudnorm A->A EBU R128 loudness normalization',
       ' ... silencedetect A->A Detect silence',
       ' ... blackdetect V->V Detect black intervals',
-    ].join('\n')],
-    [`${FFPROBE_REAL}\0-version`, 'ffprobe version 8.0 Copyright\n'],
+    ])],
+    [`${FFPROBE_AUTHORITY}\0-version`, 'ffprobe version 8.0 Copyright\n'],
     ['/usr/bin/say\0-v\0?', [
       'Tingting             zh_CN    # 你好！我是婷婷。',
       'Meijia               zh_TW    # 您好，我叫美佳。',
@@ -86,7 +110,12 @@ interface FixtureOverrides {
   qtFaststartBytes?: string;
   fontBytes?: string;
   fontError?: Error;
-  qtFaststartStatus?: PreflightFileStatus | Error;
+  qtFaststartKind?: PreflightFileIdentity['kind'];
+  qtFaststartAccessDenied?: boolean;
+  ffmpegAccessDenied?: boolean;
+  ffprobeAccessDenied?: boolean;
+  replaceFfmpegDuringProbe?: boolean;
+  replaceQtFaststartBeforeUse?: boolean;
   availableBytes?: number;
   sourceBytes?: number;
   workDirectoryUsable?: boolean;
@@ -95,9 +124,23 @@ interface FixtureOverrides {
   processFailure?: {command: string; args: readonly string[]};
 }
 
-const executableFile = (): PreflightFileStatus => ({
-  kind: 'file',
-  mode: 0o100755,
+interface ToolFixtureState {
+  bytes: string;
+  dev: bigint;
+  ino: bigint;
+  nlink: bigint;
+  kind: PreflightFileIdentity['kind'];
+  mode: bigint;
+  accessible: boolean;
+}
+
+const toolIdentity = (state: ToolFixtureState): PreflightFileIdentity => ({
+  dev: state.dev,
+  ino: state.ino,
+  nlink: state.nlink,
+  size: BigInt(Buffer.byteLength(state.bytes)),
+  mode: state.mode,
+  kind: state.kind,
 });
 
 const fixture = (overrides: FixtureOverrides = {}) => {
@@ -107,6 +150,38 @@ const fixture = (overrides: FixtureOverrides = {}) => {
   if (overrides.segmentedWav) {
     script.segments[0]!.audioPath = 'assets/source/voice/intro.wav';
   }
+
+  const toolStates = new Map<string, ToolFixtureState>([
+    [FFMPEG_REAL, {
+      bytes: overrides.ffmpegBytes ?? 'ffmpeg-binary',
+      dev: 1n,
+      ino: 101n,
+      nlink: 1n,
+      kind: 'file',
+      mode: 0o100755n,
+      accessible: overrides.ffmpegAccessDenied !== true,
+    }],
+    [QT_FASTSTART_REAL, {
+      bytes: overrides.qtFaststartBytes ?? 'qt-faststart-binary',
+      dev: 1n,
+      ino: 102n,
+      nlink: 1n,
+      kind: overrides.qtFaststartKind ?? 'file',
+      mode: 0o100755n,
+      accessible: overrides.qtFaststartAccessDenied !== true,
+    }],
+    [FFPROBE_REAL, {
+      bytes: 'ffprobe-binary',
+      dev: 1n,
+      ino: 103n,
+      nlink: 1n,
+      kind: 'file',
+      mode: 0o100755n,
+      accessible: overrides.ffprobeAccessDenied !== true,
+    }],
+  ]);
+  let ffmpegReplaced = false;
+  let qtFaststartReplaced = false;
 
   const runProcess = vi.fn(async (
     command: string,
@@ -119,12 +194,26 @@ const fixture = (overrides: FixtureOverrides = {}) => {
       throw new Error('sensitive process failure detail');
     }
 
+    if (
+      overrides.replaceFfmpegDuringProbe === true
+      && !ffmpegReplaced
+      && command === FFMPEG_AUTHORITY
+    ) {
+      ffmpegReplaced = true;
+      const current = toolStates.get(FFMPEG_REAL)!;
+      toolStates.set(FFMPEG_REAL, {
+        ...current,
+        bytes: 'replacement-ffmpeg-binary',
+        ino: current.ino + 1n,
+      });
+    }
+
     let stdout = defaultProbeOutput(command, args);
     if (command === '/usr/bin/sw_vers') {
       stdout = `${overrides.macosVersion ?? '15.6'}\n`;
-    } else if (command === FFMPEG_REAL && args[1] === '-encoders') {
+    } else if (command === FFMPEG_AUTHORITY && args[1] === '-encoders') {
       stdout = overrides.encoders ?? stdout;
-    } else if (command === FFMPEG_REAL && args[1] === '-filters') {
+    } else if (command === FFMPEG_AUTHORITY && args[1] === '-filters') {
       stdout = overrides.filters ?? stdout;
     } else if (command === '/usr/bin/say') {
       stdout = overrides.voices ?? stdout;
@@ -145,35 +234,69 @@ const fixture = (overrides: FixtureOverrides = {}) => {
     return candidate;
   });
 
-  const stat = vi.fn(async (candidate: string): Promise<PreflightFileStatus> => {
-    if (candidate === QT_FASTSTART_SIBLING) {
-      const status = overrides.qtFaststartStatus ?? executableFile();
-      if (status instanceof Error) throw status;
-      return status;
+  const heldAuthorities: PreflightExecutableAuthority[] = [];
+  const openExecutable = vi.fn(async (
+    candidate: string,
+  ): Promise<PreflightExecutableAuthority> => {
+    const state = toolStates.get(candidate);
+    if (state === undefined || state.kind !== 'file' || !state.accessible) {
+      throw new Error('executable unavailable');
     }
-    if ([FFMPEG_REAL, FFPROBE_REAL].includes(candidate)) return executableFile();
-    throw new Error(`unexpected stat: ${candidate}`);
+    const initial = {...state};
+    const close = vi.fn(async () => {});
+    const authority: PreflightExecutableAuthority = {
+      executionPath: `/.vol/${initial.dev}/${initial.ino}`,
+      snapshot: {
+        identity: toolIdentity(initial),
+        sha256: sha256(initial.bytes),
+      },
+      revalidate: vi.fn(async () => {
+        if (
+          candidate === QT_FASTSTART_REAL
+          && overrides.replaceQtFaststartBeforeUse === true
+          && !qtFaststartReplaced
+        ) {
+          qtFaststartReplaced = true;
+          const current = toolStates.get(candidate)!;
+          toolStates.set(candidate, {
+            ...current,
+            bytes: 'replacement-qt-faststart-binary',
+            ino: current.ino + 1n,
+          });
+        }
+        const current = toolStates.get(candidate);
+        return current !== undefined
+          && current.accessible
+          && current.kind === 'file'
+          && current.bytes === initial.bytes
+          && current.dev === initial.dev
+          && current.ino === initial.ino
+          && current.nlink === initial.nlink;
+      }),
+      close,
+    };
+    heldAuthorities.push(authority);
+    return authority;
   });
 
-  const readFile = vi.fn(async (candidate: string): Promise<Uint8Array> => {
-    if (candidate === FFMPEG_REAL) {
-      return Buffer.from(overrides.ffmpegBytes ?? 'ffmpeg-binary');
-    }
-    if (candidate === QT_FASTSTART_REAL) {
-      return Buffer.from(overrides.qtFaststartBytes ?? 'qt-faststart-binary');
-    }
-    throw new Error(`unexpected readFile: ${candidate}`);
-  });
-
-  const readProjectFile = vi.fn(async (
+  const hashProjectFile = vi.fn(async (
     _scope: ProjectDirectoryScope,
     relativePath: string,
-  ): Promise<{data: Uint8Array; kind: PreflightFileStatus['kind']}> => {
+    maxBytes: number,
+  ) => {
     if (overrides.fontError !== undefined) throw overrides.fontError;
     expect(relativePath).toBe(project.captions.font);
+    expect(maxBytes).toBe(MAX_FONT_BYTES);
     return {
-      data: Buffer.from(overrides.fontBytes ?? 'font-binary'),
-      kind: 'file',
+      identity: {
+        kind: 'file' as const,
+        mode: 0o100644n,
+        dev: 1n,
+        ino: 200n,
+        nlink: 1n,
+        size: BigInt(Buffer.byteLength(overrides.fontBytes ?? 'font-binary')),
+      },
+      sha256: sha256(overrides.fontBytes ?? 'font-binary'),
     };
   });
 
@@ -194,9 +317,8 @@ const fixture = (overrides: FixtureOverrides = {}) => {
     resolveExecutable,
     fileSystem: {
       realpath,
-      stat,
-      readFile,
-      readProjectFile,
+      openExecutable,
+      hashProjectFile,
       inspectDirectory,
       statfsAvailableBytes,
     },
@@ -218,9 +340,10 @@ const fixture = (overrides: FixtureOverrides = {}) => {
     runProcess,
     resolveExecutable,
     realpath,
-    stat,
-    readFile,
-    readProjectFile,
+    openExecutable,
+    hashProjectFile,
+    heldAuthorities,
+    toolStates,
     inspectDirectory,
     statfsAvailableBytes,
   };
@@ -287,8 +410,12 @@ const sourceSpecial = (
   ino: bigint,
 ): SourceSpecialNode => ({kind, dev: 1n, ino, nlink: 1n});
 
+const sourceChildPath = (parent: string, name: string): string =>
+  parent === '.' ? name : path.posix.join(parent, name);
+
 interface SourceMeterFixtureOptions {
   substituteSourceBeforeOpenPath?: string;
+  replaceWithFifoBeforeOpenPath?: string;
   replaceAfterFirstOpen?: {
     relativePath: string;
     replacement: SourceNode;
@@ -334,31 +461,17 @@ const sourceMeterFixture = (
   const directoryCloses: Array<ReturnType<typeof vi.fn>> = [];
   const statPaths: string[] = [];
   const openCounts = new Map<string, number>();
+  let scopeSubstituted = false;
 
-  const openExistingProjectFile = vi.fn(async (
-    _scope: ProjectDirectoryScope,
-    relativePath: string,
-  ) => {
-    if (relativePath === options.substituteSourceBeforeOpenPath) {
-      replaceNode('assets/source', sourceSymlink(10_000n));
-      throw new ProjectPathError(
-        `project directory changed after scope creation: ${relativePath}`,
-      );
-    }
-    const node = nodes.get(relativePath);
-    if (node === undefined || node.kind === 'symlink') {
-      throw new Error('scoped path is unavailable');
-    }
-    if (
-      node.kind === 'fifo'
-      || node.kind === 'socket'
-      || node.kind === 'device'
-      || node.kind === 'unknown'
-    ) {
-      return await new Promise<never>(() => {});
-    }
-    const openCount = openCounts.get(relativePath) ?? 0;
-    openCounts.set(relativePath, openCount + 1);
+  const pathForIdentity = (
+    identity: Pick<SourceMeterStat, 'dev' | 'ino'>,
+  ): string | undefined => [...nodes.entries()].find(([, node]) => (
+    node.kind === 'directory'
+    && node.dev === identity.dev
+    && node.ino === identity.ino
+  ))?.[0];
+
+  const makeHandle = (relativePath: string, node: SourceNode) => {
     const fd = nextFd;
     nextFd += 1;
     fdPaths.set(fd, relativePath);
@@ -370,7 +483,7 @@ const sourceMeterFixture = (
       }
     });
     fileCloses.push(close);
-    const handle = {
+    return {
       fd,
       stat: vi.fn(async () => {
         if (relativePath === options.failStatPath) {
@@ -394,6 +507,37 @@ const sourceMeterFixture = (
       }),
       close,
     };
+  };
+
+  const openExistingProjectFile = vi.fn(async (
+    _scope: ProjectDirectoryScope,
+    relativePath: string,
+  ) => {
+    expect(relativePath).toBe('.');
+    if (scopeSubstituted) {
+      throw new ProjectPathError(
+        `project directory changed after scope creation: ${relativePath}`,
+      );
+    }
+    const node = nodes.get(relativePath);
+    if (node === undefined || node.kind !== 'directory') throw new Error('missing root');
+    return makeHandle(relativePath, node);
+  });
+
+  const openAuthority = vi.fn(async (
+    parent: Pick<SourceMeterStat, 'dev' | 'ino'>,
+    name: string,
+  ) => {
+    const parentPath = pathForIdentity(parent);
+    if (parentPath === undefined) throw new Error('unknown parent authority');
+    const relativePath = sourceChildPath(parentPath, name);
+    const node = nodes.get(relativePath);
+    if (node === undefined || node.kind === 'symlink') {
+      throw new Error('authority path is unavailable');
+    }
+    const openCount = openCounts.get(relativePath) ?? 0;
+    openCounts.set(relativePath, openCount + 1);
+    const handle = makeHandle(relativePath, node);
     if (
       openCount === 0
       && options.replaceAfterFirstOpen?.relativePath === relativePath
@@ -412,12 +556,15 @@ const sourceMeterFixture = (
     }
     const node = fd === undefined ? undefined : fdNodes.get(fd);
     if (node?.kind !== 'directory') throw new Error('invalid directory fd');
-    const entries = Object.keys(node.entries).sort().map((name) => ({
-      name,
-      isFile: () => node.entries[name]!.kind === 'file',
-      isDirectory: () => node.entries[name]!.kind === 'directory',
-      isSymbolicLink: () => node.entries[name]!.kind === 'symlink',
-    }));
+    const entries = Object.keys(node.entries).sort().map((name) => {
+      const entryNode = node.entries[name]!;
+      return {
+        name,
+        isFile: () => entryNode.kind === 'file',
+        isDirectory: () => entryNode.kind === 'directory',
+        isSymbolicLink: () => entryNode.kind === 'symlink',
+      };
+    });
     const close = vi.fn(async () => {});
     directoryCloses.push(close);
     return {
@@ -425,7 +572,17 @@ const sourceMeterFixture = (
         if (fd === undefined) throw new Error('invalid directory fd');
         const index = fdOffsets.get(fd) ?? 0;
         fdOffsets.set(fd, index + 1);
-        return entries[index] ?? null;
+        const entry = entries[index] ?? null;
+        if (entry !== null) {
+          const entryPath = sourceChildPath(relativePath!, entry.name);
+          if (entryPath === options.substituteSourceBeforeOpenPath) {
+            scopeSubstituted = true;
+          }
+          if (entryPath === options.replaceWithFifoBeforeOpenPath) {
+            replaceNode(entryPath, sourceSpecial('fifo', 20_000n));
+          }
+        }
+        return entry;
       }),
       close,
     };
@@ -433,12 +590,14 @@ const sourceMeterFixture = (
 
   const dependencies: SourceMeterDependencies = {
     openExistingProjectFile,
+    openAuthority,
     openDirectory,
   };
   return {
     dependencies,
     scope: {} as ProjectDirectoryScope,
     openExistingProjectFile,
+    openAuthority,
     statPaths,
     expectAllClosed: () => {
       for (const close of fileCloses) expect(close).toHaveBeenCalledOnce();
@@ -446,6 +605,221 @@ const sourceMeterFixture = (
     },
   };
 };
+
+interface SystemFileNode {
+  dev: bigint;
+  ino: bigint;
+  nlink: bigint;
+  mode: bigint;
+  kind: 'file' | 'directory' | 'other';
+  bytes: Uint8Array;
+  reportedSize?: bigint;
+}
+
+interface SystemFileFixtureOptions {
+  fontKind?: SystemFileNode['kind'];
+  replaceFontWithFifo?: boolean;
+  fontBytes?: Uint8Array;
+  fontSize?: bigint;
+  readChunkSize?: number;
+  denyExecutableAccess?: boolean;
+}
+
+const systemFileAccessFixture = (
+  options: SystemFileFixtureOptions = {},
+) => {
+  const root: SystemFileNode = {
+    dev: 1n,
+    ino: 10n,
+    nlink: 2n,
+    mode: 0o40755n,
+    kind: 'directory',
+    bytes: new Uint8Array(),
+  };
+  const assets: SystemFileNode = {
+    ...root,
+    ino: 11n,
+  };
+  const fonts: SystemFileNode = {
+    ...root,
+    ino: 12n,
+  };
+  const font: SystemFileNode = {
+    dev: 1n,
+    ino: 13n,
+    nlink: 1n,
+    mode: 0o100644n,
+    kind: options.fontKind ?? 'file',
+    bytes: options.fontBytes ?? Buffer.from('streamed-font-data'),
+    ...(options.fontSize === undefined ? {} : {reportedSize: options.fontSize}),
+  };
+  const fifo: SystemFileNode = {
+    ...font,
+    ino: 14n,
+    mode: 0o10644n,
+    kind: 'other',
+    bytes: new Uint8Array(),
+    reportedSize: 0n,
+  };
+  const executable: SystemFileNode = {
+    dev: 2n,
+    ino: 20n,
+    nlink: 1n,
+    mode: 0o100401n,
+    kind: 'file',
+    bytes: Buffer.from('tool-binary'),
+  };
+  const authorityNodes = new Map<string, SystemFileNode>([
+    ['/.vol/1/10/assets', assets],
+    ['/.vol/1/11/fonts', fonts],
+  ]);
+  let fontOpenCount = 0;
+  const closes: Array<ReturnType<typeof vi.fn>> = [];
+  const reads: Array<ReturnType<typeof vi.fn>> = [];
+
+  const makeHandle = (node: SystemFileNode) => {
+    const close = vi.fn(async () => {});
+    const read = vi.fn(async (
+      buffer: Uint8Array,
+      offset: number,
+      length: number,
+      position: number,
+    ) => {
+      const available = Math.max(0, node.bytes.byteLength - position);
+      const bytesRead = Math.min(
+        available,
+        length,
+        options.readChunkSize ?? length,
+      );
+      buffer.set(node.bytes.subarray(position, position + bytesRead), offset);
+      return {bytesRead};
+    });
+    closes.push(close);
+    reads.push(read);
+    return {
+      fd: Number(node.ino),
+      stat: vi.fn(async (statOptions: {bigint: true}) => {
+        expect(statOptions).toEqual({bigint: true});
+        return {
+          dev: node.dev,
+          ino: node.ino,
+          nlink: node.nlink,
+          size: node.reportedSize ?? BigInt(node.bytes.byteLength),
+          mode: node.mode,
+          isFile: () => node.kind === 'file',
+          isDirectory: () => node.kind === 'directory',
+        };
+      }),
+      read,
+      close,
+    };
+  };
+
+  const open = vi.fn(async (candidate: string, flags: number) => {
+    expect(flags & constants.O_NONBLOCK).not.toBe(0);
+    if (candidate === '/tool') return makeHandle(executable);
+    if (candidate === '/.vol/1/12/font.otf') {
+      fontOpenCount += 1;
+      return makeHandle(
+        options.replaceFontWithFifo === true && fontOpenCount > 1
+          ? fifo
+          : font,
+      );
+    }
+    const node = authorityNodes.get(candidate);
+    if (node === undefined) throw new Error(`unexpected authority open: ${candidate}`);
+    return makeHandle(node);
+  });
+  const openExistingProjectFile = vi.fn(async (
+    _scope: ProjectDirectoryScope,
+    relativePath: string,
+  ) => {
+    expect(relativePath).toBe('.');
+    return makeHandle(root);
+  });
+  const access = vi.fn(async (_candidate: string, mode: number) => {
+    expect(mode).toBe(constants.X_OK);
+    if (options.denyExecutableAccess === true) {
+      throw Object.assign(new Error('not executable for effective user'), {
+        code: 'EACCES',
+      });
+    }
+  });
+  const fileSystem = createSystemPreflightFileSystem({
+    access,
+    open,
+    openExistingProjectFile,
+  });
+
+  return {
+    access,
+    closes,
+    fileSystem,
+    open,
+    reads,
+    expectAllClosed: () => {
+      for (const close of closes) expect(close).toHaveBeenCalledOnce();
+    },
+  };
+};
+
+describe('system preflight file access', () => {
+  it('streams a scoped font hash and closes every authority FD', async () => {
+    const bytes = Buffer.alloc(180_000, 0x5a);
+    const system = systemFileAccessFixture({
+      fontBytes: bytes,
+      readChunkSize: 4096,
+    });
+
+    const result = await system.fileSystem.hashProjectFile(
+      {} as ProjectDirectoryScope,
+      'assets/fonts/font.otf',
+      MAX_FONT_BYTES,
+    );
+
+    expect(result.sha256).toBe(sha256(bytes.toString('binary')));
+    expect(system.reads.reduce((count, read) => count + read.mock.calls.length, 0))
+      .toBeGreaterThan(2);
+    system.expectAllClosed();
+  });
+
+  it.each([
+    ['static FIFO', {fontKind: 'other' as const}],
+    ['replacement FIFO', {replaceFontWithFifo: true}],
+    ['oversized font', {fontSize: 64n * 1024n * 1024n + 1n}],
+  ])('rejects a %s without leaking FDs', async (_, options) => {
+    const system = systemFileAccessFixture(options);
+
+    await expect(system.fileSystem.hashProjectFile(
+      {} as ProjectDirectoryScope,
+      'assets/fonts/font.otf',
+      MAX_FONT_BYTES,
+    )).rejects.toBeInstanceOf(Error);
+
+    system.expectAllClosed();
+  });
+
+  it('rejects mode 0401 when access(X_OK) denies the effective user', async () => {
+    const system = systemFileAccessFixture({denyExecutableAccess: true});
+
+    await expect(system.fileSystem.openExecutable('/tool'))
+      .rejects.toBeInstanceOf(Error);
+
+    expect(system.access).toHaveBeenCalledWith('/tool', constants.X_OK);
+    system.expectAllClosed();
+  });
+
+  it('checks execute access against the held executable inode authority', async () => {
+    const system = systemFileAccessFixture();
+
+    const authority = await system.fileSystem.openExecutable('/tool');
+    await authority.close();
+
+    expect(system.access).toHaveBeenCalledWith('/tool', constants.X_OK);
+    expect(system.access).toHaveBeenCalledWith('/.vol/2/20', constants.X_OK);
+    system.expectAllClosed();
+  });
+});
 
 describe('scoped source measurement', () => {
   it('feeds a measured 1 GiB tree into the 3 GiB Preflight estimate', async () => {
@@ -543,6 +917,23 @@ describe('scoped source measurement', () => {
     meter.expectAllClosed();
   });
 
+  it('does not block when a file Dirent is replaced by a FIFO before open', async () => {
+    const meter = sourceMeterFixture(
+      sourceDirectory(3n, {changed: sourceFile(4n, 100n)}),
+      {replaceWithFifoBeforeOpenPath: 'assets/source/changed'},
+    );
+    const timeout = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error('source measurement timed out')), 100);
+    });
+
+    await expect(Promise.race([
+      measureProjectSourceBytes(meter.scope, meter.dependencies),
+      timeout,
+    ])).rejects.toMatchObject({code: 'PROJECT_SOURCE_INVALID'});
+
+    meter.expectAllClosed();
+  });
+
   it('requests bigint stats from the real system source-meter adapter', async () => {
     const stat = vi.fn(async (options: {bigint: true}) => {
       expect(options).toEqual({bigint: true});
@@ -556,20 +947,24 @@ describe('scoped source measurement', () => {
       };
     });
     const close = vi.fn(async () => {});
+    const open = vi.fn(async (candidate: string, flags: number) => {
+      expect(candidate).toBe('/.vol/1/9/video.mp4');
+      expect(flags & constants.O_NONBLOCK).not.toBe(0);
+      return {fd: 42, stat, close};
+    });
     const adapter = createSystemSourceMeterDependencies({
       openExistingProjectFile: vi.fn(async () => ({fd: 42, stat, close})),
+      open,
       openDirectory: vi.fn(async () => { throw new Error('not used'); }),
     });
 
-    const handle = await adapter.openExistingProjectFile(
-      {} as ProjectDirectoryScope,
-      'assets/source/video.mp4',
-    );
+    const handle = await adapter.openAuthority({dev: 1n, ino: 9n}, 'video.mp4');
     const status = await handle.stat();
     await handle.close();
 
     expect(status).toMatchObject({dev: 1n, ino: 2n, nlink: 1n, size: 3n});
     expect(stat).toHaveBeenCalledWith({bigint: true});
+    expect(open).toHaveBeenCalledOnce();
     expect(close).toHaveBeenCalledOnce();
   });
 
@@ -617,6 +1012,10 @@ describe('scoped source measurement', () => {
 
   it('maps missing source and enumeration/stat I/O failures to source errors', async () => {
     const missing = sourceMeterFixture(undefined);
+    const rootStatFailure = sourceMeterFixture(
+      sourceDirectory(3n, {}),
+      {failStatPath: '.'},
+    );
     const enumeration = sourceMeterFixture(
       sourceDirectory(3n, {}),
       {failDirectoryPath: 'assets/source'},
@@ -626,7 +1025,7 @@ describe('scoped source measurement', () => {
       {failStatPath: 'assets/source/video'},
     );
 
-    for (const meter of [missing, enumeration, statFailure]) {
+    for (const meter of [missing, rootStatFailure, enumeration, statFailure]) {
       await expect(measureProjectSourceBytes(meter.scope, meter.dependencies))
         .rejects.toMatchObject({code: 'PROJECT_SOURCE_INVALID'});
       meter.expectAllClosed();
@@ -670,14 +1069,29 @@ describe('runPreflight', () => {
     });
   });
 
+  it('rejects malformed macOS versions before parsing the major', async () => {
+    const {input, dependencies} = fixture({macosVersion: '15beta'});
+
+    const result = await runPreflight(input, dependencies);
+
+    expect(errorCheck(result, 'macos-version')).toMatchObject({
+      code: 'ENV_PLATFORM_UNSUPPORTED',
+      value: '15beta',
+    });
+  });
+
   it.each([
     {
       id: 'ffmpeg-encoder-h264',
-      encoders: ' A....D aac AAC (Advanced Audio Coding)',
+      encoders: encoderTable([
+        ' A....D aac AAC (Advanced Audio Coding) (codec aac)',
+      ]),
     },
     {
       id: 'ffmpeg-encoder-aac',
-      encoders: ' V....D h264_videotoolbox VideoToolbox H.264 Encoder',
+      encoders: encoderTable([
+        ' V....D h264_videotoolbox VideoToolbox H.264 Encoder (codec h264)',
+      ]),
     },
   ])('reports a missing encoder for $id', async ({id, encoders}) => {
     const {input, dependencies} = fixture({encoders});
@@ -689,10 +1103,10 @@ describe('runPreflight', () => {
 
   it('accepts alternate H.264 and AAC encoder implementations', async () => {
     const {input, dependencies} = fixture({
-      encoders: [
-        ' V....D libopenh264 OpenH264 H.264 encoder',
-        ' A....D aac_at AudioToolbox AAC encoder',
-      ].join('\n'),
+      encoders: encoderTable([
+        ' V....D libopenh264 OpenH264 H.264 encoder (codec h264)',
+        ' A....D aac_at AudioToolbox AAC encoder (codec aac)',
+      ]),
     });
 
     const result = await runPreflight(input, dependencies);
@@ -701,14 +1115,52 @@ describe('runPreflight', () => {
     expect(errorCheck(result, 'ffmpeg-encoder-aac')).toBeUndefined();
   });
 
+  it('accepts the standard libx264 encoder row', async () => {
+    const {input, dependencies} = fixture({
+      encoders: encoderTable([
+        ' V....D libx264 libx264 H.264 / AVC / MPEG-4 AVC (codec h264)',
+        ' A....D aac AAC (Advanced Audio Coding) (codec aac)',
+      ]),
+    });
+
+    const result = await runPreflight(input, dependencies);
+
+    expect(errorCheck(result, 'ffmpeg-encoder-h264')).toBeUndefined();
+    expect(errorCheck(result, 'ffmpeg-encoder-aac')).toBeUndefined();
+  });
+
+  it('ignores warnings, decoder tables, and disabled encoder text', async () => {
+    const {input, dependencies} = fixture({
+      encoders: [
+        'warning: h264 disabled and aac unavailable',
+        'Decoders:',
+        ' V....D h264 H.264 decoder only',
+        ' A....D aac AAC decoder only',
+        encoderTable([
+          ' V....D vp9 VP9 encoder',
+          ' A....D mp3 MP3 encoder',
+          ' V....D h264_disabled disabled encoder',
+        ]),
+      ].join('\n'),
+    });
+
+    const result = await runPreflight(input, dependencies);
+
+    expect(errorCheck(result, 'ffmpeg-encoder-h264')).toMatchObject({
+      code: 'ENV_CAPABILITY_MISSING',
+    });
+    expect(errorCheck(result, 'ffmpeg-encoder-aac')).toMatchObject({
+      code: 'ENV_CAPABILITY_MISSING',
+    });
+  });
+
   it.each(['loudnorm', 'silencedetect', 'blackdetect'] as const)(
     'reports a missing %s filter',
     async (missingFilter) => {
       const filters = ['loudnorm', 'silencedetect', 'blackdetect']
         .filter((filter) => filter !== missingFilter)
-        .map((filter) => ` ... ${filter} input->output`)
-        .join('\n');
-      const {input, dependencies} = fixture({filters});
+        .map((filter) => ` ... ${filter} input->output`);
+      const {input, dependencies} = fixture({filters: filterTable(filters)});
 
       const result = await runPreflight(input, dependencies);
 
@@ -717,6 +1169,42 @@ describe('runPreflight', () => {
       });
     },
   );
+
+  it('ignores warning and substring filter names', async () => {
+    const {input, dependencies} = fixture({
+      filters: [
+        'warning: loudnorm unavailable',
+        filterTable([
+          ' ... loudnorm_unavailable A->A not the required filter',
+          ' ... silencedetect A->A Detect silence',
+          ' ... blackdetect V->V Detect black intervals',
+        ]),
+      ].join('\n'),
+    });
+
+    const result = await runPreflight(input, dependencies);
+
+    expect(errorCheck(result, 'ffmpeg-filter-loudnorm')).toMatchObject({
+      code: 'ENV_CAPABILITY_MISSING',
+    });
+  });
+
+  it('accepts current FFmpeg filter rows with two flag columns', async () => {
+    const {input, dependencies} = fixture({
+      filters: [
+        'Filters:',
+        '  T. loudnorm A->A EBU R128 loudness normalization',
+        '  .. silencedetect A->A Detect silence',
+        '  .. blackdetect V->V Detect black intervals',
+      ].join('\n'),
+    });
+
+    const result = await runPreflight(input, dependencies);
+
+    expect(errorCheck(result, 'ffmpeg-filter-loudnorm')).toBeUndefined();
+    expect(errorCheck(result, 'ffmpeg-filter-silencedetect')).toBeUndefined();
+    expect(errorCheck(result, 'ffmpeg-filter-blackdetect')).toBeUndefined();
+  });
 
   it('resolves FFmpeg once, canonicalizes it, and reuses its real path', async () => {
     const {input, dependencies, resolveExecutable, realpath, runProcess} = fixture();
@@ -729,11 +1217,11 @@ describe('runPreflight', () => {
     expect(realpath.mock.calls.filter(([candidate]) => (
       candidate === FFMPEG_LINK
     ))).toHaveLength(1);
-    expect(runProcess.mock.calls.filter(([command]) => command === FFMPEG_REAL))
+    expect(runProcess.mock.calls.filter(([command]) => command === FFMPEG_AUTHORITY))
       .toEqual([
-        [FFMPEG_REAL, ['-version']],
-        [FFMPEG_REAL, ['-hide_banner', '-encoders']],
-        [FFMPEG_REAL, ['-hide_banner', '-filters']],
+        [FFMPEG_AUTHORITY, ['-version']],
+        [FFMPEG_AUTHORITY, ['-hide_banner', '-encoders']],
+        [FFMPEG_AUTHORITY, ['-hide_banner', '-filters']],
       ]);
     expect(runProcess.mock.calls.some(([command]) => command === 'ffmpeg')).toBe(false);
     expect(result.toolIdentities.ffmpeg?.realPath).toBe(FFMPEG_REAL);
@@ -747,26 +1235,26 @@ describe('runPreflight', () => {
 
     expect(resolveExecutable).toHaveBeenCalledWith('ffprobe');
     expect(realpath).toHaveBeenCalledWith(FFPROBE_LINK);
-    expect(runProcess).toHaveBeenCalledWith(FFPROBE_REAL, ['-version']);
+    expect(runProcess).toHaveBeenCalledWith(FFPROBE_AUTHORITY, ['-version']);
     expect(result.versions.ffprobe).toBe('8.0');
   });
 
   it('derives qt-faststart only from the canonical FFmpeg directory', async () => {
-    const {input, dependencies, stat, realpath} = fixture();
+    const {input, dependencies, openExecutable, realpath} = fixture();
 
     const result = await runPreflight(input, dependencies);
 
-    expect(stat).toHaveBeenCalledWith(QT_FASTSTART_SIBLING);
     expect(realpath).toHaveBeenCalledWith(QT_FASTSTART_SIBLING);
+    expect(openExecutable).toHaveBeenCalledWith(QT_FASTSTART_REAL);
     expect(result.toolIdentities.qtFaststart?.realPath).toBe(QT_FASTSTART_REAL);
   });
 
   it.each([
-    ['missing', Object.assign(new Error('missing'), {code: 'ENOENT'})],
-    ['non-regular', {kind: 'directory', mode: 0o40755} satisfies PreflightFileStatus],
-    ['non-executable', {kind: 'file', mode: 0o100644} satisfies PreflightFileStatus],
-  ])('maps a %s qt-faststart sibling to ENV_TOOL_MISSING', async (_, status) => {
-    const {input, dependencies} = fixture({qtFaststartStatus: status});
+    ['missing', {qtFaststartAccessDenied: true}],
+    ['non-regular', {qtFaststartKind: 'directory' as const}],
+    ['non-executable', {qtFaststartAccessDenied: true}],
+  ])('maps a %s qt-faststart sibling to ENV_TOOL_MISSING', async (_, overrides) => {
+    const {input, dependencies} = fixture(overrides);
 
     const result = await runPreflight(input, dependencies);
 
@@ -774,6 +1262,31 @@ describe('runPreflight', () => {
       code: 'ENV_TOOL_MISSING',
       affectedPaths: [QT_FASTSTART_SIBLING],
     });
+    expect(result.toolIdentities.qtFaststart).toBeNull();
+  });
+
+  it('fails closed when FFmpeg is atomically replaced during a probe', async () => {
+    const {input, dependencies} = fixture({replaceFfmpegDuringProbe: true});
+
+    const result = await runPreflight(input, dependencies);
+
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      code: 'ENV_TOOL_CHANGED',
+    }));
+    expect(result.toolIdentities.ffmpeg).toBeNull();
+    expect(result.versions.ffmpeg).toBeNull();
+    expect(result.environmentFingerprint).not.toContain('replacement-ffmpeg-binary');
+  });
+
+  it('fails closed when qt-faststart changes before fingerprint use', async () => {
+    const {input, dependencies} = fixture({replaceQtFaststartBeforeUse: true});
+
+    const result = await runPreflight(input, dependencies);
+
+    expect(result.checks).toContainEqual(expect.objectContaining({
+      id: 'qt-faststart',
+      code: 'ENV_TOOL_CHANGED',
+    }));
     expect(result.toolIdentities.qtFaststart).toBeNull();
   });
 
@@ -809,16 +1322,30 @@ describe('runPreflight', () => {
   });
 
   it('hashes every configured font', async () => {
-    const {input, dependencies, readProjectFile} = fixture({fontBytes: 'font-v2'});
+    const {input, dependencies, hashProjectFile} = fixture({fontBytes: 'font-v2'});
 
     const result = await runPreflight(input, dependencies);
 
-    expect(readProjectFile).toHaveBeenCalledOnce();
+    expect(hashProjectFile).toHaveBeenCalledOnce();
     expect(result.fonts).toEqual([{
       path: input.project.captions.font,
       sha256: sha256('font-v2'),
     }]);
     expect(errorCheck(result, `font:${input.project.captions.font}`)).toBeUndefined();
+  });
+
+  it('maps invalid or oversized configured fonts to ENV_FONT_INVALID', async () => {
+    const {input, dependencies} = fixture({
+      fontError: Object.assign(new Error('font is unsafe'), {
+        code: 'ENV_FONT_INVALID',
+      }),
+    });
+
+    const result = await runPreflight(input, dependencies);
+
+    expect(errorCheck(result, `font:${input.project.captions.font}`)).toMatchObject({
+      code: 'ENV_FONT_INVALID',
+    });
   });
 
   it('reports a configured font that cannot be read', async () => {
@@ -924,7 +1451,7 @@ describe('runPreflight', () => {
   });
 
   it('runs the complete required probe list with injected processes', async () => {
-    const {input, dependencies, runProcess} = fixture();
+    const {input, dependencies, heldAuthorities, runProcess} = fixture();
 
     await runPreflight(input, dependencies);
 
@@ -932,12 +1459,15 @@ describe('runPreflight', () => {
       ['node', ['--version']],
       ['pnpm', ['--version']],
       ['/usr/bin/sw_vers', ['-productVersion']],
-      [FFMPEG_REAL, ['-version']],
-      [FFPROBE_REAL, ['-version']],
-      [FFMPEG_REAL, ['-hide_banner', '-encoders']],
-      [FFMPEG_REAL, ['-hide_banner', '-filters']],
+      [FFMPEG_AUTHORITY, ['-version']],
+      [FFPROBE_AUTHORITY, ['-version']],
+      [FFMPEG_AUTHORITY, ['-hide_banner', '-encoders']],
+      [FFMPEG_AUTHORITY, ['-hide_banner', '-filters']],
       ['/usr/bin/say', ['-v', '?']],
     ]);
+    for (const authority of heldAuthorities) {
+      expect(authority.close).toHaveBeenCalledOnce();
+    }
   });
 
   it('maps probe exceptions to deterministic structured errors', async () => {

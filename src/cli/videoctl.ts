@@ -1,6 +1,7 @@
 import {pathToFileURL} from 'node:url';
 import path from 'node:path';
-import {opendir} from 'node:fs/promises';
+import {constants} from 'node:fs';
+import {open, opendir} from 'node:fs/promises';
 import {Command, CommanderError} from 'commander';
 import {
   loadProject,
@@ -75,6 +76,10 @@ export interface SourceMeterDependencies {
     scope: ProjectDirectoryScope,
     relativePath: string,
   ): Promise<SourceMeterFileHandle>;
+  openAuthority(
+    parent: Pick<SourceMeterStat, 'dev' | 'ino'>,
+    name: string,
+  ): Promise<SourceMeterFileHandle>;
   openDirectory(fdPath: string): Promise<SourceMeterDirectory>;
 }
 
@@ -89,6 +94,11 @@ export class ProjectSourceMeasurementError extends Error {
 
 const invalidSource = (cause?: unknown): ProjectSourceMeasurementError =>
   new ProjectSourceMeasurementError(cause === undefined ? undefined : {cause});
+
+const O_NOFOLLOW_ANY = 0x20000000;
+const SAFE_SOURCE_FLAGS = constants.O_RDONLY
+  | constants.O_NONBLOCK
+  | O_NOFOLLOW_ANY;
 
 const sameIdentity = (
   left: Pick<SourceMeterStat, 'dev' | 'ino' | 'nlink'>,
@@ -121,9 +131,6 @@ const validateDirectoryEntryName = (name: string): void => {
   }
 };
 
-const childRelativePath = (parent: string, name: string): string =>
-  parent === '.' ? name : path.posix.join(parent, name);
-
 type SourceMeterEntryKind = 'file' | 'directory';
 
 const directoryEntryKind = (
@@ -143,25 +150,65 @@ const statusKind = (status: SourceMeterStat): SourceMeterEntryKind => {
   return isFile ? 'file' : 'directory';
 };
 
+interface SourceMeterAuthority {
+  handle: SourceMeterFileHandle;
+  status: SourceMeterStat;
+  parent?: SourceMeterAuthority;
+  name?: string;
+}
+
+const closeAuthorityVerification = async (
+  handle: SourceMeterFileHandle | undefined,
+): Promise<void> => {
+  if (handle !== undefined) await handle.close();
+};
+
+const revalidateAuthority = async (
+  scope: ProjectDirectoryScope,
+  authority: SourceMeterAuthority,
+  dependencies: SourceMeterDependencies,
+): Promise<void> => {
+  if (authority.parent === undefined) {
+    let verification: SourceMeterFileHandle | undefined;
+    try {
+      verification = await dependencies.openExistingProjectFile(scope, '.');
+      const status = await verification.stat();
+      if (
+        statusKind(status) !== 'directory'
+        || !sameOpenedPath(status, authority.status)
+      ) {
+        throw invalidSource();
+      }
+    } finally {
+      await closeAuthorityVerification(verification);
+    }
+    return;
+  }
+
+  await revalidateAuthority(scope, authority.parent, dependencies);
+  let verification: SourceMeterFileHandle | undefined;
+  try {
+    verification = await dependencies.openAuthority(
+      authority.parent.status,
+      authority.name!,
+    );
+    const status = await verification.stat();
+    if (!sameOpenedPath(status, authority.status)) throw invalidSource();
+  } finally {
+    await closeAuthorityVerification(verification);
+  }
+};
+
 const findDirectoryEntry = async (
   scope: ProjectDirectoryScope,
-  parentRelativePath: string,
-  expectedParent: SourceMeterStat,
+  parent: SourceMeterAuthority,
   name: string,
   dependencies: SourceMeterDependencies,
 ): Promise<SourceMeterDirectoryEntry | undefined> => {
-  let parent: SourceMeterFileHandle | undefined;
   let directory: SourceMeterDirectory | undefined;
   try {
-    parent = await dependencies.openExistingProjectFile(
-      scope,
-      parentRelativePath,
-    );
-    const parentStatus = await parent.stat();
-    if (!parentStatus.isDirectory() || !sameOpenedPath(parentStatus, expectedParent)) {
-      throw invalidSource();
-    }
-    directory = await dependencies.openDirectory(`/dev/fd/${parent.fd}`);
+    await revalidateAuthority(scope, parent, dependencies);
+    directory = await dependencies.openDirectory(`/dev/fd/${parent.handle.fd}`);
     while (true) {
       const entry = await directory.read();
       if (entry === null) return undefined;
@@ -169,25 +216,19 @@ const findDirectoryEntry = async (
       if (entry.name === name) return entry;
     }
   } finally {
-    try {
-      if (directory !== undefined) await directory.close();
-    } finally {
-      if (parent !== undefined) await parent.close();
-    }
+    if (directory !== undefined) await directory.close();
   }
 };
 
 const requireEntryKind = async (
   scope: ProjectDirectoryScope,
-  parentRelativePath: string,
-  expectedParent: SourceMeterStat,
+  parent: SourceMeterAuthority,
   name: string,
   dependencies: SourceMeterDependencies,
 ): Promise<SourceMeterEntryKind> => {
   const entry = await findDirectoryEntry(
     scope,
-    parentRelativePath,
-    expectedParent,
+    parent,
     name,
     dependencies,
   );
@@ -195,35 +236,35 @@ const requireEntryKind = async (
   return directoryEntryKind(entry);
 };
 
-const revalidateOpenedPath = async (
+const openChildAuthority = async (
   scope: ProjectDirectoryScope,
-  relativePath: string,
-  expected: SourceMeterStat,
+  parent: SourceMeterAuthority,
+  name: string,
+  expectedKind: SourceMeterEntryKind,
   dependencies: SourceMeterDependencies,
-): Promise<void> => {
-  const verification = await dependencies.openExistingProjectFile(
-    scope,
-    relativePath,
-  );
+): Promise<SourceMeterAuthority> => {
+  await revalidateAuthority(scope, parent, dependencies);
+  const handle = await dependencies.openAuthority(parent.status, name);
   try {
-    const status = await verification.stat();
-    if (!sameOpenedPath(status, expected)) throw invalidSource();
-  } finally {
-    await verification.close();
+    const status = await handle.stat();
+    if (statusKind(status) !== expectedKind) throw invalidSource();
+    return {handle, status, parent, name};
+  } catch (error) {
+    await handle.close();
+    throw error;
   }
 };
 
 const measureOpenedDirectory = async (
   scope: ProjectDirectoryScope,
-  relativePath: string,
-  handle: SourceMeterFileHandle,
-  initialStatus: SourceMeterStat,
+  authority: SourceMeterAuthority,
   dependencies: SourceMeterDependencies,
 ): Promise<bigint> => {
   let directory: SourceMeterDirectory | undefined;
   try {
-    if (statusKind(initialStatus) !== 'directory') throw invalidSource();
-    directory = await dependencies.openDirectory(`/dev/fd/${handle.fd}`);
+    if (statusKind(authority.status) !== 'directory') throw invalidSource();
+    await revalidateAuthority(scope, authority, dependencies);
+    directory = await dependencies.openDirectory(`/dev/fd/${authority.handle.fd}`);
 
     let totalBytes = 0n;
     while (true) {
@@ -231,80 +272,34 @@ const measureOpenedDirectory = async (
       if (entry === null) break;
       validateDirectoryEntryName(entry.name);
       const entryKind = directoryEntryKind(entry);
-
-      const relativeEntry = childRelativePath(relativePath, entry.name);
-      if (await requireEntryKind(
+      await revalidateAuthority(scope, authority, dependencies);
+      const child = await openChildAuthority(
         scope,
-        relativePath,
-        initialStatus,
+        authority,
         entry.name,
+        entryKind,
         dependencies,
-      ) !== entryKind) {
-        throw invalidSource();
-      }
-      const child = await dependencies.openExistingProjectFile(
-        scope,
-        relativeEntry,
       );
       try {
-        const childStatus = await child.stat();
-        if (statusKind(childStatus) !== entryKind) throw invalidSource();
-        if (await requireEntryKind(
-          scope,
-          relativePath,
-          initialStatus,
-          entry.name,
-          dependencies,
-        ) !== entryKind) {
-          throw invalidSource();
-        }
-        await revalidateOpenedPath(
-          scope,
-          relativeEntry,
-          childStatus,
-          dependencies,
-        );
-
         if (entryKind === 'file') {
-          if (childStatus.size < 0n) throw invalidSource();
-          totalBytes += childStatus.size;
+          if (child.status.size < 0n) throw invalidSource();
+          await revalidateAuthority(scope, child, dependencies);
+          totalBytes += child.status.size;
         } else {
           const childBytes = await measureOpenedDirectory(
             scope,
-            relativeEntry,
             child,
-            childStatus,
             dependencies,
           );
           totalBytes += childBytes;
         }
-
-        if (await requireEntryKind(
-          scope,
-          relativePath,
-          initialStatus,
-          entry.name,
-          dependencies,
-        ) !== entryKind) {
-          throw invalidSource();
-        }
-        await revalidateOpenedPath(
-          scope,
-          relativeEntry,
-          childStatus,
-          dependencies,
-        );
+        await revalidateAuthority(scope, child, dependencies);
       } finally {
-        await child.close();
+        await child.handle.close();
       }
     }
 
-    await revalidateOpenedPath(
-      scope,
-      relativePath,
-      initialStatus,
-      dependencies,
-    );
+    await revalidateAuthority(scope, authority, dependencies);
     return totalBytes;
   } finally {
     if (directory !== undefined) await directory.close();
@@ -315,107 +310,70 @@ const measureProjectSourceBytesUnsafe = async (
   scope: ProjectDirectoryScope,
   dependencies: SourceMeterDependencies,
 ): Promise<bigint> => {
-  let projectRoot: SourceMeterFileHandle | undefined;
-  let assets: SourceMeterFileHandle | undefined;
-  let source: SourceMeterFileHandle | undefined;
+  let projectRootHandle: SourceMeterFileHandle | undefined;
+  let projectRoot: SourceMeterAuthority | undefined;
+  let assets: SourceMeterAuthority | undefined;
+  let source: SourceMeterAuthority | undefined;
   try {
-    projectRoot = await dependencies.openExistingProjectFile(scope, '.');
-    const projectRootStatus = await projectRoot.stat();
+    projectRootHandle = await dependencies.openExistingProjectFile(scope, '.');
+    const projectRootStatus = await projectRootHandle.stat();
     if (statusKind(projectRootStatus) !== 'directory') throw invalidSource();
+    projectRoot = {handle: projectRootHandle, status: projectRootStatus};
+    projectRootHandle = undefined;
 
     if (await requireEntryKind(
       scope,
-      '.',
-      projectRootStatus,
+      projectRoot,
       'assets',
       dependencies,
     ) !== 'directory') {
       throw invalidSource();
     }
-    assets = await dependencies.openExistingProjectFile(scope, 'assets');
-    const assetsStatus = await assets.stat();
-    if (statusKind(assetsStatus) !== 'directory') throw invalidSource();
-    if (await requireEntryKind(
+    assets = await openChildAuthority(
       scope,
-      '.',
-      projectRootStatus,
+      projectRoot,
       'assets',
+      'directory',
       dependencies,
-    ) !== 'directory') {
-      throw invalidSource();
-    }
-    await revalidateOpenedPath(scope, 'assets', assetsStatus, dependencies);
+    );
 
     if (await requireEntryKind(
       scope,
-      'assets',
-      assetsStatus,
+      assets,
       'source',
       dependencies,
     ) !== 'directory') {
       throw invalidSource();
     }
-    source = await dependencies.openExistingProjectFile(scope, 'assets/source');
-    const sourceStatus = await source.stat();
-    if (statusKind(sourceStatus) !== 'directory') throw invalidSource();
-    if (await requireEntryKind(
+    source = await openChildAuthority(
       scope,
-      'assets',
-      assetsStatus,
+      assets,
       'source',
-      dependencies,
-    ) !== 'directory') {
-      throw invalidSource();
-    }
-    await revalidateOpenedPath(
-      scope,
-      'assets/source',
-      sourceStatus,
+      'directory',
       dependencies,
     );
     const totalBytes = await measureOpenedDirectory(
       scope,
-      'assets/source',
       source,
-      sourceStatus,
       dependencies,
     );
 
-    if (await requireEntryKind(
-      scope,
-      'assets',
-      assetsStatus,
-      'source',
-      dependencies,
-    ) !== 'directory') {
-      throw invalidSource();
-    }
-    await revalidateOpenedPath(
-      scope,
-      'assets/source',
-      sourceStatus,
-      dependencies,
-    );
-    if (await requireEntryKind(
-      scope,
-      '.',
-      projectRootStatus,
-      'assets',
-      dependencies,
-    ) !== 'directory') {
-      throw invalidSource();
-    }
-    await revalidateOpenedPath(scope, 'assets', assetsStatus, dependencies);
-    await revalidateOpenedPath(scope, '.', projectRootStatus, dependencies);
+    await revalidateAuthority(scope, source, dependencies);
+    await revalidateAuthority(scope, assets, dependencies);
+    await revalidateAuthority(scope, projectRoot, dependencies);
     return totalBytes;
   } finally {
     try {
-      if (source !== undefined) await source.close();
+      if (source !== undefined) await source.handle.close();
     } finally {
       try {
-        if (assets !== undefined) await assets.close();
+        if (assets !== undefined) await assets.handle.close();
       } finally {
-        if (projectRoot !== undefined) await projectRoot.close();
+        if (projectRoot !== undefined) {
+          await projectRoot.handle.close();
+        } else if (projectRootHandle !== undefined) {
+          await projectRootHandle.close();
+        }
       }
     }
   }
@@ -569,26 +527,45 @@ export interface SystemSourceMeterFileSystem {
     scope: ProjectDirectoryScope,
     relativePath: string,
   ): Promise<SystemSourceMeterFileHandle>;
+  open(candidate: string, flags: number): Promise<SystemSourceMeterFileHandle>;
   openDirectory(fdPath: string): Promise<SourceMeterDirectory>;
 }
 
 const SYSTEM_SOURCE_METER_FILE_SYSTEM: SystemSourceMeterFileSystem = {
   openExistingProjectFile: async (scope, relativePath) =>
     await openExistingProjectFile(scope, relativePath),
+  open: async (candidate, flags) => await open(candidate, flags),
   openDirectory: async (fdPath) => await opendir(fdPath),
 };
+
+const sourceAuthorityPath = (
+  parent: Pick<SourceMeterStat, 'dev' | 'ino'>,
+  name: string,
+): string => {
+  validateDirectoryEntryName(name);
+  if (parent.dev < 0n || parent.ino < 0n) throw invalidSource();
+  return `/.vol/${parent.dev}/${parent.ino}/${name}`;
+};
+
+const systemSourceHandle = (
+  handle: SystemSourceMeterFileHandle,
+): SourceMeterFileHandle => ({
+  fd: handle.fd,
+  stat: async () => await handle.stat({bigint: true}),
+  close: async () => await handle.close(),
+});
 
 export const createSystemSourceMeterDependencies = (
   fileSystem: SystemSourceMeterFileSystem = SYSTEM_SOURCE_METER_FILE_SYSTEM,
 ): SourceMeterDependencies => ({
   openExistingProjectFile: async (scope, relativePath) => {
     const handle = await fileSystem.openExistingProjectFile(scope, relativePath);
-    return {
-      fd: handle.fd,
-      stat: async () => await handle.stat({bigint: true}),
-      close: async () => await handle.close(),
-    };
+    return systemSourceHandle(handle);
   },
+  openAuthority: async (parent, name) => systemSourceHandle(await fileSystem.open(
+    sourceAuthorityPath(parent, name),
+    SAFE_SOURCE_FLAGS,
+  )),
   openDirectory: async (fdPath) => await fileSystem.openDirectory(fdPath),
 });
 

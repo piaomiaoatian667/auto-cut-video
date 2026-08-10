@@ -44,18 +44,31 @@ const statusLabel = (check: OutputCheck): string => {
   }
 };
 
+const sanitizeTableCell = (value: string): string => value
+  .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/gu, '')
+  .replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, '')
+  .replace(/[\u0000-\u001f\u007f-\u009f]/gu, ' ')
+  .replace(/\s+/gu, ' ')
+  .trim();
+
 const table = (checks: readonly OutputCheck[]): string[] => {
+  const rows = checks.map((check) => ({
+    status: sanitizeTableCell(statusLabel(check)),
+    id: sanitizeTableCell(check.id),
+    code: sanitizeTableCell(check.code ?? '-'),
+    message: sanitizeTableCell(check.message),
+  }));
   const statusWidth = Math.max(
     'STATUS'.length,
-    ...checks.map((check) => statusLabel(check).length),
+    ...rows.map((row) => row.status.length),
   );
   const checkWidth = Math.max(
     'CHECK'.length,
-    ...checks.map((check) => check.id.length),
+    ...rows.map((row) => row.id.length),
   );
   const codeWidth = Math.max(
     'CODE'.length,
-    ...checks.map((check) => (check.code ?? '-').length),
+    ...rows.map((row) => row.code.length),
   );
   const row = (
     status: string,
@@ -71,10 +84,10 @@ const table = (checks: readonly OutputCheck[]): string[] => {
 
   return [
     row('STATUS', 'CHECK', 'CODE', 'MESSAGE'),
-    ...checks.map((check) => row(
-      statusLabel(check),
+    ...rows.map((check) => row(
+      check.status,
       check.id,
-      check.code ?? '-',
+      check.code,
       check.message,
     )),
   ];
@@ -84,22 +97,29 @@ const identityValue = (
   value: string | undefined,
 ): string => value ?? 'unavailable';
 
+const tableIdentityValue = (value: string | undefined): string =>
+  sanitizeTableCell(identityValue(value));
+
 export const formatDoctorTable = (
   project: string,
   result: PreflightResult,
 ): string => [
-  `Environment doctor: ${project}`,
+  `Environment doctor: ${sanitizeTableCell(project)}`,
   ...table(result.checks),
   '',
-  `FFmpeg real path: ${identityValue(result.toolIdentities.ffmpeg?.realPath)}`,
-  `FFmpeg SHA-256: ${identityValue(result.toolIdentities.ffmpeg?.sha256)}`,
-  `qt-faststart real path: ${identityValue(
+  `FFmpeg real path: ${tableIdentityValue(
+    result.toolIdentities.ffmpeg?.realPath,
+  )}`,
+  `FFmpeg SHA-256: ${tableIdentityValue(
+    result.toolIdentities.ffmpeg?.sha256,
+  )}`,
+  `qt-faststart real path: ${tableIdentityValue(
     result.toolIdentities.qtFaststart?.realPath,
   )}`,
-  `qt-faststart SHA-256: ${identityValue(
+  `qt-faststart SHA-256: ${tableIdentityValue(
     result.toolIdentities.qtFaststart?.sha256,
   )}`,
-  `Environment fingerprint: ${result.environmentFingerprint}`,
+  `Environment fingerprint: ${sanitizeTableCell(result.environmentFingerprint)}`,
   '',
 ].join('\n');
 
@@ -142,7 +162,7 @@ export const formatDoctorFailure = (
   const report = createDoctorFailureReport(project, failure);
   if (json) return `${JSON.stringify(report, null, 2)}\n`;
   return [
-    `Environment doctor: ${project}`,
+    `Environment doctor: ${sanitizeTableCell(project)}`,
     ...table(report.checks),
     '',
     'FFmpeg real path: unavailable',
