@@ -9,6 +9,7 @@ export interface RenderTimelineVideoInput {
   outputLocation: string;
   publicDir: string;
   entryPoint?: string;
+  scale?: number;
 }
 
 const defaultEntryPoint = (): string => path.join(
@@ -54,6 +55,7 @@ export const renderTimelineVideo = async ({
   outputLocation,
   publicDir,
   entryPoint = defaultEntryPoint(),
+  scale,
 }: RenderTimelineVideoInput): Promise<void> => {
   const inputProps = CompiledTimelineSchema.parse(timeline) as unknown as Record<string, unknown>;
   const bundleLocation = await bundle({
@@ -78,5 +80,6 @@ export const renderTimelineVideo = async ({
     overwrite: true,
     concurrency: 1,
     logLevel: 'warn',
+    ...(scale === undefined ? {} : {scale}),
   });
 };
