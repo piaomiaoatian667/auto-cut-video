@@ -1074,6 +1074,11 @@ interface WorkDirectoryAnchor {
   authorityPath: string;
 }
 
+interface MissingWorkDirectoryComponent {
+  parent: WorkDirectoryAnchor;
+  name: string;
+}
+
 const workIdentityMatches = (
   identity: WorkDirectoryIdentity,
   status: PreflightBigIntStat,
@@ -1146,6 +1151,31 @@ const assertWorkAnchorsStable = async (
   }
 };
 
+const assertMissingWorkComponent = async (
+  missing: MissingWorkDirectoryComponent,
+  fileSystem: SystemPreflightFileSystem,
+): Promise<void> => {
+  try {
+    await fileSystem.lstat(`${missing.parent.authorityPath}/${missing.name}`);
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ENOENT') return;
+    throw error;
+  }
+  throw new Error('missing work directory component appeared');
+};
+
+const assertWorkInspectionStable = async (
+  anchors: readonly WorkDirectoryAnchor[],
+  missing: MissingWorkDirectoryComponent | undefined,
+  fileSystem: SystemPreflightFileSystem,
+): Promise<void> => {
+  await assertWorkAnchorsStable(anchors, fileSystem);
+  if (missing !== undefined) {
+    await assertMissingWorkComponent(missing, fileSystem);
+  }
+  await assertWorkAnchorsStable(anchors, fileSystem);
+};
+
 const closeWorkDirectoryAnchors = async (
   anchors: readonly WorkDirectoryAnchor[],
 ): Promise<boolean> => {
@@ -1199,6 +1229,7 @@ const inspectSystemWorkDirectory = async (
     }
 
     let nearest = await openWorkDirectoryAnchor(workspaceIdentity, fileSystem);
+    let missing: MissingWorkDirectoryComponent | undefined;
     anchors.push(nearest);
     for (const segment of ['.work', validatedProjectId]) {
       await assertWorkAnchorsStable(anchors, fileSystem);
@@ -1207,7 +1238,10 @@ const inspectSystemWorkDirectory = async (
       try {
         childStatus = await fileSystem.lstat(childAuthorityPath);
       } catch (error) {
-        if (isNodeError(error) && error.code === 'ENOENT') break;
+        if (isNodeError(error) && error.code === 'ENOENT') {
+          missing = {parent: nearest, name: segment};
+          break;
+        }
         throw error;
       }
       if (!plainWorkDirectory(childStatus)) {
@@ -1223,16 +1257,18 @@ const inspectSystemWorkDirectory = async (
       anchors.push(nearest);
     }
 
-    await assertWorkAnchorsStable(anchors, fileSystem);
+    await assertWorkInspectionStable(anchors, missing, fileSystem);
     await fileSystem.access(
       nearest.authorityPath,
       constants.R_OK | constants.W_OK | constants.X_OK,
     );
-    await assertWorkAnchorsStable(anchors, fileSystem);
+    await assertWorkInspectionStable(anchors, missing, fileSystem);
+    await assertWorkInspectionStable(anchors, missing, fileSystem);
     const fileSystemStatus = await fileSystem.statfs(nearest.authorityPath);
-    await assertWorkAnchorsStable(anchors, fileSystem);
+    await assertWorkInspectionStable(anchors, missing, fileSystem);
     const available = fileSystemStatus.bavail * fileSystemStatus.bsize;
     if (available < 0n) throw new Error('invalid available disk bytes');
+    await assertWorkInspectionStable(anchors, missing, fileSystem);
     result = {
       usable: true,
       inspectedPath: nearest.identity.path,

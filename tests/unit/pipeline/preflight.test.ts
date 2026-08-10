@@ -930,6 +930,73 @@ describe('system work directory inspection', () => {
       .rejects.toMatchObject({code: 'ENOENT'});
   });
 
+  it.each([
+    ['permission', 'symlink'],
+    ['permission', 'directory'],
+    ['statfs-before', 'symlink'],
+    ['statfs-before', 'directory'],
+    ['statfs-after', 'symlink'],
+    ['statfs-after', 'directory'],
+  ] as const)(
+    'fails closed when missing .work appears during %s as a %s',
+    async (mutationStage, appearance) => {
+      const workspaceRoot = await makeWorkInspectionDirectory('preflight-workspace-');
+      const outsideRoot = await makeWorkInspectionDirectory('preflight-outside-');
+      const workPath = path.join(workspaceRoot, '.work');
+      let mutated = false;
+      const introduceWorkComponent = async (): Promise<void> => {
+        if (mutated) return;
+        mutated = true;
+        if (appearance === 'symlink') {
+          await symlink(outsideRoot, workPath);
+        } else {
+          await mkdir(workPath);
+        }
+      };
+      const fileSystem = createSystemPreflightFileSystem({
+        access: async (candidate, mode) => {
+          if (mutationStage === 'permission') {
+            await introduceWorkComponent();
+          }
+          await accessPath(candidate, mode);
+        },
+        statfs: async (candidate) => {
+          if (mutationStage === 'statfs-before') {
+            await introduceWorkComponent();
+          }
+          const status = await statfsPath(candidate, {bigint: true});
+          if (mutationStage === 'statfs-after') {
+            await introduceWorkComponent();
+          }
+          return status;
+        },
+      });
+      const preflight = fixture();
+      preflight.input.workspaceRoot = workspaceRoot;
+      preflight.input.workDirectory = path.join(workPath, 'demo');
+      preflight.dependencies.fileSystem.inspectWorkDirectory =
+        fileSystem.inspectWorkDirectory;
+
+      const result = await runPreflight(preflight.input, preflight.dependencies);
+
+      expect(mutated).toBe(true);
+      expect(errorCheck(result, 'work-directory')).toMatchObject({
+        code: 'ENV_WORK_DIRECTORY_UNAVAILABLE',
+      });
+      expect(errorCheck(result, 'disk-space')).toMatchObject({
+        code: 'ENV_WORK_DIRECTORY_UNAVAILABLE',
+      });
+      expect(result.checks).not.toContainEqual(expect.objectContaining({
+        id: 'disk-space',
+        severity: 'info',
+      }));
+      const runProjectPath = appearance === 'symlink'
+        ? path.join(outsideRoot, 'demo')
+        : path.join(workPath, 'demo');
+      await expect(lstat(runProjectPath)).rejects.toMatchObject({code: 'ENOENT'});
+    },
+  );
+
   it('accepts an existing plain project work directory', async () => {
     const workspaceRoot = await makeWorkInspectionDirectory('preflight-workspace-');
     const workDirectory = path.join(workspaceRoot, '.work', 'demo');
