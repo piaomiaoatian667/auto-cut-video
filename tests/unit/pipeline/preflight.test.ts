@@ -19,6 +19,7 @@ import {
   type PreflightProcessResult,
 } from '../../../src/pipeline/stages/preflight';
 import {
+  createSystemSourceMeterDependencies,
   createSystemVideoctlDependencies,
   measureProjectSourceBytes,
   type SourceMeterDependencies,
@@ -232,8 +233,9 @@ const sha256 = (value: string): string =>
   `sha256:${createHash('sha256').update(value).digest('hex')}`;
 
 interface SourceNodeBase {
-  dev: number;
-  ino: number;
+  dev: bigint;
+  ino: bigint;
+  nlink: bigint;
 }
 
 interface SourceDirectoryNode extends SourceNodeBase {
@@ -243,35 +245,55 @@ interface SourceDirectoryNode extends SourceNodeBase {
 
 interface SourceFileNode extends SourceNodeBase {
   kind: 'file';
-  size: number;
+  size: bigint;
 }
 
 interface SourceSymlinkNode extends SourceNodeBase {
   kind: 'symlink';
 }
 
-type SourceNode = SourceDirectoryNode | SourceFileNode | SourceSymlinkNode;
+interface SourceSpecialNode extends SourceNodeBase {
+  kind: 'fifo' | 'socket' | 'device' | 'unknown';
+}
+
+type SourceNode =
+  | SourceDirectoryNode
+  | SourceFileNode
+  | SourceSymlinkNode
+  | SourceSpecialNode;
 
 const sourceDirectory = (
-  ino: number,
+  ino: bigint,
   entries: Record<string, SourceNode>,
-): SourceDirectoryNode => ({kind: 'directory', dev: 1, ino, entries});
+): SourceDirectoryNode => ({kind: 'directory', dev: 1n, ino, nlink: 2n, entries});
 
-const sourceFile = (ino: number, size: number): SourceFileNode => ({
+const sourceFile = (ino: bigint, size: bigint): SourceFileNode => ({
   kind: 'file',
-  dev: 1,
+  dev: 1n,
   ino,
+  nlink: 1n,
   size,
 });
 
-const sourceSymlink = (ino: number): SourceSymlinkNode => ({
+const sourceSymlink = (ino: bigint): SourceSymlinkNode => ({
   kind: 'symlink',
-  dev: 1,
+  dev: 1n,
   ino,
+  nlink: 1n,
 });
+
+const sourceSpecial = (
+  kind: SourceSpecialNode['kind'],
+  ino: bigint,
+): SourceSpecialNode => ({kind, dev: 1n, ino, nlink: 1n});
 
 interface SourceMeterFixtureOptions {
   substituteSourceBeforeOpenPath?: string;
+  replaceAfterFirstOpen?: {
+    relativePath: string;
+    replacement: SourceNode;
+  };
+  statAsNonRegularPath?: string;
   failStatPath?: string;
   failDirectoryPath?: string;
   failClosePath?: string;
@@ -281,8 +303,8 @@ const sourceMeterFixture = (
   sourceNode: SourceNode | undefined,
   options: SourceMeterFixtureOptions = {},
 ) => {
-  const root = sourceDirectory(1, {
-    assets: sourceDirectory(2, sourceNode === undefined ? {} : {source: sourceNode}),
+  const root = sourceDirectory(1n, {
+    assets: sourceDirectory(2n, sourceNode === undefined ? {} : {source: sourceNode}),
   });
   const nodes = new Map<string, SourceNode>();
   const indexNode = (relativePath: string, node: SourceNode): void => {
@@ -296,6 +318,13 @@ const sourceMeterFixture = (
     }
   };
   indexNode('.', root);
+  const replaceNode = (relativePath: string, replacement: SourceNode): void => {
+    const parentPath = path.posix.dirname(relativePath);
+    const parent = nodes.get(parentPath);
+    if (parent?.kind !== 'directory') throw new Error('invalid replacement parent');
+    parent.entries[path.posix.basename(relativePath)] = replacement;
+    nodes.set(relativePath, replacement);
+  };
 
   let nextFd = 20;
   const fdPaths = new Map<number, string>();
@@ -304,13 +333,14 @@ const sourceMeterFixture = (
   const fileCloses: Array<ReturnType<typeof vi.fn>> = [];
   const directoryCloses: Array<ReturnType<typeof vi.fn>> = [];
   const statPaths: string[] = [];
+  const openCounts = new Map<string, number>();
 
   const openExistingProjectFile = vi.fn(async (
     _scope: ProjectDirectoryScope,
     relativePath: string,
   ) => {
     if (relativePath === options.substituteSourceBeforeOpenPath) {
-      nodes.set('assets/source', sourceSymlink(10_000));
+      replaceNode('assets/source', sourceSymlink(10_000n));
       throw new ProjectPathError(
         `project directory changed after scope creation: ${relativePath}`,
       );
@@ -319,6 +349,16 @@ const sourceMeterFixture = (
     if (node === undefined || node.kind === 'symlink') {
       throw new Error('scoped path is unavailable');
     }
+    if (
+      node.kind === 'fifo'
+      || node.kind === 'socket'
+      || node.kind === 'device'
+      || node.kind === 'unknown'
+    ) {
+      return await new Promise<never>(() => {});
+    }
+    const openCount = openCounts.get(relativePath) ?? 0;
+    openCounts.set(relativePath, openCount + 1);
     const fd = nextFd;
     nextFd += 1;
     fdPaths.set(fd, relativePath);
@@ -330,7 +370,7 @@ const sourceMeterFixture = (
       }
     });
     fileCloses.push(close);
-    return {
+    const handle = {
       fd,
       stat: vi.fn(async () => {
         if (relativePath === options.failStatPath) {
@@ -340,13 +380,27 @@ const sourceMeterFixture = (
         return {
           dev: node.dev,
           ino: node.ino,
-          size: node.kind === 'file' ? node.size : 0,
-          isFile: () => node.kind === 'file',
-          isDirectory: () => node.kind === 'directory',
+          nlink: node.nlink,
+          size: node.kind === 'file' ? node.size : 0n,
+          isFile: () => (
+            relativePath !== options.statAsNonRegularPath
+            && node.kind === 'file'
+          ),
+          isDirectory: () => (
+            relativePath !== options.statAsNonRegularPath
+            && node.kind === 'directory'
+          ),
         };
       }),
       close,
     };
+    if (
+      openCount === 0
+      && options.replaceAfterFirstOpen?.relativePath === relativePath
+    ) {
+      replaceNode(relativePath, options.replaceAfterFirstOpen.replacement);
+    }
+    return handle;
   });
 
   const openDirectory = vi.fn(async (fdPath: string) => {
@@ -360,6 +414,8 @@ const sourceMeterFixture = (
     if (node?.kind !== 'directory') throw new Error('invalid directory fd');
     const entries = Object.keys(node.entries).sort().map((name) => ({
       name,
+      isFile: () => node.entries[name]!.kind === 'file',
+      isDirectory: () => node.entries[name]!.kind === 'directory',
       isSymbolicLink: () => node.entries[name]!.kind === 'symlink',
     }));
     const close = vi.fn(async () => {});
@@ -393,9 +449,9 @@ const sourceMeterFixture = (
 
 describe('scoped source measurement', () => {
   it('feeds a measured 1 GiB tree into the 3 GiB Preflight estimate', async () => {
-    const meter = sourceMeterFixture(sourceDirectory(3, {
-      video: sourceFile(4, GIB - 512),
-      nested: sourceDirectory(5, {audio: sourceFile(6, 512)}),
+    const meter = sourceMeterFixture(sourceDirectory(3n, {
+      video: sourceFile(4n, BigInt(GIB - 512)),
+      nested: sourceDirectory(5n, {audio: sourceFile(6n, 512n)}),
     }));
     const projectInputs: ProjectInputs = {
       workspaceRoot: '/workspace',
@@ -424,7 +480,7 @@ describe('scoped source measurement', () => {
   });
 
   it('rejects an assets/source symlink without opening its target', async () => {
-    const meter = sourceMeterFixture(sourceSymlink(3));
+    const meter = sourceMeterFixture(sourceSymlink(3n));
 
     await expect(measureProjectSourceBytes(meter.scope, meter.dependencies))
       .rejects.toMatchObject({code: 'PROJECT_SOURCE_INVALID'});
@@ -437,9 +493,9 @@ describe('scoped source measurement', () => {
   });
 
   it('rejects symlink entries and closes every opened FD and directory', async () => {
-    const meter = sourceMeterFixture(sourceDirectory(3, {
-      safe: sourceFile(4, 100),
-      escape: sourceSymlink(5),
+    const meter = sourceMeterFixture(sourceDirectory(3n, {
+      safe: sourceFile(4n, 100n),
+      escape: sourceSymlink(5n),
     }));
 
     await expect(measureProjectSourceBytes(meter.scope, meter.dependencies))
@@ -452,9 +508,103 @@ describe('scoped source measurement', () => {
     meter.expectAllClosed();
   });
 
+  it.each(['fifo', 'socket', 'device', 'unknown'] as const)(
+    'rejects a %s entry before any potentially blocking open',
+    async (kind) => {
+      const meter = sourceMeterFixture(sourceDirectory(3n, {
+        blocked: sourceSpecial(kind, 4n),
+      }));
+      const timeout = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('source measurement timed out')), 100);
+      });
+
+      await expect(Promise.race([
+        measureProjectSourceBytes(meter.scope, meter.dependencies),
+        timeout,
+      ])).rejects.toMatchObject({code: 'PROJECT_SOURCE_INVALID'});
+
+      expect(meter.openExistingProjectFile).not.toHaveBeenCalledWith(
+        meter.scope,
+        'assets/source/blocked',
+      );
+      meter.expectAllClosed();
+    },
+  );
+
+  it('rejects when a file Dirent fresh-opens as a non-regular type', async () => {
+    const meter = sourceMeterFixture(
+      sourceDirectory(3n, {changed: sourceFile(4n, 100n)}),
+      {statAsNonRegularPath: 'assets/source/changed'},
+    );
+
+    await expect(measureProjectSourceBytes(meter.scope, meter.dependencies))
+      .rejects.toMatchObject({code: 'PROJECT_SOURCE_INVALID'});
+
+    meter.expectAllClosed();
+  });
+
+  it('requests bigint stats from the real system source-meter adapter', async () => {
+    const stat = vi.fn(async (options: {bigint: true}) => {
+      expect(options).toEqual({bigint: true});
+      return {
+        dev: 1n,
+        ino: 2n,
+        nlink: 1n,
+        size: 3n,
+        isFile: () => true,
+        isDirectory: () => false,
+      };
+    });
+    const close = vi.fn(async () => {});
+    const adapter = createSystemSourceMeterDependencies({
+      openExistingProjectFile: vi.fn(async () => ({fd: 42, stat, close})),
+      openDirectory: vi.fn(async () => { throw new Error('not used'); }),
+    });
+
+    const handle = await adapter.openExistingProjectFile(
+      {} as ProjectDirectoryScope,
+      'assets/source/video.mp4',
+    );
+    const status = await handle.stat();
+    await handle.close();
+
+    expect(status).toMatchObject({dev: 1n, ino: 2n, nlink: 1n, size: 3n});
+    expect(stat).toHaveBeenCalledWith({bigint: true});
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('rejects replacement between adjacent inode values above 2^53', async () => {
+    const inode = 2n ** 53n;
+    const meter = sourceMeterFixture(
+      sourceDirectory(3n, {video: sourceFile(inode, 100n)}),
+      {
+        replaceAfterFirstOpen: {
+          relativePath: 'assets/source/video',
+          replacement: sourceFile(inode + 1n, 100n),
+        },
+      },
+    );
+
+    await expect(measureProjectSourceBytes(meter.scope, meter.dependencies))
+      .rejects.toMatchObject({code: 'PROJECT_SOURCE_INVALID'});
+
+    meter.expectAllClosed();
+  });
+
+  it('rejects totals that cannot be converted to safe source bytes', async () => {
+    const meter = sourceMeterFixture(sourceDirectory(3n, {
+      video: sourceFile(4n, BigInt(Number.MAX_SAFE_INTEGER) + 1n),
+    }));
+
+    await expect(measureProjectSourceBytes(meter.scope, meter.dependencies))
+      .rejects.toMatchObject({code: 'PROJECT_SOURCE_INVALID'});
+
+    meter.expectAllClosed();
+  });
+
   it('fails closed when assets/source is replaced by an external symlink', async () => {
     const meter = sourceMeterFixture(
-      sourceDirectory(3, {outside: sourceFile(4, 9 * GIB)}),
+      sourceDirectory(3n, {outside: sourceFile(4n, BigInt(9 * GIB))}),
       {substituteSourceBeforeOpenPath: 'assets/source/outside'},
     );
 
@@ -468,11 +618,11 @@ describe('scoped source measurement', () => {
   it('maps missing source and enumeration/stat I/O failures to source errors', async () => {
     const missing = sourceMeterFixture(undefined);
     const enumeration = sourceMeterFixture(
-      sourceDirectory(3, {}),
+      sourceDirectory(3n, {}),
       {failDirectoryPath: 'assets/source'},
     );
     const statFailure = sourceMeterFixture(
-      sourceDirectory(3, {video: sourceFile(4, 100)}),
+      sourceDirectory(3n, {video: sourceFile(4n, 100n)}),
       {failStatPath: 'assets/source/video'},
     );
 
@@ -485,7 +635,7 @@ describe('scoped source measurement', () => {
 
   it('maps FD close failures to a structured source error', async () => {
     const meter = sourceMeterFixture(
-      sourceDirectory(3, {}),
+      sourceDirectory(3n, {}),
       {failClosePath: '.'},
     );
 
