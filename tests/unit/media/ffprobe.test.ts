@@ -99,7 +99,11 @@ describe('parseFfprobeJson', () => {
         ...videoStream,
         side_data_list: [{
           side_data_type: 'Display Matrix',
-          displaymatrix: '00000000: 0 -65536 0',
+          displaymatrix: [
+            '00000000:            0       65536           0',
+            '00000001:       -65536           0           0',
+            '00000002:            0           0  1073741824',
+          ].join('\n'),
           rotation: -90,
         }],
       },
@@ -154,6 +158,29 @@ describe('parseFfprobeJson', () => {
     expect(result.videoStreams[0]).toMatchObject({codec: 'png', width: 64, height: 48});
   });
 
+  it('uses primary video duration_ts/time_base instead of longer format audio duration', () => {
+    const result = parseFfprobeJson(JSON.stringify({
+      streams: [{
+        ...videoStream,
+        duration: undefined,
+        duration_ts: 90_000,
+        time_base: '1/90000',
+        nb_frames: '30',
+      }, {
+        ...audioStream,
+        duration: '3.000000',
+      }],
+      format: {
+        format_name: 'mov,mp4,m4a,3gp,3g2,mj2',
+        duration: '3.000000',
+      },
+    }));
+
+    expect(result.durationMs).toBe(1000);
+    expect(result.videoStreams[0]?.durationMs).toBe(1000);
+    expect(result.audioStreams[0]?.durationMs).toBe(3000);
+  });
+
   it.each([
     {name: 'malformed JSON', input: '{'},
     {name: 'missing streams', input: JSON.stringify({format: {duration: '1'}})},
@@ -176,6 +203,44 @@ describe('parseFfprobeJson', () => {
     }))},
     {name: 'missing pixel format', input: JSON.stringify(ffprobeDocument({
       streams: [{...videoStream, pix_fmt: undefined}, audioStream],
+    }))},
+    {name: 'malformed display matrix', input: JSON.stringify(ffprobeDocument({
+      streams: [{
+        ...videoStream,
+        side_data_list: [{
+          side_data_type: 'Display Matrix',
+          displaymatrix: 'not a matrix',
+        }],
+      }],
+    }))},
+    {name: 'structurally inconsistent display matrix', input: JSON.stringify(ffprobeDocument({
+      streams: [{
+        ...videoStream,
+        side_data_list: [{
+          side_data_type: 'Display Matrix',
+          displaymatrix: [
+            '00000000:            0      -65536           0',
+            '00000001:            0           0           0',
+            '00000002:            0           0  1073741824',
+          ].join('\n'),
+        }],
+      }],
+    }))},
+    {name: 'malformed rotation field', input: JSON.stringify(ffprobeDocument({
+      streams: [{
+        ...videoStream,
+        side_data_list: [{side_data_type: 'Display Matrix', rotation: 'clockwise'}],
+      }],
+    }))},
+    {name: 'conflicting rotation fields', input: JSON.stringify(ffprobeDocument({
+      streams: [{
+        ...videoStream,
+        tags: {rotate: '90'},
+        side_data_list: [{side_data_type: 'Display Matrix', rotation: -90}],
+      }],
+    }))},
+    {name: 'non-quarter-turn rotation', input: JSON.stringify(ffprobeDocument({
+      streams: [{...videoStream, tags: {rotate: '45'}}],
     }))},
   ])('rejects $name', ({input}) => {
     expect(() => parseFfprobeJson(input)).toThrow(FfprobeParseError);

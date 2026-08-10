@@ -115,6 +115,34 @@ const closedHandle = async (handle: FileHandle): Promise<void> => {
   await expect(handle.stat()).rejects.toMatchObject({code: 'EBADF'});
 };
 
+type ManifestFaultPhase = 'write' | 'file-sync' | 'rename' | 'directory-sync';
+
+const dependenciesWithManifestFault = (
+  system: IngestDependencies,
+  phase: ManifestFaultPhase,
+  failure: Error,
+): IngestDependencies => ({
+  ...system,
+  manifestFileOps: {
+    writeFile: async (handle: FileHandle, contents: string) => {
+      if (phase === 'write') throw failure;
+      await handle.writeFile(contents, 'utf8');
+    },
+    syncFile: async (handle: FileHandle) => {
+      if (phase === 'file-sync') throw failure;
+      await handle.sync();
+    },
+    rename: async (action: () => Promise<void>) => {
+      if (phase === 'rename') throw failure;
+      await action();
+    },
+    syncDirectory: async (action: () => Promise<void>) => {
+      if (phase === 'directory-sync') throw failure;
+      await action();
+    },
+  },
+} as IngestDependencies);
+
 describe('runIngest', () => {
   it('publishes a strict manifest for direct video, music, and image assets without changing sources', async () => {
     const project = await makeProject();
@@ -214,6 +242,7 @@ describe('runIngest', () => {
       fds: number[];
     }> = [];
     const dependencies: IngestDependencies = {
+      manifestFileOps: system.manifestFileOps,
       runProcess: async (command, args, options) => {
         const fds = [...(options.extraStdioFds ?? [])];
         const result = await runProcess(command, args, options);
@@ -267,13 +296,29 @@ describe('runIngest', () => {
       'assets/interview/render.mp4',
     );
     expect(outputProbe.audioStreams).toHaveLength(0);
+    expect(outputProbe.videoStreams[0]).toMatchObject({
+      codec: 'h264',
+      pixelFormat: 'yuv420p',
+      colorPrimaries: 'bt709',
+      colorTransfer: 'bt709',
+      colorSpace: 'bt709',
+      colorRange: 'tv',
+    });
+    expect(outputProbe.videoStreams[0]?.averageFrameRate).toMatchObject({
+      numerator: 30,
+      denominator: 1,
+    });
+    expect(outputProbe.videoStreams[0]?.realFrameRate).toMatchObject({
+      numerator: 30,
+      denominator: 1,
+    });
     expect(decideVideoCompatibility(outputProbe, {decodable: true})).toEqual({
       compatibility: 'direct',
     });
 
-    expect(projectHandles).toHaveLength(7);
+    expect(projectHandles).toHaveLength(14);
     expect(new Set(projectHandles).size).toBe(projectHandles.length);
-    expect(runReadHandles).toHaveLength(5);
+    expect(runReadHandles).toHaveLength(8);
     expect(new Set(runReadHandles).size).toBe(runReadHandles.length);
     expect(runNewHandles).toHaveLength(2);
     await Promise.all([
@@ -297,6 +342,139 @@ describe('runIngest', () => {
     expect((await stat(sourcePath, {bigint: true})).mtimeNs).toBe(sourceBefore.stats.mtimeNs);
   });
 
+  it('samples first, middle, and tail from the primary video duration, not longer audio', async () => {
+    const project = await makeProject();
+    await createTestVideo(
+      path.join(project.projectRoot, 'assets/source/interview.mp4'),
+      1,
+      {audioSeconds: 3},
+    );
+    const system = createSystemIngestDependencies();
+    const sampledOffsets: number[] = [];
+    const dependencies: IngestDependencies = {
+      ...system,
+      runProcess: async (command, args, options) => {
+        const seekIndex = args.indexOf('-ss');
+        if (seekIndex >= 0) sampledOffsets.push(Number(args[seekIndex + 1]));
+        return await runProcess(command, args, options);
+      },
+    };
+
+    const {manifest} = await runIngest(inputFor(project, [{
+      assetId: 'interview',
+      kind: 'video',
+      sourcePath: 'assets/source/interview.mp4',
+    }]), dependencies);
+
+    expect(manifest.assets.interview).toMatchObject({durationMs: 1000});
+    expect(sampledOffsets).toEqual([0, 0.5, 0.9]);
+    expect(sampledOffsets.every((offset) => offset < 1)).toBe(true);
+  });
+
+  it('rejects an exit-zero sample decode that reports zero decoded frames', async () => {
+    const project = await makeProject();
+    await createTestVideo(path.join(project.projectRoot, 'assets/source/interview.mp4'), 1);
+    const system = createSystemIngestDependencies();
+    const dependencies: IngestDependencies = {
+      ...system,
+      runProcess: async (command, args, options) => {
+        if (command === FFMPEG_EXECUTABLE && args.includes('-frames:v')) {
+          return {
+            command,
+            args: [...args],
+            exitCode: 0,
+            signal: null,
+            stdout: 'frame=0\nprogress=end\n',
+            stderr: '',
+            durationMs: 1,
+          };
+        }
+        return await runProcess(command, args, options);
+      },
+    };
+
+    await expect(runIngest(inputFor(project, [{
+      assetId: 'interview',
+      kind: 'video',
+      sourcePath: 'assets/source/interview.mp4',
+    }]), dependencies)).rejects.toMatchObject({
+      code: 'ASSET_DECODE_FAILED',
+      assetId: 'interview',
+      reasons: ['video sample decode failed'],
+    });
+    await expectMissingManifest(project.runDirectory);
+  });
+
+  it('rejects a transcoded output that is CFR but not exactly 30 fps', async () => {
+    const project = await makeProject();
+    await createTestVideo(
+      path.join(project.projectRoot, 'assets/source/interview.mp4'),
+      1,
+      {pixelFormat: 'yuv422p'},
+    );
+    const system = createSystemIngestDependencies();
+    const dependencies: IngestDependencies = {
+      ...system,
+      runProcess: async (command, args, options) => await runProcess(
+        command,
+        args.includes('/dev/fd/4')
+          ? args.map((argument) => argument === 'fps=30,format=yuv420p'
+            ? 'fps=24,format=yuv420p'
+            : argument)
+          : args,
+        options,
+      ),
+    };
+
+    await expect(runIngest(inputFor(project, [{
+      assetId: 'interview',
+      kind: 'video',
+      sourcePath: 'assets/source/interview.mp4',
+    }]), dependencies)).rejects.toMatchObject({
+      code: 'ASSET_DECODE_FAILED',
+      assetId: 'interview',
+      reasons: ['transcoded output frame rate must be 30 fps'],
+    });
+    await expectMissingManifest(project.runDirectory);
+  });
+
+  it('rejects a transcoded output without limited-range BT.709 metadata', async () => {
+    const project = await makeProject();
+    await createTestVideo(
+      path.join(project.projectRoot, 'assets/source/interview.mp4'),
+      1,
+      {pixelFormat: 'yuv422p'},
+    );
+    const system = createSystemIngestDependencies();
+    let probeCount = 0;
+    const dependencies: IngestDependencies = {
+      ...system,
+      runProcess: async (command, args, options) => {
+        const result = await runProcess(command, args, options);
+        if (command !== FFPROBE_EXECUTABLE) return result;
+        probeCount += 1;
+        if (probeCount !== 2) return result;
+        const output = JSON.parse(result.stdout) as {
+          streams: Array<Record<string, unknown>>;
+        };
+        const video = output.streams.find((stream) => stream.codec_type === 'video');
+        if (video !== undefined) video.color_range = 'pc';
+        return {...result, stdout: JSON.stringify(output)};
+      },
+    };
+
+    await expect(runIngest(inputFor(project, [{
+      assetId: 'interview',
+      kind: 'video',
+      sourcePath: 'assets/source/interview.mp4',
+    }]), dependencies)).rejects.toMatchObject({
+      code: 'ASSET_DECODE_FAILED',
+      assetId: 'interview',
+      reasons: ['transcoded output must use limited-range BT.709'],
+    });
+    await expectMissingManifest(project.runDirectory);
+  });
+
   it('rejects a source symlink escape and never publishes a manifest', async () => {
     const project = await makeProject();
     const outsideRoot = await mkdtemp(path.join(tmpdir(), 'ingest-outside-'));
@@ -312,6 +490,34 @@ describe('runIngest', () => {
     }]), createSystemIngestDependencies())).rejects.toMatchObject({
       code: 'ASSET_PATH_OUTSIDE_PROJECT',
       assetId: 'interview',
+    });
+    await expectMissingManifest(project.runDirectory);
+  });
+
+  it.each([
+    '../outside.mp4',
+    '/tmp/outside.mp4',
+    'C:\\outside.mp4',
+    'assets/source/invalid\0name.mp4',
+    'assets//source/interview.mp4',
+  ])('maps invalid lexical source path %j to ASSET_PATH_OUTSIDE_PROJECT', async (sourcePath) => {
+    const project = await makeProject();
+
+    let caught: unknown;
+    try {
+      await runIngest(inputFor(project, [{
+        assetId: 'interview',
+        kind: 'video',
+        sourcePath,
+      }]), createSystemIngestDependencies());
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      code: 'ASSET_PATH_OUTSIDE_PROJECT',
+      assetId: 'interview',
+      cause: expect.any(Error),
     });
     await expectMissingManifest(project.runDirectory);
   });
@@ -364,7 +570,50 @@ describe('runIngest', () => {
       assetId: 'interview',
       reasons: ['source changed during ingest'],
     });
-    expect(sourceOpenCount).toBe(6);
+    expect(sourceOpenCount).toBeGreaterThanOrEqual(6);
+    await expectMissingManifest(project.runDirectory);
+  });
+
+  it('rejects an ABA path substitution instead of probing a replacement inode', async () => {
+    const project = await makeProject();
+    const sourcePath = path.join(project.projectRoot, 'assets/source/interview.mp4');
+    const replacementPath = path.join(project.projectRoot, 'assets/source/replacement.mp4');
+    const parkedPath = path.join(project.projectRoot, 'assets/source/interview-original.mp4');
+    await createTestVideo(sourcePath, 2);
+    await createTestVideo(replacementPath, 1);
+    const system = createSystemIngestDependencies();
+    let sourceOpenCount = 0;
+    const dependencies: IngestDependencies = {
+      ...system,
+      fileSystem: {
+        ...system.fileSystem,
+        openExistingProjectFile: async (scope, relativePath) => {
+          sourceOpenCount += 1;
+          if (sourceOpenCount !== 3) {
+            return await system.fileSystem.openExistingProjectFile(scope, relativePath);
+          }
+          await rename(sourcePath, parkedPath);
+          await rename(replacementPath, sourcePath);
+          const replacementHandle = await system.fileSystem.openExistingProjectFile(
+            scope,
+            relativePath,
+          );
+          await rename(sourcePath, replacementPath);
+          await rename(parkedPath, sourcePath);
+          return replacementHandle;
+        },
+      },
+    };
+
+    await expect(runIngest(inputFor(project, [{
+      assetId: 'interview',
+      kind: 'video',
+      sourcePath: 'assets/source/interview.mp4',
+    }]), dependencies)).rejects.toMatchObject({
+      code: 'ASSET_DECODE_FAILED',
+      assetId: 'interview',
+      reasons: ['source changed during ingest'],
+    });
     await expectMissingManifest(project.runDirectory);
   });
 
@@ -453,6 +702,44 @@ describe('runIngest', () => {
       sourcePath: 'assets/source/poster.png',
     }]), dependencies)).rejects.toBe(failure);
     await expectMissingManifest(project.runDirectory);
+  });
+
+  it.each([
+    'write',
+    'file-sync',
+    'rename',
+    'directory-sync',
+  ] as const)('keeps the final manifest absent after injected %s failure', async (phase) => {
+    const project = await makeProject(`manifest-${phase}`);
+    await createTestImage(path.join(project.projectRoot, 'assets/source/poster.png'));
+    const failure = new Error(`injected manifest ${phase} failure`);
+    const system = createSystemIngestDependencies();
+
+    await expect(runIngest(inputFor(project, [{
+      assetId: 'poster',
+      kind: 'image',
+      sourcePath: 'assets/source/poster.png',
+    }]), dependenciesWithManifestFault(system, phase, failure))).rejects.toBe(failure);
+    await expectMissingManifest(project.runDirectory);
+  });
+
+  it('never overwrites an existing final manifest', async () => {
+    const project = await makeProject('manifest-existing');
+    await createTestImage(path.join(project.projectRoot, 'assets/source/poster.png'));
+    const existing = await openNewRunFile(project.runDirectory, 'asset-manifest.json');
+    await existing.writeFile('existing manifest');
+    await existing.sync();
+    await existing.close();
+
+    await expect(runIngest(inputFor(project, [{
+      assetId: 'poster',
+      kind: 'image',
+      sourcePath: 'assets/source/poster.png',
+    }]), createSystemIngestDependencies())).rejects.toMatchObject({code: 'EEXIST'});
+    expect((await readHandle(await openExistingRunFile(
+      project.runDirectory,
+      'asset-manifest.json',
+    ))).toString('utf8')).toBe('existing manifest');
   });
 
   it.each(['failure', 'abort', 'timeout'] as const)(

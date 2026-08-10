@@ -139,6 +139,35 @@ const optionalInteger = (
 const durationMs = (value: unknown, field: string): number =>
   Math.round(parseNumber(value, field, 0) * 1000);
 
+const streamDurationMs = (
+  stream: JsonRecord,
+  path: string,
+): number | undefined => {
+  const declaredDuration = stream.duration === undefined
+    ? undefined
+    : durationMs(stream.duration, `${path}.duration`);
+  const hasDurationTicks = stream.duration_ts !== undefined;
+  const hasTimeBase = stream.time_base !== undefined;
+  if (hasDurationTicks && !hasTimeBase) {
+    return fail(`${path}.duration_ts requires ${path}.time_base`);
+  }
+  const tickDuration = hasDurationTicks
+    ? Math.round(
+      parseInteger(stream.duration_ts, `${path}.duration_ts`, 0)
+      * parseFrameRate(stream.time_base, `${path}.time_base`).value
+      * 1000,
+    )
+    : undefined;
+  if (
+    declaredDuration !== undefined
+    && tickDuration !== undefined
+    && Math.abs(declaredDuration - tickDuration) > 1
+  ) {
+    return fail(`${path} contains conflicting duration metadata`);
+  }
+  return declaredDuration ?? tickDuration;
+};
+
 const greatestCommonDivisor = (left: number, right: number): number => {
   let a = Math.abs(left);
   let b = Math.abs(right);
@@ -182,18 +211,63 @@ const normalizeRotation = (value: number): number => {
   return Number(normalized.toFixed(6));
 };
 
-const rotationFromDisplayMatrix = (value: unknown): number | undefined => {
-  if (typeof value !== 'string') return undefined;
-  const firstRow = value.split('\n')[0];
-  if (firstRow === undefined) return undefined;
-  const payload = firstRow.includes(':')
-    ? firstRow.slice(firstRow.indexOf(':') + 1)
-    : firstRow;
-  const values = payload.trim().split(/\s+/).slice(0, 2).map(Number);
-  const first = values[0];
-  const second = values[1];
-  if (!Number.isFinite(first) || !Number.isFinite(second)) return undefined;
-  return normalizeRotation(-Math.atan2(second!, first!) * 180 / Math.PI);
+const parseQuarterTurn = (value: unknown, field: string): number => {
+  const parsed = parseNumber(value, field, -Number.MAX_VALUE);
+  const quarterTurns = parsed / 90;
+  if (!Number.isSafeInteger(quarterTurns)) {
+    return fail(`${field} must be a multiple of 90 degrees`);
+  }
+  return normalizeRotation(quarterTurns * 90);
+};
+
+const rotationFromDisplayMatrix = (value: unknown, field: string): number => {
+  if (typeof value !== 'string' || value.trim() === '') {
+    return fail(`${field} must be a display matrix string`);
+  }
+  const rows = value.trim().split(/\r?\n/);
+  if (rows.length !== 3) return fail(`${field} must contain exactly three rows`);
+  const matrix = rows.map((row, index) => {
+    const match = /^\s*(?:([0-9a-fA-F]{8}):)?\s*(-?\d+)\s+(-?\d+)\s+(-?\d+)\s*$/.exec(row);
+    if (!match) return fail(`${field} row ${index} is malformed`);
+    if (match[1] !== undefined && Number.parseInt(match[1], 16) !== index) {
+      return fail(`${field} row ${index} has an invalid address`);
+    }
+    return match.slice(2).map((entry) => {
+      const parsed = Number(entry);
+      if (!Number.isSafeInteger(parsed)) {
+        return fail(`${field} row ${index} contains an unsafe integer`);
+      }
+      return parsed;
+    });
+  });
+  const first = matrix[0]?.[0];
+  const second = matrix[0]?.[1];
+  const third = matrix[1]?.[0];
+  const fourth = matrix[1]?.[1];
+  const perspectiveX = matrix[2]?.[0];
+  const perspectiveY = matrix[2]?.[1];
+  const perspectiveScale = matrix[2]?.[2];
+  if (
+    first === undefined
+    || second === undefined
+    || third === undefined
+    || fourth === undefined
+    || perspectiveX === undefined
+    || perspectiveY === undefined
+    || perspectiveScale === undefined
+    || (first === 0 && second === 0)
+    || third !== -second
+    || fourth !== first
+    || perspectiveX !== 0
+    || perspectiveY !== 0
+    || perspectiveScale === 0
+  ) {
+    return fail(`${field} does not encode a rotation`);
+  }
+  return parseQuarterTurn(
+    -Math.atan2(second, first) * 180 / Math.PI,
+    field,
+  );
 };
 
 const parseRotation = (
@@ -201,26 +275,37 @@ const parseRotation = (
   sideData: JsonRecord[],
   path: string,
 ): number => {
+  const declaredRotations: number[] = [];
   for (const [index, entry] of sideData.entries()) {
     if (entry.rotation !== undefined) {
-      return normalizeRotation(parseNumber(
+      declaredRotations.push(parseQuarterTurn(
         entry.rotation,
         `${path}.side_data_list[${index}].rotation`,
-        -Number.MAX_VALUE,
       ));
     }
-    const matrixRotation = rotationFromDisplayMatrix(entry.displaymatrix);
-    if (matrixRotation !== undefined) return matrixRotation;
+    if (entry.displaymatrix !== undefined) {
+      declaredRotations.push(rotationFromDisplayMatrix(
+        entry.displaymatrix,
+        `${path}.side_data_list[${index}].displaymatrix`,
+      ));
+    }
   }
 
-  if (stream.tags === undefined) return 0;
-  const tags = asRecord(stream.tags, `${path}.tags`);
-  if (tags.rotate === undefined) return 0;
-  return normalizeRotation(parseNumber(
-    tags.rotate,
-    `${path}.tags.rotate`,
-    -Number.MAX_VALUE,
-  ));
+  if (stream.tags !== undefined) {
+    const tags = asRecord(stream.tags, `${path}.tags`);
+    if (tags.rotate !== undefined) {
+      declaredRotations.push(parseQuarterTurn(
+        tags.rotate,
+        `${path}.tags.rotate`,
+      ));
+    }
+  }
+  if (declaredRotations.length === 0) return 0;
+  const rotation = declaredRotations[0]!;
+  if (declaredRotations.some((candidate) => candidate !== rotation)) {
+    return fail(`${path} contains conflicting rotation metadata`);
+  }
+  return rotation;
 };
 
 const parseSideData = (stream: JsonRecord, path: string): JsonRecord[] => {
@@ -240,9 +325,7 @@ const parseVideoStream = (stream: JsonRecord, path: string): VideoStreamProbe =>
   const colorTransfer = optionalString(stream, 'color_transfer', path);
   const colorSpace = optionalString(stream, 'color_space', path);
   const colorRange = optionalString(stream, 'color_range', path);
-  const streamDuration = stream.duration === undefined
-    ? undefined
-    : durationMs(stream.duration, `${path}.duration`);
+  const streamDuration = streamDurationMs(stream, path);
   const frameCount = optionalInteger(stream, 'nb_frames', path, 0);
   const bitsPerRawSample = optionalInteger(stream, 'bits_per_raw_sample', path, 0);
   const bitsPerCodedSample = optionalInteger(stream, 'bits_per_coded_sample', path, 0);
@@ -289,9 +372,7 @@ const parseAudioStream = (stream: JsonRecord, path: string): AudioStreamProbe =>
   const sampleRate = optionalInteger(stream, 'sample_rate', path, 1);
   const channels = optionalInteger(stream, 'channels', path, 1);
   const channelLayout = optionalString(stream, 'channel_layout', path);
-  const streamDuration = stream.duration === undefined
-    ? undefined
-    : durationMs(stream.duration, `${path}.duration`);
+  const streamDuration = streamDurationMs(stream, path);
 
   return {
     index: parseInteger(stream.index, `${path}.index`, 0),
@@ -322,24 +403,34 @@ const resolveDuration = (
   videoStreams: VideoStreamProbe[],
   audioStreams: AudioStreamProbe[],
 ): number => {
-  if (format.duration !== undefined) {
-    const parsed = durationMs(format.duration, 'format.duration');
-    if (parsed === 0 && !STILL_IMAGE_FORMATS.has(formatName)) {
-      return fail('format.duration must be positive for timed media');
+  const formatDuration = format.duration === undefined
+    ? undefined
+    : durationMs(format.duration, 'format.duration');
+  if (videoStreams.length > 0) {
+    const primaryVideoDuration = videoStreams[0]?.durationMs;
+    if (primaryVideoDuration !== undefined) {
+      if (primaryVideoDuration === 0 && !STILL_IMAGE_FORMATS.has(formatName)) {
+        return fail('primary video duration must be positive for timed media');
+      }
+      return primaryVideoDuration;
     }
-    return parsed;
+    if (STILL_IMAGE_FORMATS.has(formatName) && videoStreams.length === 1) return 0;
+    return fail('ffprobe output is missing the primary video duration');
   }
 
-  const streamDurations = [...videoStreams, ...audioStreams]
-    .flatMap((stream) => stream.durationMs === undefined ? [] : [stream.durationMs]);
-  if (streamDurations.length > 0) {
-    const parsed = Math.max(...streamDurations);
-    if (parsed === 0 && !STILL_IMAGE_FORMATS.has(formatName)) {
-      return fail('stream duration must be positive for timed media');
+  const primaryAudioDuration = audioStreams[0]?.durationMs;
+  if (primaryAudioDuration !== undefined) {
+    if (primaryAudioDuration === 0) {
+      return fail('primary audio duration must be positive');
     }
-    return parsed;
+    return primaryAudioDuration;
   }
-  if (STILL_IMAGE_FORMATS.has(formatName) && videoStreams.length === 1) return 0;
+  if (formatDuration !== undefined) {
+    if (formatDuration === 0) {
+      return fail('format.duration must be positive for timed media');
+    }
+    return formatDuration;
+  }
   return fail('ffprobe output is missing a valid duration');
 };
 
@@ -479,25 +570,56 @@ const hasDolbyVision = (stream: VideoStreamProbe): boolean => {
     || /^(dva1|dvav|dvhe|dvh1)/.test(value));
 };
 
-const explicitPixelBitDepth = (pixelFormat: string): number | undefined => {
+const inferredPixelBitDepth = (pixelFormat: string): number | undefined => {
   const normalized = pixelFormat.toLowerCase();
   const planar = /(?:^|p)(9|10|12|14|16)(?:le|be)?$/.exec(normalized);
   if (planar) return Number(planar[1]);
-  const packedYuv = /^p0?(10|12|16)(?:le|be)$/.exec(normalized);
+  const packedYuv = /^[py](?:0|2|4)?(10|12|16)(?:le|be)$/.exec(normalized);
   if (packedYuv) return Number(packedYuv[1]);
   const gray = /^gray(9|10|12|14|16)(?:le|be)$/.exec(normalized);
   if (gray) return Number(gray[1]);
+  const float = /^(?:gray|gbrp|gbrap)f(16|32)(?:le|be)$/.exec(normalized);
+  if (float) return Number(float[1]);
   const rgb = /^(?:rgb|bgr)(30|36|48)(?:le|be)?$/.exec(normalized);
   if (rgb) return Number(rgb[1]) / 3;
   const rgba = /^(?:rgba|bgra|argb|abgr)(40|48|64)(?:le|be)?$/.exec(normalized);
   if (rgba) return Number(rgba[1]) / 4;
+  if (/^(?:a2|x2)(?:rgb|bgr)10(?:le|be)$/.test(normalized)) return 10;
+  if (/^(?:v210|v410)$/.test(normalized)) return 10;
+  const packedHigh = /^xv(30|36|48)(?:le|be)?$/.exec(normalized);
+  if (packedHigh) return Number(packedHigh[1]) / 3;
+  const bayer = /^bayer_[a-z]+(8|16)(?:le|be)?$/.exec(normalized);
+  if (bayer) return Number(bayer[1]);
+  const xyz = /^xyz(12)(?:le|be)$/.exec(normalized);
+  if (xyz) return Number(xyz[1]);
+
+  if (
+    /^(?:yuvj?|yuva)\d{3}p$/.test(normalized)
+    || /^(?:gbrp|gbrap|gray|gray8|ya8|pal8|monob|monow)$/.test(normalized)
+    || /^(?:nv12|nv21|nv16|nv24)$/.test(normalized)
+    || /^(?:yuyv422|uyvy422|yvyu422|vyuy422|uyyvyy411|yuv24|vuy24|vuyx)$/.test(normalized)
+    || /^(?:rgb24|bgr24|rgba|bgra|argb|abgr|rgb0|bgr0|0rgb|0bgr)$/.test(normalized)
+    || /^(?:rgb|bgr)(?:4|4_byte|8|444|555|565)(?:le|be)?$/.test(normalized)
+  ) {
+    return 8;
+  }
+  const explicitHighDepth = /(?:^|[^0-9])(9|10|12|14|16)(?![0-9])/.exec(
+    normalized,
+  );
+  if (explicitHighDepth) return Number(explicitHighDepth[1]);
   return undefined;
 };
 
-const hasHighBitDepth = (stream: VideoStreamProbe): boolean =>
-  (stream.bitsPerRawSample ?? 0) > 8
-  || (stream.bitsPerCodedSample ?? 0) > 8
-  || (explicitPixelBitDepth(stream.pixelFormat) ?? 8) > 8;
+const pixelBitDepth = (stream: VideoStreamProbe): number | undefined => {
+  const inferredDepth = inferredPixelBitDepth(stream.pixelFormat);
+  if (inferredDepth === undefined) return undefined;
+  const rawDepth = stream.bitsPerRawSample ?? 0;
+  const codedDepth = stream.bitsPerCodedSample ?? 0;
+  const codedComponentDepth = [9, 10, 12, 14, 16].includes(codedDepth)
+    ? codedDepth
+    : 0;
+  return Math.max(inferredDepth, rawDepth, codedComponentDepth);
+};
 
 const normalizedColor = (value: string | undefined): string | undefined => {
   if (value === undefined) return undefined;
@@ -555,7 +677,12 @@ export const decideVideoCompatibility = (
 
   const rejectionReasons: string[] = [];
   if (hasDolbyVision(stream)) rejectionReasons.push('Dolby Vision is unsupported');
-  if (hasHighBitDepth(stream)) {
+  const bitDepth = pixelBitDepth(stream);
+  if (bitDepth === undefined) {
+    rejectionReasons.push(
+      `pixel format bit depth is unknown or unsupported (${stream.pixelFormat})`,
+    );
+  } else if (bitDepth > 8) {
     rejectionReasons.push(`high bit-depth video is unsupported (${stream.pixelFormat})`);
   }
   const transfer = normalizedColor(stream.colorTransfer);

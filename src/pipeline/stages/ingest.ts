@@ -1,5 +1,16 @@
-import {createHash} from 'node:crypto';
-import type {FileHandle} from 'node:fs/promises';
+import {execFile} from 'node:child_process';
+import {createHash, randomUUID} from 'node:crypto';
+import {constants, type BigIntStats} from 'node:fs';
+import {
+  link,
+  lstat,
+  open,
+  realpath,
+  unlink,
+  type FileHandle,
+} from 'node:fs/promises';
+import path from 'node:path';
+import {promisify} from 'node:util';
 import {z} from 'zod';
 import {
   ensureRunDirectory,
@@ -35,6 +46,8 @@ import {
 
 const HashSchema = z.string().regex(/^sha256:[0-9a-f]{64}$/);
 const RenderScopeSchema = z.enum(['project', 'run']);
+const O_NOFOLLOW_ANY = 0x20000000;
+const execFileAsync = promisify(execFile);
 
 const ManifestBaseAssetSchema = z.object({
   sourcePath: ProjectRelativePathSchema,
@@ -78,10 +91,27 @@ export const IngestManifestSchema = z.object({
   assets: z.record(StableIdSchema, IngestAssetRecordSchema),
 }).strict();
 
+const IngestSourcePathSchema = ProjectRelativePathSchema.superRefine(
+  (value, context) => {
+    const segments = value.split('/');
+    if (
+      value.includes('\0')
+      || path.posix.isAbsolute(value)
+      || path.win32.isAbsolute(value)
+      || segments.some((segment) => segment === '' || segment === '.' || segment === '..')
+    ) {
+      context.addIssue({
+        code: 'custom',
+        message: 'must be a valid project-relative path',
+      });
+    }
+  },
+);
+
 const IngestAssetSchema = z.object({
   assetId: StableIdSchema,
   kind: z.enum(['video', 'audio', 'image']),
-  sourcePath: ProjectRelativePathSchema,
+  sourcePath: IngestSourcePathSchema,
 }).strict();
 
 const IngestAssetsSchema = z.array(IngestAssetSchema).min(1).superRefine(
@@ -140,6 +170,14 @@ export interface IngestFileSystem {
 export interface IngestDependencies {
   runProcess: MediaProcessRunner;
   fileSystem: IngestFileSystem;
+  manifestFileOps: IngestManifestFileOps;
+}
+
+export interface IngestManifestFileOps {
+  writeFile(handle: FileHandle, contents: string): Promise<void>;
+  syncFile(handle: FileHandle): Promise<void>;
+  rename(action: () => Promise<void>): Promise<void>;
+  syncDirectory(action: () => Promise<void>): Promise<void>;
 }
 
 export type IngestErrorCode =
@@ -179,6 +217,20 @@ export const createSystemIngestDependencies = (): IngestDependencies => ({
   runProcess: async (command, args, options) =>
     await runProcess(command, args, options),
   fileSystem: {...SYSTEM_INGEST_FILE_SYSTEM},
+  manifestFileOps: {
+    writeFile: async (handle, contents) => {
+      await handle.writeFile(contents, 'utf8');
+    },
+    syncFile: async (handle) => {
+      await handle.sync();
+    },
+    rename: async (action) => {
+      await action();
+    },
+    syncDirectory: async (action) => {
+      await action();
+    },
+  },
 });
 
 type HandleOutcome<T> =
@@ -218,6 +270,65 @@ const errorCode = (error: unknown): string | undefined =>
     ? error.code
     : undefined;
 
+interface SourceIdentity {
+  dev: bigint;
+  ino: bigint;
+  nlink: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}
+
+interface SourceAuthority {
+  identity: SourceIdentity;
+  volumePath: string;
+  hash: string;
+}
+
+const sourceIdentity = (stats: BigIntStats): SourceIdentity => ({
+  dev: stats.dev,
+  ino: stats.ino,
+  nlink: stats.nlink,
+  size: stats.size,
+  mtimeNs: stats.mtimeNs,
+  ctimeNs: stats.ctimeNs,
+});
+
+const sameSourceIdentity = (
+  left: SourceIdentity,
+  right: SourceIdentity,
+): boolean => left.dev === right.dev
+  && left.ino === right.ino
+  && left.nlink === right.nlink
+  && left.size === right.size
+  && left.mtimeNs === right.mtimeNs
+  && left.ctimeNs === right.ctimeNs;
+
+const sourceChanged = (asset: IngestAsset, cause?: unknown): IngestError =>
+  new IngestError(
+    'ASSET_DECODE_FAILED',
+    asset.assetId,
+    ['source changed during ingest'],
+    cause === undefined ? undefined : {cause},
+  );
+
+const inspectSourceHandle = async (
+  handle: FileHandle,
+  asset: IngestAsset,
+): Promise<SourceIdentity> => {
+  const stats = await handle.stat({bigint: true});
+  if (!stats.isFile() || stats.nlink < 1n) throw sourceChanged(asset);
+  return sourceIdentity(stats);
+};
+
+const assertSourceIdentity = (
+  actual: SourceIdentity,
+  expected: SourceIdentity,
+  asset: IngestAsset,
+): void => {
+  if (!sameSourceIdentity(actual, expected)) throw sourceChanged(asset);
+};
+
 const mapSourceFailure = (
   asset: IngestAsset,
   reason: string,
@@ -240,21 +351,158 @@ const mapSourceFailure = (
   );
 };
 
-const consumeSource = async <T>(
+const hashFileHandle = async (handle: FileHandle): Promise<string> => {
+  const hash = createHash('sha256');
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let position = 0;
+  while (true) {
+    const {bytesRead} = await handle.read(buffer, 0, buffer.length, position);
+    if (bytesRead === 0) break;
+    hash.update(buffer.subarray(0, bytesRead));
+    position += bytesRead;
+  }
+  return `sha256:${hash.digest('hex')}`;
+};
+
+const establishSourceAuthority = async (
   input: IngestInput,
   dependencies: IngestDependencies,
   asset: IngestAsset,
-  failureReason: string,
-  consumer: (handle: FileHandle) => Promise<T>,
-): Promise<T> => {
+): Promise<SourceAuthority> => {
   try {
-    return await withFreshHandle(
+    const authority = await withFreshHandle(
       async () => await dependencies.fileSystem.openExistingProjectFile(
         input.projectDirectory,
         asset.sourcePath,
       ),
-      consumer,
+      async (handle) => {
+        const identity = await inspectSourceHandle(handle, asset);
+        const hash = await hashFileHandle(handle);
+        assertSourceIdentity(await inspectSourceHandle(handle, asset), identity, asset);
+        return {
+          identity,
+          volumePath: path.join('/.vol', String(identity.dev), String(identity.ino)),
+          hash,
+        };
+      },
     );
+    await assertProjectSourceIdentity(input, dependencies, asset, authority);
+    return authority;
+  } catch (error) {
+    throw mapSourceFailure(asset, 'asset source could not be hashed', error);
+  }
+};
+
+const assertProjectSourceIdentity = async (
+  input: IngestInput,
+  dependencies: IngestDependencies,
+  asset: IngestAsset,
+  authority: SourceAuthority,
+): Promise<void> => {
+  try {
+    await withFreshHandle(
+      async () => await dependencies.fileSystem.openExistingProjectFile(
+        input.projectDirectory,
+        asset.sourcePath,
+      ),
+      async (handle) => {
+        assertSourceIdentity(
+          await inspectSourceHandle(handle, asset),
+          authority.identity,
+          asset,
+        );
+      },
+    );
+  } catch (error) {
+    if (error instanceof IngestError) throw error;
+    if (errorCode(error) === 'ASSET_PATH_OUTSIDE_PROJECT') {
+      throw mapSourceFailure(asset, 'source changed during ingest', error);
+    }
+    throw sourceChanged(asset, error);
+  }
+};
+
+const consumeAuthorityHandle = async <T>(
+  asset: IngestAsset,
+  authority: SourceAuthority,
+  consumer: (handle: FileHandle) => Promise<T>,
+): Promise<T> => await withFreshHandle(
+  async () => await open(
+    authority.volumePath,
+    constants.O_RDONLY | O_NOFOLLOW_ANY,
+  ),
+  async (handle) => {
+    assertSourceIdentity(
+      await inspectSourceHandle(handle, asset),
+      authority.identity,
+      asset,
+    );
+    let outcome: HandleOutcome<T>;
+    try {
+      outcome = {ok: true, value: await consumer(handle)};
+    } catch (error) {
+      outcome = {ok: false, error};
+    }
+    let identityError: unknown;
+    try {
+      assertSourceIdentity(
+        await inspectSourceHandle(handle, asset),
+        authority.identity,
+        asset,
+      );
+    } catch (error) {
+      identityError = error;
+    }
+    if (!outcome.ok && identityError !== undefined) {
+      if (identityError instanceof IngestError) throw identityError;
+      throw new AggregateError(
+        [outcome.error, identityError],
+        'source consumer and identity verification both failed',
+        {cause: outcome.error},
+      );
+    }
+    if (identityError !== undefined) throw identityError;
+    if (!outcome.ok) throw outcome.error;
+    return outcome.value;
+  },
+);
+
+const consumeSource = async <T>(
+  input: IngestInput,
+  dependencies: IngestDependencies,
+  asset: IngestAsset,
+  authority: SourceAuthority,
+  failureReason: string,
+  consumer: (handle: FileHandle) => Promise<T>,
+): Promise<T> => {
+  try {
+    await assertProjectSourceIdentity(input, dependencies, asset, authority);
+    let outcome: HandleOutcome<T>;
+    try {
+      outcome = {
+        ok: true,
+        value: await consumeAuthorityHandle(asset, authority, consumer),
+      };
+    } catch (error) {
+      outcome = {ok: false, error};
+    }
+    let pathError: unknown;
+    try {
+      await assertProjectSourceIdentity(input, dependencies, asset, authority);
+    } catch (error) {
+      pathError = error;
+    }
+    if (!outcome.ok && pathError !== undefined) {
+      if (pathError instanceof IngestError) throw pathError;
+      throw new AggregateError(
+        [outcome.error, pathError],
+        'source consumer and project path verification both failed',
+        {cause: outcome.error},
+      );
+    }
+    if (pathError !== undefined) throw pathError;
+    if (!outcome.ok) throw outcome.error;
+    return outcome.value;
   } catch (error) {
     throw mapSourceFailure(asset, failureReason, error);
   }
@@ -287,27 +535,16 @@ const consumeRunFile = async <T>(
   }
 };
 
-const hashFileHandle = async (handle: FileHandle): Promise<string> => {
-  const hash = createHash('sha256');
-  const buffer = Buffer.allocUnsafe(64 * 1024);
-  let position = 0;
-  while (true) {
-    const {bytesRead} = await handle.read(buffer, 0, buffer.length, position);
-    if (bytesRead === 0) break;
-    hash.update(buffer.subarray(0, bytesRead));
-    position += bytesRead;
-  }
-  return `sha256:${hash.digest('hex')}`;
-};
-
 const hashSource = async (
   input: IngestInput,
   dependencies: IngestDependencies,
   asset: IngestAsset,
+  authority: SourceAuthority,
 ): Promise<string> => await consumeSource(
   input,
   dependencies,
   asset,
+  authority,
   'asset source could not be hashed',
   hashFileHandle,
 );
@@ -344,10 +581,12 @@ const probeSource = async (
   input: IngestInput,
   dependencies: IngestDependencies,
   asset: IngestAsset,
+  authority: SourceAuthority,
 ): Promise<MediaProbe> => await consumeSource(
   input,
   dependencies,
   asset,
+  authority,
   'media probe failed',
   async (handle) => await probeHandle(input, dependencies, handle),
 );
@@ -368,10 +607,14 @@ const probeRun = async (
 
 const videoSampleOffsets = (durationMs: number): number[] => {
   const lastDecodableMs = Math.max(0, durationMs - 1);
+  const clamp = (value: number): number => Math.min(
+    lastDecodableMs,
+    Math.max(0, Math.round(value)),
+  );
   const candidates = [
-    0,
-    Math.min(lastDecodableMs, Math.round(durationMs / 2)),
-    Math.min(lastDecodableMs, Math.max(0, durationMs - 100)),
+    clamp(0),
+    clamp(durationMs / 2),
+    clamp(durationMs - 100),
   ];
   return [...new Set(candidates)];
 };
@@ -382,10 +625,12 @@ const decodeVideoHandle = async (
   handle: FileHandle,
   offsetMs: number,
 ): Promise<void> => {
-  await dependencies.runProcess(
+  const result = await dependencies.runProcess(
     input.ffmpegExecutable,
     [
       '-v', 'error',
+      '-nostats',
+      '-progress', 'pipe:1',
       '-ss', (offsetMs / 1000).toFixed(3),
       '-i', '/dev/fd/3',
       '-map', '0:v:0',
@@ -396,12 +641,18 @@ const decodeVideoHandle = async (
     ],
     processOptions(input, [handle.fd]),
   );
+  const decodedFrames = [...result.stdout.matchAll(/^frame=(\d+)$/gm)]
+    .map((match) => Number(match[1]));
+  if (decodedFrames.length === 0 || Math.max(...decodedFrames) < 1) {
+    throw new Error('ffmpeg reported zero decoded video frames');
+  }
 };
 
 const decodeVideoSourceSamples = async (
   input: IngestInput,
   dependencies: IngestDependencies,
   asset: IngestAsset,
+  authority: SourceAuthority,
   durationMs: number,
 ): Promise<void> => {
   for (const offsetMs of videoSampleOffsets(durationMs)) {
@@ -409,6 +660,7 @@ const decodeVideoSourceSamples = async (
       input,
       dependencies,
       asset,
+      authority,
       'video sample decode failed',
       async (handle) => await decodeVideoHandle(
         input,
@@ -448,16 +700,20 @@ const decodeImageSource = async (
   input: IngestInput,
   dependencies: IngestDependencies,
   asset: IngestAsset,
+  authority: SourceAuthority,
 ): Promise<void> => await consumeSource(
   input,
   dependencies,
   asset,
+  authority,
   'image decode failed',
   async (handle) => {
-    await dependencies.runProcess(
+    const result = await dependencies.runProcess(
       input.ffmpegExecutable,
       [
         '-v', 'error',
+        '-nostats',
+        '-progress', 'pipe:1',
         '-i', '/dev/fd/3',
         '-map', '0:v:0',
         '-frames:v', '1',
@@ -467,6 +723,11 @@ const decodeImageSource = async (
       ],
       processOptions(input, [handle.fd]),
     );
+    const decodedFrames = [...result.stdout.matchAll(/^frame=(\d+)$/gm)]
+      .map((match) => Number(match[1]));
+    if (decodedFrames.length === 0 || Math.max(...decodedFrames) < 1) {
+      throw new Error('ffmpeg reported zero decoded image frames');
+    }
   },
 );
 
@@ -474,10 +735,12 @@ const decodeAudioSource = async (
   input: IngestInput,
   dependencies: IngestDependencies,
   asset: IngestAsset,
+  authority: SourceAuthority,
 ): Promise<void> => await consumeSource(
   input,
   dependencies,
   asset,
+  authority,
   'audio sample decode failed',
   async (handle) => {
     await dependencies.runProcess(
@@ -521,7 +784,7 @@ const videoRecord = (
   sourceHash,
   renderPath,
   renderScope,
-  durationMs: probe.durationMs,
+  durationMs: stream.durationMs ?? probe.durationMs,
   width: stream.width,
   height: stream.height,
   videoCodec: stream.codec,
@@ -536,6 +799,7 @@ const transcodeAsset = async (
   input: IngestInput,
   dependencies: IngestDependencies,
   asset: IngestAsset,
+  authority: SourceAuthority,
   sourceHash: string,
 ): Promise<IngestAssetRecord> => {
   const renderPath = `assets/${asset.assetId}/render.mp4`;
@@ -554,6 +818,7 @@ const transcodeAsset = async (
         input,
         dependencies,
         asset,
+        authority,
         'video transcode failed',
         async (sourceHandle) => {
           try {
@@ -579,12 +844,27 @@ const transcodeAsset = async (
   );
 
   const outputProbe = await probeRun(input, dependencies, asset, renderPath);
+  const outputStream = outputProbe.videoStreams[0];
+  if (outputStream === undefined) {
+    throw new IngestError(
+      'ASSET_DECODE_FAILED',
+      asset.assetId,
+      ['transcoded output has no video stream'],
+    );
+  }
+  if (outputStream.durationMs === undefined || outputStream.durationMs <= 0) {
+    throw new IngestError(
+      'ASSET_DECODE_FAILED',
+      asset.assetId,
+      ['transcoded output video duration is missing'],
+    );
+  }
   await decodeVideoRunSamples(
     input,
     dependencies,
     asset,
     renderPath,
-    outputProbe.durationMs,
+    outputStream.durationMs,
   );
   await consumeRunFile(
     input,
@@ -603,9 +883,24 @@ const transcodeAsset = async (
   if (outputDecision.compatibility !== 'direct') {
     validationReasons.push(...outputDecision.reasons);
   }
-  const outputStream = outputProbe.videoStreams[0];
-  if (outputStream === undefined) validationReasons.push('transcoded output has no video stream');
-  if (validationReasons.length > 0 || outputStream === undefined) {
+  if (
+    outputStream.averageFrameRate.numerator !== 30
+    || outputStream.averageFrameRate.denominator !== 1
+    || outputStream.realFrameRate.numerator !== 30
+    || outputStream.realFrameRate.denominator !== 1
+    || isVariableFrameRate(outputStream)
+  ) {
+    validationReasons.push('transcoded output frame rate must be 30 fps');
+  }
+  if (
+    outputStream.colorPrimaries?.toLowerCase() !== 'bt709'
+    || outputStream.colorTransfer?.toLowerCase() !== 'bt709'
+    || outputStream.colorSpace?.toLowerCase() !== 'bt709'
+    || outputStream.colorRange?.toLowerCase() !== 'tv'
+  ) {
+    validationReasons.push('transcoded output must use limited-range BT.709');
+  }
+  if (validationReasons.length > 0) {
     throw new IngestError(
       'ASSET_DECODE_FAILED',
       asset.assetId,
@@ -628,6 +923,7 @@ const ingestVideo = async (
   input: IngestInput,
   dependencies: IngestDependencies,
   asset: IngestAsset,
+  authority: SourceAuthority,
   sourceHash: string,
   probe: MediaProbe,
 ): Promise<IngestAssetRecord> => {
@@ -639,11 +935,24 @@ const ingestVideo = async (
       ['video stream is missing'],
     );
   }
-  await decodeVideoSourceSamples(input, dependencies, asset, probe.durationMs);
+  if (stream.durationMs === undefined || stream.durationMs <= 0) {
+    throw new IngestError(
+      'ASSET_DECODE_FAILED',
+      asset.assetId,
+      ['primary video duration is missing'],
+    );
+  }
+  await decodeVideoSourceSamples(
+    input,
+    dependencies,
+    asset,
+    authority,
+    stream.durationMs,
+  );
   const decision = decideVideoCompatibility(probe, {decodable: true});
   if (decision.compatibility === 'rejected') rejectDecision(asset, decision);
   if (decision.compatibility === 'transcoded') {
-    return await transcodeAsset(input, dependencies, asset, sourceHash);
+    return await transcodeAsset(input, dependencies, asset, authority, sourceHash);
   }
   return videoRecord(
     asset,
@@ -660,6 +969,7 @@ const ingestAudio = async (
   input: IngestInput,
   dependencies: IngestDependencies,
   asset: IngestAsset,
+  authority: SourceAuthority,
   sourceHash: string,
   probe: MediaProbe,
 ): Promise<IngestAssetRecord> => {
@@ -670,7 +980,7 @@ const ingestAudio = async (
       ['audio stream is missing'],
     );
   }
-  await decodeAudioSource(input, dependencies, asset);
+  await decodeAudioSource(input, dependencies, asset, authority);
   return {
     kind: 'audio',
     sourcePath: asset.sourcePath,
@@ -686,6 +996,7 @@ const ingestImage = async (
   input: IngestInput,
   dependencies: IngestDependencies,
   asset: IngestAsset,
+  authority: SourceAuthority,
   sourceHash: string,
   probe: MediaProbe,
 ): Promise<IngestAssetRecord> => {
@@ -697,7 +1008,7 @@ const ingestImage = async (
       ['image stream is missing'],
     );
   }
-  await decodeImageSource(input, dependencies, asset);
+  await decodeImageSource(input, dependencies, asset, authority);
   return {
     kind: 'image',
     sourcePath: asset.sourcePath,
@@ -715,15 +1026,15 @@ const ingestAsset = async (
   dependencies: IngestDependencies,
   asset: IngestAsset,
 ): Promise<IngestAssetRecord> => {
-  const initialSourceHash = await hashSource(input, dependencies, asset);
-  const probe = await probeSource(input, dependencies, asset);
+  const authority = await establishSourceAuthority(input, dependencies, asset);
+  const probe = await probeSource(input, dependencies, asset, authority);
   const record = asset.kind === 'video'
-    ? await ingestVideo(input, dependencies, asset, initialSourceHash, probe)
+    ? await ingestVideo(input, dependencies, asset, authority, authority.hash, probe)
     : asset.kind === 'audio'
-      ? await ingestAudio(input, dependencies, asset, initialSourceHash, probe)
-      : await ingestImage(input, dependencies, asset, initialSourceHash, probe);
-  const finalSourceHash = await hashSource(input, dependencies, asset);
-  if (finalSourceHash !== initialSourceHash) {
+      ? await ingestAudio(input, dependencies, asset, authority, authority.hash, probe)
+      : await ingestImage(input, dependencies, asset, authority, authority.hash, probe);
+  const finalSourceHash = await hashSource(input, dependencies, asset, authority);
+  if (finalSourceHash !== authority.hash) {
     throw new IngestError(
       'ASSET_DECODE_FAILED',
       asset.assetId,
@@ -733,20 +1044,252 @@ const ingestAsset = async (
   return record;
 };
 
+interface InodeIdentity {
+  dev: bigint;
+  ino: bigint;
+}
+
+interface RunPublication {
+  readonly published: boolean;
+  rename(): Promise<void>;
+  syncDirectory(): Promise<void>;
+  rollback(): Promise<void>;
+  close(): Promise<void>;
+}
+
+const inodeIdentity = (stats: BigIntStats): InodeIdentity => ({
+  dev: stats.dev,
+  ino: stats.ino,
+});
+
+const sameInode = (left: InodeIdentity, right: InodeIdentity): boolean =>
+  left.dev === right.dev && left.ino === right.ino;
+
+const descriptorFilePath = async (descriptor: number): Promise<string> => {
+  const {stdout} = await execFileAsync(
+    '/usr/sbin/lsof',
+    ['-a', '-p', String(process.pid), '-d', String(descriptor), '-F0pn'],
+    {encoding: 'utf8', maxBuffer: 64 * 1024},
+  );
+  const fields = String(stdout)
+    .split('\0')
+    .map((field) => field.replace(/^\n+/, ''));
+  const nameField = fields.find((field) => field.startsWith('n/'));
+  if (nameField === undefined) {
+    throw new Error(`could not resolve path for open descriptor ${descriptor}`);
+  }
+  return nameField.slice(1);
+};
+
+const assertScopedRunInode = async (
+  input: IngestInput,
+  dependencies: IngestDependencies,
+  relativePath: string,
+  expected: InodeIdentity,
+): Promise<void> => await withFreshHandle(
+  async () => await dependencies.fileSystem.openExistingRunFile(
+    input.runDirectory,
+    relativePath,
+  ),
+  async (handle) => {
+    const stats = await handle.stat({bigint: true});
+    if (!stats.isFile() || !sameInode(inodeIdentity(stats), expected)) {
+      throw new Error(`Run file identity changed: ${relativePath}`);
+    }
+  },
+);
+
+const prepareRunPublication = async (
+  input: IngestInput,
+  dependencies: IngestDependencies,
+  tempPath: string,
+  finalPath: string,
+  tempHandle: FileHandle,
+): Promise<RunPublication> => {
+  if (path.posix.dirname(tempPath) !== path.posix.dirname(finalPath)) {
+    throw new Error('atomic Run publication requires one parent directory');
+  }
+  const tempStats = await tempHandle.stat({bigint: true});
+  if (!tempStats.isFile() || tempStats.nlink !== 1n) {
+    throw new Error('manifest temporary file identity is invalid');
+  }
+  const tempIdentity = inodeIdentity(tempStats);
+  await assertScopedRunInode(input, dependencies, tempPath, tempIdentity);
+
+  const descriptorPath = await descriptorFilePath(tempHandle.fd);
+  if (path.basename(descriptorPath) !== path.posix.basename(tempPath)) {
+    throw new Error('manifest temporary file path changed after scoped open');
+  }
+  const descriptorStats = await lstat(descriptorPath, {bigint: true});
+  if (!descriptorStats.isFile() || !sameInode(inodeIdentity(descriptorStats), tempIdentity)) {
+    throw new Error('manifest temporary descriptor no longer names the scoped file');
+  }
+
+  const parentPath = path.dirname(descriptorPath);
+  const parentStats = await lstat(parentPath, {bigint: true});
+  if (
+    parentStats.isSymbolicLink()
+    || !parentStats.isDirectory()
+    || await realpath(parentPath) !== parentPath
+  ) {
+    throw new Error('manifest parent directory is not a stable plain directory');
+  }
+  const parentIdentity = inodeIdentity(parentStats);
+  const parentHandle = await open(
+    parentPath,
+    constants.O_RDONLY | O_NOFOLLOW_ANY,
+  );
+  try {
+    const heldParentStats = await parentHandle.stat({bigint: true});
+    if (
+      !heldParentStats.isDirectory()
+      || !sameInode(inodeIdentity(heldParentStats), parentIdentity)
+    ) {
+      throw new Error('manifest parent directory changed while anchoring');
+    }
+    const parentVolumePath = path.join(
+      '/.vol',
+      String(parentIdentity.dev),
+      String(parentIdentity.ino),
+    );
+    const anchoredParentStats = await lstat(parentVolumePath, {bigint: true});
+    if (
+      !anchoredParentStats.isDirectory()
+      || !sameInode(inodeIdentity(anchoredParentStats), parentIdentity)
+    ) {
+      throw new Error('manifest parent inode authority is unavailable');
+    }
+    const anchoredTempPath = path.join(parentVolumePath, path.basename(descriptorPath));
+    const anchoredFinalPath = path.join(parentVolumePath, path.posix.basename(finalPath));
+    let published = false;
+
+    const rollback = async (): Promise<void> => {
+      if (!published) return;
+      const current = await lstat(anchoredFinalPath, {bigint: true});
+      if (!current.isFile() || !sameInode(inodeIdentity(current), tempIdentity)) {
+        throw new Error('refusing to rollback a replaced manifest file');
+      }
+      await unlink(anchoredFinalPath);
+      published = false;
+      await parentHandle.sync();
+    };
+
+    return {
+      get published() {
+        return published;
+      },
+      rename: async () => {
+        await assertScopedRunInode(input, dependencies, tempPath, tempIdentity);
+        await link(anchoredTempPath, anchoredFinalPath);
+        published = true;
+        try {
+          await unlink(anchoredTempPath);
+          await assertScopedRunInode(input, dependencies, finalPath, tempIdentity);
+        } catch (error) {
+          await rollback().catch((rollbackError) => {
+            throw new AggregateError(
+              [error, rollbackError],
+              'manifest publication and rollback both failed',
+              {cause: error},
+            );
+          });
+          throw error;
+        }
+      },
+      syncDirectory: async () => {
+        await parentHandle.sync();
+      },
+      rollback,
+      close: async () => {
+        await parentHandle.close();
+      },
+    };
+  } catch (error) {
+    await parentHandle.close().catch(() => undefined);
+    throw error;
+  }
+};
+
 const writeManifest = async (
   input: IngestInput,
   dependencies: IngestDependencies,
   manifest: IngestManifest,
-): Promise<void> => await withFreshHandle(
-  async () => await dependencies.fileSystem.openNewRunFile(
-    input.runDirectory,
-    'asset-manifest.json',
-  ),
-  async (handle) => {
-    await handle.writeFile(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-    await handle.sync();
-  },
-);
+): Promise<void> => {
+  const finalPath = 'asset-manifest.json';
+  const tempPath = `.asset-manifest.${process.pid}.${randomUUID()}.tmp`;
+  await withFreshHandle(
+    async () => await dependencies.fileSystem.openNewRunFile(
+      input.runDirectory,
+      tempPath,
+    ),
+    async (handle) => {
+      let publication: RunPublication | undefined;
+      try {
+        await dependencies.manifestFileOps.writeFile(
+          handle,
+          `${JSON.stringify(manifest, null, 2)}\n`,
+        );
+        await dependencies.manifestFileOps.syncFile(handle);
+        publication = await prepareRunPublication(
+          input,
+          dependencies,
+          tempPath,
+          finalPath,
+          handle,
+        );
+        await dependencies.manifestFileOps.rename(
+          async () => await publication!.rename(),
+        );
+        await dependencies.manifestFileOps.syncDirectory(
+          async () => await publication!.syncDirectory(),
+        );
+      } catch (error) {
+        if (publication?.published) {
+          try {
+            await publication.rollback();
+          } catch (rollbackError) {
+            throw new AggregateError(
+              [error, rollbackError],
+              'manifest publication failed and final rollback failed',
+              {cause: error},
+            );
+          }
+        }
+        throw error;
+      } finally {
+        await publication?.close();
+      }
+    },
+  );
+};
+
+const parseIngestAssets = (assets: readonly IngestAsset[]): IngestAsset[] => {
+  try {
+    return IngestAssetsSchema.parse([...assets]);
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      const sourcePathIssue = error.issues.find((issue) =>
+        typeof issue.path[0] === 'number' && issue.path[1] === 'sourcePath');
+      if (sourcePathIssue !== undefined) {
+        const index = sourcePathIssue.path[0] as number;
+        const rawAsset = assets[index] as unknown;
+        const assetId = rawAsset !== null
+          && typeof rawAsset === 'object'
+          && 'assetId' in rawAsset
+          && typeof rawAsset.assetId === 'string'
+          ? rawAsset.assetId
+          : 'unknown';
+        throw new IngestError(
+          'ASSET_PATH_OUTSIDE_PROJECT',
+          assetId,
+          ['asset source path is outside the project'],
+          {cause: error},
+        );
+      }
+    }
+    throw error;
+  }
+};
 
 export async function runIngest(
   input: IngestInput,
@@ -755,7 +1298,7 @@ export async function runIngest(
   if (input.ffmpegExecutable.length === 0 || input.ffprobeExecutable.length === 0) {
     throw new TypeError('ffmpegExecutable and ffprobeExecutable are required');
   }
-  const assets = IngestAssetsSchema.parse([...input.assets])
+  const assets = parseIngestAssets(input.assets)
     .sort((left, right) => left.assetId.localeCompare(right.assetId));
   const records: Record<string, IngestAssetRecord> = {};
   for (const asset of assets) {

@@ -5,6 +5,7 @@ const FFMPEG_EXECUTABLE = process.env.FFMPEG_PATH ?? '/opt/homebrew/bin/ffmpeg';
 export interface TestVideoOptions {
   pixelFormat?: 'yuv420p' | 'yuv422p';
   includeAudio?: boolean;
+  audioSeconds?: number;
 }
 
 export async function createTestVideo(
@@ -14,6 +15,7 @@ export async function createTestVideo(
 ): Promise<void> {
   const pixelFormat = options.pixelFormat ?? 'yuv420p';
   const includeAudio = options.includeAudio ?? true;
+  const audioSeconds = options.audioSeconds ?? seconds;
   const args = [
     '-v', 'error',
     '-y',
@@ -21,11 +23,10 @@ export async function createTestVideo(
     '-f', 'lavfi',
     '-i', `testsrc2=size=320x180:rate=30:duration=${seconds}`,
     ...(includeAudio
-      ? ['-f', 'lavfi', '-i', `sine=frequency=440:sample_rate=48000:duration=${seconds}`]
+      ? ['-f', 'lavfi', '-i', `sine=frequency=440:sample_rate=48000:duration=${audioSeconds}`]
       : []),
     '-map', '0:v:0',
     ...(includeAudio ? ['-map', '1:a:0'] : []),
-    '-t', String(seconds),
     '-vf', [
       'setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709',
       `format=${pixelFormat}`,

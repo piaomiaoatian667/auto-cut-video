@@ -127,11 +127,6 @@ describe('video compatibility', () => {
 
   it.each([
     {
-      name: '10-bit pixel format',
-      overrides: {pix_fmt: 'yuv420p10le', bits_per_raw_sample: '10'},
-      reasons: ['high bit-depth video is unsupported (yuv420p10le)'],
-    },
-    {
       name: 'PQ transfer',
       overrides: {color_transfer: 'smpte2084'},
       reasons: ['HDR transfer is unsupported (smpte2084)'],
@@ -166,6 +161,52 @@ describe('video compatibility', () => {
       compatibility: 'rejected',
       errorCode: 'ASSET_HDR_UNSUPPORTED',
       reasons,
+    });
+  });
+
+  it.each([
+    'yuv420p10le',
+    'p010le',
+    'y210le',
+    'gbrp10le',
+    'gray10le',
+    'vendor9le',
+    'vendor_10bit',
+    'vendor12be',
+    'vendor_p14',
+    'vendor14xyz',
+    'vendor16_planar',
+  ])('rejects inferred high-bit-depth pixel format %s without descriptor bits', (pixelFormat) => {
+    expect(decideVideoCompatibility(createProbe({
+      pix_fmt: pixelFormat,
+      bits_per_raw_sample: undefined,
+    }), {decodable: true})).toEqual({
+      compatibility: 'rejected',
+      errorCode: 'ASSET_HDR_UNSUPPORTED',
+      reasons: [`high bit-depth video is unsupported (${pixelFormat})`],
+    });
+  });
+
+  it('rejects an unknown pixel format when 8-bit depth cannot be proven', () => {
+    expect(decideVideoCompatibility(createProbe({
+      pix_fmt: 'mystery_fmt',
+      bits_per_raw_sample: undefined,
+    }), {decodable: true})).toEqual({
+      compatibility: 'rejected',
+      errorCode: 'ASSET_HDR_UNSUPPORTED',
+      reasons: ['pixel format bit depth is unknown or unsupported (mystery_fmt)'],
+    });
+  });
+
+  it('does not use an 8-bit descriptor to bless an unknown pixel format', () => {
+    expect(decideVideoCompatibility(createProbe({
+      pix_fmt: 'mystery_fmt',
+      bits_per_raw_sample: '8',
+      bits_per_coded_sample: '8',
+    }), {decodable: true})).toEqual({
+      compatibility: 'rejected',
+      errorCode: 'ASSET_HDR_UNSUPPORTED',
+      reasons: ['pixel format bit depth is unknown or unsupported (mystery_fmt)'],
     });
   });
 
@@ -249,12 +290,14 @@ describe('transcodeVideo', () => {
         '-map', '0:v:0',
         '-an',
         '-vf', 'fps=30,format=yuv420p',
+        '-fps_mode', 'cfr',
         '-c:v', 'libx264',
         '-crf', '18',
         '-preset', 'medium',
         '-color_primaries', 'bt709',
         '-color_trc', 'bt709',
         '-colorspace', 'bt709',
+        '-color_range', 'tv',
         '-f', 'mp4',
         '/dev/fd/4',
       ],
