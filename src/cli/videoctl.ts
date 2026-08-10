@@ -24,6 +24,7 @@ import {
   formatDoctorJson,
   formatDoctorTable,
 } from './output';
+import {runReviewCommand, type ReviewCommandOptions} from './commands/review';
 
 export interface OutputWriter {
   write(chunk: string): unknown;
@@ -496,6 +497,16 @@ export async function runVideoctl(
     .option('--json', 'print machine-readable JSON')
     .action(async (project: string, options: DoctorOptions) => {
       exitCode = await runDoctor(project, options, dependencies);
+    });
+  command
+    .command('review')
+    .description('Approve the current draft review for a project')
+    .argument('<project>')
+    .option('--approve', 'approve the current draft')
+    .requiredOption('--reason <text>', 'approval reason')
+    .option('--reviewer <name>', 'reviewer identity')
+    .action(async (project: string, options: ReviewCommandOptions) => {
+      exitCode = await runReviewCommand(project, options, dependencies);
     });
 
   try {
