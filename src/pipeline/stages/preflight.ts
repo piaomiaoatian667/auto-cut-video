@@ -2,6 +2,7 @@ import {createHash} from 'node:crypto';
 import {constants} from 'node:fs';
 import {
   access,
+  lstat,
   open,
   realpath,
   stat,
@@ -10,6 +11,7 @@ import {
 import path from 'node:path';
 import type {Project} from '../../domain/project-schema';
 import type {Script} from '../../domain/script-schema';
+import {StableIdSchema} from '../../domain/schema-primitives';
 import {
   openExistingProjectFile,
   type ProjectDirectoryScope,
@@ -91,6 +93,10 @@ export interface DirectoryInspection {
   inspectedPath: string;
 }
 
+export interface WorkDirectoryInspection extends DirectoryInspection {
+  availableBytes: number | null;
+}
+
 export interface PreflightFileSystem {
   realpath(candidate: string): Promise<string>;
   openExecutable(candidate: string): Promise<PreflightExecutableAuthority>;
@@ -99,8 +105,10 @@ export interface PreflightFileSystem {
     relativePath: string,
     maxBytes: number,
   ): Promise<PreflightHashedProjectFile>;
-  inspectDirectory(candidate: string): Promise<DirectoryInspection>;
-  statfsAvailableBytes(candidate: string): Promise<number>;
+  inspectWorkDirectory(
+    workspaceRoot: string,
+    projectId: string,
+  ): Promise<WorkDirectoryInspection>;
 }
 
 export interface PreflightDependencies {
@@ -186,6 +194,7 @@ interface PreflightBigIntStat {
   mode: bigint;
   isFile(): boolean;
   isDirectory(): boolean;
+  isSymbolicLink?(): boolean;
 }
 
 interface PreflightSystemFileHandle {
@@ -200,13 +209,21 @@ interface PreflightSystemFileHandle {
   close(): Promise<void>;
 }
 
+interface PreflightStatFs {
+  bavail: bigint;
+  bsize: bigint;
+}
+
 export interface SystemPreflightFileSystem {
   access(candidate: string, mode: number): Promise<void>;
+  lstat(candidate: string): Promise<PreflightBigIntStat>;
   open(candidate: string, flags: number): Promise<PreflightSystemFileHandle>;
   openExistingProjectFile(
     scope: ProjectDirectoryScope,
     relativePath: string,
   ): Promise<PreflightSystemFileHandle>;
+  realpath(candidate: string): Promise<string>;
+  statfs(candidate: string): Promise<PreflightStatFs>;
 }
 
 class ProjectFontError extends Error {
@@ -455,8 +472,10 @@ export async function runPreflight(
       );
     }
     const requiredBytes = Math.max(sourceBytes * 3, MINIMUM_REQUIRED_BYTES);
-    const workDirectory = input.workDirectory
-      ?? path.join(input.workspaceRoot, '.work', input.project.id);
+    const projectId = StableIdSchema.safeParse(input.project.id);
+    const workDirectory = projectId.success
+      ? path.join(input.workspaceRoot, '.work', projectId.data)
+      : path.join(input.workspaceRoot, '.work');
 
     const versions: PreflightVersions = {
       node: null,
@@ -786,10 +805,26 @@ export async function runPreflight(
       }
     }
 
-    try {
-      const inspection = await dependencies.fileSystem
-        .inspectDirectory(workDirectory);
-      if (inspection.usable) {
+    let availableBytes: number | null = null;
+    let workInspection: WorkDirectoryInspection | null = null;
+    if (!projectId.success) {
+      addError(
+        checks,
+        'work-directory',
+        'ENV_WORK_DIRECTORY_UNAVAILABLE',
+        'Project id cannot establish a fixed work directory authority.',
+        {affectedPaths: [workDirectory]},
+      );
+    } else {
+      try {
+        workInspection = await dependencies.fileSystem.inspectWorkDirectory(
+          input.workspaceRoot,
+          projectId.data,
+        );
+      } catch {
+        workInspection = null;
+      }
+      if (workInspection?.usable === true) {
         addInfo(checks, 'work-directory', 'Work directory is usable.', {
           affectedPaths: [workDirectory],
         });
@@ -798,28 +833,19 @@ export async function runPreflight(
           checks,
           'work-directory',
           'ENV_WORK_DIRECTORY_UNAVAILABLE',
-          'Work directory is unavailable or lacks required permissions.',
+          'Work directory authority is unavailable or unsafe.',
           {affectedPaths: [workDirectory]},
         );
       }
-    } catch {
-      addError(
-        checks,
-        'work-directory',
-        'ENV_WORK_DIRECTORY_UNAVAILABLE',
-        'Work directory could not be inspected.',
-        {affectedPaths: [workDirectory]},
-      );
     }
 
-    let availableBytes: number | null = null;
-    try {
-      const measuredBytes = await dependencies.fileSystem
-        .statfsAvailableBytes(workDirectory);
-      if (!Number.isFinite(measuredBytes) || measuredBytes < 0) {
-        throw new Error('invalid statfs result');
-      }
-      availableBytes = measuredBytes;
+    if (
+      workInspection?.usable === true
+      && workInspection.availableBytes !== null
+      && Number.isFinite(workInspection.availableBytes)
+      && workInspection.availableBytes >= 0
+    ) {
+      availableBytes = workInspection.availableBytes;
       if (availableBytes < requiredBytes) {
         addError(
           checks,
@@ -834,12 +860,12 @@ export async function runPreflight(
           expected: requiredBytes,
         });
       }
-    } catch {
+    } else {
       addError(
         checks,
         'disk-space',
         'ENV_WORK_DIRECTORY_UNAVAILABLE',
-        'Available disk space could not be inspected.',
+        'Disk space was not inspected without a valid work directory authority.',
         {expected: requiredBytes},
       );
     }
@@ -1036,6 +1062,201 @@ const authorityPath = (
   return name === undefined ? base : `${base}/${name}`;
 };
 
+interface WorkDirectoryIdentity {
+  path: string;
+  dev: bigint;
+  ino: bigint;
+}
+
+interface WorkDirectoryAnchor {
+  identity: WorkDirectoryIdentity;
+  handle: PreflightSystemFileHandle;
+  authorityPath: string;
+}
+
+const workIdentityMatches = (
+  identity: WorkDirectoryIdentity,
+  status: PreflightBigIntStat,
+): boolean => status.dev === identity.dev && status.ino === identity.ino;
+
+const plainWorkDirectory = (status: PreflightBigIntStat): boolean => (
+  status.isSymbolicLink?.() !== true && status.isDirectory()
+);
+
+const assertWorkIdentityStable = async (
+  identity: WorkDirectoryIdentity,
+  fileSystem: SystemPreflightFileSystem,
+): Promise<void> => {
+  const lexicalStatus = await fileSystem.lstat(identity.path);
+  if (
+    !plainWorkDirectory(lexicalStatus)
+    || !workIdentityMatches(identity, lexicalStatus)
+    || await fileSystem.realpath(identity.path) !== identity.path
+  ) {
+    throw new Error('work directory authority changed');
+  }
+  const anchoredStatus = await fileSystem.lstat(authorityPath(identity));
+  if (
+    !plainWorkDirectory(anchoredStatus)
+    || !workIdentityMatches(identity, anchoredStatus)
+  ) {
+    throw new Error('work directory anchor changed');
+  }
+};
+
+const openWorkDirectoryAnchor = async (
+  identity: WorkDirectoryIdentity,
+  fileSystem: SystemPreflightFileSystem,
+): Promise<WorkDirectoryAnchor> => {
+  await assertWorkIdentityStable(identity, fileSystem);
+  const handle = await fileSystem.open(identity.path, SAFE_READ_FLAGS);
+  try {
+    const status = await handle.stat({bigint: true});
+    if (!plainWorkDirectory(status) || !workIdentityMatches(identity, status)) {
+      throw new Error('work directory changed while opening');
+    }
+    const anchoredPath = authorityPath(identity);
+    const anchoredStatus = await fileSystem.lstat(anchoredPath);
+    if (
+      !plainWorkDirectory(anchoredStatus)
+      || !workIdentityMatches(identity, anchoredStatus)
+    ) {
+      throw new Error('work directory anchor changed while opening');
+    }
+    return {identity, handle, authorityPath: anchoredPath};
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
+  }
+};
+
+const assertWorkAnchorsStable = async (
+  anchors: readonly WorkDirectoryAnchor[],
+  fileSystem: SystemPreflightFileSystem,
+): Promise<void> => {
+  for (const anchor of anchors) {
+    await assertWorkIdentityStable(anchor.identity, fileSystem);
+    const status = await anchor.handle.stat({bigint: true});
+    if (
+      !plainWorkDirectory(status)
+      || !workIdentityMatches(anchor.identity, status)
+    ) {
+      throw new Error('held work directory authority changed');
+    }
+  }
+};
+
+const closeWorkDirectoryAnchors = async (
+  anchors: readonly WorkDirectoryAnchor[],
+): Promise<boolean> => {
+  const results = await Promise.allSettled(
+    [...anchors].reverse().map(async (anchor) => anchor.handle.close()),
+  );
+  return results.every((result) => result.status === 'fulfilled');
+};
+
+const withinWorkspace = (workspaceRoot: string, candidate: string): boolean => {
+  const relative = path.relative(workspaceRoot, candidate);
+  return relative !== ''
+    && relative !== '..'
+    && !relative.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relative);
+};
+
+const inspectSystemWorkDirectory = async (
+  workspaceRoot: string,
+  projectId: string,
+  fileSystem: SystemPreflightFileSystem,
+): Promise<WorkDirectoryInspection> => {
+  const anchors: WorkDirectoryAnchor[] = [];
+  let result: WorkDirectoryInspection = {
+    usable: false,
+    inspectedPath: workspaceRoot,
+    availableBytes: null,
+  };
+  try {
+    const validatedProjectId = StableIdSchema.parse(projectId);
+    const canonicalWorkspace = await fileSystem.realpath(workspaceRoot);
+    const workspaceStatus = await fileSystem.lstat(canonicalWorkspace);
+    if (
+      !plainWorkDirectory(workspaceStatus)
+      || await fileSystem.realpath(canonicalWorkspace) !== canonicalWorkspace
+    ) {
+      throw new Error('workspace root is not a plain directory');
+    }
+    const workspaceIdentity: WorkDirectoryIdentity = {
+      path: canonicalWorkspace,
+      dev: workspaceStatus.dev,
+      ino: workspaceStatus.ino,
+    };
+    const targetPath = path.join(
+      canonicalWorkspace,
+      '.work',
+      validatedProjectId,
+    );
+    if (!withinWorkspace(canonicalWorkspace, targetPath)) {
+      throw new Error('work directory escapes workspace');
+    }
+
+    let nearest = await openWorkDirectoryAnchor(workspaceIdentity, fileSystem);
+    anchors.push(nearest);
+    for (const segment of ['.work', validatedProjectId]) {
+      await assertWorkAnchorsStable(anchors, fileSystem);
+      const childAuthorityPath = `${nearest.authorityPath}/${segment}`;
+      let childStatus: PreflightBigIntStat;
+      try {
+        childStatus = await fileSystem.lstat(childAuthorityPath);
+      } catch (error) {
+        if (isNodeError(error) && error.code === 'ENOENT') break;
+        throw error;
+      }
+      if (!plainWorkDirectory(childStatus)) {
+        throw new Error('work directory component is not a plain directory');
+      }
+      const childIdentity: WorkDirectoryIdentity = {
+        path: path.join(nearest.identity.path, segment),
+        dev: childStatus.dev,
+        ino: childStatus.ino,
+      };
+      await assertWorkAnchorsStable(anchors, fileSystem);
+      nearest = await openWorkDirectoryAnchor(childIdentity, fileSystem);
+      anchors.push(nearest);
+    }
+
+    await assertWorkAnchorsStable(anchors, fileSystem);
+    await fileSystem.access(
+      nearest.authorityPath,
+      constants.R_OK | constants.W_OK | constants.X_OK,
+    );
+    await assertWorkAnchorsStable(anchors, fileSystem);
+    const fileSystemStatus = await fileSystem.statfs(nearest.authorityPath);
+    await assertWorkAnchorsStable(anchors, fileSystem);
+    const available = fileSystemStatus.bavail * fileSystemStatus.bsize;
+    if (available < 0n) throw new Error('invalid available disk bytes');
+    result = {
+      usable: true,
+      inspectedPath: nearest.identity.path,
+      availableBytes: available > BigInt(Number.MAX_SAFE_INTEGER)
+        ? Number.MAX_SAFE_INTEGER
+        : Number(available),
+    };
+  } catch {
+    result = {
+      usable: false,
+      inspectedPath: workspaceRoot,
+      availableBytes: null,
+    };
+  }
+  if (!await closeWorkDirectoryAnchors(anchors)) {
+    return {
+      usable: false,
+      inspectedPath: workspaceRoot,
+      availableBytes: null,
+    };
+  }
+  return result;
+};
+
 const projectPathParts = (relativePath: string): string[] => {
   if (
     relativePath.length === 0
@@ -1126,89 +1347,87 @@ const hashProjectFileOnce = async (
 
 const SYSTEM_PREFLIGHT_FILE_SYSTEM: SystemPreflightFileSystem = {
   access: async (candidate, mode) => await access(candidate, mode),
+  lstat: async (candidate) => await lstat(candidate, {bigint: true}),
   open: async (candidate, flags) => await open(candidate, flags),
   openExistingProjectFile: async (scope, relativePath) =>
     await openExistingProjectFile(scope, relativePath),
+  realpath: async (candidate) => await realpath(candidate),
+  statfs: async (candidate) => await statfs(candidate, {bigint: true}),
 };
 
 export const createSystemPreflightFileSystem = (
-  fileSystem: SystemPreflightFileSystem = SYSTEM_PREFLIGHT_FILE_SYSTEM,
-): Pick<PreflightFileSystem, 'openExecutable' | 'hashProjectFile'> => ({
-  openExecutable: async (candidate) => {
-    await fileSystem.access(candidate, constants.X_OK);
-    const held = await fileSystem.open(candidate, SAFE_READ_FLAGS);
-    try {
-      const snapshot = await hashHeldRegularFile(held);
-      const executionPath = authorityPath(snapshot.identity);
-      await fileSystem.access(executionPath, constants.X_OK);
-      return {
-        executionPath,
-        snapshot,
-        revalidate: async () => {
-          let verification: PreflightSystemFileHandle | undefined;
-          try {
-            await fileSystem.access(candidate, constants.X_OK);
-            verification = await fileSystem.open(candidate, SAFE_READ_FLAGS);
-            const current = await hashHeldRegularFile(verification);
-            await fileSystem.access(
-              authorityPath(current.identity),
-              constants.X_OK,
-            );
-            return sameSnapshot(snapshot, current);
-          } catch {
-            return false;
-          } finally {
-            if (verification !== undefined) await verification.close();
-          }
-        },
-        close: async () => await held.close(),
-      };
-    } catch (error) {
-      await held.close();
-      throw error;
-    }
-  },
-  hashProjectFile: async (scope, relativePath, maxBytes) => {
-    try {
-      if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
-        throw new ProjectFontError('ENV_FONT_INVALID');
+  overrides: Partial<SystemPreflightFileSystem> = {},
+): Pick<
+  PreflightFileSystem,
+  'openExecutable' | 'hashProjectFile' | 'inspectWorkDirectory'
+> => {
+  const fileSystem: SystemPreflightFileSystem = {
+    ...SYSTEM_PREFLIGHT_FILE_SYSTEM,
+    ...overrides,
+  };
+  return {
+    openExecutable: async (candidate) => {
+      await fileSystem.access(candidate, constants.X_OK);
+      const held = await fileSystem.open(candidate, SAFE_READ_FLAGS);
+      try {
+        const snapshot = await hashHeldRegularFile(held);
+        const executionPath = authorityPath(snapshot.identity);
+        await fileSystem.access(executionPath, constants.X_OK);
+        return {
+          executionPath,
+          snapshot,
+          revalidate: async () => {
+            let verification: PreflightSystemFileHandle | undefined;
+            try {
+              await fileSystem.access(candidate, constants.X_OK);
+              verification = await fileSystem.open(candidate, SAFE_READ_FLAGS);
+              const current = await hashHeldRegularFile(verification);
+              await fileSystem.access(
+                authorityPath(current.identity),
+                constants.X_OK,
+              );
+              return sameSnapshot(snapshot, current);
+            } catch {
+              return false;
+            } finally {
+              if (verification !== undefined) await verification.close();
+            }
+          },
+          close: async () => await held.close(),
+        };
+      } catch (error) {
+        await held.close();
+        throw error;
       }
-      const initial = await hashProjectFileOnce(
-        scope,
-        relativePath,
-        maxBytes,
-        fileSystem,
-      );
-      const verification = await hashProjectFileOnce(
-        scope,
-        relativePath,
-        maxBytes,
-        fileSystem,
-      );
-      if (!sameSnapshot(initial, verification)) {
-        throw new ProjectFontError('ENV_FONT_INVALID');
+    },
+    hashProjectFile: async (scope, relativePath, maxBytes) => {
+      try {
+        if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+          throw new ProjectFontError('ENV_FONT_INVALID');
+        }
+        const initial = await hashProjectFileOnce(
+          scope,
+          relativePath,
+          maxBytes,
+          fileSystem,
+        );
+        const verification = await hashProjectFileOnce(
+          scope,
+          relativePath,
+          maxBytes,
+          fileSystem,
+        );
+        if (!sameSnapshot(initial, verification)) {
+          throw new ProjectFontError('ENV_FONT_INVALID');
+        }
+        return initial;
+      } catch (error) {
+        throw mapProjectFontError(error);
       }
-      return initial;
-    } catch (error) {
-      throw mapProjectFontError(error);
-    }
-  },
-});
-
-const nearestExistingDirectory = async (candidate: string): Promise<string> => {
-  let current = candidate;
-  while (true) {
-    try {
-      const status = await stat(current);
-      if (!status.isDirectory()) throw new Error('path is not a directory');
-      return current;
-    } catch (error) {
-      if (!isNodeError(error) || error.code !== 'ENOENT') throw error;
-      const parent = path.dirname(current);
-      if (parent === current) throw error;
-      current = parent;
-    }
-  }
+    },
+    inspectWorkDirectory: async (workspaceRoot, projectId) =>
+      await inspectSystemWorkDirectory(workspaceRoot, projectId, fileSystem),
+  };
 };
 
 const resolveFromPath = async (
@@ -1252,23 +1471,6 @@ export const createSystemPreflightDependencies = (
     fileSystem: {
       realpath,
       ...safeFiles,
-      inspectDirectory: async (candidate) => {
-        try {
-          const inspectedPath = await nearestExistingDirectory(candidate);
-          await access(
-            inspectedPath,
-            constants.R_OK | constants.W_OK | constants.X_OK,
-          );
-          return {usable: true, inspectedPath};
-        } catch {
-          return {usable: false, inspectedPath: candidate};
-        }
-      },
-      statfsAvailableBytes: async (candidate) => {
-        const inspectedPath = await nearestExistingDirectory(candidate);
-        const value = await statfs(inspectedPath);
-        return value.bavail * value.bsize;
-      },
     },
   };
 };

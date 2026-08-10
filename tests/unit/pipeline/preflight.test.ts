@@ -1,7 +1,20 @@
 import {createHash} from 'node:crypto';
 import {constants} from 'node:fs';
+import {
+  access as accessPath,
+  lstat,
+  mkdir,
+  mkdtemp,
+  realpath,
+  rename,
+  rm,
+  statfs as statfsPath,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
 import path from 'node:path';
-import {describe, expect, it, vi} from 'vitest';
+import {afterEach, describe, expect, it, vi} from 'vitest';
 import {
   createEditFixture,
   createProjectFixture,
@@ -29,6 +42,7 @@ import {
   type SourceMeterDependencies,
   type SourceMeterStat,
 } from '../../../src/cli/videoctl';
+import {createRunStore} from '../../../src/pipeline/run-store';
 
 const GIB = 1024 ** 3;
 const FFMPEG_SELECTION = '/configured/ffmpeg';
@@ -41,6 +55,20 @@ const FFPROBE_LINK = '/opt/homebrew/bin/ffprobe';
 const FFPROBE_REAL = '/opt/homebrew/Cellar/ffmpeg/8.0/bin/ffprobe';
 const FFPROBE_AUTHORITY = '/.vol/1/103';
 const WORK_DIRECTORY = '/workspace/.work/demo';
+const workInspectionTempDirectories: string[] = [];
+
+const makeWorkInspectionDirectory = async (prefix: string): Promise<string> => {
+  const directory = await mkdtemp(path.join(tmpdir(), prefix));
+  workInspectionTempDirectories.push(directory);
+  return directory;
+};
+
+afterEach(async () => {
+  const directories = workInspectionTempDirectories.splice(0);
+  await Promise.all(directories.map(async (directory) => {
+    await rm(directory, {recursive: true, force: true});
+  }));
+});
 
 const encoderTable = (rows: readonly string[]): string => [
   'Encoders:',
@@ -300,13 +328,23 @@ const fixture = (overrides: FixtureOverrides = {}) => {
     };
   });
 
-  const inspectDirectory = vi.fn(async (candidate: string) => (
+  const inspectWorkDirectory = vi.fn(async (
+    workspaceRoot: string,
+    projectId: string,
+  ) => (
     overrides.workDirectoryUsable === false
-      ? {usable: false, reason: 'not writable', inspectedPath: candidate}
-      : {usable: true, inspectedPath: candidate}
+      ? {
+          usable: false,
+          reason: 'not writable',
+          inspectedPath: workspaceRoot,
+          availableBytes: null,
+        }
+      : {
+          usable: true,
+          inspectedPath: path.join(workspaceRoot, '.work', projectId),
+          availableBytes: overrides.availableBytes ?? 20 * GIB,
+        }
   ));
-
-  const statfsAvailableBytes = vi.fn(async () => overrides.availableBytes ?? 20 * GIB);
 
   const dependencies: PreflightDependencies = {
     runtime: {
@@ -319,8 +357,7 @@ const fixture = (overrides: FixtureOverrides = {}) => {
       realpath,
       openExecutable,
       hashProjectFile,
-      inspectDirectory,
-      statfsAvailableBytes,
+      inspectWorkDirectory,
     },
   };
 
@@ -344,8 +381,7 @@ const fixture = (overrides: FixtureOverrides = {}) => {
     hashProjectFile,
     heldAuthorities,
     toolStates,
-    inspectDirectory,
-    statfsAvailableBytes,
+    inspectWorkDirectory,
   };
 };
 
@@ -818,6 +854,154 @@ describe('system preflight file access', () => {
     expect(system.access).toHaveBeenCalledWith('/tool', constants.X_OK);
     expect(system.access).toHaveBeenCalledWith('/.vol/2/20', constants.X_OK);
     system.expectAllClosed();
+  });
+});
+
+describe('system work directory inspection', () => {
+  it('rejects an external .work symlink without creating a Run', async () => {
+    const workspaceRoot = await makeWorkInspectionDirectory('preflight-workspace-');
+    const outsideRoot = await makeWorkInspectionDirectory('preflight-outside-');
+    await symlink(outsideRoot, path.join(workspaceRoot, '.work'));
+    const fileSystem = createSystemPreflightFileSystem();
+
+    const inspection = await fileSystem.inspectWorkDirectory(
+      workspaceRoot,
+      'demo',
+    );
+    const preflight = fixture();
+    preflight.input.workspaceRoot = workspaceRoot;
+    preflight.input.workDirectory = path.join(workspaceRoot, '.work', 'demo');
+    preflight.dependencies.fileSystem.inspectWorkDirectory =
+      fileSystem.inspectWorkDirectory;
+    const result = await runPreflight(preflight.input, preflight.dependencies);
+
+    expect(inspection).toMatchObject({usable: false, availableBytes: null});
+    expect(errorCheck(result, 'work-directory')).toMatchObject({
+      code: 'ENV_WORK_DIRECTORY_UNAVAILABLE',
+    });
+    expect(errorCheck(result, 'disk-space')).toMatchObject({
+      code: 'ENV_WORK_DIRECTORY_UNAVAILABLE',
+    });
+    expect(result.checks).not.toContainEqual(expect.objectContaining({
+      id: 'disk-space',
+      severity: 'info',
+    }));
+    await expect(createRunStore(workspaceRoot).createRun('demo', 'run-one'))
+      .rejects.toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
+    await expect(lstat(path.join(outsideRoot, 'demo')))
+      .rejects.toMatchObject({code: 'ENOENT'});
+  });
+
+  it('rejects an external project work symlink', async () => {
+    const workspaceRoot = await makeWorkInspectionDirectory('preflight-workspace-');
+    const outsideRoot = await makeWorkInspectionDirectory('preflight-outside-');
+    await mkdir(path.join(workspaceRoot, '.work'));
+    await symlink(outsideRoot, path.join(workspaceRoot, '.work', 'demo'));
+    const fileSystem = createSystemPreflightFileSystem();
+
+    const inspection = await fileSystem.inspectWorkDirectory(
+      workspaceRoot,
+      'demo',
+    );
+
+    expect(inspection).toMatchObject({usable: false, availableBytes: null});
+    await expect(createRunStore(workspaceRoot).createRun('demo', 'run-one'))
+      .rejects.toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
+    await expect(lstat(path.join(outsideRoot, 'runs')))
+      .rejects.toMatchObject({code: 'ENOENT'});
+  });
+
+  it('uses the safe workspace ancestor when .work is missing without creating it', async () => {
+    const workspaceRoot = await makeWorkInspectionDirectory('preflight-workspace-');
+    const canonicalWorkspace = await realpath(workspaceRoot);
+    const fileSystem = createSystemPreflightFileSystem();
+
+    const inspection = await fileSystem.inspectWorkDirectory(
+      workspaceRoot,
+      'demo',
+    );
+
+    expect(inspection).toMatchObject({
+      usable: true,
+      inspectedPath: canonicalWorkspace,
+      availableBytes: expect.any(Number),
+    });
+    await expect(lstat(path.join(workspaceRoot, '.work')))
+      .rejects.toMatchObject({code: 'ENOENT'});
+  });
+
+  it('accepts an existing plain project work directory', async () => {
+    const workspaceRoot = await makeWorkInspectionDirectory('preflight-workspace-');
+    const workDirectory = path.join(workspaceRoot, '.work', 'demo');
+    await mkdir(workDirectory, {recursive: true});
+    const canonicalWorkDirectory = await realpath(workDirectory);
+    const permissionTargets: string[] = [];
+    const statfsTargets: string[] = [];
+    const fileSystem = createSystemPreflightFileSystem({
+      access: async (candidate, mode) => {
+        permissionTargets.push(candidate);
+        await accessPath(candidate, mode);
+      },
+      statfs: async (candidate) => {
+        statfsTargets.push(candidate);
+        return await statfsPath(candidate, {bigint: true});
+      },
+    });
+
+    const inspection = await fileSystem.inspectWorkDirectory(
+      workspaceRoot,
+      'demo',
+    );
+
+    expect(inspection).toMatchObject({
+      usable: true,
+      inspectedPath: canonicalWorkDirectory,
+      availableBytes: expect.any(Number),
+    });
+    expect(permissionTargets).toEqual([statfsTargets[0]]);
+    expect(permissionTargets[0]).toMatch(/^\/\.vol\/\d+\/\d+$/u);
+  });
+
+  it('rejects a non-directory fixed work component', async () => {
+    const workspaceRoot = await makeWorkInspectionDirectory('preflight-workspace-');
+    await writeFile(path.join(workspaceRoot, '.work'), 'not a directory');
+    const fileSystem = createSystemPreflightFileSystem();
+
+    const inspection = await fileSystem.inspectWorkDirectory(
+      workspaceRoot,
+      'demo',
+    );
+
+    expect(inspection).toMatchObject({usable: false, availableBytes: null});
+  });
+
+  it('fails closed when the workspace root is substituted during inspection', async () => {
+    const workspaceRoot = await makeWorkInspectionDirectory('preflight-workspace-');
+    const outsideRoot = await makeWorkInspectionDirectory('preflight-outside-');
+    const displacedWorkspace = `${workspaceRoot}-original`;
+    workInspectionTempDirectories.push(displacedWorkspace);
+    await mkdir(path.join(workspaceRoot, '.work', 'demo'), {recursive: true});
+    let substituted = false;
+    const fileSystem = createSystemPreflightFileSystem({
+      access: async (candidate, mode) => {
+        if (!substituted && candidate.startsWith('/.vol/')) {
+          substituted = true;
+          await rename(workspaceRoot, displacedWorkspace);
+          await symlink(outsideRoot, workspaceRoot);
+        }
+        await accessPath(candidate, mode);
+      },
+    });
+
+    const inspection = await fileSystem.inspectWorkDirectory(
+      workspaceRoot,
+      'demo',
+    );
+
+    expect(substituted).toBe(true);
+    expect(inspection).toMatchObject({usable: false, availableBytes: null});
+    await expect(lstat(path.join(outsideRoot, '.work')))
+      .rejects.toMatchObject({code: 'ENOENT'});
   });
 });
 
@@ -1406,11 +1590,11 @@ describe('runPreflight', () => {
   ])(
     'estimates disk as max(sourceBytes * 3, 2 GiB)',
     async ({sourceBytes, expectedRequiredBytes}) => {
-      const {input, dependencies, statfsAvailableBytes} = fixture({sourceBytes});
+      const {input, dependencies, inspectWorkDirectory} = fixture({sourceBytes});
 
       const result = await runPreflight(input, dependencies);
 
-      expect(statfsAvailableBytes).toHaveBeenCalledWith(WORK_DIRECTORY);
+      expect(inspectWorkDirectory).toHaveBeenCalledWith('/workspace', 'demo');
       expect(result.system).toMatchObject({
         sourceBytes,
         requiredBytes: expectedRequiredBytes,
@@ -1437,16 +1621,40 @@ describe('runPreflight', () => {
   });
 
   it('checks work directory usability without writing to it', async () => {
-    const {input, dependencies, inspectDirectory} = fixture({
+    const {input, dependencies, inspectWorkDirectory} = fixture({
       workDirectoryUsable: false,
     });
+    input.workDirectory = '/external/override';
 
     const result = await runPreflight(input, dependencies);
 
-    expect(inspectDirectory).toHaveBeenCalledWith(WORK_DIRECTORY);
+    expect(inspectWorkDirectory).toHaveBeenCalledWith('/workspace', 'demo');
+    expect(result.system.workDirectory).toBe(WORK_DIRECTORY);
     expect(errorCheck(result, 'work-directory')).toMatchObject({
       code: 'ENV_WORK_DIRECTORY_UNAVAILABLE',
       affectedPaths: [WORK_DIRECTORY],
+    });
+    expect(errorCheck(result, 'disk-space')).toMatchObject({
+      code: 'ENV_WORK_DIRECTORY_UNAVAILABLE',
+    });
+    expect(result.checks).not.toContainEqual(expect.objectContaining({
+      id: 'disk-space',
+      severity: 'info',
+    }));
+  });
+
+  it('rejects an unvalidated project id before deriving work authority', async () => {
+    const {input, dependencies, inspectWorkDirectory} = fixture();
+    input.project.id = '../escape';
+
+    const result = await runPreflight(input, dependencies);
+
+    expect(inspectWorkDirectory).not.toHaveBeenCalled();
+    expect(errorCheck(result, 'work-directory')).toMatchObject({
+      code: 'ENV_WORK_DIRECTORY_UNAVAILABLE',
+    });
+    expect(errorCheck(result, 'disk-space')).toMatchObject({
+      code: 'ENV_WORK_DIRECTORY_UNAVAILABLE',
     });
   });
 
