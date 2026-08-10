@@ -281,7 +281,6 @@ interface SourceIdentity {
 
 interface SourceAuthority {
   identity: SourceIdentity;
-  volumePath: string;
   hash: string;
 }
 
@@ -381,7 +380,6 @@ const establishSourceAuthority = async (
         assertSourceIdentity(await inspectSourceHandle(handle, asset), identity, asset);
         return {
           identity,
-          volumePath: path.join('/.vol', String(identity.dev), String(identity.ino)),
           hash,
         };
       },
@@ -422,14 +420,16 @@ const assertProjectSourceIdentity = async (
   }
 };
 
-const consumeAuthorityHandle = async <T>(
+const consumeScopedSourceHandle = async <T>(
+  input: IngestInput,
+  dependencies: IngestDependencies,
   asset: IngestAsset,
   authority: SourceAuthority,
   consumer: (handle: FileHandle) => Promise<T>,
 ): Promise<T> => await withFreshHandle(
-  async () => await open(
-    authority.volumePath,
-    constants.O_RDONLY | O_NOFOLLOW_ANY,
+  async () => await dependencies.fileSystem.openExistingProjectFile(
+    input.projectDirectory,
+    asset.sourcePath,
   ),
   async (handle) => {
     assertSourceIdentity(
@@ -476,12 +476,17 @@ const consumeSource = async <T>(
   consumer: (handle: FileHandle) => Promise<T>,
 ): Promise<T> => {
   try {
-    await assertProjectSourceIdentity(input, dependencies, asset, authority);
     let outcome: HandleOutcome<T>;
     try {
       outcome = {
         ok: true,
-        value: await consumeAuthorityHandle(asset, authority, consumer),
+        value: await consumeScopedSourceHandle(
+          input,
+          dependencies,
+          asset,
+          authority,
+          consumer,
+        ),
       };
     } catch (error) {
       outcome = {ok: false, error};
@@ -736,6 +741,7 @@ const decodeAudioSource = async (
   dependencies: IngestDependencies,
   asset: IngestAsset,
   authority: SourceAuthority,
+  durationMs: number,
 ): Promise<void> => await consumeSource(
   input,
   dependencies,
@@ -743,19 +749,36 @@ const decodeAudioSource = async (
   authority,
   'audio sample decode failed',
   async (handle) => {
-    await dependencies.runProcess(
+    const result = await dependencies.runProcess(
       input.ffmpegExecutable,
       [
         '-v', 'error',
+        '-nostats',
         '-i', '/dev/fd/3',
         '-map', '0:a:0',
-        '-t', '0.250',
+        '-t', (durationMs / 1000).toFixed(3),
+        '-frames:a', '1',
         '-vn',
-        '-f', 'null',
-        '-',
+        '-f', 'framehash',
+        'pipe:1',
       ],
       processOptions(input, [handle.fd]),
     );
+    const hasDecodedFrame = result.stdout.split(/\r?\n/).some((line) => {
+      const normalizedLine = line.trim();
+      if (normalizedLine.startsWith('#')) return false;
+      const fields = normalizedLine.split(',').map((field) => field.trim());
+      if (fields.length < 6 || !/^\d+$/.test(fields[0] ?? '')) return false;
+      const frameDuration = Number(fields[3]);
+      const frameSize = Number(fields[4]);
+      return Number.isSafeInteger(frameDuration)
+        && frameDuration > 0
+        && Number.isSafeInteger(frameSize)
+        && frameSize > 0;
+    });
+    if (!hasDecodedFrame) {
+      throw new Error('ffmpeg reported zero decoded audio frames');
+    }
   },
 );
 
@@ -801,7 +824,24 @@ const transcodeAsset = async (
   asset: IngestAsset,
   authority: SourceAuthority,
   sourceHash: string,
+  sourceStream: VideoStreamProbe,
 ): Promise<IngestAssetRecord> => {
+  const colorPrimaries = sourceStream.colorPrimaries?.toLowerCase();
+  const colorTransfer = sourceStream.colorTransfer?.toLowerCase();
+  const colorSpace = sourceStream.colorSpace?.toLowerCase();
+  const colorRange = sourceStream.colorRange?.toLowerCase();
+  if (
+    colorPrimaries === undefined
+    || colorTransfer === undefined
+    || colorSpace === undefined
+    || (colorRange !== 'tv' && colorRange !== 'pc')
+  ) {
+    throw new IngestError(
+      'ASSET_HDR_UNSUPPORTED',
+      asset.assetId,
+      ['color metadata is missing or unsupported'],
+    );
+  }
   const renderPath = `assets/${asset.assetId}/render.mp4`;
   await dependencies.fileSystem.ensureRunDirectory(
     input.runDirectory,
@@ -826,6 +866,12 @@ const transcodeAsset = async (
               ffmpegExecutable: input.ffmpegExecutable,
               sourceFd: sourceHandle.fd,
               outputFd: outputHandle.fd,
+              sourceColor: {
+                primaries: colorPrimaries,
+                transfer: colorTransfer,
+                space: colorSpace,
+                range: colorRange,
+              },
               runner: dependencies.runProcess,
               ...(input.timeoutMs === undefined ? {} : {timeoutMs: input.timeoutMs}),
               ...(input.signal === undefined ? {} : {signal: input.signal}),
@@ -952,7 +998,14 @@ const ingestVideo = async (
   const decision = decideVideoCompatibility(probe, {decodable: true});
   if (decision.compatibility === 'rejected') rejectDecision(asset, decision);
   if (decision.compatibility === 'transcoded') {
-    return await transcodeAsset(input, dependencies, asset, authority, sourceHash);
+    return await transcodeAsset(
+      input,
+      dependencies,
+      asset,
+      authority,
+      sourceHash,
+      stream,
+    );
   }
   return videoRecord(
     asset,
@@ -973,21 +1026,29 @@ const ingestAudio = async (
   sourceHash: string,
   probe: MediaProbe,
 ): Promise<IngestAssetRecord> => {
-  if (probe.audioStreams.length === 0) {
+  const stream = probe.audioStreams[0];
+  if (stream === undefined) {
     throw new IngestError(
       'ASSET_DECODE_FAILED',
       asset.assetId,
       ['audio stream is missing'],
     );
   }
-  await decodeAudioSource(input, dependencies, asset, authority);
+  if (stream.durationMs === undefined || stream.durationMs <= 0) {
+    throw new IngestError(
+      'ASSET_DECODE_FAILED',
+      asset.assetId,
+      ['primary audio duration is missing'],
+    );
+  }
+  await decodeAudioSource(input, dependencies, asset, authority, stream.durationMs);
   return {
     kind: 'audio',
     sourcePath: asset.sourcePath,
     sourceHash,
     renderPath: asset.sourcePath,
     renderScope: 'project',
-    durationMs: probe.durationMs,
+    durationMs: stream.durationMs,
     compatibility: 'direct',
   };
 };

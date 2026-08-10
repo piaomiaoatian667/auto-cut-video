@@ -147,6 +147,26 @@ describe('video compatibility', () => {
       reasons: ['Dolby Vision is unsupported'],
     },
     {
+      name: 'HDR10+ dynamic metadata',
+      overrides: {side_data_list: [{side_data_type: 'HDR10+ Dynamic Metadata'}]},
+      reasons: ['HDR side data is unsupported (HDR10+ Dynamic Metadata)'],
+    },
+    {
+      name: 'mastering display metadata',
+      overrides: {side_data_list: [{side_data_type: 'Mastering display metadata'}]},
+      reasons: ['HDR side data is unsupported (Mastering display metadata)'],
+    },
+    {
+      name: 'content light level metadata',
+      overrides: {side_data_list: [{side_data_type: 'Content light level metadata'}]},
+      reasons: ['HDR side data is unsupported (Content light level metadata)'],
+    },
+    {
+      name: 'unknown video side data',
+      overrides: {side_data_list: [{side_data_type: 'Future Color Volume Metadata'}]},
+      reasons: ['video side data is unsupported (Future Color Volume Metadata)'],
+    },
+    {
       name: 'missing color metadata',
       overrides: {color_primaries: undefined},
       reasons: ['color metadata is missing or unsupported'],
@@ -269,6 +289,12 @@ describe('transcodeVideo', () => {
       ffmpegExecutable: '/tools/ffmpeg',
       sourceFd: 41,
       outputFd: 42,
+      sourceColor: {
+        primaries: 'bt470bg',
+        transfer: 'bt470bg',
+        space: 'bt470bg',
+        range: 'tv',
+      },
       runner: async (command, args, options) => {
         calls.push({
           command,
@@ -289,7 +315,11 @@ describe('transcodeVideo', () => {
         '-i', '/dev/fd/3',
         '-map', '0:v:0',
         '-an',
-        '-vf', 'fps=30,format=yuv420p',
+        '-vf', [
+          'colorspace=space=bt709:trc=bt709:primaries=bt709:range=tv:ispace=bt470bg:itrc=bt470bg:iprimaries=bt470bg:irange=tv:fast=0',
+          'fps=30',
+          'format=yuv420p',
+        ].join(','),
         '-fps_mode', 'cfr',
         '-c:v', 'libx264',
         '-crf', '18',

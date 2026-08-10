@@ -242,25 +242,32 @@ const rotationFromDisplayMatrix = (value: unknown, field: string): number => {
   });
   const first = matrix[0]?.[0];
   const second = matrix[0]?.[1];
+  const perspectiveU = matrix[0]?.[2];
   const third = matrix[1]?.[0];
   const fourth = matrix[1]?.[1];
-  const perspectiveX = matrix[2]?.[0];
-  const perspectiveY = matrix[2]?.[1];
-  const perspectiveScale = matrix[2]?.[2];
+  const perspectiveV = matrix[1]?.[2];
+  const translationX = matrix[2]?.[0];
+  const translationY = matrix[2]?.[1];
+  const homogeneousScale = matrix[2]?.[2];
   if (
     first === undefined
     || second === undefined
+    || perspectiveU === undefined
     || third === undefined
     || fourth === undefined
-    || perspectiveX === undefined
-    || perspectiveY === undefined
-    || perspectiveScale === undefined
+    || perspectiveV === undefined
+    || translationX === undefined
+    || translationY === undefined
+    || homogeneousScale === undefined
+    || matrix.flat().some((entry) => entry < -2_147_483_648 || entry > 2_147_483_647)
     || (first === 0 && second === 0)
     || third !== -second
     || fourth !== first
-    || perspectiveX !== 0
-    || perspectiveY !== 0
-    || perspectiveScale === 0
+    || perspectiveU !== 0
+    || perspectiveV !== 0
+    || translationX !== 0
+    || translationY !== 0
+    || homogeneousScale !== 1_073_741_824
   ) {
     return fail(`${field} does not encode a rotation`);
   }
@@ -355,14 +362,12 @@ const parseVideoStream = (stream: JsonRecord, path: string): VideoStreamProbe =>
     ...(frameCount === undefined ? {} : {frameCount}),
     ...(bitsPerRawSample === undefined ? {} : {bitsPerRawSample}),
     ...(bitsPerCodedSample === undefined ? {} : {bitsPerCodedSample}),
-    sideDataTypes: sideData.flatMap((entry, index) => {
-      const sideDataType = optionalString(
+    sideDataTypes: sideData.map((entry, index) =>
+      requiredString(
         entry,
         'side_data_type',
         `${path}.side_data_list[${index}]`,
-      );
-      return sideDataType === undefined ? [] : [sideDataType];
-    }),
+      )),
   };
 };
 
@@ -521,41 +526,75 @@ const SDR_PRIMARIES = new Set([
   'jedec-p22',
   'smpte170m',
   'smpte240m',
+  'smpte428',
   'smpte431',
   'smpte432',
 ]);
 
 const SDR_TRANSFERS = new Set([
-  'bt1361e',
   'bt2020-10',
   'bt2020-12',
+  'bt470bg',
+  'bt470m',
   'bt709',
   'gamma22',
   'gamma28',
   'iec61966-2-1',
   'iec61966-2-4',
   'linear',
-  'log',
-  'log_sqrt',
   'smpte170m',
   'smpte240m',
 ]);
 
 const SDR_SPACES = new Set([
-  'bt2020c',
   'bt2020nc',
   'bt470bg',
   'bt709',
-  'chroma-derived-c',
-  'chroma-derived-nc',
   'fcc',
   'gbr',
-  'rgb',
   'smpte170m',
-  'smpte2085',
   'smpte240m',
   'ycgco',
 ]);
+
+const SAFE_VIDEO_SIDE_DATA = new Set([
+  'display matrix',
+  'frame cropping',
+  'rotation',
+  'spherical mapping',
+  'stereo 3d',
+]);
+
+const isDolbyVisionSideData = (value: string): boolean => {
+  const normalized = value.toLowerCase();
+  return normalized.includes('dolby vision') || normalized.includes('dovi');
+};
+
+const isHdrSideData = (value: string): boolean => {
+  const normalized = value.toLowerCase();
+  return normalized.includes('hdr')
+    || normalized.includes('mastering display')
+    || normalized.includes('content light level')
+    || normalized.includes('content colour volume')
+    || normalized.includes('content color volume')
+    || normalized.includes('ambient viewing environment')
+    || normalized.includes('alternative transfer characteristics')
+    || normalized.includes('icc profile');
+};
+
+const unsupportedSideDataReasons = (stream: VideoStreamProbe): string[] => {
+  const reasons = new Set<string>();
+  for (const sideDataType of stream.sideDataTypes) {
+    const normalized = sideDataType.toLowerCase();
+    if (SAFE_VIDEO_SIDE_DATA.has(normalized) || isDolbyVisionSideData(sideDataType)) {
+      continue;
+    }
+    reasons.add(isHdrSideData(sideDataType)
+      ? `HDR side data is unsupported (${sideDataType})`
+      : `video side data is unsupported (${sideDataType})`);
+  }
+  return [...reasons];
+};
 
 const hasDolbyVision = (stream: VideoStreamProbe): boolean => {
   const fields = [
@@ -677,6 +716,7 @@ export const decideVideoCompatibility = (
 
   const rejectionReasons: string[] = [];
   if (hasDolbyVision(stream)) rejectionReasons.push('Dolby Vision is unsupported');
+  rejectionReasons.push(...unsupportedSideDataReasons(stream));
   const bitDepth = pixelBitDepth(stream);
   if (bitDepth === undefined) {
     rejectionReasons.push(

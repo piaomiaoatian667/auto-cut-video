@@ -12,7 +12,7 @@ import {
 } from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
-import {describe, expect, it, onTestFinished} from 'vitest';
+import {describe, expect, it, onTestFinished, vi} from 'vitest';
 import {
   createRunStore,
   ensureRunDirectory,
@@ -42,6 +42,7 @@ import {
   createTestImage,
   createTestMusic,
   createTestVideo,
+  createZeroDurationAac,
 } from '../../helpers/media-fixtures';
 import {createTempProject} from '../../helpers/temp-project';
 
@@ -234,8 +235,10 @@ describe('runIngest', () => {
     };
     const system = createSystemIngestDependencies();
     const projectHandles: FileHandle[] = [];
+    const activeProjectFds = new Set<number>();
     const runReadHandles: FileHandle[] = [];
     const runNewHandles: FileHandle[] = [];
+    let sourceProcessPhase = true;
     const processCalls: Array<{
       command: string;
       args: string[];
@@ -245,7 +248,9 @@ describe('runIngest', () => {
       manifestFileOps: system.manifestFileOps,
       runProcess: async (command, args, options) => {
         const fds = [...(options.extraStdioFds ?? [])];
+        if (sourceProcessPhase) expect(activeProjectFds.has(fds[0]!)).toBe(true);
         const result = await runProcess(command, args, options);
+        if (args.includes('/dev/fd/4')) sourceProcessPhase = false;
         for (const fd of fds) expect(fstatSync(fd).isFile()).toBe(true);
         processCalls.push({command, args: [...args], fds});
         return result;
@@ -254,6 +259,17 @@ describe('runIngest', () => {
         ...system.fileSystem,
         openExistingProjectFile: async (scope, relativePath) => {
           const handle = await system.fileSystem.openExistingProjectFile(scope, relativePath);
+          vi.spyOn(handle, 'read');
+          const descriptor = handle.fd;
+          const close = handle.close.bind(handle);
+          activeProjectFds.add(descriptor);
+          handle.close = async () => {
+            try {
+              await close();
+            } finally {
+              activeProjectFds.delete(descriptor);
+            }
+          };
           projectHandles.push(handle);
           return handle;
         },
@@ -318,6 +334,9 @@ describe('runIngest', () => {
 
     expect(projectHandles).toHaveLength(14);
     expect(new Set(projectHandles).size).toBe(projectHandles.length);
+    expect(projectHandles.filter((handle) =>
+      vi.mocked(handle.read).mock.calls.length > 0)).toHaveLength(2);
+    expect(activeProjectFds).toEqual(new Set());
     expect(runReadHandles).toHaveLength(8);
     expect(new Set(runReadHandles).size).toBe(runReadHandles.length);
     expect(runNewHandles).toHaveLength(2);
@@ -340,6 +359,42 @@ describe('runIngest', () => {
 
     expect(await readFile(sourcePath)).toEqual(sourceBefore.bytes);
     expect((await stat(sourcePath, {bigint: true})).mtimeNs).toBe(sourceBefore.stats.mtimeNs);
+  });
+
+  it.each([
+    'bt470bg',
+    'smpte170m',
+  ] as const)('converts %s SDR frames to limited-range BT.709', async (colorProfile) => {
+    const project = await makeProject(`colorspace-${colorProfile}`);
+    await createTestVideo(
+      path.join(project.projectRoot, 'assets/source/interview.mp4'),
+      1,
+      {includeAudio: false, colorProfile},
+    );
+
+    const {manifest} = await runIngest(inputFor(project, [{
+      assetId: 'interview',
+      kind: 'video',
+      sourcePath: 'assets/source/interview.mp4',
+    }]), createSystemIngestDependencies());
+    const outputProbe = await probeRunFile(
+      project.runDirectory,
+      'assets/interview/render.mp4',
+    );
+
+    expect(manifest.assets.interview).toMatchObject({
+      compatibility: 'transcoded',
+      renderScope: 'run',
+    });
+    expect(outputProbe.videoStreams[0]).toMatchObject({
+      codec: 'h264',
+      pixelFormat: 'yuv420p',
+      colorPrimaries: 'bt709',
+      colorTransfer: 'bt709',
+      colorSpace: 'bt709',
+      colorRange: 'tv',
+    });
+    expect(outputProbe.audioStreams).toHaveLength(0);
   });
 
   it('samples first, middle, and tail from the primary video duration, not longer audio', async () => {
@@ -418,9 +473,7 @@ describe('runIngest', () => {
       runProcess: async (command, args, options) => await runProcess(
         command,
         args.includes('/dev/fd/4')
-          ? args.map((argument) => argument === 'fps=30,format=yuv420p'
-            ? 'fps=24,format=yuv420p'
-            : argument)
+          ? args.map((argument) => argument.replace('fps=30', 'fps=24'))
           : args,
         options,
       ),
@@ -617,6 +670,51 @@ describe('runIngest', () => {
     await expectMissingManifest(project.runDirectory);
   });
 
+  it('keeps the scoped probe handle on the original inode during an ABA path swap', async () => {
+    const project = await makeProject('probe-aba');
+    const sourcePath = path.join(project.projectRoot, 'assets/source/interview.mp4');
+    const replacementPath = path.join(project.projectRoot, 'assets/source/replacement.mp4');
+    const parkedPath = path.join(project.projectRoot, 'assets/source/interview-original.mp4');
+    await createTestVideo(sourcePath, 2, {includeAudio: false});
+    await createTestVideo(replacementPath, 1, {includeAudio: false});
+    const system = createSystemIngestDependencies();
+    let swapped = false;
+    let probedDurationMs: number | undefined;
+    const dependencies: IngestDependencies = {
+      ...system,
+      runProcess: async (command, args, options) => {
+        if (command !== FFPROBE_EXECUTABLE || swapped) {
+          return await runProcess(command, args, options);
+        }
+        swapped = true;
+        await rename(sourcePath, parkedPath);
+        await rename(replacementPath, sourcePath);
+        try {
+          const result = await runProcess(command, args, options);
+          probedDurationMs = parseFfprobeJson(result.stdout).durationMs;
+          return result;
+        } finally {
+          await rename(sourcePath, replacementPath);
+          await rename(parkedPath, sourcePath);
+        }
+      },
+    };
+
+    await expect(runIngest(inputFor(project, [{
+      assetId: 'interview',
+      kind: 'video',
+      sourcePath: 'assets/source/interview.mp4',
+    }]), dependencies)).rejects.toMatchObject({
+      code: 'ASSET_DECODE_FAILED',
+      assetId: 'interview',
+      reasons: ['source changed during ingest'],
+    });
+
+    expect(swapped).toBe(true);
+    expect(probedDurationMs).toBe(2000);
+    await expectMissingManifest(project.runDirectory);
+  });
+
   it('requires music assets to contain a decodable audio track', async () => {
     const project = await makeProject();
     await createTestVideo(
@@ -633,6 +731,112 @@ describe('runIngest', () => {
       code: 'ASSET_DECODE_FAILED',
       assetId: 'music',
       reasons: ['audio stream is missing'],
+    });
+    await expectMissingManifest(project.runDirectory);
+  });
+
+  it('uses the primary audio stream duration and requires a decoded framehash row', async () => {
+    const project = await makeProject('audio-duration');
+    await createTestVideo(
+      path.join(project.projectRoot, 'assets/source/music.mp4'),
+      1,
+      {audioSeconds: 3},
+    );
+    const system = createSystemIngestDependencies();
+    let audioDecodeArgs: readonly string[] | undefined;
+    const dependencies: IngestDependencies = {
+      ...system,
+      runProcess: async (command, args, options) => {
+        if (command === FFMPEG_EXECUTABLE && args.includes('0:a:0')) {
+          audioDecodeArgs = [...args];
+        }
+        return await runProcess(command, args, options);
+      },
+    };
+
+    const {manifest} = await runIngest(inputFor(project, [{
+      assetId: 'music',
+      kind: 'audio',
+      sourcePath: 'assets/source/music.mp4',
+    }]), dependencies);
+
+    expect(manifest.assets.music).toMatchObject({durationMs: 3000});
+    expect(audioDecodeArgs?.[audioDecodeArgs.indexOf('-t') + 1]).toBe('3.000');
+    expect(audioDecodeArgs).toContain('framehash');
+  });
+
+  it('rejects exit-zero audio decode output without a decoded framehash row', async () => {
+    const project = await makeProject('audio-no-samples');
+    await createTestMusic(path.join(project.projectRoot, 'assets/source/music.wav'), 1);
+    const system = createSystemIngestDependencies();
+    const dependencies: IngestDependencies = {
+      ...system,
+      runProcess: async (command, args, options) => {
+        if (command === FFMPEG_EXECUTABLE && args.includes('0:a:0')) {
+          return {
+            command,
+            args: [...args],
+            exitCode: 0,
+            signal: null,
+            stdout: [
+              '#format: frame checksums',
+              '#version: 2',
+              '#stream#, dts, pts, duration, size, hash',
+              '',
+            ].join('\n'),
+            stderr: '',
+            durationMs: 1,
+          };
+        }
+        return await runProcess(command, args, options);
+      },
+    };
+
+    await expect(runIngest(inputFor(project, [{
+      assetId: 'music',
+      kind: 'audio',
+      sourcePath: 'assets/source/music.wav',
+    }]), dependencies)).rejects.toMatchObject({
+      code: 'ASSET_DECODE_FAILED',
+      assetId: 'music',
+      reasons: ['audio sample decode failed'],
+    });
+    await expectMissingManifest(project.runDirectory);
+  });
+
+  it('accepts silent audio when it contains decodable samples', async () => {
+    const project = await makeProject('silent-audio');
+    await createTestMusic(
+      path.join(project.projectRoot, 'assets/source/silence.wav'),
+      1,
+      {silent: true},
+    );
+
+    const {manifest} = await runIngest(inputFor(project, [{
+      assetId: 'silence',
+      kind: 'audio',
+      sourcePath: 'assets/source/silence.wav',
+    }]), createSystemIngestDependencies());
+
+    expect(manifest.assets.silence).toMatchObject({
+      durationMs: 1000,
+      compatibility: 'direct',
+    });
+  });
+
+  it('rejects a zero-duration AAC stream without decodable samples', async () => {
+    const project = await makeProject('zero-aac');
+    await createZeroDurationAac(
+      path.join(project.projectRoot, 'assets/source/empty.aac'),
+    );
+
+    await expect(runIngest(inputFor(project, [{
+      assetId: 'empty',
+      kind: 'audio',
+      sourcePath: 'assets/source/empty.aac',
+    }]), createSystemIngestDependencies())).rejects.toMatchObject({
+      code: 'ASSET_DECODE_FAILED',
+      assetId: 'empty',
     });
     await expectMissingManifest(project.runDirectory);
   });

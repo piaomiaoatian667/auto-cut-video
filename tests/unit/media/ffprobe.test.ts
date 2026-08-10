@@ -129,6 +129,21 @@ describe('parseFfprobeJson', () => {
       },
       expected: 90,
     },
+    {
+      name: 'scaled display matrix text',
+      stream: {
+        ...videoStream,
+        side_data_list: [{
+          side_data_type: 'Display Matrix',
+          displaymatrix: [
+            '00000000:            0     -131072           0',
+            '00000001:       131072           0           0',
+            '00000002:            0           0  1073741824',
+          ].join('\n'),
+        }],
+      },
+      expected: 90,
+    },
   ])('parses rotation from $name', ({stream, expected}) => {
     const result = parseFfprobeJson(JSON.stringify(ffprobeDocument({
       streams: [stream],
@@ -181,6 +196,24 @@ describe('parseFfprobeJson', () => {
     expect(result.audioStreams[0]?.durationMs).toBe(3000);
   });
 
+  it('parses primary audio duration_ts/time_base without using format duration', () => {
+    const result = parseFfprobeJson(JSON.stringify({
+      streams: [{
+        ...audioStream,
+        duration: undefined,
+        duration_ts: 96_000,
+        time_base: '1/48000',
+      }],
+      format: {
+        format_name: 'mov,mp4,m4a,3gp,3g2,mj2',
+        duration: '5.000000',
+      },
+    }));
+
+    expect(result.durationMs).toBe(2000);
+    expect(result.audioStreams[0]?.durationMs).toBe(2000);
+  });
+
   it.each([
     {name: 'malformed JSON', input: '{'},
     {name: 'missing streams', input: JSON.stringify({format: {duration: '1'}})},
@@ -204,6 +237,9 @@ describe('parseFfprobeJson', () => {
     {name: 'missing pixel format', input: JSON.stringify(ffprobeDocument({
       streams: [{...videoStream, pix_fmt: undefined}, audioStream],
     }))},
+    {name: 'video side data without a type', input: JSON.stringify(ffprobeDocument({
+      streams: [{...videoStream, side_data_list: [{}]}, audioStream],
+    }))},
     {name: 'malformed display matrix', input: JSON.stringify(ffprobeDocument({
       streams: [{
         ...videoStream,
@@ -222,6 +258,58 @@ describe('parseFfprobeJson', () => {
             '00000000:            0      -65536           0',
             '00000001:            0           0           0',
             '00000002:            0           0  1073741824',
+          ].join('\n'),
+        }],
+      }],
+    }))},
+    {name: 'display matrix with horizontal perspective', input: JSON.stringify(ffprobeDocument({
+      streams: [{
+        ...videoStream,
+        side_data_list: [{
+          side_data_type: 'Display Matrix',
+          displaymatrix: [
+            '00000000:        65536           0           1',
+            '00000001:            0       65536           0',
+            '00000002:            0           0  1073741824',
+          ].join('\n'),
+        }],
+      }],
+    }))},
+    {name: 'display matrix with vertical perspective', input: JSON.stringify(ffprobeDocument({
+      streams: [{
+        ...videoStream,
+        side_data_list: [{
+          side_data_type: 'Display Matrix',
+          displaymatrix: [
+            '00000000:        65536           0           0',
+            '00000001:            0       65536           1',
+            '00000002:            0           0  1073741824',
+          ].join('\n'),
+        }],
+      }],
+    }))},
+    {name: 'display matrix with shear', input: JSON.stringify(ffprobeDocument({
+      streams: [{
+        ...videoStream,
+        side_data_list: [{
+          side_data_type: 'Display Matrix',
+          displaymatrix: [
+            '00000000:        65536        1024           0',
+            '00000001:            0       65536           0',
+            '00000002:            0           0  1073741824',
+          ].join('\n'),
+        }],
+      }],
+    }))},
+    {name: 'display matrix with invalid homogeneous scale', input: JSON.stringify(ffprobeDocument({
+      streams: [{
+        ...videoStream,
+        side_data_list: [{
+          side_data_type: 'Display Matrix',
+          displaymatrix: [
+            '00000000:        65536           0           0',
+            '00000001:            0       65536           0',
+            '00000002:            0           0           1',
           ].join('\n'),
         }],
       }],
