@@ -483,6 +483,9 @@ interface UnknownReportOutcomeProbe {
   armed: boolean;
   targetReport: string;
   parentSyncErrors: Error[];
+  postLinkStatError?: Error;
+  postLinkFaultInjected?: boolean;
+  postLinkCloseErrors?: Error[];
   commitParentHandleId?: number;
   parentSyncHandleIds: number[];
   linkedSource?: string;
@@ -506,6 +509,27 @@ const importPipelineModulesWithUnknownReportOutcomeProbe = async (
         if (!probe.armed) return handle;
         const openedPath = String(args[0]);
         const status = await handle.stat({bigint: true});
+        if (status.isFile()) {
+          return new Proxy(handle, {
+            get(target, property) {
+              if (property === 'stat') {
+                return async (...statArgs: Parameters<typeof target.stat>) => {
+                  if (
+                    probe.postLinkStatError !== undefined
+                    && probe.postLinkFaultInjected !== true
+                    && probe.linkedSource === openedPath
+                  ) {
+                    probe.postLinkFaultInjected = true;
+                    throw probe.postLinkStatError;
+                  }
+                  return await Reflect.apply(target.stat, target, statArgs);
+                };
+              }
+              const value = Reflect.get(target, property, target);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+        }
         if (!status.isDirectory() || path.basename(openedPath) !== 'reports') {
           return handle;
         }
@@ -528,6 +552,16 @@ const importPipelineModulesWithUnknownReportOutcomeProbe = async (
                   }
                 }
                 await target.sync();
+              };
+            }
+            if (property === 'close') {
+              return async () => {
+                probe.events.push('close-parent:reports');
+                await target.close();
+                if (probe.postLinkFaultInjected === true) {
+                  const closeError = probe.postLinkCloseErrors?.shift();
+                  if (closeError !== undefined) throw closeError;
+                }
               };
             }
             const value = Reflect.get(target, property, target);
@@ -1374,183 +1408,224 @@ describe('Pipeline Runner', () => {
     expect(runtime.stageCalls).toEqual(['preflight']);
   });
 
-  it('preserves ordinary artifacts after an unknown canonical report outcome and reconciles on restart', async () => {
-    const tempProject = await createTempProject();
-    tempProjects.push(tempProject);
-    const project = await loadProject(tempProject.workspaceRoot, 'demo');
-    const parentSyncError = Object.assign(new Error('compile report parent sync failed'), {
-      code: 'EIO',
-    });
-    const retrySyncError = Object.assign(new Error('compile report parent retry failed'), {
-      code: 'EIO',
-    });
-    const probe: UnknownReportOutcomeProbe = {
-      armed: false,
-      targetReport: 'compile.json',
-      parentSyncErrors: [parentSyncError, retrySyncError],
-      parentSyncHandleIds: [],
-      events: [],
-    };
-    const modules = await importPipelineModulesWithUnknownReportOutcomeProbe(probe);
-    try {
-      const runStore = modules.scopes.createRunStore(tempProject.workspaceRoot);
-      const outputStore = modules.scopes.createOutputStore(tempProject.workspaceRoot);
-      const reportStore = modules.reports.createStageReportStore();
-      const runId = 'run-resume';
-      const runDirectory = await runStore.createRun('demo', runId);
-      for (const stageId of ['preflight', 'ingest', 'narration'] as const) {
-        await reportStore.writeStage(runDirectory, makeReport({
-          runId,
+  it.each([
+    ['parent-sync', false],
+    ['post-link-stat', true],
+  ] as const)(
+    'preserves ordinary artifacts after a %s report outcome and reconciles on restart',
+    async (_mode, failAfterLink) => {
+      const tempProject = await createTempProject();
+      tempProjects.push(tempProject);
+      const project = await loadProject(tempProject.workspaceRoot, 'demo');
+      const primaryError = Object.assign(new Error(
+        failAfterLink
+          ? 'compile report post-link stat failed'
+          : 'compile report parent sync failed',
+      ), {
+        code: 'EIO',
+      });
+      const retrySyncError = Object.assign(new Error('compile report parent retry failed'), {
+        code: 'EIO',
+      });
+      const closeError = Object.assign(new Error('compile report anchor close failed'), {
+        code: 'EIO',
+      });
+      const probe: UnknownReportOutcomeProbe = {
+        armed: false,
+        targetReport: 'compile.json',
+        parentSyncErrors: failAfterLink ? [] : [primaryError, retrySyncError],
+        ...(failAfterLink ? {
+          postLinkStatError: primaryError,
+          postLinkCloseErrors: [closeError],
+        } : {}),
+        parentSyncHandleIds: [],
+        events: [],
+      };
+      const modules = await importPipelineModulesWithUnknownReportOutcomeProbe(probe);
+      try {
+        const runStore = modules.scopes.createRunStore(tempProject.workspaceRoot);
+        const outputStore = modules.scopes.createOutputStore(tempProject.workspaceRoot);
+        const reportStore = modules.reports.createStageReportStore();
+        const runId = 'run-resume';
+        const runDirectory = await runStore.createRun('demo', runId);
+        for (const stageId of ['preflight', 'ingest', 'narration'] as const) {
+          await reportStore.writeStage(runDirectory, makeReport({
+            runId,
+            preset: 'draft',
+            stageId,
+          }));
+        }
+        await runStore.publishCurrent('demo', currentPointer(runId, 'narration', {
           preset: 'draft',
-          stageId,
+          stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft'],
         }));
-      }
-      await runStore.publishCurrent('demo', currentPointer(runId, 'narration', {
-        preset: 'draft',
-        stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft'],
-      }));
-      const events: string[] = [];
-      const stageCalls: StageId[] = [];
-      const artifactPath = 'compiled/unknown-report.json';
-      const registry = createStages(events, stageCalls).map((stage) => (
-        stage.id !== 'compile'
-          ? stage
-          : {
-            ...stage,
-            verify: async (context: StagePlanningContext, report: StageReport) => {
-              if (
-                context.sourceRun === undefined
-                || report.fingerprint !== stageFingerprint('compile')
-              ) {
-                return false;
-              }
-              for (const artifact of report.artifacts) {
+        const events: string[] = [];
+        const stageCalls: StageId[] = [];
+        const artifactPath = 'compiled/unknown-report.json';
+        const registry = createStages(events, stageCalls).map((stage) => (
+          stage.id !== 'compile'
+            ? stage
+            : {
+              ...stage,
+              verify: async (context: StagePlanningContext, report: StageReport) => {
                 if (
-                  artifact.scope !== 'run'
-                  || !await modules.artifacts.verifyRunArtifact(
-                    context.sourceRun.runDirectory,
-                    artifact,
-                  )
+                  context.sourceRun === undefined
+                  || report.fingerprint !== stageFingerprint('compile')
                 ) {
                   return false;
                 }
-              }
-              return true;
+                for (const artifact of report.artifacts) {
+                  if (
+                    artifact.scope !== 'run'
+                    || !await modules.artifacts.verifyRunArtifact(
+                      context.sourceRun.runDirectory,
+                      artifact,
+                    )
+                  ) {
+                    return false;
+                  }
+                }
+                return true;
+              },
+              execute: async (context: StageExecutionContext, signal: AbortSignal) => {
+                const executed = await stage.execute(context, signal);
+                if (context.runDirectory === undefined) throw new Error('missing Run');
+                const artifact = await writeFaultInjectedRunArtifact(
+                  modules,
+                  context.runDirectory,
+                  artifactPath,
+                  'compiled unknown bytes',
+                );
+                return {...executed, artifacts: [artifact]};
+              },
+            }
+        ));
+        const release = vi.fn(async () => undefined);
+        const dependencies: RunnerDependencies = {
+          registry,
+          runStore,
+          outputStore,
+          reportStore,
+          acquireProjectLock: vi.fn(async () => ({
+            record: {
+              pid: 1,
+              hostname: 'test',
+              processStart: 'test',
+              createdAt: NOW,
+              runId,
             },
-            execute: async (context: StageExecutionContext, signal: AbortSignal) => {
-              const executed = await stage.execute(context, signal);
-              if (context.runDirectory === undefined) throw new Error('missing Run');
-              const artifact = await writeFaultInjectedRunArtifact(
-                modules,
-                context.runDirectory,
-                artifactPath,
-                'compiled unknown bytes',
-              );
-              return {...executed, artifacts: [artifact]};
-            },
-          }
-      ));
-      const release = vi.fn(async () => undefined);
-      const dependencies: RunnerDependencies = {
-        registry,
-        runStore,
-        outputStore,
-        reportStore,
-        acquireProjectLock: vi.fn(async () => ({
-          record: {
-            pid: 1,
-            hostname: 'test',
-            processStart: 'test',
-            createdAt: NOW,
-            runId,
-          },
-          release,
-        })) as unknown as RunnerDependencies['acquireProjectLock'],
-        createRunId: vi.fn(() => runId),
-        now: vi.fn(() => NOW),
-      };
-      const plan = makePlan({
-        preset: 'draft',
-        stageIds: ['preflight', 'ingest', 'narration', 'compile'],
-        actions: ['run', 'cached', 'cached', 'resume'],
-        runMode: 'resume',
-        sourceRunId: runId,
-        targetRunId: runId,
-      });
-      probe.armed = true;
+            release,
+          })) as unknown as RunnerDependencies['acquireProjectLock'],
+          createRunId: vi.fn(() => runId),
+          now: vi.fn(() => NOW),
+        };
+        const plan = makePlan({
+          preset: 'draft',
+          stageIds: ['preflight', 'ingest', 'narration', 'compile'],
+          actions: ['run', 'cached', 'cached', 'resume'],
+          runMode: 'resume',
+          sourceRunId: runId,
+          targetRunId: runId,
+        });
+        probe.armed = true;
 
-      await expect(modules.runner.runExecutionPlan(
-        executionInput(plan, project),
-        dependencies,
-      )).rejects.toMatchObject({
-        name: 'StageReportOutcomeError',
-        code: 'PIPELINE_REPORT_OUTCOME_UNKNOWN',
-        cause: parentSyncError,
-        errors: [parentSyncError, retrySyncError],
-      });
+        let runError: unknown;
+        try {
+          await modules.runner.runExecutionPlan(
+            executionInput(plan, project),
+            dependencies,
+          );
+        } catch (error) {
+          runError = error;
+        }
 
-      await expect(reportStore.readStage(runDirectory, 'compile')).resolves.toMatchObject({
-        state: 'passed',
-        artifacts: [expect.objectContaining({path: artifactPath})],
-      });
-      await expect(readFile(path.join(
-        tempProject.workspaceRoot,
-        '.work/demo/runs/run-resume',
-        artifactPath,
-      ), 'utf8')).resolves.toBe('compiled unknown bytes');
-      await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
-        completedStage: 'narration',
-      });
-      expect(probe.parentSyncHandleIds).toEqual([
-        probe.commitParentHandleId,
-        probe.commitParentHandleId,
-      ]);
-      expect(probe.events).not.toContain('unlink-final:compile.json');
+        expect(runError).toMatchObject({
+          name: 'StageReportOutcomeError',
+          code: 'PIPELINE_REPORT_OUTCOME_UNKNOWN',
+        });
+        if (failAfterLink) {
+          const linkError = (runError as AggregateError).cause;
+          expect(linkError).toMatchObject({
+            name: 'AppDirectoryLinkOutcomeError',
+            code: 'APP_DIRECTORY_LINK_OUTCOME_UNKNOWN',
+            cause: primaryError,
+          });
+          expect((linkError as AggregateError).errors).toEqual([
+            primaryError,
+            closeError,
+          ]);
+        } else {
+          expect(runError).toMatchObject({
+            cause: primaryError,
+            errors: [primaryError, retrySyncError],
+          });
+        }
 
-      probe.armed = false;
-      const restartPlan = await modules.executionPlan.buildExecutionPlan({
-        project,
-        sourceCatalog,
-        registry,
-        runStore,
-        outputStore,
-        reportStore,
-        createRunId: dependencies.createRunId,
-      }, {
-        preset: 'draft',
-        to: 'compile',
-        resume: true,
-      });
-      expect(restartPlan).toMatchObject({
-        runMode: 'resume',
-        requiresProgressReconciliation: true,
-      });
-      expect(restartPlan.items.at(-1)).toMatchObject({
-        stageId: 'compile',
-        action: 'cached',
-      });
+        await expect(reportStore.readStage(runDirectory, 'compile')).resolves.toMatchObject({
+          state: 'passed',
+          artifacts: [expect.objectContaining({path: artifactPath})],
+        });
+        await expect(readFile(path.join(
+          tempProject.workspaceRoot,
+          '.work/demo/runs/run-resume',
+          artifactPath,
+        ), 'utf8')).resolves.toBe('compiled unknown bytes');
+        await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
+          completedStage: 'narration',
+        });
+        if (!failAfterLink) {
+          expect(probe.parentSyncHandleIds).toEqual([
+            probe.commitParentHandleId,
+            probe.commitParentHandleId,
+          ]);
+        }
+        expect(probe.events).not.toContain('unlink-final:compile.json');
 
-      const restarted = await modules.runner.runExecutionPlan(
-        executionInput(restartPlan, project),
-        dependencies,
-      );
+        probe.armed = false;
+        const restartPlan = await modules.executionPlan.buildExecutionPlan({
+          project,
+          sourceCatalog,
+          registry,
+          runStore,
+          outputStore,
+          reportStore,
+          createRunId: dependencies.createRunId,
+        }, {
+          preset: 'draft',
+          to: 'compile',
+          resume: true,
+        });
+        expect(restartPlan).toMatchObject({
+          runMode: 'resume',
+          requiresProgressReconciliation: true,
+        });
+        expect(restartPlan.items.at(-1)).toMatchObject({
+          stageId: 'compile',
+          action: 'cached',
+        });
 
-      expect(restarted).toMatchObject({
-        runId,
-        state: 'passed',
-        completedStage: 'compile',
-      });
-      expect(stageCalls.filter((stageId) => stageId === 'compile')).toHaveLength(1);
-      await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
-        runId,
-        completedStage: 'compile',
-      });
-      expect(release).toHaveBeenCalledTimes(2);
-    } finally {
-      vi.doUnmock('node:fs/promises');
-      vi.resetModules();
-    }
-  });
+        const restarted = await modules.runner.runExecutionPlan(
+          executionInput(restartPlan, project),
+          dependencies,
+        );
+
+        expect(restarted).toMatchObject({
+          runId,
+          state: 'passed',
+          completedStage: 'compile',
+        });
+        expect(stageCalls.filter((stageId) => stageId === 'compile')).toHaveLength(1);
+        await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
+          runId,
+          completedStage: 'compile',
+        });
+        expect(release).toHaveBeenCalledTimes(2);
+      } finally {
+        vi.doUnmock('node:fs/promises');
+        vi.resetModules();
+      }
+    },
+  );
 
   it('preserves cached artifacts after an unknown canonical report outcome and reconciles on restart', async () => {
     const tempProject = await createTempProject();

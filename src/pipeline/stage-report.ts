@@ -3,6 +3,7 @@ import path from 'node:path';
 import {z} from 'zod';
 import {StableIdSchema} from '../domain/schema-primitives';
 import {
+  AppDirectoryLinkOutcomeError,
   ensureRunDirectory,
   getRunDirectoryIdentity,
   linkRunFile,
@@ -312,6 +313,17 @@ export class StageReportOutcomeError extends AggregateError {
 const isMissingFile = (error: unknown): error is NodeJS.ErrnoException =>
   error instanceof Error && 'code' in error && error.code === 'ENOENT';
 
+const isLinkOutcomeUnknown = (
+  error: unknown,
+): error is AppDirectoryLinkOutcomeError => (
+  error instanceof AppDirectoryLinkOutcomeError
+  || (
+    error instanceof Error
+    && 'code' in error
+    && error.code === 'APP_DIRECTORY_LINK_OUTCOME_UNKNOWN'
+  )
+);
+
 const invalidReport = (message: string): StageReportValidationError =>
   new StageReportValidationError(`STAGE_REPORT_INVALID: ${message}`);
 
@@ -463,6 +475,10 @@ const writeImmutableReport = async (
       target,
     );
   } catch (error) {
+    if (isLinkOutcomeUnknown(error)) {
+      if (target !== undefined) await closeReportBestEffort(target);
+      throw new StageReportOutcomeError(relativePath, error, []);
+    }
     if (target !== undefined) {
       return await rollbackReportWrite({
         target,

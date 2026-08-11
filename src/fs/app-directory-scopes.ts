@@ -43,6 +43,24 @@ export class AppDirectoryPlatformError extends Error {
   }
 }
 
+export class AppDirectoryLinkOutcomeError extends AggregateError {
+  readonly code = 'APP_DIRECTORY_LINK_OUTCOME_UNKNOWN';
+
+  constructor(
+    readonly sourceRelativePath: string,
+    readonly targetRelativePath: string,
+    primaryError: unknown,
+    cleanupErrors: readonly unknown[],
+  ) {
+    super(
+      [primaryError, ...cleanupErrors],
+      `App-owned hard link outcome could not be determined for ${targetRelativePath}`,
+      {cause: primaryError},
+    );
+    this.name = 'AppDirectoryLinkOutcomeError';
+  }
+}
+
 interface DirectoryIdentity {
   readonly path: string;
   readonly dev: bigint;
@@ -1659,6 +1677,7 @@ const linkScopedFileAuthority = async (
   let target: ScopedPathAnchor | undefined;
   let linked = false;
   let transferred = false;
+  let postLinkAnchorsClosed = false;
   try {
     target = await openScopedPathAnchor(state, targetRelativePath);
     if (!identityMatchesStats(source.parent.identity, await target.parent.handle.stat({
@@ -1774,29 +1793,29 @@ const linkScopedFileAuthority = async (
     transferred = true;
     return result;
   } catch (error) {
-    const cleanupErrors: unknown[] = [];
-    if (linked && target !== undefined) {
-      try {
-        await unlink(path.join(target.parent.volumePath, target.basename));
-      } catch (cleanupError) {
-        cleanupErrors.push(cleanupError);
+    if (linked) {
+      const cleanupErrors: unknown[] = [];
+      const anchors = [source.parent, target?.parent].filter(
+        (anchor): anchor is DirectoryAnchor => anchor !== undefined,
+      );
+      for (const anchor of [...anchors].reverse()) {
+        try {
+          await closeDirectoryAnchor(anchor);
+        } catch (cleanupError) {
+          cleanupErrors.push(cleanupError);
+        }
       }
-      try {
-        await syncHeldDirectoryAnchor(target.parent, targetRelativePath);
-      } catch (cleanupError) {
-        cleanupErrors.push(cleanupError);
-      }
-    }
-    if (cleanupErrors.length > 0) {
-      throw new AggregateError(
-        [error, ...cleanupErrors],
-        `failed to publish scoped hard link: ${targetRelativePath}`,
-        {cause: error},
+      postLinkAnchorsClosed = true;
+      throw new AppDirectoryLinkOutcomeError(
+        sourceRelativePath,
+        targetRelativePath,
+        error,
+        cleanupErrors,
       );
     }
     throw error;
   } finally {
-    if (!transferred) {
+    if (!transferred && !postLinkAnchorsClosed) {
       const anchors = [source.parent, target?.parent].filter(
         (anchor): anchor is DirectoryAnchor => anchor !== undefined,
       );

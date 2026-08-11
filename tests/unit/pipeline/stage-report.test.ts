@@ -202,6 +202,8 @@ type AtomicReportFault =
   | 'write'
   | 'sync'
   | 'link'
+  | 'post-link-stat'
+  | 'post-link-verify'
   | 'parent-sync'
   | 'temp-cleanup';
 
@@ -214,6 +216,7 @@ interface AtomicReportProbe {
   parentSyncErrors?: Error[];
   commitParentHandleId?: number;
   parentSyncHandleIds?: number[];
+  postLinkCloseErrors?: Error[];
   linkedSource?: string;
   linkedTarget?: string;
 }
@@ -266,6 +269,17 @@ const importReportModulesWithAtomicWriteProbe = async (
                   await target.sync();
                 };
               }
+              if (property === 'stat') {
+                return async (...statArgs: Parameters<typeof target.stat>) => {
+                  if (
+                    probe.linkedSource === openedPath
+                    && shouldInject('post-link-stat')
+                  ) {
+                    inject();
+                  }
+                  return await Reflect.apply(target.stat, target, statArgs);
+                };
+              }
               const value = Reflect.get(target, property, target);
               return typeof value === 'function' ? value.bind(target) : value;
             },
@@ -298,10 +312,30 @@ const importReportModulesWithAtomicWriteProbe = async (
                 await target.sync();
               };
             }
+            if (property === 'close') {
+              return async () => {
+                probe.events.push(`close-parent:${path.basename(openedPath)}`);
+                await target.close();
+                if (probe.faultInjected) {
+                  const closeError = probe.postLinkCloseErrors?.shift();
+                  if (closeError !== undefined) throw closeError;
+                }
+              };
+            }
             const value = Reflect.get(target, property, target);
             return typeof value === 'function' ? value.bind(target) : value;
           },
         });
+      },
+      lstat: async (...args: Parameters<typeof actual.lstat>) => {
+        const targetPath = String(args[0]);
+        if (
+          probe.linkedTarget === targetPath
+          && shouldInject('post-link-verify')
+        ) {
+          inject();
+        }
+        return await Reflect.apply(actual.lstat, undefined, args);
       },
       link: async (...args: Parameters<typeof actual.link>) => {
         probe.events.push(
@@ -677,6 +711,73 @@ describe('StageReportStore', () => {
         await expect(store.writeStage(runDirectory, report)).resolves.toBeUndefined();
         await expect(store.readStage(runDirectory, 'ingest')).resolves.toEqual(report);
         expect(await readdir(reportsPath)).toEqual(['ingest.json']);
+      } finally {
+        vi.doUnmock('node:fs/promises');
+        vi.resetModules();
+        await rm(workspaceRoot, {recursive: true, force: true});
+      }
+    },
+  );
+
+  it.each([
+    ['post-link source stat', 'post-link-stat', false],
+    ['post-link target verification with close cleanup', 'post-link-verify', true],
+  ] as const)(
+    'preserves the exact canonical report after %s failure',
+    async (_label, fault, failClose) => {
+      const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'stage-report-post-link-'));
+      const faultError = Object.assign(new Error(`${fault} failed`), {code: 'EIO'});
+      const closeError = Object.assign(new Error('linked report anchor close failed'), {
+        code: 'EIO',
+      });
+      const probe: AtomicReportProbe = {
+        armed: false,
+        events: [],
+        fault,
+        faultError,
+        faultInjected: false,
+        postLinkCloseErrors: failClose ? [closeError] : [],
+      };
+      const {scopes, reports} = await importReportModulesWithAtomicWriteProbe(probe);
+      try {
+        const runDirectory = await scopes.createRunStore(workspaceRoot)
+          .createRun('demo', 'run-one');
+        await scopes.ensureRunDirectory(runDirectory, 'reports');
+        const store = reports.createStageReportStore();
+        const report = passedStageReport({stageId: 'ingest'});
+        const finalPath = path.join(
+          workspaceRoot,
+          '.work/demo/runs/run-one/reports/ingest.json',
+        );
+        probe.armed = true;
+
+        let writeError: unknown;
+        try {
+          await store.writeStage(runDirectory, report);
+        } catch (error) {
+          writeError = error;
+        }
+
+        expect(writeError).toMatchObject({
+          name: 'StageReportOutcomeError',
+          code: 'PIPELINE_REPORT_OUTCOME_UNKNOWN',
+        });
+        const linkError = (writeError as AggregateError).cause;
+        expect(linkError).toMatchObject({
+          name: 'AppDirectoryLinkOutcomeError',
+          code: 'APP_DIRECTORY_LINK_OUTCOME_UNKNOWN',
+          cause: faultError,
+        });
+        if (failClose) {
+          expect((linkError as AggregateError).errors).toEqual([
+            faultError,
+            closeError,
+          ]);
+        }
+        await expect(store.readStage(runDirectory, 'ingest')).resolves.toEqual(report);
+        const exactReport = await readFile(finalPath, 'utf8');
+        expect(JSON.parse(exactReport)).toEqual(report);
+        expect(probe.events).not.toContain('unlink-final:ingest.json');
       } finally {
         vi.doUnmock('node:fs/promises');
         vi.resetModules();

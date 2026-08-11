@@ -185,6 +185,106 @@ const importScopesWithMutationProbe = async (
   return await import('../../../src/fs/app-directory-scopes');
 };
 
+type PostLinkFault = 'stat' | 'verify';
+
+interface PostLinkFaultProbe {
+  armed: boolean;
+  fault: PostLinkFault;
+  faultError: Error;
+  faultInjected: boolean;
+  closeErrors: Error[];
+  linkedSource?: string;
+  linkedTarget?: string;
+  events: string[];
+}
+
+const importScopesWithPostLinkFault = async (
+  probe: PostLinkFaultProbe,
+): Promise<typeof import('../../../src/fs/app-directory-scopes')> => {
+  vi.resetModules();
+  vi.doMock('node:fs/promises', async () => {
+    const actual = await vi.importActual<typeof import('node:fs/promises')>(
+      'node:fs/promises',
+    );
+    const injectFault = (): never => {
+      probe.faultInjected = true;
+      throw probe.faultError;
+    };
+    return {
+      ...actual,
+      open: async (...args: Parameters<typeof actual.open>) => {
+        const openedPath = String(args[0]);
+        const handle = await Reflect.apply(actual.open, undefined, args);
+        if (!probe.armed) return handle;
+        const status = await handle.stat({bigint: true});
+        if (status.isDirectory() && path.basename(openedPath) === 'reports') {
+          return new Proxy(handle, {
+            get(target, property) {
+              if (property === 'close') {
+                return async () => {
+                  probe.events.push('close:reports');
+                  await target.close();
+                  if (probe.faultInjected) {
+                    const closeError = probe.closeErrors.shift();
+                    if (closeError !== undefined) throw closeError;
+                  }
+                };
+              }
+              const value = Reflect.get(target, property, target);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+        }
+        if (!status.isFile()) return handle;
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === 'stat') {
+              return async (...statArgs: Parameters<typeof target.stat>) => {
+                if (
+                  probe.fault === 'stat'
+                  && !probe.faultInjected
+                  && probe.linkedSource === openedPath
+                ) {
+                  injectFault();
+                }
+                return await Reflect.apply(target.stat, target, statArgs);
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
+      lstat: async (...args: Parameters<typeof actual.lstat>) => {
+        const targetPath = String(args[0]);
+        if (
+          probe.armed
+          && probe.fault === 'verify'
+          && !probe.faultInjected
+          && probe.linkedTarget === targetPath
+        ) {
+          injectFault();
+        }
+        return await Reflect.apply(actual.lstat, undefined, args);
+      },
+      link: async (...args: Parameters<typeof actual.link>) => {
+        await Reflect.apply(actual.link, undefined, args);
+        if (probe.armed) {
+          probe.linkedSource = String(args[0]);
+          probe.linkedTarget = String(args[1]);
+          probe.events.push('link');
+        }
+      },
+      unlink: async (...args: Parameters<typeof actual.unlink>) => {
+        const targetPath = String(args[0]);
+        if (probe.linkedTarget === targetPath) probe.events.push('unlink-final');
+        await Reflect.apply(actual.unlink, undefined, args);
+      },
+    };
+  });
+  return await import('../../../src/fs/app-directory-scopes');
+};
+
 const importScopesWithDelayedRealpath = async (
   gate: Promise<void>,
 ): Promise<typeof import('../../../src/fs/app-directory-scopes')> => {
@@ -698,6 +798,79 @@ describe('app-owned directory scopes', () => {
     await expect(openExistingRunFile(run, 'artifact.bin'))
       .rejects.toMatchObject({code: 'ENOENT'});
   });
+
+  it.each([
+    ['post-link source stat', 'stat', false],
+    ['post-link target verification with close cleanup', 'verify', true],
+  ] as const)(
+    'preserves the linked Run target after %s failure',
+    async (_label, fault, failClose) => {
+      const workspaceRoot = await makeTempDirectory('app-scopes-post-link-');
+      const faultError = Object.assign(new Error(`${fault} failed after link`), {
+        code: 'EIO',
+      });
+      const closeError = Object.assign(new Error('linked anchor close failed'), {
+        code: 'EIO',
+      });
+      const probe: PostLinkFaultProbe = {
+        armed: false,
+        fault,
+        faultError,
+        faultInjected: false,
+        closeErrors: failClose ? [closeError] : [],
+        events: [],
+      };
+      const scopes = await importScopesWithPostLinkFault(probe);
+      const run = await scopes.createRunStore(workspaceRoot)
+        .createRun('demo', 'run-one');
+      await scopes.ensureRunDirectory(run, 'reports');
+      const tempPath = 'reports/.ingest.json.test.tmp';
+      const finalPath = 'reports/ingest.json';
+      const contents = '{"complete":true}\n';
+      probe.armed = true;
+      const authority = await scopes.openNewRunFileForWrite(run, tempPath);
+      await authority.handle.writeFile(contents);
+      await authority.syncAndSeal();
+      await authority.revalidate();
+
+      let linkError: unknown;
+      let linkedAuthority: Awaited<ReturnType<typeof scopes.linkRunFile>> | undefined;
+      try {
+        linkedAuthority = await scopes.linkRunFile(
+          run,
+          tempPath,
+          finalPath,
+          authority,
+        );
+      } catch (error) {
+        linkError = error;
+      }
+
+      expect(linkError).toMatchObject({
+        name: 'AppDirectoryLinkOutcomeError',
+        code: 'APP_DIRECTORY_LINK_OUTCOME_UNKNOWN',
+        cause: faultError,
+        sourceRelativePath: tempPath,
+        targetRelativePath: finalPath,
+      });
+      expect(linkError).toBeInstanceOf(AggregateError);
+      if (failClose) {
+        expect((linkError as AggregateError).errors).toEqual([
+          faultError,
+          closeError,
+        ]);
+      }
+      await expect(readFile(path.join(
+        workspaceRoot,
+        '.work/demo/runs/run-one',
+        finalPath,
+      ), 'utf8')).resolves.toBe(contents);
+      expect(probe.events).toContain('link');
+      expect(probe.events).not.toContain('unlink-final');
+      await linkedAuthority?.close().catch(() => undefined);
+      await authority.close().catch(() => undefined);
+    },
+  );
 
   it('unlinks the exact created inode when its basename is swapped', async () => {
     const workspaceRoot = await makeTempDirectory('app-scopes-exact-unlink-');
