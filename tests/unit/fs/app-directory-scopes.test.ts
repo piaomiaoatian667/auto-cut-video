@@ -204,6 +204,83 @@ const importScopesWithDelayedRealpath = async (
   return await import('../../../src/fs/app-directory-scopes');
 };
 
+interface DirectoryCreationSwapProbe {
+  armed: boolean;
+  childName: string;
+  parentPath: string;
+  movedParentPath: string;
+  originalParent?: {dev: bigint; ino: bigint};
+  replacementParent?: {dev: bigint; ino: bigint};
+  originalSyncs: number;
+  replacementSyncs: number;
+  restoredBySync: boolean;
+  swapped: boolean;
+}
+
+const importScopesWithDirectoryCreationSwap = async (
+  probe: DirectoryCreationSwapProbe,
+): Promise<typeof import('../../../src/fs/app-directory-scopes')> => {
+  vi.resetModules();
+  vi.doMock('node:fs/promises', async () => {
+    const actual = await vi.importActual<typeof import('node:fs/promises')>(
+      'node:fs/promises',
+    );
+    return {
+      ...actual,
+      mkdir: async (...args: Parameters<typeof actual.mkdir>) => {
+        const result = await Reflect.apply(actual.mkdir, undefined, args);
+        if (
+          probe.armed
+          && !probe.swapped
+          && path.basename(String(args[0])) === probe.childName
+        ) {
+          probe.swapped = true;
+          await actual.rename(probe.parentPath, probe.movedParentPath);
+          await actual.mkdir(probe.parentPath, {mode: 0o700});
+          const replacement = await actual.lstat(probe.parentPath, {bigint: true});
+          probe.replacementParent = {
+            dev: replacement.dev,
+            ino: replacement.ino,
+          };
+        }
+        return result;
+      },
+      open: async (...args: Parameters<typeof actual.open>) => {
+        const handle = await Reflect.apply(actual.open, undefined, args);
+        if (!probe.armed) return handle;
+        const opened = await handle.stat({bigint: true});
+        if (!opened.isDirectory()) return handle;
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === 'sync') {
+              return async () => {
+                const stats = await target.stat({bigint: true});
+                const isOriginal = probe.originalParent !== undefined
+                  && stats.dev === probe.originalParent.dev
+                  && stats.ino === probe.originalParent.ino;
+                const isReplacement = probe.replacementParent !== undefined
+                  && stats.dev === probe.replacementParent.dev
+                  && stats.ino === probe.replacementParent.ino;
+                if (isOriginal) probe.originalSyncs += 1;
+                if (isReplacement) probe.replacementSyncs += 1;
+                await target.sync();
+                if (isOriginal && probe.swapped && !probe.restoredBySync) {
+                  await actual.rm(probe.parentPath, {recursive: true, force: true});
+                  await actual.rename(probe.movedParentPath, probe.parentPath);
+                  probe.restoredBySync = true;
+                }
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
+    };
+  });
+  return await import('../../../src/fs/app-directory-scopes');
+};
+
 const withInode = (stats: BigIntStats, ino: bigint): BigIntStats => {
   Object.defineProperty(stats, 'ino', {
     configurable: true,
@@ -693,6 +770,71 @@ describe('app-owned directory scopes', () => {
     expect(replacementSyncs).toBe(0);
     await expect(readFile(reportPath, 'utf8')).rejects.toMatchObject({code: 'ENOENT'});
   });
+
+  it.each([
+    ['Run root', 'reports', false],
+    ['reports parent', 'attempts', true],
+  ] as const)(
+    'syncs the held %s when directory creation races with replacement',
+    async (_label, childName, createReportsFirst) => {
+      const workspaceRoot = await makeTempDirectory('app-scopes-create-sync-');
+      const probe: DirectoryCreationSwapProbe = {
+        armed: false,
+        childName,
+        parentPath: '',
+        movedParentPath: '',
+        originalSyncs: 0,
+        replacementSyncs: 0,
+        restoredBySync: false,
+        swapped: false,
+      };
+      const scopes = await importScopesWithDirectoryCreationSwap(probe);
+      const run = await scopes.createRunStore(workspaceRoot)
+        .createRun('demo', 'run-one');
+      const runRoot = path.join(
+        workspaceRoot,
+        '.work',
+        'demo',
+        'runs',
+        'run-one',
+      );
+      if (createReportsFirst) await scopes.ensureRunDirectory(run, 'reports');
+      probe.parentPath = createReportsFirst
+        ? path.join(runRoot, 'reports')
+        : runRoot;
+      probe.movedParentPath = `${probe.parentPath}-original`;
+      const original = await lstat(probe.parentPath, {bigint: true});
+      probe.originalParent = {dev: original.dev, ino: original.ino};
+      probe.armed = true;
+
+      let creationError: unknown;
+      try {
+        await scopes.ensureRunDirectory(
+          run,
+          createReportsFirst ? 'reports/attempts' : 'reports',
+        );
+      } catch (error) {
+        creationError = error;
+      }
+      const restoredBySync = probe.restoredBySync;
+      if (!probe.restoredBySync) {
+        await rm(probe.parentPath, {recursive: true, force: true});
+        await rename(probe.movedParentPath, probe.parentPath);
+      }
+
+      expect(creationError).toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
+      expect(restoredBySync).toBe(true);
+      expect(probe.originalSyncs).toBe(1);
+      expect(probe.replacementSyncs).toBe(0);
+      const syncCount = probe.originalSyncs;
+      await expect(scopes.ensureRunDirectory(
+        run,
+        createReportsFirst ? 'reports/attempts' : 'reports',
+      )).resolves.toBeUndefined();
+      expect(probe.originalSyncs).toBe(syncCount);
+      expect(probe.replacementSyncs).toBe(0);
+    },
+  );
 
   it('retries identity acquisition to clean up after the first created-file stat fails', async () => {
     const workspaceRoot = await makeTempDirectory('app-scopes-created-stat-');

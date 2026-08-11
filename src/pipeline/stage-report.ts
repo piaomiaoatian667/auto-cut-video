@@ -6,7 +6,6 @@ import {
   getRunDirectoryIdentity,
   openExistingRunFileForRead,
   openNewRunFileForWrite,
-  syncRunDirectory,
   type AppDirectoryReadFileAuthority,
   type AppDirectoryWriteFileAuthority,
   type RunDirectoryScope,
@@ -417,15 +416,12 @@ const ensureCanonicalReportDirectory = async (
   run: RunDirectoryScope,
 ): Promise<void> => {
   await ensureRunDirectory(run, 'reports');
-  await syncRunDirectory(run);
 };
 
 const ensureAttemptReportDirectory = async (
   run: RunDirectoryScope,
 ): Promise<void> => {
   await ensureRunDirectory(run, 'reports/attempts');
-  await syncRunDirectory(run);
-  await syncRunDirectory(run, 'reports');
 };
 
 export const createStageReportStore = (): StageReportStore => ({

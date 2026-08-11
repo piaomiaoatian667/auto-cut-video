@@ -635,6 +635,8 @@ describe('StageReportStore', () => {
     let directoryCloseFailed = false;
     let reportFileOpened = false;
     let reportFileClosed = false;
+    let reportParentSyncs = 0;
+    let reportsIdentity: {dev: bigint; ino: bigint} | undefined;
     vi.resetModules();
     vi.doMock('node:fs/promises', async () => {
       const actual = await vi.importActual<typeof import('node:fs/promises')>(
@@ -666,6 +668,19 @@ describe('StageReportStore', () => {
           directoryProxied = true;
           return new Proxy(handle, {
             get(target, property) {
+              if (property === 'sync') {
+                return async () => {
+                  const current = await target.stat({bigint: true});
+                  if (
+                    reportsIdentity !== undefined
+                    && current.dev === reportsIdentity.dev
+                    && current.ino === reportsIdentity.ino
+                  ) {
+                    reportParentSyncs += 1;
+                  }
+                  await target.sync();
+                };
+              }
               if (property === 'close') {
                 return async () => {
                   await target.close();
@@ -688,6 +703,16 @@ describe('StageReportStore', () => {
       const reports = await import('../../../src/pipeline/stage-report');
       const runDirectory = await scopes.createRunStore(workspaceRoot)
         .createRun('demo', 'run-one');
+      await scopes.ensureRunDirectory(runDirectory, 'reports');
+      const reportsStats = await lstat(path.join(
+        workspaceRoot,
+        '.work',
+        'demo',
+        'runs',
+        'run-one',
+        'reports',
+      ), {bigint: true});
+      reportsIdentity = {dev: reportsStats.dev, ino: reportsStats.ino};
       const store = reports.createStageReportStore();
       const report = passedStageReport({stageId: 'ingest'});
       armed = true;
@@ -699,16 +724,11 @@ describe('StageReportStore', () => {
         writeError = error;
       }
 
-      expect(writeError).toBeInstanceOf(AggregateError);
-      const errors = writeError instanceof AggregateError
-        ? writeError.errors
-        : [];
-      expect(errors).toHaveLength(2);
-      expect(errors[0]).toBe(closeError);
-      expect(errors[1]).toBeInstanceOf(AggregateError);
+      expect(writeError).toBe(closeError);
       expect(directoryProxied).toBe(true);
       expect(directoryCloseFailed).toBe(true);
       expect(reportFileClosed).toBe(true);
+      expect(reportParentSyncs).toBe(2);
       await expect(scopes.openExistingRunFile(
         runDirectory,
         'reports/ingest.json',

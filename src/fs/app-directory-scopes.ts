@@ -316,6 +316,51 @@ const closeDirectoryAnchors = async (
   }
 };
 
+const assertDirectoryAnchorStable = async (
+  anchor: DirectoryAnchor,
+  label: string,
+): Promise<void> => {
+  await assertDirectoryIdentityStable(anchor.identity, label);
+  const held = await anchor.handle.stat({bigint: true});
+  if (!held.isDirectory() || !identityMatchesStats(anchor.identity, held)) {
+    throw securityError(`app-owned directory changed while held open: ${label}`);
+  }
+  const anchored = await lstat(anchor.volumePath, {bigint: true});
+  if (!anchored.isDirectory() || !identityMatchesStats(anchor.identity, anchored)) {
+    throw securityError(`Darwin directory anchor changed: ${label}`);
+  }
+};
+
+const syncHeldDirectoryAnchor = async (
+  anchor: DirectoryAnchor,
+  label: string,
+): Promise<void> => {
+  const errors: unknown[] = [];
+  try {
+    await assertDirectoryAnchorStable(anchor, label);
+  } catch (error) {
+    errors.push(error);
+  }
+  try {
+    await anchor.handle.sync();
+  } catch (error) {
+    errors.push(error);
+  }
+  try {
+    await assertDirectoryAnchorStable(anchor, label);
+  } catch (error) {
+    errors.push(error);
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    throw new AggregateError(
+      errors,
+      `failed to sync held directory authority: ${label}`,
+      {cause: errors[0]},
+    );
+  }
+};
+
 const inspectPlainDirectory = (
   canonicalPath: string,
   label: string,
@@ -367,36 +412,83 @@ const ensurePlainDirectory = async (
 ): Promise<DirectoryIdentity> => {
   const anchor = await openDirectoryAnchor(parent, name);
   const target = path.join(anchor.volumePath, name);
+  let created = false;
+  let syncAttempted = false;
+  let identity: DirectoryIdentity | undefined;
+  let primaryError: unknown;
   try {
     if (options.exclusive) {
       await mkdir(target, {mode: 0o700});
+      created = true;
     } else {
       try {
         await mkdir(target, {mode: 0o700});
+        created = true;
       } catch (error) {
         if (!isNodeError(error) || error.code !== 'EEXIST') throw error;
       }
     }
-    await assertDirectoryIdentityStable(parent, name);
     const stats = await lstat(target, {bigint: true});
     if (stats.isSymbolicLink() || !stats.isDirectory()) {
       throw securityError(`app-owned directory is not a plain directory: ${name}`);
     }
-    const identity = identityFromStats(path.join(parent.path, name), stats);
+    identity = identityFromStats(path.join(parent.path, name), stats);
+    if (created) {
+      syncAttempted = true;
+      await syncHeldDirectoryAnchor(anchor, name);
+    } else {
+      await assertDirectoryAnchorStable(anchor, name);
+    }
     await assertDirectoryIdentityStable(identity, name);
-    return identity;
   } catch (error) {
-    if (error instanceof AppDirectoryScopeError) throw error;
-    if (isNodeError(error) && error.code === 'EEXIST') {
+    if (error instanceof AppDirectoryScopeError) {
+      primaryError = error;
+    } else if (isNodeError(error) && error.code === 'EEXIST') {
       const stats = await lstat(target, {bigint: true}).catch(() => undefined);
       if (stats?.isSymbolicLink() || (stats !== undefined && !stats.isDirectory())) {
-        throw securityError(`app-owned directory is not a plain directory: ${target}`);
+        primaryError = securityError(
+          `app-owned directory is not a plain directory: ${target}`,
+        );
+      } else {
+        primaryError = error;
+      }
+    } else {
+      try {
+        mapSymlinkError(error, name);
+      } catch (mappedError) {
+        primaryError = mappedError;
       }
     }
-    return mapSymlinkError(error, name);
-  } finally {
-    await closeDirectoryAnchor(anchor);
   }
+  const cleanupErrors: unknown[] = [];
+  if (created && !syncAttempted) {
+    try {
+      await syncHeldDirectoryAnchor(anchor, name);
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  try {
+    await closeDirectoryAnchor(anchor);
+  } catch (error) {
+    cleanupErrors.push(error);
+  }
+  if (primaryError !== undefined || cleanupErrors.length > 0) {
+    const errors = [
+      ...(primaryError === undefined ? [] : [primaryError]),
+      ...cleanupErrors,
+    ];
+    if (errors.length === 1) throw errors[0];
+    throw new AggregateError(
+      errors,
+      `failed to ensure app-owned directory: ${name}`,
+      {cause: errors[0]},
+    );
+  }
+  if (identity === undefined) {
+    throw new TypeError(`directory identity was not established: ${name}`);
+  }
+  return identity;
 };
 
 const createWorkspaceState = (workspaceRoot: string): DirectoryIdentity => {
@@ -1083,11 +1175,16 @@ const openNewScopedWriteFileAuthority = async (
   const pathAuthority = await openScopedReadPathAuthority(state, relativePath);
   const anchor = pathAuthority.finalEntry;
   let handle: FileHandle | undefined;
+  let parentSyncAnchor: DirectoryAnchor | undefined;
   let createdIdentity: RegularFileIdentity | undefined;
   let fileCreated = false;
   let transferred = false;
   try {
     await assertScopedReadPathStable(state, pathAuthority, relativePath);
+    parentSyncAnchor = await openDirectoryAnchor(
+      anchor.parent.identity,
+      relativePath,
+    );
     handle = await open(
       path.join(anchor.parent.volumePath, anchor.basename),
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | O_NOFOLLOW_ANY,
@@ -1110,6 +1207,7 @@ const openNewScopedWriteFileAuthority = async (
 
     const openedHandle = handle;
     const openedIdentity = createdIdentity;
+    const retainedParentSyncAnchor = parentSyncAnchor;
     let sealedIdentity: RegularFileIdentity | undefined;
     const revalidate = async (): Promise<void> => {
       await assertScopedReadPathStable(state, pathAuthority, relativePath);
@@ -1145,30 +1243,7 @@ const openNewScopedWriteFileAuthority = async (
       sealedIdentity = identity;
     };
     const syncParent = async (): Promise<void> => {
-      const errors: unknown[] = [];
-      try {
-        await assertScopedReadPathStable(state, pathAuthority, relativePath);
-      } catch (error) {
-        errors.push(error);
-      }
-      try {
-        await anchor.parent.handle.sync();
-      } catch (error) {
-        errors.push(error);
-      }
-      try {
-        await assertScopedReadPathStable(state, pathAuthority, relativePath);
-      } catch (error) {
-        errors.push(error);
-      }
-      if (errors.length === 1) throw errors[0];
-      if (errors.length > 1) {
-        throw new AggregateError(
-          errors,
-          `failed to sync held parent directory: ${relativePath}`,
-          {cause: errors[0]},
-        );
-      }
+      await syncHeldDirectoryAnchor(retainedParentSyncAnchor, relativePath);
     };
     const openForRead = async (): Promise<AppDirectoryReadFileAuthority> => {
       const expected = sealedIdentity;
@@ -1214,6 +1289,7 @@ const openNewScopedWriteFileAuthority = async (
     };
     let fileClosed = false;
     let directoriesClosed = false;
+    let parentSyncClosed = false;
     let unlinked = false;
     const result: AppDirectoryWriteFileAuthority = {
       handle: openedHandle,
@@ -1230,9 +1306,10 @@ const openNewScopedWriteFileAuthority = async (
         unlinked = true;
       },
       close: async () => {
-        if (fileClosed && directoriesClosed) return;
+        if (fileClosed && directoriesClosed && parentSyncClosed) return;
         let fileCloseError: unknown;
         let directoryCloseError: unknown;
+        let parentSyncCloseError: unknown;
         if (!directoriesClosed) {
           try {
             await closeDirectoryAnchors(pathAuthority.directories);
@@ -1241,7 +1318,18 @@ const openNewScopedWriteFileAuthority = async (
             directoryCloseError = error;
           }
         }
-        if (!fileClosed && (directoriesClosed || unlinked)) {
+        if (!parentSyncClosed && (directoriesClosed || unlinked)) {
+          try {
+            await closeDirectoryAnchor(retainedParentSyncAnchor);
+            parentSyncClosed = true;
+          } catch (error) {
+            parentSyncCloseError = error;
+          }
+        }
+        if (
+          !fileClosed
+          && ((directoriesClosed && parentSyncClosed) || unlinked)
+        ) {
           try {
             await openedHandle.close();
             fileClosed = true;
@@ -1249,17 +1337,23 @@ const openNewScopedWriteFileAuthority = async (
             fileCloseError = error;
           }
         }
-        if (fileCloseError !== undefined && directoryCloseError !== undefined) {
+        const closeErrors = [
+          directoryCloseError,
+          parentSyncCloseError,
+          fileCloseError,
+        ].filter((error): error is NonNullable<unknown> => error !== undefined);
+        if (closeErrors.length > 1) {
           throw new AggregateError(
-            [fileCloseError, directoryCloseError],
+            closeErrors,
             'failed to close scoped artifact write authority',
+            {cause: closeErrors[0]},
           );
         }
-        if (fileCloseError !== undefined) throw fileCloseError;
-        if (directoryCloseError !== undefined) throw directoryCloseError;
+        if (closeErrors.length === 1) throw closeErrors[0];
       },
     };
     handle = undefined;
+    parentSyncAnchor = undefined;
     createdIdentity = undefined;
     transferred = true;
     return result;
@@ -1296,6 +1390,17 @@ const openNewScopedWriteFileAuthority = async (
         cleanupErrors.push(cleanupError);
       }
     }
+    if (
+      handle !== undefined
+      && cleanupIdentity !== undefined
+      && parentSyncAnchor !== undefined
+    ) {
+      try {
+        await syncHeldDirectoryAnchor(parentSyncAnchor, relativePath);
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+    }
     if (cleanupErrors.length > 0) {
       throw new AggregateError(
         [error, ...cleanupErrors],
@@ -1310,7 +1415,13 @@ const openNewScopedWriteFileAuthority = async (
       try {
         if (handle !== undefined) await handle.close();
       } finally {
-        await closeDirectoryAnchors(pathAuthority.directories);
+        try {
+          if (parentSyncAnchor !== undefined) {
+            await closeDirectoryAnchor(parentSyncAnchor);
+          }
+        } finally {
+          await closeDirectoryAnchors(pathAuthority.directories);
+        }
       }
     }
   }
