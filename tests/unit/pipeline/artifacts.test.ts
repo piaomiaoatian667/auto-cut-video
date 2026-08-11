@@ -524,6 +524,72 @@ describe('pipeline artifacts', () => {
       .rejects.toMatchObject({code: 'ENOENT'});
   });
 
+  it('removes the exact target when its parent is swapped during sync', async () => {
+    const workspaceRoot = await makeWorkspace();
+    const runStore = createRunStore(workspaceRoot);
+    const sourceRun = await runStore.createRun('demo', 'source-run');
+    const targetRun = await runStore.createRun('demo', 'target-run');
+    const relativePath = 'nested/parent/stable.bin';
+    const bytes = Buffer.alloc(128 * 1024, 0x61);
+    await writeRunBytes(sourceRun, relativePath, bytes);
+    const targetPath = path.join(
+      workspaceRoot,
+      '.work',
+      'demo',
+      'runs',
+      'target-run',
+      relativePath,
+    );
+    const nestedRoot = path.dirname(path.dirname(targetPath));
+    const movedRoot = `${nestedRoot}-original`;
+    const orphanPath = path.join(movedRoot, 'parent', path.basename(targetPath));
+    const probe = await openExistingRunFile(sourceRun, relativePath);
+    const prototype = Object.getPrototypeOf(probe) as {sync: InterceptedSync};
+    const originalSync = prototype.sync;
+    await probe.close();
+    let parentSwapped = false;
+    prototype.sync = async function () {
+      const status = await this.stat({bigint: true});
+      const target = await lstat(targetPath, {bigint: true}).catch((error) => {
+        if (isNodeError(error) && error.code === 'ENOENT') return undefined;
+        throw error;
+      });
+      if (
+        !parentSwapped
+        && target?.isFile()
+        && status.dev === target.dev
+        && status.ino === target.ino
+      ) {
+        parentSwapped = true;
+        await rename(nestedRoot, movedRoot);
+        await mkdir(path.dirname(targetPath), {recursive: true});
+      }
+      await originalSync.call(this);
+    };
+
+    let caughtError: unknown;
+    try {
+      await copyRunArtifact({
+        sourceRun,
+        targetRun,
+        artifact: {
+          scope: 'run',
+          path: relativePath,
+          sha256: sha256(bytes),
+        },
+      });
+    } catch (error) {
+      caughtError = error;
+    } finally {
+      prototype.sync = originalSync;
+    }
+
+    expect(parentSwapped).toBe(true);
+    await expect(lstat(orphanPath)).rejects.toMatchObject({code: 'ENOENT'});
+    await expect(lstat(targetPath)).rejects.toMatchObject({code: 'ENOENT'});
+    expect(caughtError).toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
+  });
+
   it('reports both a copy failure and rollback failure', async () => {
     const workspaceRoot = await makeWorkspace();
     const runStore = createRunStore(workspaceRoot);

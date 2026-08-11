@@ -5,9 +5,9 @@ import {
   ensureRunDirectory,
   openExistingOutputFileForRead,
   openExistingRunFileForRead,
-  openNewRunFile,
-  unlinkRunFile,
+  openNewRunFileForWrite,
   type AppDirectoryReadFileAuthority,
+  type AppDirectoryWriteFileAuthority,
   type OutputDirectoryScope,
   type RunDirectoryScope,
 } from '../fs/app-directory-scopes';
@@ -209,15 +209,24 @@ const copyFileHandles = async (
 };
 
 const rollbackRunArtifact = async (
-  runDirectory: RunDirectoryScope,
+  target: AppDirectoryWriteFileAuthority,
   relativePath: string,
   primaryError: unknown,
 ): Promise<never> => {
+  const cleanupErrors: unknown[] = [];
   try {
-    await unlinkRunFile(runDirectory, relativePath);
+    await target.unlink();
   } catch (cleanupError) {
+    cleanupErrors.push(cleanupError);
+  }
+  try {
+    await target.close();
+  } catch (cleanupError) {
+    cleanupErrors.push(cleanupError);
+  }
+  if (cleanupErrors.length > 0) {
     throw new AggregateError(
-      [primaryError, cleanupError],
+      [primaryError, ...cleanupErrors],
       `artifact rollback failed for ${relativePath}; a partial target may remain and must be removed before retrying`,
       {cause: primaryError},
     );
@@ -234,58 +243,42 @@ export async function copyRunArtifact(input: {
   const parent = path.posix.dirname(input.artifact.path);
   if (parent !== '.') await ensureRunDirectory(input.targetRun, parent);
 
-  let targetCreated = false;
+  let target: AppDirectoryWriteFileAuthority | undefined;
   try {
     const source = await openExistingRunFileForRead(
       input.sourceRun,
       input.artifact.path,
     );
     try {
-      const target = await openNewRunFile(
+      target = await openNewRunFileForWrite(
         input.targetRun,
         input.artifact.path,
       );
-      targetCreated = true;
-      try {
-        await copyFileHandles(source.handle, target);
-        await target.sync();
-        await source.revalidate();
-      } finally {
-        await target.close();
-      }
+      await copyFileHandles(source.handle, target.handle);
+      await target.syncAndSeal();
+      await source.revalidate();
     } finally {
       await source.close();
     }
-  } catch (error) {
-    if (targetCreated) {
-      return await rollbackRunArtifact(
-        input.targetRun,
-        input.artifact.path,
-        error,
+    const copied: PipelineArtifact = {
+      scope: 'run',
+      path: input.artifact.path,
+      sha256: await hashScopedFile(async () => await target!.openForRead()),
+    };
+    await target.revalidate();
+    if (copied.sha256 !== input.artifact.sha256) {
+      throw new PipelineArtifactError(
+        'ARTIFACT_HASH_MISMATCH',
+        'copied Run artifact does not match its source report',
       );
+    }
+    await target.close();
+    target = undefined;
+    return copied;
+  } catch (error) {
+    if (target !== undefined) {
+      return await rollbackRunArtifact(target, input.artifact.path, error);
     }
     throw error;
   }
-
-  let copied: PipelineArtifact;
-  try {
-    copied = await hashRunArtifact(input.targetRun, input.artifact.path);
-  } catch (error) {
-    return await rollbackRunArtifact(
-      input.targetRun,
-      input.artifact.path,
-      error,
-    );
-  }
-  if (copied.sha256 !== input.artifact.sha256) {
-    return await rollbackRunArtifact(
-      input.targetRun,
-      input.artifact.path,
-      new PipelineArtifactError(
-        'ARTIFACT_HASH_MISMATCH',
-        'copied Run artifact does not match its source report',
-      ),
-    );
-  }
-  return copied;
 }

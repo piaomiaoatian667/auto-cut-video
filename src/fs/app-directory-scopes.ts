@@ -67,6 +67,15 @@ export interface AppDirectoryReadFileAuthority {
   close(): Promise<void>;
 }
 
+export interface AppDirectoryWriteFileAuthority {
+  readonly handle: FileHandle;
+  syncAndSeal(): Promise<void>;
+  openForRead(): Promise<AppDirectoryReadFileAuthority>;
+  revalidate(): Promise<void>;
+  unlink(): Promise<void>;
+  close(): Promise<void>;
+}
+
 const workStates = new WeakMap<WorkDirectoryScope, ScopeState>();
 const runStates = new WeakMap<RunDirectoryScope, ScopeState>();
 const outputStates = new WeakMap<OutputDirectoryScope, ScopeState>();
@@ -214,6 +223,16 @@ const regularFileIdentityMatches = (
   && stats.size === identity.size
   && stats.mtimeNs === identity.mtimeNs
   && stats.ctimeNs === identity.ctimeNs
+);
+
+const sameRegularFileObject = (
+  stats: BigIntStats,
+  identity: RegularFileIdentity,
+): boolean => (
+  stats.isFile()
+  && stats.dev === identity.dev
+  && stats.ino === identity.ino
+  && stats.nlink === identity.nlink
 );
 
 const volumePath = (dev: bigint, ino: bigint): string =>
@@ -771,6 +790,14 @@ export const openNewRunFile = async (
   'write-only',
 );
 
+export const openNewRunFileForWrite = async (
+  scope: RunDirectoryScope,
+  relativePath: string,
+): Promise<AppDirectoryWriteFileAuthority> => await openNewScopedWriteFileAuthority(
+  stateFor(runStates, scope, 'RunDirectoryScope'),
+  relativePath,
+);
+
 export const openNewRunReadWriteFile = async (
   scope: RunDirectoryScope,
   relativePath: string,
@@ -998,6 +1025,217 @@ const inspectAnchoredEntry = async (
   } catch (error) {
     if (isNodeError(error) && error.code === 'ENOENT') return {kind: 'missing'};
     return mapSymlinkError(error, relativePath);
+  }
+};
+
+const unlinkAnchoredCreatedFile = async (
+  anchor: ScopedPathAnchor,
+  identity: RegularFileIdentity,
+  handle: FileHandle,
+  relativePath: string,
+): Promise<void> => {
+  const current = await inspectAnchoredEntry(anchor, relativePath);
+  if (current.kind === 'missing') {
+    const held = await handle.stat({bigint: true});
+    if (held.nlink === 0n) return;
+    throw securityError(`created app-owned file moved before cleanup: ${relativePath}`);
+  }
+  if (
+    current.kind !== 'file'
+    || current.stats === undefined
+    || !sameRegularFileObject(current.stats, identity)
+  ) {
+    throw securityError(`created app-owned file changed before cleanup: ${relativePath}`);
+  }
+  await unlink(path.join(anchor.parent.volumePath, anchor.basename));
+  if ((await inspectAnchoredEntry(anchor, relativePath)).kind !== 'missing') {
+    throw securityError(`created app-owned file remained after cleanup: ${relativePath}`);
+  }
+  const held = await handle.stat({bigint: true});
+  if (held.nlink !== 0n) {
+    throw securityError(`created app-owned file remains linked after cleanup: ${relativePath}`);
+  }
+};
+
+const openNewScopedWriteFileAuthority = async (
+  state: ScopeState,
+  relativePath: string,
+): Promise<AppDirectoryWriteFileAuthority> => {
+  assertDarwin();
+  const pathAuthority = await openScopedReadPathAuthority(state, relativePath);
+  const anchor = pathAuthority.finalEntry;
+  let handle: FileHandle | undefined;
+  let createdIdentity: RegularFileIdentity | undefined;
+  let transferred = false;
+  try {
+    await assertScopedReadPathStable(state, pathAuthority, relativePath);
+    handle = await open(
+      path.join(anchor.parent.volumePath, anchor.basename),
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | O_NOFOLLOW_ANY,
+      0o600,
+    );
+    const created = await handle.stat({bigint: true});
+    if (!created.isFile() || created.nlink !== 1n) {
+      throw securityError(`created app-owned target is not a regular file: ${relativePath}`);
+    }
+    createdIdentity = regularFileIdentity(created);
+    const current = await inspectAnchoredEntry(anchor, relativePath);
+    if (
+      current.kind !== 'file'
+      || current.stats === undefined
+      || !regularFileIdentityMatches(current.stats, createdIdentity)
+    ) {
+      throw securityError(`created app-owned target changed while opening: ${relativePath}`);
+    }
+
+    const openedHandle = handle;
+    const openedIdentity = createdIdentity;
+    let sealedIdentity: RegularFileIdentity | undefined;
+    const revalidate = async (): Promise<void> => {
+      await assertScopedReadPathStable(state, pathAuthority, relativePath);
+      const held = await openedHandle.stat({bigint: true});
+      const currentTarget = await inspectAnchoredEntry(anchor, relativePath);
+      const matches = sealedIdentity === undefined
+        ? sameRegularFileObject(held, openedIdentity)
+          && currentTarget.stats !== undefined
+          && sameRegularFileObject(currentTarget.stats, openedIdentity)
+        : regularFileIdentityMatches(held, sealedIdentity)
+          && currentTarget.stats !== undefined
+          && regularFileIdentityMatches(currentTarget.stats, sealedIdentity);
+      if (currentTarget.kind !== 'file' || !matches) {
+        throw securityError(`created app-owned target changed: ${relativePath}`);
+      }
+    };
+    const syncAndSeal = async (): Promise<void> => {
+      await openedHandle.sync();
+      const held = await openedHandle.stat({bigint: true});
+      if (!sameRegularFileObject(held, openedIdentity)) {
+        throw securityError(`created app-owned target changed while writing: ${relativePath}`);
+      }
+      const identity = regularFileIdentity(held);
+      await assertScopedReadPathStable(state, pathAuthority, relativePath);
+      const currentTarget = await inspectAnchoredEntry(anchor, relativePath);
+      if (
+        currentTarget.kind !== 'file'
+        || currentTarget.stats === undefined
+        || !regularFileIdentityMatches(currentTarget.stats, identity)
+      ) {
+        throw securityError(`created app-owned target changed while syncing: ${relativePath}`);
+      }
+      sealedIdentity = identity;
+    };
+    const openForRead = async (): Promise<AppDirectoryReadFileAuthority> => {
+      const expected = sealedIdentity;
+      if (expected === undefined) {
+        throw new TypeError('app-owned write authority must be sealed before reading');
+      }
+      await revalidate();
+      let readHandle: FileHandle | undefined;
+      try {
+        readHandle = await open(
+          path.join(anchor.parent.volumePath, anchor.basename),
+          constants.O_RDONLY | constants.O_NONBLOCK | O_NOFOLLOW_ANY,
+        );
+        const opened = await readHandle.stat({bigint: true});
+        if (!regularFileIdentityMatches(opened, expected)) {
+          throw securityError(`created app-owned target changed while reopening: ${relativePath}`);
+        }
+        await revalidate();
+        const freshHandle = readHandle;
+        let closed = false;
+        const result: AppDirectoryReadFileAuthority = {
+          handle: freshHandle,
+          revalidate: async () => {
+            await revalidate();
+            const held = await freshHandle.stat({bigint: true});
+            if (!regularFileIdentityMatches(held, expected)) {
+              throw securityError(`created app-owned read handle changed: ${relativePath}`);
+            }
+          },
+          close: async () => {
+            if (closed) return;
+            closed = true;
+            await freshHandle.close();
+          },
+        };
+        readHandle = undefined;
+        return result;
+      } catch (error) {
+        if (readHandle !== undefined) await readHandle.close().catch(() => undefined);
+        if (error instanceof AppDirectoryScopeError) throw error;
+        return mapSymlinkError(error, relativePath);
+      }
+    };
+    let closed = false;
+    const result: AppDirectoryWriteFileAuthority = {
+      handle: openedHandle,
+      syncAndSeal,
+      openForRead,
+      revalidate,
+      unlink: async () => await unlinkAnchoredCreatedFile(
+        anchor,
+        openedIdentity,
+        openedHandle,
+        relativePath,
+      ),
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        let fileCloseError: unknown;
+        try {
+          await openedHandle.close();
+        } catch (error) {
+          fileCloseError = error;
+        }
+        try {
+          await closeDirectoryAnchors(pathAuthority.directories);
+        } catch (directoryCloseError) {
+          if (fileCloseError !== undefined) {
+            throw new AggregateError(
+              [fileCloseError, directoryCloseError],
+              'failed to close scoped artifact write authority',
+            );
+          }
+          throw directoryCloseError;
+        }
+        if (fileCloseError !== undefined) throw fileCloseError;
+      },
+    };
+    handle = undefined;
+    createdIdentity = undefined;
+    transferred = true;
+    return result;
+  } catch (error) {
+    const cleanupErrors: unknown[] = [];
+    if (handle !== undefined && createdIdentity !== undefined) {
+      try {
+        await unlinkAnchoredCreatedFile(
+          anchor,
+          createdIdentity,
+          handle,
+          relativePath,
+        );
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupErrors],
+        `failed to create scoped write authority for ${relativePath}`,
+        {cause: error},
+      );
+    }
+    if (error instanceof AppDirectoryScopeError) throw error;
+    return mapSymlinkError(error, relativePath);
+  } finally {
+    if (!transferred) {
+      try {
+        if (handle !== undefined) await handle.close();
+      } finally {
+        await closeDirectoryAnchors(pathAuthority.directories);
+      }
+    }
   }
 };
 
