@@ -11,8 +11,16 @@ import {
   type PipelineArtifact,
 } from './artifacts';
 
+const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/u;
+
 const isMissingFile = (error: unknown): error is NodeJS.ErrnoException =>
   error instanceof Error && 'code' in error && error.code === 'ENOENT';
+
+const requireSha256 = (value: string, label: string): void => {
+  if (!SHA256_PATTERN.test(value)) {
+    throw new Error(`invalid SHA-256 ${label}`);
+  }
+};
 
 const readNarrationManifest = async (
   sourceRun: RunDirectoryScope,
@@ -35,6 +43,34 @@ const readNarrationManifest = async (
 const narrationCachePath = (inputHash: string): string =>
   `audio/cache/${inputHash.slice('sha256:'.length)}.wav`;
 
+const validateCompatibility = (
+  sourceManifest: NarrationManifest,
+  providerFingerprint: string,
+): void => {
+  requireSha256(providerFingerprint, 'provider fingerprint');
+  requireSha256(sourceManifest.master.audioHash, 'master audio hash');
+  const inputHashes = new Set<string>();
+
+  for (const segment of sourceManifest.segments) {
+    requireSha256(segment.inputHash, `input hash for segment ${segment.id}`);
+    requireSha256(segment.audioHash, `audio hash for segment ${segment.id}`);
+    requireSha256(
+      segment.providerFingerprint,
+      `provider fingerprint for segment ${segment.id}`,
+    );
+    if (inputHashes.has(segment.inputHash)) {
+      throw new Error(`duplicate narration segment input hash: ${segment.inputHash}`);
+    }
+    inputHashes.add(segment.inputHash);
+  }
+
+  for (const segment of sourceManifest.segments) {
+    if (segment.providerFingerprint !== providerFingerprint) {
+      throw new Error(`provider fingerprint mismatch for segment ${segment.id}`);
+    }
+  }
+};
+
 export async function seedNarrationCache(input: {
   sourceRun: RunDirectoryScope;
   targetRun: RunDirectoryScope;
@@ -44,17 +80,21 @@ export async function seedNarrationCache(input: {
   providerFingerprint: string;
 }): Promise<string[]> {
   const sourceManifest = await readNarrationManifest(input.sourceRun);
-  const allowedHashes = new Set(input.script.segments.map((segment) => (
+  validateCompatibility(sourceManifest, input.providerFingerprint);
+  if (sourceManifest.provider === 'file') return [];
+
+  const expectedHashesById = new Map(input.script.segments.map((segment) => [
+    segment.id,
     narrationSegmentInputHash(
       segment,
       input.voice,
       input.rate,
       input.providerFingerprint,
-    )
-  )));
+    ),
+  ]));
   const cachePaths = [...new Set(sourceManifest.segments
-    .map((segment) => segment.inputHash)
-    .filter((inputHash) => allowedHashes.has(inputHash)))]
+    .filter((segment) => expectedHashesById.get(segment.id) === segment.inputHash)
+    .map((segment) => segment.inputHash))]
     .map(narrationCachePath)
     .sort();
   const copiedPaths: string[] = [];
