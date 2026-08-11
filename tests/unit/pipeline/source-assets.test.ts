@@ -1,8 +1,22 @@
-import {describe, expect, it, vi} from 'vitest';
+import {
+  mkdir,
+  mkdtemp,
+  rename,
+  rm,
+  symlink as createSymlink,
+  writeFile,
+} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import path from 'node:path';
+import {afterEach, describe, expect, it, vi} from 'vitest';
 import type {ProjectInputs} from '../../../src/domain/load-project';
-import type {ProjectDirectoryScope} from '../../../src/fs/project-paths';
+import {
+  createProjectDirectoryScope,
+  type ProjectDirectoryScope,
+} from '../../../src/fs/project-paths';
 import {fingerprintValue} from '../../../src/pipeline/fingerprint';
 import {
+  createSystemSourceCatalogDependencies,
   discoverProjectSourceCatalog,
   type SourceCatalogDependencies,
 } from '../../../src/pipeline/source-assets';
@@ -12,6 +26,13 @@ import {
 } from '../../helpers/temp-project';
 
 const projectDirectory = {} as ProjectDirectoryScope;
+const tempDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(tempDirectories.splice(0).map(async (directory) => {
+    await rm(directory, {recursive: true, force: true});
+  }));
+});
 
 const clipBase = {
   startFrame: 0,
@@ -101,6 +122,33 @@ const fakeSourceTree = (
   }),
 });
 
+const createSystemSourceProject = async (): Promise<{
+  project: ProjectInputs;
+  cameraPath: string;
+  originalCameraPath: string;
+}> => {
+  const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'source-identity-'));
+  tempDirectories.push(workspaceRoot);
+  const sourceRoot = path.join(workspaceRoot, 'projects', 'demo', 'assets', 'source');
+  await mkdir(path.join(sourceRoot, 'nested'), {recursive: true});
+  const cameraPath = path.join(sourceRoot, 'camera-a.mp4');
+  const originalCameraPath = path.join(sourceRoot, 'camera-original.mp4');
+  await Promise.all([
+    writeFile(cameraPath, 'camera-old'),
+    writeFile(path.join(sourceRoot, 'nested', 'cover.png'), 'cover'),
+    writeFile(path.join(sourceRoot, 'music-main.wav'), 'music'),
+  ]);
+  return {
+    project: {
+      ...projectInputs,
+      workspaceRoot,
+      projectDirectory: await createProjectDirectoryScope(workspaceRoot, 'demo'),
+    },
+    cameraPath,
+    originalCameraPath,
+  };
+};
+
 describe('discoverProjectSourceCatalog', () => {
   it('resolves referenced EDL assets by unique filename stem', async () => {
     const catalog = await discoverProjectSourceCatalog(projectInputs, fakeSourceTree({
@@ -184,4 +232,29 @@ describe('discoverProjectSourceCatalog', () => {
       'assets/source/music-main.wav': file(0, 'sha256:music'),
     }))).rejects.toMatchObject({code: 'PROJECT_SOURCE_INVALID'});
   });
+
+  it.each(['regular file', 'internal symlink'] as const)(
+    'rejects an inventoried file replaced by a %s before hashing',
+    async (replacement) => {
+      const {project, cameraPath, originalCameraPath} =
+        await createSystemSourceProject();
+      const system = createSystemSourceCatalogDependencies();
+      const dependencies: SourceCatalogDependencies = {
+        listSourceFiles: async (scope) => {
+          const files = await system.listSourceFiles(scope);
+          await rename(cameraPath, originalCameraPath);
+          if (replacement === 'regular file') {
+            await writeFile(cameraPath, 'camera-new');
+          } else {
+            await createSymlink(path.basename(originalCameraPath), cameraPath);
+          }
+          return files;
+        },
+        hashProjectFile: system.hashProjectFile,
+      };
+
+      await expect(discoverProjectSourceCatalog(project, dependencies))
+        .rejects.toMatchObject({code: 'PROJECT_SOURCE_INVALID'});
+    },
+  );
 });

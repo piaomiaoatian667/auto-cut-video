@@ -20,7 +20,6 @@ import {
   createProjectFixture,
   createScriptFixture,
 } from '../../helpers/temp-project';
-import type {ProjectInputs} from '../../../src/domain/load-project';
 import {
   ProjectPathError,
   type ProjectDirectoryScope,
@@ -37,11 +36,10 @@ import {
 } from '../../../src/pipeline/stages/preflight';
 import {
   createSystemSourceMeterDependencies,
-  createSystemVideoctlDependencies,
   measureProjectSourceBytes,
   type SourceMeterDependencies,
   type SourceMeterStat,
-} from '../../../src/cli/videoctl';
+} from '../../../src/pipeline/source-assets';
 import {createRunStore} from '../../../src/pipeline/run-store';
 
 const GIB = 1024 ** 3;
@@ -1078,18 +1076,11 @@ describe('scoped source measurement', () => {
       video: sourceFile(4n, BigInt(GIB - 512)),
       nested: sourceDirectory(5n, {audio: sourceFile(6n, 512n)}),
     }));
-    const projectInputs: ProjectInputs = {
-      workspaceRoot: '/workspace',
-      projectDirectory: meter.scope,
-      project: createProjectFixture(),
-      script: createScriptFixture(),
-      edit: createEditFixture(),
-    };
-    const system = createSystemVideoctlDependencies({
-      sourceMeter: meter.dependencies,
-    });
 
-    const measuredBytes = await system.measureSourceBytes(projectInputs);
+    const measuredBytes = await measureProjectSourceBytes(
+      meter.scope,
+      meter.dependencies,
+    );
     const preflight = fixture({sourceBytes: measuredBytes});
     const result = await runPreflight(preflight.input, preflight.dependencies);
 

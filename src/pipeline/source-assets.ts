@@ -171,9 +171,17 @@ interface SourceMeterAuthority {
   name?: string;
 }
 
+interface SourceFileIdentity {
+  dev: bigint;
+  ino: bigint;
+  nlink: bigint;
+  size: bigint;
+}
+
 interface MeasuredSourceFile {
   sourcePath: string;
   sizeBytes: bigint;
+  identity: SourceFileIdentity;
 }
 
 interface MeasuredSourceTree {
@@ -311,7 +319,16 @@ const measureOpenedDirectory = async (
         if (entryKind === 'file') {
           if (child.status.size < 0n) throw invalidSource();
           await revalidateAuthority(scope, child, dependencies);
-          files.push({sourcePath: childSourcePath, sizeBytes: child.status.size});
+          files.push({
+            sourcePath: childSourcePath,
+            sizeBytes: child.status.size,
+            identity: {
+              dev: child.status.dev,
+              ino: child.status.ino,
+              nlink: child.status.nlink,
+              size: child.status.size,
+            },
+          });
           totalBytes += child.status.size;
         } else {
           const childTree = await measureOpenedDirectory(
@@ -410,10 +427,16 @@ const measureProjectSourceTreeUnsafe = async (
   }
 };
 
-const listProjectSourceFiles = async (
+interface InventoriedSourceFile {
+  sourcePath: string;
+  sizeBytes: number;
+  identity: SourceFileIdentity;
+}
+
+const inventoryProjectSourceFiles = async (
   scope: ProjectDirectoryScope,
   dependencies: SourceMeterDependencies,
-): Promise<readonly {sourcePath: string; sizeBytes: number}[]> => {
+): Promise<readonly InventoriedSourceFile[]> => {
   try {
     const tree = await measureProjectSourceTreeUnsafe(scope, dependencies);
     if (
@@ -423,11 +446,11 @@ const listProjectSourceFiles = async (
       throw invalidSource();
     }
     return tree.files
-      .map(({sourcePath, sizeBytes}) => {
+      .map(({sourcePath, sizeBytes, identity}) => {
         if (sizeBytes < 0n || sizeBytes > BigInt(Number.MAX_SAFE_INTEGER)) {
           throw invalidSource();
         }
-        return {sourcePath, sizeBytes: Number(sizeBytes)};
+        return {sourcePath, sizeBytes: Number(sizeBytes), identity};
       })
       .sort((left, right) => left.sourcePath.localeCompare(right.sourcePath));
   } catch (error) {
@@ -440,7 +463,7 @@ export const measureProjectSourceBytes = async (
   scope: ProjectDirectoryScope,
   dependencies: SourceMeterDependencies,
 ): Promise<number> => {
-  const files = await listProjectSourceFiles(scope, dependencies);
+  const files = await inventoryProjectSourceFiles(scope, dependencies);
   return files.reduce((total, source) => total + source.sizeBytes, 0);
 };
 
@@ -497,9 +520,117 @@ export const createSystemSourceMeterDependencies = (
   openDirectory: async (fdPath) => await fileSystem.openDirectory(fdPath),
 });
 
-const hashFileHandle = async (handle: FileHandle): Promise<string> => {
+const identityMatchesStatus = (
+  status: Pick<SourceMeterStat, 'dev' | 'ino' | 'nlink' | 'size'> & {
+    isFile(): boolean;
+  },
+  identity: SourceFileIdentity,
+): boolean => (
+  status.isFile()
+  && status.dev === identity.dev
+  && status.ino === identity.ino
+  && status.nlink === identity.nlink
+  && status.size === identity.size
+);
+
+const sourcePathSegments = (sourcePath: string): string[] => {
+  const segments = sourcePath.split('/');
+  if (
+    sourcePath.includes('\0')
+    || sourcePath.includes('\\')
+    || sourcePath !== path.posix.normalize(sourcePath)
+    || segments.length < 3
+    || segments[0] !== 'assets'
+    || segments[1] !== 'source'
+    || segments.some((segment) => (
+      segment.length === 0 || segment === '.' || segment === '..'
+    ))
+  ) {
+    throw invalidSource();
+  }
+  return segments;
+};
+
+const closeSourceAuthorities = async (
+  authorities: readonly SourceMeterAuthority[],
+): Promise<void> => {
+  let closeError: unknown;
+  for (const authority of [...authorities].reverse()) {
+    try {
+      await authority.handle.close();
+    } catch (error) {
+      closeError ??= error;
+    }
+  }
+  if (closeError !== undefined) throw closeError;
+};
+
+const openInventoriedSourceAuthority = async (
+  scope: ProjectDirectoryScope,
+  sourcePath: string,
+  dependencies: SourceMeterDependencies,
+): Promise<{
+  authorities: readonly SourceMeterAuthority[];
+  target: SourceMeterAuthority;
+}> => {
+  const segments = sourcePathSegments(sourcePath);
+  const authorities: SourceMeterAuthority[] = [];
+  let pendingHandle: SourceMeterFileHandle | undefined;
+  try {
+    pendingHandle = await dependencies.openExistingProjectFile(scope, '.');
+    const rootStatus = await pendingHandle.stat();
+    if (statusKind(rootStatus) !== 'directory') throw invalidSource();
+    let parent: SourceMeterAuthority = {handle: pendingHandle, status: rootStatus};
+    authorities.push(parent);
+    pendingHandle = undefined;
+
+    for (const [index, segment] of segments.entries()) {
+      const expectedKind: SourceMeterEntryKind = index === segments.length - 1
+        ? 'file'
+        : 'directory';
+      if (await requireEntryKind(
+        scope,
+        parent,
+        segment,
+        dependencies,
+      ) !== expectedKind) {
+        throw invalidSource();
+      }
+      parent = await openChildAuthority(
+        scope,
+        parent,
+        segment,
+        expectedKind,
+        dependencies,
+      );
+      authorities.push(parent);
+    }
+    return {authorities, target: parent};
+  } catch (error) {
+    let closeError: unknown;
+    if (pendingHandle !== undefined) {
+      try {
+        await pendingHandle.close();
+      } catch (pendingCloseError) {
+        closeError = pendingCloseError;
+      }
+    }
+    try {
+      await closeSourceAuthorities(authorities);
+    } catch (authorityCloseError) {
+      closeError ??= authorityCloseError;
+    }
+    if (closeError !== undefined) throw closeError;
+    throw error;
+  }
+};
+
+const hashFileHandle = async (
+  handle: FileHandle,
+  expectedIdentity: SourceFileIdentity,
+): Promise<string> => {
   const before = await handle.stat({bigint: true});
-  if (!before.isFile() || before.size < 0n) throw invalidSource();
+  if (!identityMatchesStatus(before, expectedIdentity)) throw invalidSource();
   const hash = createHash('sha256');
   const buffer = Buffer.allocUnsafe(64 * 1024);
   let position = 0;
@@ -510,47 +641,72 @@ const hashFileHandle = async (handle: FileHandle): Promise<string> => {
     position += bytesRead;
   }
   const after = await handle.stat({bigint: true});
-  const beforeStatus: SourceMeterStat = {
-    dev: before.dev,
-    ino: before.ino,
-    nlink: before.nlink,
-    size: before.size,
-    isFile: () => before.isFile(),
-    isDirectory: () => before.isDirectory(),
-  };
-  const afterStatus: SourceMeterStat = {
-    dev: after.dev,
-    ino: after.ino,
-    nlink: after.nlink,
-    size: after.size,
-    isFile: () => after.isFile(),
-    isDirectory: () => after.isDirectory(),
-  };
-  if (!sameOpenedPath(afterStatus, beforeStatus)) throw invalidSource();
+  if (!identityMatchesStatus(after, expectedIdentity)) throw invalidSource();
   return `sha256:${hash.digest('hex')}`;
 };
 
-const hashProjectFile = async (
+const hashInventoriedProjectFile = async (
   projectDirectory: ProjectDirectoryScope,
   sourcePath: string,
+  expectedIdentity: SourceFileIdentity,
+  sourceMeter: SourceMeterDependencies,
 ): Promise<string> => {
-  const handle = await openExistingProjectFile(projectDirectory, sourcePath);
+  const opened = await openInventoriedSourceAuthority(
+    projectDirectory,
+    sourcePath,
+    sourceMeter,
+  );
   try {
-    return await hashFileHandle(handle);
+    if (!identityMatchesStatus(opened.target.status, expectedIdentity)) {
+      throw invalidSource();
+    }
+    await revalidateAuthority(projectDirectory, opened.target, sourceMeter);
+    const handle = await openExistingProjectFile(projectDirectory, sourcePath);
+    try {
+      const sha256 = await hashFileHandle(handle, expectedIdentity);
+      await revalidateAuthority(projectDirectory, opened.target, sourceMeter);
+      return sha256;
+    } finally {
+      await handle.close();
+    }
   } finally {
-    await handle.close();
+    await closeSourceAuthorities(opened.authorities);
   }
 };
 
 export const createSystemSourceCatalogDependencies = (
   sourceMeter: SourceMeterDependencies = createSystemSourceMeterDependencies(),
-): SourceCatalogDependencies => ({
-  listSourceFiles: async (projectDirectory) => await listProjectSourceFiles(
-    projectDirectory,
-    sourceMeter,
-  ),
-  hashProjectFile,
-});
+): SourceCatalogDependencies => {
+  const inventories = new WeakMap<
+    ProjectDirectoryScope,
+    ReadonlyMap<string, SourceFileIdentity>
+  >();
+  return {
+    listSourceFiles: async (projectDirectory) => {
+      const files = await inventoryProjectSourceFiles(projectDirectory, sourceMeter);
+      inventories.set(projectDirectory, new Map(files.map((source) => [
+        source.sourcePath,
+        source.identity,
+      ])));
+      return files.map(({sourcePath, sizeBytes}) => ({sourcePath, sizeBytes}));
+    },
+    hashProjectFile: async (projectDirectory, sourcePath) => {
+      const expectedIdentity = inventories.get(projectDirectory)?.get(sourcePath);
+      if (expectedIdentity === undefined) throw invalidSource();
+      try {
+        return await hashInventoriedProjectFile(
+          projectDirectory,
+          sourcePath,
+          expectedIdentity,
+          sourceMeter,
+        );
+      } catch (error) {
+        if (error instanceof ProjectSourceMeasurementError) throw error;
+        throw invalidSource(error);
+      }
+    },
+  };
+};
 
 const projectSourceError = (
   code: ProjectSourceErrorCode,

@@ -8,9 +8,7 @@ import {
 import {
   createSystemSourceCatalogDependencies,
   discoverProjectSourceCatalog,
-  measureProjectSourceBytes,
   type SourceCatalogDependencies,
-  type SourceMeterDependencies,
 } from '../pipeline/source-assets';
 import {
   createSystemPreflightDependencies,
@@ -27,19 +25,6 @@ import {
 } from './output';
 import {runReviewCommand, type ReviewCommandOptions} from './commands/review';
 
-export {
-  ProjectSourceMeasurementError,
-  createSystemSourceMeterDependencies,
-  measureProjectSourceBytes,
-  type SourceMeterDependencies,
-  type SourceMeterDirectory,
-  type SourceMeterDirectoryEntry,
-  type SourceMeterFileHandle,
-  type SourceMeterStat,
-  type SystemSourceMeterFileHandle,
-  type SystemSourceMeterFileSystem,
-} from '../pipeline/source-assets';
-
 export interface OutputWriter {
   write(chunk: string): unknown;
 }
@@ -49,7 +34,7 @@ export interface VideoctlDependencies {
   stdout: OutputWriter;
   stderr: OutputWriter;
   loadProject(workspaceRoot: string, projectId: string): Promise<ProjectInputs>;
-  measureSourceBytes(project: ProjectInputs): Promise<number>;
+  sourceCatalog: SourceCatalogDependencies;
   preflight(input: PreflightInput): Promise<PreflightResult>;
   ffmpegExecutable?: string;
   ffprobeExecutable?: string;
@@ -108,7 +93,9 @@ const runDoctor = async (
 
   let sourceBytes: number;
   try {
-    sourceBytes = await dependencies.measureSourceBytes(project);
+    sourceBytes = (
+      await discoverProjectSourceCatalog(project, dependencies.sourceCatalog)
+    ).totalBytes;
   } catch {
     dependencies.stdout.write(formatDoctorFailure(
       projectId,
@@ -188,7 +175,6 @@ export async function runVideoctl(
 
 export interface SystemVideoctlOptions {
   sourceCatalog?: SourceCatalogDependencies;
-  sourceMeter?: SourceMeterDependencies;
 }
 
 export const createSystemVideoctlDependencies = (
@@ -204,14 +190,7 @@ export const createSystemVideoctlDependencies = (
     stdout: process.stdout,
     stderr: process.stderr,
     loadProject,
-    measureSourceBytes: options.sourceMeter === undefined
-      ? async (project) => (
-        await discoverProjectSourceCatalog(project, sourceCatalog)
-      ).totalBytes
-      : async (project) => await measureProjectSourceBytes(
-        project.projectDirectory,
-        options.sourceMeter!,
-      ),
+    sourceCatalog,
     preflight: async (input) => runPreflight(input, preflightDependencies),
     ...(ffmpegExecutable === undefined ? {} : {ffmpegExecutable}),
     ...(ffprobeExecutable === undefined ? {} : {ffprobeExecutable}),

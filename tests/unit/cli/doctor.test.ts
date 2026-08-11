@@ -2,10 +2,20 @@ import {describe, expect, it, vi} from 'vitest';
 import {createEditFixture, createProjectFixture, createScriptFixture} from '../../helpers/temp-project';
 import type {ProjectInputs} from '../../../src/domain/load-project';
 import type {ProjectDirectoryScope} from '../../../src/fs/project-paths';
-import {ProjectSourceError} from '../../../src/pipeline/source-assets';
+import {
+  ProjectSourceError,
+  discoverProjectSourceCatalog,
+  type SourceCatalogDependencies,
+  type SourceMeterDependencies,
+} from '../../../src/pipeline/source-assets';
 import type {PreflightResult} from '../../../src/pipeline/stages/preflight';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
-import {runVideoctl, type VideoctlDependencies} from '../../../src/cli/videoctl';
+import {
+  createSystemVideoctlDependencies,
+  runVideoctl,
+  type SystemVideoctlOptions,
+  type VideoctlDependencies,
+} from '../../../src/cli/videoctl';
 
 const successfulResult = (): PreflightResult => ({
   checks: [
@@ -77,12 +87,19 @@ const fixture = (result: PreflightResult = successfulResult()) => {
   let stdout = '';
   let stderr = '';
   const projectInputs = loadedProject();
+  const sourceCatalog: SourceCatalogDependencies = {
+    listSourceFiles: vi.fn(async () => [{
+      sourcePath: 'assets/source/cover.png',
+      sizeBytes: 1024,
+    }]),
+    hashProjectFile: vi.fn(async () => 'sha256:cover'),
+  };
   const dependencies: VideoctlDependencies = {
     workspaceRoot: '/workspace',
     stdout: {write: (chunk) => { stdout += chunk; }},
     stderr: {write: (chunk) => { stderr += chunk; }},
     loadProject: vi.fn(async () => projectInputs),
-    measureSourceBytes: vi.fn(async () => 1024),
+    sourceCatalog,
     preflight: vi.fn(async () => result),
     ffmpegExecutable: '/configured/ffmpeg',
     ffprobeExecutable: '/configured/ffprobe',
@@ -113,7 +130,12 @@ describe('videoctl doctor', () => {
 
     expect(exitCode).toBe(EXIT_CODES.success);
     expect(dependencies.loadProject).toHaveBeenCalledWith('/workspace', 'demo');
-    expect(dependencies.measureSourceBytes).toHaveBeenCalledWith(projectInputs);
+    expect(dependencies.sourceCatalog.listSourceFiles)
+      .toHaveBeenCalledWith(projectInputs.projectDirectory);
+    expect(dependencies.sourceCatalog.hashProjectFile).toHaveBeenCalledWith(
+      projectInputs.projectDirectory,
+      'assets/source/cover.png',
+    );
     expect(dependencies.preflight).toHaveBeenCalledWith({
       workspaceRoot: '/workspace',
       projectDirectory: projectInputs.projectDirectory,
@@ -142,7 +164,7 @@ describe('videoctl doctor', () => {
 
   it('maps source catalog failures to sanitized project validation JSON', async () => {
     const {dependencies, stdout, stderr} = fixture();
-    dependencies.measureSourceBytes = vi.fn(async () => {
+    dependencies.sourceCatalog.listSourceFiles = vi.fn(async () => {
       throw new ProjectSourceError(
         'PROJECT_SOURCE_INVALID',
         'project directory changed after scope creation: assets/source',
@@ -165,6 +187,59 @@ describe('videoctl doctor', () => {
     }));
     expect(stdout()).not.toContain('assets/source');
     expect(stderr()).toBe('');
+  });
+
+  it('does not allow a byte-only source meter to bypass catalog validation', async () => {
+    const sourceCatalog: SourceCatalogDependencies = {
+      listSourceFiles: vi.fn(async () => []),
+      hashProjectFile: vi.fn(async () => 'sha256:not-used'),
+    };
+    const sourceMeter: SourceMeterDependencies = {
+      openExistingProjectFile: vi.fn(async () => {
+        throw new Error('legacy source meter bypass invoked');
+      }),
+      openAuthority: vi.fn(async () => {
+        throw new Error('legacy source meter bypass invoked');
+      }),
+      openDirectory: vi.fn(async () => {
+        throw new Error('legacy source meter bypass invoked');
+      }),
+    };
+    const options = {
+      sourceCatalog,
+      sourceMeter,
+    } as SystemVideoctlOptions & {sourceMeter: SourceMeterDependencies};
+    const dependencies = createSystemVideoctlDependencies(options);
+
+    await expect(discoverProjectSourceCatalog(
+      loadedProject(),
+      dependencies.sourceCatalog,
+    ))
+      .rejects.toMatchObject({code: 'PROJECT_SOURCE_MISSING'});
+    expect(sourceCatalog.listSourceFiles).toHaveBeenCalledOnce();
+    expect(sourceMeter.openExistingProjectFile).not.toHaveBeenCalled();
+  });
+
+  it('does not allow direct CLI dependencies to inject measured source bytes', async () => {
+    const run = fixture();
+    const sourceCatalog: SourceCatalogDependencies = {
+      listSourceFiles: vi.fn(async () => []),
+      hashProjectFile: vi.fn(async () => 'sha256:not-used'),
+    };
+    const measureSourceBytes = vi.fn(async () => 1024);
+    const dependencies = {
+      ...run.dependencies,
+      sourceCatalog,
+      measureSourceBytes,
+    } as VideoctlDependencies & {
+      measureSourceBytes: typeof measureSourceBytes;
+    };
+
+    const exitCode = await runVideoctl(['doctor', 'demo', '--json'], dependencies);
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(sourceCatalog.listSourceFiles).toHaveBeenCalledOnce();
+    expect(measureSourceBytes).not.toHaveBeenCalled();
   });
 
   it('prints machine-readable JSON with identities, fingerprint, and checks', async () => {

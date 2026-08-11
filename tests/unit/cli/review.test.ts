@@ -81,7 +81,10 @@ const makeFixture = async () => {
     stdout: {write: (chunk) => { stdout += chunk; }},
     stderr: {write: (chunk) => { stderr += chunk; }},
     loadProject: vi.fn(async () => projectInputs),
-    measureSourceBytes: vi.fn(async () => 0),
+    sourceCatalog: {
+      listSourceFiles: vi.fn(async () => []),
+      hashProjectFile: vi.fn(async () => 'sha256:not-used'),
+    },
     preflight: vi.fn(async () => { throw new Error('unused'); }),
   };
   return {workspaceRoot, runId, dependencies, stdout: () => stdout, stderr: () => stderr};
