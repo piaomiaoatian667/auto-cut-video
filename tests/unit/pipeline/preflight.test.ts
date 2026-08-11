@@ -519,6 +519,7 @@ const sourceMeterFixture = (
     fileCloses.push(close);
     return {
       fd,
+      read: vi.fn(async () => ({bytesRead: 0})),
       stat: vi.fn(async () => {
         if (relativePath === options.failStatPath) {
           throw new Error('stat failed');
@@ -1189,13 +1190,14 @@ describe('scoped source measurement', () => {
       };
     });
     const close = vi.fn(async () => {});
+    const read = vi.fn(async () => ({bytesRead: 0}));
     const open = vi.fn(async (candidate: string, flags: number) => {
       expect(candidate).toBe('/.vol/1/9/video.mp4');
       expect(flags & constants.O_NONBLOCK).not.toBe(0);
-      return {fd: 42, stat, close};
+      return {fd: 42, stat, read, close};
     });
     const adapter = createSystemSourceMeterDependencies({
-      openExistingProjectFile: vi.fn(async () => ({fd: 42, stat, close})),
+      openExistingProjectFile: vi.fn(async () => ({fd: 42, stat, read, close})),
       open,
       openDirectory: vi.fn(async () => { throw new Error('not used'); }),
     });

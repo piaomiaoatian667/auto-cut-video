@@ -1,6 +1,9 @@
+import {execFile as execFileCallback} from 'node:child_process';
+import {constants} from 'node:fs';
 import {
   mkdir,
   mkdtemp,
+  open as openFile,
   rename,
   rm,
   symlink as createSymlink,
@@ -8,6 +11,8 @@ import {
 } from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
+import {setTimeout as delay} from 'node:timers/promises';
+import {promisify} from 'node:util';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import type {ProjectInputs} from '../../../src/domain/load-project';
 import {
@@ -17,8 +22,10 @@ import {
 import {fingerprintValue} from '../../../src/pipeline/fingerprint';
 import {
   createSystemSourceCatalogDependencies,
+  createSystemSourceMeterDependencies,
   discoverProjectSourceCatalog,
   type SourceCatalogDependencies,
+  type SourceMeterDependencies,
 } from '../../../src/pipeline/source-assets';
 import {
   createProjectFixture,
@@ -27,6 +34,10 @@ import {
 
 const projectDirectory = {} as ProjectDirectoryScope;
 const tempDirectories: string[] = [];
+const execFile = promisify(execFileCallback);
+
+const isNodeError = (error: unknown): error is NodeJS.ErrnoException =>
+  error instanceof Error && 'code' in error;
 
 afterEach(async () => {
   await Promise.all(tempDirectories.splice(0).map(async (directory) => {
@@ -257,4 +268,75 @@ describe('discoverProjectSourceCatalog', () => {
         .rejects.toMatchObject({code: 'PROJECT_SOURCE_INVALID'});
     },
   );
+
+  it('rejects a FIFO replacement in the final-open window without blocking', async () => {
+    const {project, cameraPath, originalCameraPath} =
+      await createSystemSourceProject();
+    const systemMeter = createSystemSourceMeterDependencies();
+    let inventoryComplete = false;
+    let cameraOpenCount = 0;
+    let resolveFifoInstalled!: () => void;
+    const fifoInstalled = new Promise<void>((resolve) => {
+      resolveFifoInstalled = resolve;
+    });
+    const sourceMeter: SourceMeterDependencies = {
+      ...systemMeter,
+      openAuthority: async (parent, name) => {
+        const handle = await systemMeter.openAuthority(parent, name);
+        if (!inventoryComplete || name !== 'camera-a.mp4') return handle;
+        cameraOpenCount += 1;
+        if (cameraOpenCount !== 2) return handle;
+        return {
+          ...handle,
+          close: async () => {
+            await handle.close();
+            await rename(cameraPath, originalCameraPath);
+            await execFile('mkfifo', [cameraPath]);
+            resolveFifoInstalled();
+          },
+        };
+      },
+    };
+    const systemCatalog = createSystemSourceCatalogDependencies(sourceMeter);
+    const dependencies: SourceCatalogDependencies = {
+      listSourceFiles: async (scope) => {
+        const files = await systemCatalog.listSourceFiles(scope);
+        inventoryComplete = true;
+        return files;
+      },
+      hashProjectFile: systemCatalog.hashProjectFile,
+    };
+    const outcome = discoverProjectSourceCatalog(project, dependencies).then(
+      () => ({status: 'resolved'} as const),
+      (error: unknown) => ({status: 'rejected', error} as const),
+    );
+
+    await fifoInstalled;
+    const fifoPeer = delay(500).then(async () => {
+      try {
+        const handle = await openFile(
+          cameraPath,
+          constants.O_WRONLY | constants.O_NONBLOCK,
+        );
+        await handle.close();
+      } catch (error) {
+        if (!isNodeError(error) || error.code !== 'ENXIO') throw error;
+      }
+    });
+    const promptOutcome = await Promise.race([
+      outcome,
+      delay(200, {status: 'timed-out'} as const),
+    ]);
+    await fifoPeer;
+    const finalOutcome = await outcome;
+
+    expect(promptOutcome).toMatchObject({
+      status: 'rejected',
+      error: {code: 'PROJECT_SOURCE_INVALID'},
+    });
+    expect(finalOutcome).toMatchObject({
+      status: 'rejected',
+      error: {code: 'PROJECT_SOURCE_INVALID'},
+    });
+  });
 });

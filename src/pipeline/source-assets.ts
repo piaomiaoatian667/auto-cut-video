@@ -3,7 +3,6 @@ import {constants} from 'node:fs';
 import {
   open,
   opendir,
-  type FileHandle,
 } from 'node:fs/promises';
 import path from 'node:path';
 import type {ProjectInputs} from '../domain/load-project';
@@ -68,6 +67,12 @@ export interface SourceMeterStat {
 export interface SourceMeterFileHandle {
   fd: number;
   stat(): Promise<SourceMeterStat>;
+  read(
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number,
+  ): Promise<{bytesRead: number}>;
   close(): Promise<void>;
 }
 
@@ -470,6 +475,12 @@ export const measureProjectSourceBytes = async (
 export interface SystemSourceMeterFileHandle {
   fd: number;
   stat(options: {bigint: true}): Promise<SourceMeterStat>;
+  read(
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number,
+  ): Promise<{bytesRead: number}>;
   close(): Promise<void>;
 }
 
@@ -503,6 +514,8 @@ const systemSourceHandle = (
 ): SourceMeterFileHandle => ({
   fd: handle.fd,
   stat: async () => await handle.stat({bigint: true}),
+  read: async (buffer, offset, length, position) =>
+    await handle.read(buffer, offset, length, position),
   close: async () => await handle.close(),
 });
 
@@ -626,10 +639,10 @@ const openInventoriedSourceAuthority = async (
 };
 
 const hashFileHandle = async (
-  handle: FileHandle,
+  handle: SourceMeterFileHandle,
   expectedIdentity: SourceFileIdentity,
 ): Promise<string> => {
-  const before = await handle.stat({bigint: true});
+  const before = await handle.stat();
   if (!identityMatchesStatus(before, expectedIdentity)) throw invalidSource();
   const hash = createHash('sha256');
   const buffer = Buffer.allocUnsafe(64 * 1024);
@@ -640,7 +653,7 @@ const hashFileHandle = async (
     hash.update(buffer.subarray(0, bytesRead));
     position += bytesRead;
   }
-  const after = await handle.stat({bigint: true});
+  const after = await handle.stat();
   if (!identityMatchesStatus(after, expectedIdentity)) throw invalidSource();
   return `sha256:${hash.digest('hex')}`;
 };
@@ -661,14 +674,9 @@ const hashInventoriedProjectFile = async (
       throw invalidSource();
     }
     await revalidateAuthority(projectDirectory, opened.target, sourceMeter);
-    const handle = await openExistingProjectFile(projectDirectory, sourcePath);
-    try {
-      const sha256 = await hashFileHandle(handle, expectedIdentity);
-      await revalidateAuthority(projectDirectory, opened.target, sourceMeter);
-      return sha256;
-    } finally {
-      await handle.close();
-    }
+    const sha256 = await hashFileHandle(opened.target.handle, expectedIdentity);
+    await revalidateAuthority(projectDirectory, opened.target, sourceMeter);
+    return sha256;
   } finally {
     await closeSourceAuthorities(opened.authorities);
   }
