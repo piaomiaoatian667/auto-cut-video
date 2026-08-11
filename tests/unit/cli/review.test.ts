@@ -1,5 +1,6 @@
+import {createHash} from 'node:crypto';
 import {afterEach, describe, expect, it, vi} from 'vitest';
-import {rm} from 'node:fs/promises';
+import {rm, symlink, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {mkdtemp} from 'node:fs/promises';
@@ -15,6 +16,9 @@ import {createEditFixture, createProjectFixture, createScriptFixture} from '../.
 import type {ProjectInputs} from '../../../src/domain/load-project';
 
 const tempDirectories: string[] = [];
+
+const sha256 = (value: Buffer | string): string =>
+  `sha256:${createHash('sha256').update(value).digest('hex')}`;
 
 afterEach(async () => {
   await Promise.all(tempDirectories.splice(0).map(async (directory) =>
@@ -43,18 +47,59 @@ const readRunJson = async (workspaceRoot: string, runId: string, relativePath: s
   }
 };
 
+const writeRunText = async (
+  workspaceRoot: string,
+  runId: string,
+  relativePath: string,
+  contents: string,
+): Promise<string> => {
+  const run = await createRunStore(workspaceRoot).openExistingRun('demo', runId);
+  await ensureRunDirectory(run, path.posix.dirname(relativePath));
+  const handle = await openNewRunFile(run, relativePath);
+  try {
+    await handle.writeFile(contents, 'utf8');
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  return sha256(contents);
+};
+
 const makeFixture = async () => {
   const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'videoctl-review-'));
   tempDirectories.push(workspaceRoot);
   const store = createRunStore(workspaceRoot);
   const runId = 'run-review';
   await store.createRun('demo', runId);
+  const draftVideoSha = await writeRunText(
+    workspaceRoot,
+    runId,
+    'draft/draft.mp4',
+    'draft-video',
+  );
+  const contactSheetSha = await writeRunText(
+    workspaceRoot,
+    runId,
+    'draft/contact-sheet.jpg',
+    'contact-sheet',
+  );
+  const reviewFrameSha = await writeRunText(
+    workspaceRoot,
+    runId,
+    'draft/frames/frame-000000.jpg',
+    'review-frame',
+  );
   await writeRunJson(workspaceRoot, runId, 'draft/draft-report.json', {
     version: 1,
+    projectId: 'demo',
     outputs: {
-      draftVideo: {path: 'draft/draft.mp4', sha256: 'sha256:draft'},
-      contactSheet: {path: 'draft/contact-sheet.jpg', sha256: 'sha256:sheet'},
-      reviewFrames: [{path: 'draft/frames/frame-000000.jpg', sha256: 'sha256:frame'}],
+      draftVideo: {path: 'draft/draft.mp4', sha256: draftVideoSha},
+      contactSheet: {path: 'draft/contact-sheet.jpg', sha256: contactSheetSha},
+      reviewFrames: [{path: 'draft/frames/frame-000000.jpg', sha256: reviewFrameSha}],
+      audio: {
+        filterGraph: {path: 'audio/filter-graph.txt', sha256: sha256('filter-graph')},
+        mixedAudio: {path: 'audio/mixed-normalized.wav', sha256: sha256('mixed-audio')},
+      },
     },
   });
   await store.publishCurrent('demo', {
@@ -87,7 +132,14 @@ const makeFixture = async () => {
     },
     preflight: vi.fn(async () => { throw new Error('unused'); }),
   };
-  return {workspaceRoot, runId, dependencies, stdout: () => stdout, stderr: () => stderr};
+  return {
+    workspaceRoot,
+    runId,
+    dependencies,
+    stdout: () => stdout,
+    stderr: () => stderr,
+    runRoot: path.join(workspaceRoot, '.work', 'demo', 'runs', runId),
+  };
 };
 
 describe('videoctl review', () => {
@@ -110,5 +162,32 @@ describe('videoctl review', () => {
       reason: 'looks good',
       evidencePaths: ['draft/draft.mp4', 'draft/contact-sheet.jpg', 'draft/frames/frame-000000.jpg'],
     });
+  });
+
+  it.each([
+    ['missing', async (fixture: Awaited<ReturnType<typeof makeFixture>>) => {
+      await rm(path.join(fixture.runRoot, 'draft/draft.mp4'));
+    }],
+    ['changed', async (fixture: Awaited<ReturnType<typeof makeFixture>>) => {
+      await writeFile(path.join(fixture.runRoot, 'draft/draft.mp4'), 'changed');
+    }],
+    ['cross-scope symlink', async (fixture: Awaited<ReturnType<typeof makeFixture>>) => {
+      const outsidePath = path.join(fixture.workspaceRoot, 'outside-draft.mp4');
+      await writeFile(outsidePath, 'draft-video');
+      await rm(path.join(fixture.runRoot, 'draft/draft.mp4'));
+      await symlink(outsidePath, path.join(fixture.runRoot, 'draft/draft.mp4'));
+    }],
+  ])('rejects %s Draft review evidence', async (_label, mutateEvidence) => {
+    const fixture = await makeFixture();
+    await mutateEvidence(fixture);
+
+    const exitCode = await runVideoctl([
+      'review', 'demo', '--approve', '--reason', 'looks good', '--reviewer', 'tester',
+    ], fixture.dependencies);
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(fixture.stdout()).toBe('');
+    await expect(createRunStore(fixture.workspaceRoot).readCurrent('demo'))
+      .resolves.toMatchObject({state: 'needs_review'});
   });
 });

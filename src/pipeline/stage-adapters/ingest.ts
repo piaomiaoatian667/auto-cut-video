@@ -15,6 +15,7 @@ import {
   type IngestInput,
   type IngestManifest,
 } from '../stages/ingest';
+import type {ProjectSourceCatalog} from '../source-assets';
 import {
   STAGE_ALGORITHM_VERSIONS,
   verifyReportedArtifacts,
@@ -35,17 +36,37 @@ export interface IngestStageAdapterDependencies {
   hashRunArtifact?: typeof hashRunArtifact;
 }
 
-const runOwnedRenderPaths = (manifest: IngestManifest): string[] | null => {
+const runOwnedRenderPaths = (
+  manifest: IngestManifest,
+  sourceAssets: ProjectSourceCatalog['assets'],
+): string[] | null => {
+  const manifestAssetIds = Object.keys(manifest.assets);
+  if (
+    manifestAssetIds.length !== sourceAssets.length
+    || new Set(manifestAssetIds).size !== manifestAssetIds.length
+  ) return null;
   const paths = new Set<string>();
-  for (const [assetId, asset] of Object.entries(manifest.assets)) {
-    if (asset.renderScope !== 'run') continue;
-    const expectedPath = `assets/${assetId}/render.mp4`;
+  for (const sourceAsset of sourceAssets) {
+    const asset = manifest.assets[sourceAsset.assetId];
     if (
-      asset.kind !== 'video'
-      || asset.renderPath !== expectedPath
-      || paths.has(asset.renderPath)
+      asset === undefined
+      || asset.kind !== sourceAsset.kind
+      || asset.sourcePath !== sourceAsset.sourcePath
+      || asset.sourceHash !== sourceAsset.sha256
     ) return null;
-    paths.add(asset.renderPath);
+    if (asset.renderScope === 'run') {
+      const expectedPath = `assets/${sourceAsset.assetId}/render.mp4`;
+      if (
+        asset.kind !== 'video'
+        || asset.compatibility !== 'transcoded'
+        || asset.renderPath !== expectedPath
+        || paths.has(asset.renderPath)
+      ) return null;
+      paths.add(asset.renderPath);
+    } else if (
+      asset.compatibility !== 'direct'
+      || asset.renderPath !== sourceAsset.sourcePath
+    ) return null;
   }
   return [...paths].sort();
 };
@@ -97,7 +118,10 @@ export const createIngestStage = (
     verify: async (context, report) => {
       const parsed = IngestAdapterOutputSchema.safeParse(report.outputs);
       if (!parsed.success) return false;
-      const renderPaths = runOwnedRenderPaths(parsed.data.manifest);
+      const renderPaths = runOwnedRenderPaths(
+        parsed.data.manifest,
+        context.sourceCatalog.assets,
+      );
       if (renderPaths === null) return false;
       return await verifyReportedArtifacts({
         context,
@@ -144,7 +168,10 @@ export const createIngestStage = (
         manifestTempPath: INGEST_MANIFEST_TEMP_PATH,
         signal,
       });
-      const renderPaths = runOwnedRenderPaths(result.manifest);
+      const renderPaths = runOwnedRenderPaths(
+        result.manifest,
+        context.sourceCatalog.assets,
+      );
       if (renderPaths === null) {
         throw new PipelineContextError('Ingest returned invalid Run-owned render paths');
       }

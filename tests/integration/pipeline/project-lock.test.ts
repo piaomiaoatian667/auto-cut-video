@@ -284,7 +284,7 @@ describe('project lock', () => {
     await symlink(outsideRoot, workRoot);
 
     await expect(lease.release()).rejects.toMatchObject({
-      code: 'APP_PATH_OUTSIDE_SCOPE',
+      code: 'APP_SCOPE_AUTHORITY_CHANGED',
     });
 
     await rm(workRoot);

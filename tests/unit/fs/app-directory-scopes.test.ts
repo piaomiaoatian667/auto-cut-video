@@ -459,7 +459,7 @@ describe('app-owned directory scopes', () => {
       releaseRealpath();
 
       await expect(useStore()).rejects.toMatchObject({
-        code: 'APP_PATH_OUTSIDE_SCOPE',
+        code: 'APP_SCOPE_AUTHORITY_CHANGED',
       });
       const escapedPath = owner === 'run'
         ? path.join(outsideRoot, '.work', 'demo', 'runs', 'run-one')
@@ -505,7 +505,7 @@ describe('app-owned directory scopes', () => {
     const store = scopes.createRunStore(workspaceRoot);
 
     await expect(store.createWork('demo')).rejects.toMatchObject({
-      code: 'APP_PATH_OUTSIDE_SCOPE',
+      code: 'APP_SCOPE_AUTHORITY_CHANGED',
     });
   });
 
@@ -815,7 +815,7 @@ describe('app-owned directory scopes', () => {
       await authority.close();
     }
 
-    expect(successSyncError).toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
+    expect(successSyncError).toMatchObject({code: 'APP_SCOPE_AUTHORITY_CHANGED'});
     expect(rollbackSyncError).toBeUndefined();
     expect(originalSyncs).toBe(2);
     expect(replacementSyncs).toBe(0);
@@ -873,7 +873,7 @@ describe('app-owned directory scopes', () => {
         await rename(probe.movedParentPath, probe.parentPath);
       }
 
-      expect(creationError).toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
+      expect(creationError).toMatchObject({code: 'APP_SCOPE_AUTHORITY_CHANGED'});
       expect(restoredBySync).toBe(true);
       expect(probe.originalSyncs).toBe(1);
       expect(probe.replacementSyncs).toBe(0);
@@ -1011,7 +1011,7 @@ describe('app-owned directory scopes', () => {
           ? openNewRunReadWriteFile(scope as RunDirectoryScope, 'new.mp4')
           : openNewOutputReadWriteFile(scope as OutputDirectoryScope, 'new.mp4');
       await expect(pending).rejects.toMatchObject({
-        code: 'APP_PATH_OUTSIDE_SCOPE',
+        code: 'APP_SCOPE_AUTHORITY_CHANGED',
       });
     },
   );
@@ -1100,7 +1100,7 @@ describe('app-owned directory scopes', () => {
           ? openNewRunFile(scope as RunDirectoryScope, 'new.txt')
           : openNewOutputFile(scope as OutputDirectoryScope, 'new.txt');
       await expect(pending).rejects.toMatchObject({
-        code: 'APP_PATH_OUTSIDE_SCOPE',
+        code: 'APP_SCOPE_AUTHORITY_CHANGED',
       });
     },
   );

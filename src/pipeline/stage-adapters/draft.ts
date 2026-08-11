@@ -24,6 +24,7 @@ import {
 import {
   STAGE_ALGORITHM_VERSIONS,
   planningReportFingerprint,
+  readPlanningInput,
   readRunJson,
   readRunStageReport,
   runArtifact,
@@ -78,6 +79,7 @@ const uniquePartialArtifacts = (
 
 const draftExpectedArtifacts = (
   outputs: z.infer<typeof DraftAdapterOutputSchema>['outputs'],
+  expectedFramePaths: readonly string[],
 ) => {
   if (
     outputs.mutedVideo.path !== 'draft/muted-video.mp4'
@@ -89,7 +91,8 @@ const draftExpectedArtifacts = (
   ) return null;
   const framePaths = outputs.reviewFrames.map((frame) => frame.path);
   if (
-    framePaths.some((framePath) => !/^draft\/frames\/frame-\d{6}\.jpg$/u.test(framePath))
+    framePaths.length !== expectedFramePaths.length
+    || framePaths.some((framePath, index) => framePath !== expectedFramePaths[index])
     || new Set(framePaths).size !== framePaths.length
   ) return null;
   const artifacts = [
@@ -160,8 +163,19 @@ export const createDraftStage = (
     verify: async (context, report) => {
       const parsed = DraftAdapterOutputSchema.safeParse(report.outputs);
       if (!parsed.success) return false;
+      if (context.sourceRun === undefined) return false;
+      const timeline = await readPlanningInput(async () => await readTimeline(
+        context.sourceRun!.runDirectory,
+      ));
+      if (timeline === null || timeline.projectId !== context.project.project.id) {
+        return false;
+      }
       const outputs = parsed.data.outputs;
-      const expected = draftExpectedArtifacts(outputs);
+      const expected = draftExpectedArtifacts(
+        outputs,
+        selectReviewFrames(timeline).map((frame) =>
+          `draft/frames/frame-${String(frame).padStart(6, '0')}.jpg`),
+      );
       if (expected === null) return false;
       return await verifyReportedArtifacts({
         context,
@@ -187,20 +201,16 @@ export const createDraftStage = (
       if (stageFingerprint === null) {
         throw new PipelineContextError('Draft requires a passed Compile report');
       }
-      try {
-        const timeline = await readTimeline(runDirectory);
-        partialArtifactsByRun.set(runDirectory, [
-          ...baselinePartialArtifacts(),
-          ...selectReviewFrames(timeline).map((frame) => ({
-            scope: 'run' as const,
-            path: `draft/frames/frame-${String(frame).padStart(6, '0')}.jpg`,
-          })),
-        ]);
-      } catch (error) {
-        if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) {
-          throw error;
-        }
-      }
+      const timeline = await readTimeline(runDirectory);
+      const expectedFramePaths = selectReviewFrames(timeline).map((frame) =>
+        `draft/frames/frame-${String(frame).padStart(6, '0')}.jpg`);
+      partialArtifactsByRun.set(runDirectory, [
+        ...baselinePartialArtifacts(),
+        ...expectedFramePaths.map((framePath) => ({
+          scope: 'run' as const,
+          path: framePath,
+        })),
+      ]);
       const result = await executeDraft({
         ...context.project,
         runDirectory,
@@ -208,7 +218,7 @@ export const createDraftStage = (
         ffprobeExecutable: ffprobeIdentity.realPath,
         signal,
       });
-      const expected = draftExpectedArtifacts(result.outputs);
+      const expected = draftExpectedArtifacts(result.outputs, expectedFramePaths);
       if (expected === null) {
         throw new PipelineContextError('Draft returned invalid owned artifact paths');
       }

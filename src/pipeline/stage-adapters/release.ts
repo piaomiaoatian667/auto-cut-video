@@ -21,13 +21,14 @@ import {
   type StageReport,
 } from '../stage-report';
 import {fingerprintValue} from '../fingerprint';
+import {verifyRunArtifact} from '../artifacts';
 import {
   ArtifactReferenceSchema,
   DraftReportSchema,
+  draftReviewEvidenceArtifacts,
   type DraftReport,
 } from '../stages/draft';
 import {
-  RELEASE_FIXED_PROFILE,
   releaseCurrentPointer,
   releaseStageFingerprint,
   runRelease,
@@ -86,7 +87,6 @@ const ReleaseAdapterOutputSchema = z.object({
 
 export interface ReleaseStageAdapterDependencies {
   algorithmVersion?: string;
-  profile?: Record<string, unknown>;
   readDraftReport?: (runDirectory: RunDirectoryScope) => Promise<DraftReport>;
   readCompiledTimeline?: (runDirectory: RunDirectoryScope) => Promise<CompiledTimeline>;
   readReview?: (runDirectory: RunDirectoryScope) => Promise<Review>;
@@ -130,12 +130,17 @@ const requireReleaseTools = (preflight: ReleasePreflightSnapshot): void => {
   }
 };
 
-const requireBoundStageReport = (
+type SuccessfulBoundStageReport = StageReport & {
+  state: 'passed' | 'cached';
+  fingerprint: string;
+};
+
+const requireSuccessfulBoundStageReport = (
   report: StageReport | null,
   projectId: string,
   runId: string,
   stageId: 'preflight' | 'compile',
-): StageReport => {
+): SuccessfulBoundStageReport => {
   if (report === null) {
     throw new StageReportValidationError(`missing ${stageId} Stage report`);
   }
@@ -148,7 +153,15 @@ const requireBoundStageReport = (
       `${stageId} Stage report is not bound to ${projectId}/${runId}`,
     );
   }
-  return report;
+  if (
+    (report.state !== 'passed' && report.state !== 'cached')
+    || report.fingerprint === null
+  ) {
+    throw new StageReportValidationError(
+      `${stageId} Stage report must be passed or cached with a fingerprint`,
+    );
+  }
+  return report as SuccessfulBoundStageReport;
 };
 
 const releaseExpectedArtifacts = (
@@ -193,7 +206,6 @@ export const createReleaseStage = (
 ): PipelineStage => {
   const algorithmVersion = dependencies.algorithmVersion
     ?? STAGE_ALGORITHM_VERSIONS.release;
-  const profile = dependencies.profile ?? RELEASE_FIXED_PROFILE;
   const readDraftReport = dependencies.readDraftReport
     ?? (async (runDirectory: RunDirectoryScope) => await readRunJson(
       runDirectory,
@@ -238,15 +250,18 @@ export const createReleaseStage = (
       readReview(runDirectory),
     ]);
     if (draft.projectId !== projectId || timeline.projectId !== projectId) return null;
+    const evidence = draftReviewEvidenceArtifacts(draft);
+    for (const artifact of evidence) {
+      if (!await verifyRunArtifact(runDirectory, {scope: 'run', ...artifact})) {
+        return null;
+      }
+    }
     let approvedReview: Review;
     try {
       const gate = await evaluateReview({
         projectId,
         runId,
-        evidencePaths: [
-          draft.outputs.contactSheet.path,
-          ...draft.outputs.reviewFrames.map((frame) => frame.path),
-        ],
+        evidencePaths: evidence.map((artifact) => artifact.path),
         review,
       });
       if (gate.state !== 'passed' || gate.review === undefined) return null;
@@ -262,7 +277,6 @@ export const createReleaseStage = (
       compiledTimeline: timeline,
       review: approvedReview,
       preflightEnvironmentFingerprint: preflight.environmentFingerprint,
-      profile,
       algorithmVersion,
     });
   };
@@ -278,13 +292,13 @@ export const createReleaseStage = (
           readStageReport(context.sourceRun!.runDirectory, 'preflight'),
           readStageReport(context.sourceRun!.runDirectory, 'compile'),
         ]);
-        const preflightReport = requireBoundStageReport(
+        const preflightReport = requireSuccessfulBoundStageReport(
           preflightReportValue,
           context.project.project.id,
           context.sourceRun!.runId,
           'preflight',
         );
-        const compileReport = requireBoundStageReport(
+        const compileReport = requireSuccessfulBoundStageReport(
           compileReportValue,
           context.project.project.id,
           context.sourceRun!.runId,
@@ -296,7 +310,7 @@ export const createReleaseStage = (
           context.sourceRun!.runId,
           context.project.project.id,
           preflight,
-          compileReport.fingerprint!,
+          compileReport.fingerprint,
         );
       });
     },
@@ -355,13 +369,13 @@ export const createReleaseStage = (
         readStageReport(runDirectory, 'preflight'),
         readStageReport(runDirectory, 'compile'),
       ]);
-      const preflightReport = requireBoundStageReport(
+      const preflightReport = requireSuccessfulBoundStageReport(
         preflightReportValue,
         context.project.project.id,
         runId,
         'preflight',
       );
-      const compileReport = requireBoundStageReport(
+      const compileReport = requireSuccessfulBoundStageReport(
         compileReportValue,
         context.project.project.id,
         runId,
@@ -382,7 +396,7 @@ export const createReleaseStage = (
         runId,
         context.project.project.id,
         preflight,
-        compileReport.fingerprint!,
+        compileReport.fingerprint,
       );
       if (stageFingerprint === null) {
         throw new ReviewGateError('Release requires approved Review evidence');
@@ -394,12 +408,11 @@ export const createReleaseStage = (
         runDirectory,
         runId,
         preflight,
-        compileStageFingerprint: compileReport.fingerprint!,
+        compileStageFingerprint: compileReport.fingerprint,
         signal,
         now: () => publishedAt,
       }, {
         publishCurrent: false,
-        profile,
         algorithmVersion,
       });
       if (result.outputs.releaseFingerprint !== stageFingerprint) {

@@ -1,10 +1,12 @@
 import {createHash} from 'node:crypto';
-import {readFile} from 'node:fs/promises';
+import {readFile, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {afterEach, describe, expect, it} from 'vitest';
 import {loadProject} from '../../../src/domain/load-project';
 import {ReviewSchema} from '../../../src/domain/review-schema';
 import type {CompiledTimeline} from '../../../src/domain/timeline-schema';
+import {runReviewCommand} from '../../../src/cli/commands/review';
+import {EXIT_CODES} from '../../../src/cli/exit-codes';
 import {
   createOutputStore,
   createRunStore,
@@ -17,7 +19,13 @@ import {
   type RunDirectoryScope,
 } from '../../../src/fs/app-directory-scopes';
 import {parseTopLevelMp4Atoms, assertMoovBeforeMdat} from '../../../src/media/release-verify';
-import {DraftReportSchema} from '../../../src/pipeline/stages/draft';
+import {
+  DraftReportSchema,
+  draftReviewEvidenceArtifacts,
+} from '../../../src/pipeline/stages/draft';
+import {createReviewStage} from '../../../src/pipeline/stage-adapters/review';
+import type {ProjectSourceCatalog} from '../../../src/pipeline/source-assets';
+import type {PreflightResult} from '../../../src/pipeline/stages/preflight';
 import {
   releaseStageFingerprint,
   runRelease,
@@ -176,6 +184,33 @@ const preflight = (): ReleasePreflightSnapshot => ({
   environmentFingerprint: 'sha256:environment',
 });
 
+const reviewPreflight = (): PreflightResult => ({
+  checks: [],
+  toolIdentities: preflight().toolIdentities,
+  fonts: [],
+  voice: {
+    configured: 'fixture',
+    available: true,
+    segmentedWavFallback: false,
+  },
+  versions: {
+    node: process.version,
+    pnpm: null,
+    macos: null,
+    ffmpeg: null,
+    ffprobe: null,
+  },
+  system: {
+    platform: process.platform,
+    arch: process.arch,
+    sourceBytes: 0,
+    requiredBytes: 0,
+    availableBytes: null,
+    workDirectory: '.work/demo',
+  },
+  environmentFingerprint: preflight().environmentFingerprint,
+});
+
 const pointer = (runId: string, publishedAt = '2026-08-10T00:00:00.000Z'): CurrentPointer => ({
   runId,
   relativePath: `releases/${runId}`,
@@ -196,8 +231,10 @@ const pointer = (runId: string, publishedAt = '2026-08-10T00:00:00.000Z'): Curre
 
 const prepareReleaseRun = async ({
   includeAudioMixFingerprint = true,
+  includeReview = true,
 }: {
   includeAudioMixFingerprint?: boolean;
+  includeReview?: boolean;
 } = {}) => {
   const tempProject = await createTempProject({
     project: createProjectFixture('demo'),
@@ -211,14 +248,16 @@ const prepareReleaseRun = async ({
   await writeRunText(runDirectory, 'captions.srt', '1\n00:00:00,000 --> 00:00:01,000\n介绍\n');
   const filterGraphSha = await writeRunText(runDirectory, 'audio/filter-graph.txt', 'anull\n');
   const mixedAudioSha = await writeRunAudio(runDirectory, 'audio/mixed-normalized.wav');
+  const draftVideoSha = await writeRunText(runDirectory, 'draft/draft.mp4', 'draft-video');
   const contactSheetSha = await writeRunJpeg(runDirectory, 'draft/contact-sheet.jpg');
-  const reviewFrameSha = await writeRunJpeg(runDirectory, 'draft/review-frames/frame-000000.jpg');
+  const reviewFrameSha = await writeRunJpeg(runDirectory, 'draft/frames/frame-000000.jpg');
   await writeRunText(runDirectory, 'draft/draft-report.json', `${JSON.stringify({
     version: 1,
     projectId: 'demo',
     outputs: {
+      draftVideo: {path: 'draft/draft.mp4', sha256: draftVideoSha},
       contactSheet: {path: 'draft/contact-sheet.jpg', sha256: contactSheetSha},
-      reviewFrames: [{path: 'draft/review-frames/frame-000000.jpg', sha256: reviewFrameSha}],
+      reviewFrames: [{path: 'draft/frames/frame-000000.jpg', sha256: reviewFrameSha}],
       audio: {
         filterGraph: {path: 'audio/filter-graph.txt', sha256: filterGraphSha},
         mixedAudio: {path: 'audio/mixed-normalized.wav', sha256: mixedAudioSha},
@@ -228,16 +267,22 @@ const prepareReleaseRun = async ({
         : {}),
     },
   }, null, 2)}\n`);
-  await writeRunText(runDirectory, 'review.json', `${JSON.stringify({
-    version: 1,
-    projectId: 'demo',
-    runId: 'run-release',
-    status: 'approved',
-    reviewer: 'codex',
-    reviewedAt: '2026-08-10T00:00:00.000Z',
-    reason: '视觉复核通过',
-    evidencePaths: ['draft/contact-sheet.jpg', 'draft/review-frames/frame-000000.jpg'],
-  }, null, 2)}\n`);
+  if (includeReview) {
+    await writeRunText(runDirectory, 'review.json', `${JSON.stringify({
+      version: 1,
+      projectId: 'demo',
+      runId: 'run-release',
+      status: 'approved',
+      reviewer: 'codex',
+      reviewedAt: '2026-08-10T00:00:00.000Z',
+      reason: '视觉复核通过',
+      evidencePaths: [
+        'draft/draft.mp4',
+        'draft/contact-sheet.jpg',
+        'draft/frames/frame-000000.jpg',
+      ],
+    }, null, 2)}\n`);
+  }
   return {tempProject, project, runDirectory};
 };
 
@@ -261,6 +306,7 @@ describe('runRelease', () => {
       version: 1,
       projectId: 'demo',
       outputs: {
+        draftVideo: {path: 'draft/draft.mp4', sha256: sha256('draft')},
         contactSheet: {path: 'draft/contact-sheet.jpg', sha256: sha256('contact')},
         reviewFrames: [{path: 'draft/frame.jpg', sha256: sha256('frame')}],
         audio: {
@@ -291,7 +337,6 @@ describe('runRelease', () => {
       return await runProcess(command, args, options);
     };
 
-    const profile = {fps: 60, codec: 'injected-release-profile'};
     const algorithmVersion = 'release-stage-v2';
     const result = await runRelease({
       ...project,
@@ -303,7 +348,6 @@ describe('runRelease', () => {
       renderTimelineVideo: renderFinalVideo,
       runProcess: recordingRunner,
       outputStore,
-      profile,
       algorithmVersion,
     });
 
@@ -319,7 +363,6 @@ describe('runRelease', () => {
       compiledTimeline: compiledTimeline(),
       review: persistedReview,
       preflightEnvironmentFingerprint: preflight().environmentFingerprint,
-      profile,
       algorithmVersion,
     }));
 
@@ -357,6 +400,97 @@ describe('runRelease', () => {
     await expect(readOutputText(tempProject.workspaceRoot, 'releases/run-release/validation-report.json')).resolves.toContain('moovBeforeMdat');
     await expect(readOutputText(tempProject.workspaceRoot, 'releases/run-release/checksums.sha256')).resolves.toContain('releases/run-release/final.mp4');
   }, 90_000);
+
+  it('uses one Draft evidence contract from CLI approval through Review and Release', async () => {
+    const {tempProject, project, runDirectory} = await prepareReleaseRun({
+      includeReview: false,
+    });
+    const store = createRunStore(tempProject.workspaceRoot);
+    await store.publishCurrent('demo', {
+      runId: 'run-release',
+      relativePath: 'runs/run-release',
+      preset: 'draft',
+      stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft', 'review'],
+      completedStage: 'review',
+      state: 'needs_review',
+      publishedAt: '2026-08-10T00:00:00.000Z',
+    });
+    let stdout = '';
+    let stderr = '';
+
+    await expect(runReviewCommand('demo', {
+      approve: true,
+      reason: '视觉复核通过',
+      reviewer: 'codex',
+    }, {
+      workspaceRoot: tempProject.workspaceRoot,
+      stdout: {write: (chunk) => { stdout += chunk; }},
+      stderr: {write: (chunk) => { stderr += chunk; }},
+      now: () => '2026-08-10T00:00:30.000Z',
+    })).resolves.toBe(EXIT_CODES.success);
+    expect(stdout).toBe('Review approved: run-release\n');
+    expect(stderr).toBe('');
+
+    const sourceCatalog: ProjectSourceCatalog = {
+      assets: [],
+      totalBytes: 0,
+      fingerprint: sha256('source-catalog'),
+    };
+    const reviewResult = await createReviewStage().execute({
+      project,
+      sourceCatalog,
+      preflight: reviewPreflight(),
+      preset: 'release',
+      runId: 'run-release',
+      runDirectory,
+      now: () => '2026-08-10T00:00:30.000Z',
+    }, new AbortController().signal);
+    expect(reviewResult.state).toBe('passed');
+    const persistedDraft = DraftReportSchema.parse(JSON.parse(
+      (await readRunFile(runDirectory, 'draft/draft-report.json')).toString('utf8'),
+    ));
+    expect(reviewResult.outputs).toMatchObject({
+      evidence: draftReviewEvidenceArtifacts(persistedDraft),
+    });
+
+    const release = await runRelease({
+      ...project,
+      runDirectory,
+      runId: 'run-release',
+      preflight: preflight(),
+      now: () => '2026-08-10T00:01:00.000Z',
+    }, {
+      renderTimelineVideo: renderFinalVideo,
+      outputStore: createOutputStore(tempProject.workspaceRoot),
+    });
+    expect(release.outputs.finalVideo.path).toBe('releases/run-release/final.mp4');
+  }, 90_000);
+
+  it('rejects an approved Review when Draft evidence bytes change', async () => {
+    const {tempProject, project, runDirectory} = await prepareReleaseRun();
+    const draftVideoPath = path.join(
+      tempProject.workspaceRoot,
+      '.work',
+      'demo',
+      'runs',
+      'run-release',
+      'draft',
+      'draft.mp4',
+    );
+    await writeFile(draftVideoPath, 'tampered-draft-video');
+    const renderTimelineVideo = async () => {
+      throw new Error('Release must reject evidence before rendering');
+    };
+
+    await expect(runRelease({
+      ...project,
+      runDirectory,
+      runId: 'run-release',
+      preflight: preflight(),
+    }, {renderTimelineVideo})).rejects.toMatchObject({
+      code: 'RELEASE_ARTIFACT_CHANGED',
+    });
+  });
 
   it('preserves the previous output pointer when qt-faststart is missing', async () => {
     const {tempProject, project, runDirectory} = await prepareReleaseRun();

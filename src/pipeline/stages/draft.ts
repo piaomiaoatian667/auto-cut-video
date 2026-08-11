@@ -35,6 +35,7 @@ export const DraftReportSchema = z.object({
   version: z.literal(1),
   projectId: z.string().min(1),
   outputs: z.object({
+    draftVideo: ArtifactReferenceSchema,
     contactSheet: ArtifactReferenceSchema,
     reviewFrames: z.array(ArtifactReferenceSchema).min(1),
     audio: z.object({
@@ -42,10 +43,37 @@ export const DraftReportSchema = z.object({
       mixedAudio: ArtifactReferenceSchema,
     }).strict(),
     audioMixFingerprint: z.string().min(1).optional(),
-  }).passthrough(),
+  }).passthrough().superRefine((outputs, context) => {
+    const evidencePaths = [
+      outputs.draftVideo.path,
+      outputs.contactSheet.path,
+      ...outputs.reviewFrames.map((frame) => frame.path),
+    ];
+    if (new Set(evidencePaths).size !== evidencePaths.length) {
+      context.addIssue({
+        code: 'custom',
+        path: ['reviewFrames'],
+        message: 'Draft review evidence paths must be unique',
+      });
+    }
+  }),
 }).passthrough();
 
 export type DraftReport = z.infer<typeof DraftReportSchema>;
+
+export const draftReviewEvidenceArtifacts = (
+  report: DraftReport,
+): ArtifactReference[] => {
+  const artifacts = [
+    report.outputs.draftVideo,
+    report.outputs.contactSheet,
+    ...report.outputs.reviewFrames,
+  ];
+  if (new Set(artifacts.map((artifact) => artifact.path)).size !== artifacts.length) {
+    throw new TypeError('Draft review evidence paths must be unique');
+  }
+  return artifacts;
+};
 
 export interface DraftStageInput extends ProjectInputs {
   runDirectory: RunDirectoryScope;

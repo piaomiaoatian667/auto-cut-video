@@ -19,10 +19,16 @@ import {StableIdSchema} from '../domain/schema-primitives';
 
 const O_NOFOLLOW_ANY = 0x20000000;
 
-export class AppDirectoryScopeError extends Error {
-  readonly code = 'APP_PATH_OUTSIDE_SCOPE';
+export type AppDirectoryScopeErrorCode =
+  | 'APP_PATH_OUTSIDE_SCOPE'
+  | 'APP_SCOPE_AUTHORITY_CHANGED';
 
-  constructor(message: string, options?: ErrorOptions) {
+export class AppDirectoryScopeError extends Error {
+  constructor(
+    readonly code: AppDirectoryScopeErrorCode,
+    message: string,
+    options?: ErrorOptions,
+  ) {
     super(message, options);
     this.name = 'AppDirectoryScopeError';
   }
@@ -143,6 +149,16 @@ const securityError = (
   message: string,
   cause?: unknown,
 ): AppDirectoryScopeError => new AppDirectoryScopeError(
+  'APP_PATH_OUTSIDE_SCOPE',
+  message,
+  cause === undefined ? undefined : {cause},
+);
+
+const authorityError = (
+  message: string,
+  cause?: unknown,
+): AppDirectoryScopeError => new AppDirectoryScopeError(
+  'APP_SCOPE_AUTHORITY_CHANGED',
   message,
   cause === undefined ? undefined : {cause},
 );
@@ -260,12 +276,12 @@ const assertDirectoryIdentityStable = async (
       || !identityMatchesStats(identity, stats)
       || await realpath(identity.path) !== identity.path
     ) {
-      throw securityError(`app-owned directory changed after validation: ${label}`);
+      throw authorityError(`app-owned directory changed after validation: ${label}`);
     }
   } catch (error) {
     if (error instanceof AppDirectoryScopeError) throw error;
     if (isNodeError(error) && error.code === 'ENOENT') {
-      throw securityError(`app-owned directory disappeared: ${label}`, error);
+      throw authorityError(`app-owned directory disappeared: ${label}`, error);
     }
     return mapSymlinkError(error, label);
   }
@@ -280,12 +296,12 @@ const openDirectoryAnchor = async (
   try {
     const stats = await handle.stat({bigint: true});
     if (!stats.isDirectory() || !identityMatchesStats(identity, stats)) {
-      throw securityError(`app-owned directory changed while opening: ${label}`);
+      throw authorityError(`app-owned directory changed while opening: ${label}`);
     }
     const anchoredPath = volumePath(identity.dev, identity.ino);
     const anchoredStats = await lstat(anchoredPath, {bigint: true});
     if (!anchoredStats.isDirectory() || !identityMatchesStats(identity, anchoredStats)) {
-      throw securityError(`Darwin directory anchor changed: ${label}`);
+      throw authorityError(`Darwin directory anchor changed: ${label}`);
     }
     return {identity, handle, volumePath: anchoredPath};
   } catch (error) {
@@ -323,11 +339,11 @@ const assertDirectoryAnchorStable = async (
   await assertDirectoryIdentityStable(anchor.identity, label);
   const held = await anchor.handle.stat({bigint: true});
   if (!held.isDirectory() || !identityMatchesStats(anchor.identity, held)) {
-    throw securityError(`app-owned directory changed while held open: ${label}`);
+    throw authorityError(`app-owned directory changed while held open: ${label}`);
   }
   const anchored = await lstat(anchor.volumePath, {bigint: true});
   if (!anchored.isDirectory() || !identityMatchesStats(anchor.identity, anchored)) {
-    throw securityError(`Darwin directory anchor changed: ${label}`);
+    throw authorityError(`Darwin directory anchor changed: ${label}`);
   }
 };
 
@@ -517,17 +533,17 @@ const assertScopeStable = async (
         || stats.ino !== identity.ino
         || await realpath(identity.path) !== identity.path
       ) {
-        throw securityError(`app-owned scope changed after creation: ${relativePath}`);
+        throw authorityError(`app-owned scope changed after creation: ${relativePath}`);
       }
     }
     const workspace = state.ancestors[0]!;
     if (!isWithin(workspace.path, state.root) || state.root === workspace.path) {
-      throw securityError(`app-owned scope escapes workspace: ${relativePath}`);
+      throw authorityError(`app-owned scope escapes workspace: ${relativePath}`);
     }
   } catch (error) {
     if (error instanceof AppDirectoryScopeError) throw error;
     if (isNodeError(error) && error.code === 'ENOENT') {
-      throw securityError(`app-owned scope disappeared: ${relativePath}`, error);
+      throw authorityError(`app-owned scope disappeared: ${relativePath}`, error);
     }
     return mapSymlinkError(error, relativePath);
   }
@@ -776,7 +792,7 @@ const openExistingScopedReadFile = async (
       || opened.mtimeNs !== inspected.stats.mtimeNs
       || opened.ctimeNs !== inspected.stats.ctimeNs
     ) {
-      throw securityError(`app-owned read target changed while opening: ${relativePath}`);
+      throw authorityError(`app-owned read target changed while opening: ${relativePath}`);
     }
     const identity = regularFileIdentity(opened);
     const openedHandle = handle;
@@ -784,7 +800,7 @@ const openExistingScopedReadFile = async (
       await assertScopedReadPathStable(state, pathAuthority, relativePath);
       const held = await openedHandle.stat({bigint: true});
       if (!regularFileIdentityMatches(held, identity)) {
-        throw securityError(`app-owned read handle changed: ${relativePath}`);
+        throw authorityError(`app-owned read handle changed: ${relativePath}`);
       }
       const current = await inspectAnchoredEntry(anchor, relativePath);
       if (
@@ -792,7 +808,7 @@ const openExistingScopedReadFile = async (
         || current.stats === undefined
         || !regularFileIdentityMatches(current.stats, identity)
       ) {
-        throw securityError(`app-owned read target changed after opening: ${relativePath}`);
+        throw authorityError(`app-owned read target changed after opening: ${relativePath}`);
       }
     };
     await revalidate();
@@ -1043,11 +1059,11 @@ const assertScopedReadPathStable = async (
     await assertDirectoryIdentityStable(directory.identity, relativePath);
     const held = await directory.handle.stat({bigint: true});
     if (!held.isDirectory() || !identityMatchesStats(directory.identity, held)) {
-      throw securityError(`app-owned parent changed while held open: ${relativePath}`);
+      throw authorityError(`app-owned parent changed while held open: ${relativePath}`);
     }
     const anchored = await lstat(directory.volumePath, {bigint: true});
     if (!anchored.isDirectory() || !identityMatchesStats(directory.identity, anchored)) {
-      throw securityError(`Darwin parent anchor changed: ${relativePath}`);
+      throw authorityError(`Darwin parent anchor changed: ${relativePath}`);
     }
     if (index > 0) {
       const parent = authority.directories[index - 1]!;
@@ -1056,7 +1072,7 @@ const assertScopedReadPathStable = async (
         {bigint: true},
       );
       if (!child.isDirectory() || !identityMatchesStats(directory.identity, child)) {
-        throw securityError(`app-owned parent chain changed: ${relativePath}`);
+        throw authorityError(`app-owned parent chain changed: ${relativePath}`);
       }
     }
   }
@@ -1109,14 +1125,14 @@ const assertScopedPathAnchorStable = async (
   await assertDirectoryIdentityStable(anchor.parent.identity, relativePath);
   const stats = await anchor.parent.handle.stat({bigint: true});
   if (!stats.isDirectory() || !identityMatchesStats(anchor.parent.identity, stats)) {
-    throw securityError(`app-owned parent changed while held open: ${relativePath}`);
+    throw authorityError(`app-owned parent changed while held open: ${relativePath}`);
   }
   const anchoredStats = await lstat(anchor.parent.volumePath, {bigint: true});
   if (
     !anchoredStats.isDirectory()
     || !identityMatchesStats(anchor.parent.identity, anchoredStats)
   ) {
-    throw securityError(`Darwin parent anchor changed: ${relativePath}`);
+    throw authorityError(`Darwin parent anchor changed: ${relativePath}`);
   }
 };
 
@@ -1150,16 +1166,16 @@ const unlinkHeldCreatedFile = async (
     || held.dev !== identity.dev
     || held.ino !== identity.ino
   ) {
-    throw securityError(`created app-owned file identity changed before cleanup: ${relativePath}`);
+    throw authorityError(`created app-owned file identity changed before cleanup: ${relativePath}`);
   }
   if (held.nlink === 0n) return;
   if (held.nlink !== 1n) {
-    throw securityError(`created app-owned file has unexpected hard links: ${relativePath}`);
+    throw authorityError(`created app-owned file has unexpected hard links: ${relativePath}`);
   }
   await unlink(volumePath(held.dev, held.ino));
   const removed = await handle.stat({bigint: true});
   if (removed.nlink !== 0n) {
-    throw securityError(`created app-owned file remains linked after cleanup: ${relativePath}`);
+    throw authorityError(`created app-owned file remains linked after cleanup: ${relativePath}`);
   }
 };
 
@@ -1189,7 +1205,7 @@ const openNewScopedWriteFileAuthority = async (
     fileCreated = true;
     const created = await handle.stat({bigint: true});
     if (!created.isFile() || created.nlink !== 1n) {
-      throw securityError(`created app-owned target is not a regular file: ${relativePath}`);
+      throw authorityError(`created app-owned target is not a regular file: ${relativePath}`);
     }
     createdIdentity = regularFileIdentity(created);
     const current = await inspectAnchoredEntry(anchor, relativePath);
@@ -1198,7 +1214,7 @@ const openNewScopedWriteFileAuthority = async (
       || current.stats === undefined
       || !regularFileIdentityMatches(current.stats, createdIdentity)
     ) {
-      throw securityError(`created app-owned target changed while opening: ${relativePath}`);
+      throw authorityError(`created app-owned target changed while opening: ${relativePath}`);
     }
 
     const openedHandle = handle;
@@ -1217,14 +1233,14 @@ const openNewScopedWriteFileAuthority = async (
           && currentTarget.stats !== undefined
           && regularFileIdentityMatches(currentTarget.stats, sealedIdentity);
       if (currentTarget.kind !== 'file' || !matches) {
-        throw securityError(`created app-owned target changed: ${relativePath}`);
+        throw authorityError(`created app-owned target changed: ${relativePath}`);
       }
     };
     const syncAndSeal = async (): Promise<void> => {
       await openedHandle.sync();
       const held = await openedHandle.stat({bigint: true});
       if (!sameRegularFileObject(held, openedIdentity)) {
-        throw securityError(`created app-owned target changed while writing: ${relativePath}`);
+        throw authorityError(`created app-owned target changed while writing: ${relativePath}`);
       }
       const identity = regularFileIdentity(held);
       await assertScopedReadPathStable(state, pathAuthority, relativePath);
@@ -1234,7 +1250,7 @@ const openNewScopedWriteFileAuthority = async (
         || currentTarget.stats === undefined
         || !regularFileIdentityMatches(currentTarget.stats, identity)
       ) {
-        throw securityError(`created app-owned target changed while syncing: ${relativePath}`);
+        throw authorityError(`created app-owned target changed while syncing: ${relativePath}`);
       }
       sealedIdentity = identity;
     };
@@ -1255,7 +1271,7 @@ const openNewScopedWriteFileAuthority = async (
         );
         const opened = await readHandle.stat({bigint: true});
         if (!regularFileIdentityMatches(opened, expected)) {
-          throw securityError(`created app-owned target changed while reopening: ${relativePath}`);
+          throw authorityError(`created app-owned target changed while reopening: ${relativePath}`);
         }
         await revalidate();
         const freshHandle = readHandle;
@@ -1266,7 +1282,7 @@ const openNewScopedWriteFileAuthority = async (
             await revalidate();
             const held = await freshHandle.stat({bigint: true});
             if (!regularFileIdentityMatches(held, expected)) {
-              throw securityError(`created app-owned read handle changed: ${relativePath}`);
+              throw authorityError(`created app-owned read handle changed: ${relativePath}`);
             }
           },
           close: async () => {
@@ -1363,13 +1379,13 @@ const openNewScopedWriteFileAuthority = async (
           !recovered.isFile()
           || (recovered.nlink !== 0n && recovered.nlink !== 1n)
         ) {
-          throw securityError(
+          throw authorityError(
             `created app-owned file identity is unsafe for cleanup: ${relativePath}`,
           );
         }
         cleanupIdentity = regularFileIdentity(recovered);
       } catch (identityError) {
-        cleanupErrors.push(securityError(
+        cleanupErrors.push(authorityError(
           `created app-owned file identity could not be recovered for cleanup: ${relativePath}`,
           identityError,
         ));
@@ -1694,11 +1710,11 @@ export const unlinkProjectLockFile = async (
     await assertScopedPathAnchorStable(state, anchor, PROJECT_LOCK_PATH);
     const held = await expectedHandle.stat({bigint: true});
     if (held.dev !== expected.dev || held.ino !== expected.ino) {
-      throw securityError('project lock file handle identity changed');
+      throw authorityError('project lock file handle identity changed');
     }
     if (held.nlink === 0n) return 'missing';
     if (held.nlink !== 1n) {
-      throw securityError('project lock has unexpected hard links');
+      throw authorityError('project lock has unexpected hard links');
     }
     try {
       await unlink(volumePath(expected.dev, expected.ino));

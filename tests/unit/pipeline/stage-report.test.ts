@@ -603,11 +603,11 @@ describe('StageReportStore', () => {
         ? writeError.errors
         : [];
       expect(errors).toHaveLength(2);
-      expect(errors[0]).toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
+      expect(errors[0]).toMatchObject({code: 'APP_SCOPE_AUTHORITY_CHANGED'});
       expect(errors[1]).toBeInstanceOf(AggregateError);
       expect((errors[1] as AggregateError).errors).toEqual([
-        expect.objectContaining({code: 'APP_PATH_OUTSIDE_SCOPE'}),
-        expect.objectContaining({code: 'APP_PATH_OUTSIDE_SCOPE'}),
+        expect.objectContaining({code: 'APP_SCOPE_AUTHORITY_CHANGED'}),
+        expect.objectContaining({code: 'APP_SCOPE_AUTHORITY_CHANGED'}),
       ]);
       expect(originalSyncs).toBe(2);
       expect(replacementSyncs).toBe(0);
@@ -964,7 +964,7 @@ describe('StageReportStore', () => {
 
       expect(caughtError).toBeInstanceOf(AggregateError);
       expect((caughtError as AggregateError).errors).toEqual([
-        expect.objectContaining({code: 'APP_PATH_OUTSIDE_SCOPE'}),
+        expect.objectContaining({code: 'APP_SCOPE_AUTHORITY_CHANGED'}),
         closeError,
       ]);
     } finally {

@@ -1,11 +1,18 @@
 import type {FileHandle} from 'node:fs/promises';
+import {z} from 'zod';
 import {
+  AppDirectoryScopeError,
   createRunStore,
-  openExistingRunFile,
+  openExistingRunFileForRead,
   openNewRunFile,
   type CurrentPointer,
   type RunDirectoryScope,
 } from '../../fs/app-directory-scopes';
+import {verifyRunArtifact} from '../../pipeline/artifacts';
+import {
+  DraftReportSchema,
+  draftReviewEvidenceArtifacts,
+} from '../../pipeline/stages/draft';
 import {recordReviewApproval} from '../../pipeline/stages/review';
 import {EXIT_CODES} from '../exit-codes';
 import type {OutputWriter} from '../videoctl';
@@ -37,10 +44,16 @@ const withHandle = async <Output>(
 const readRunJson = async (
   runDirectory: RunDirectoryScope,
   relativePath: string,
-): Promise<unknown> => await withHandle(
-  await openExistingRunFile(runDirectory, relativePath),
-  async (handle) => JSON.parse(await handle.readFile('utf8')) as unknown,
-);
+): Promise<unknown> => {
+  const authority = await openExistingRunFileForRead(runDirectory, relativePath);
+  try {
+    const value = JSON.parse(await authority.handle.readFile('utf8')) as unknown;
+    await authority.revalidate();
+    return value;
+  } finally {
+    await authority.close();
+  }
+};
 
 const writeRunJson = async (
   runDirectory: RunDirectoryScope,
@@ -54,27 +67,19 @@ const writeRunJson = async (
   },
 );
 
-const isArtifact = (value: unknown): value is {path: string} => value !== null
-  && typeof value === 'object'
-  && 'path' in value
-  && typeof value.path === 'string';
-
-const evidenceFromDraftReport = (report: unknown): string[] => {
-  const output = report !== null && typeof report === 'object' && 'outputs' in report
-    ? (report as {outputs?: unknown}).outputs
-    : undefined;
-  if (output === null || typeof output !== 'object' || output === undefined) return [];
-  const record = output as Record<string, unknown>;
-  const evidence: string[] = [];
-  if (isArtifact(record.draftVideo)) evidence.push(record.draftVideo.path);
-  if (isArtifact(record.contactSheet)) evidence.push(record.contactSheet.path);
-  if (Array.isArray(record.reviewFrames)) {
-    for (const frame of record.reviewFrames) {
-      if (isArtifact(frame)) evidence.push(frame.path);
-    }
-  }
-  return [...new Set(evidence)];
-};
+const isReviewValidationMiss = (error: unknown): boolean => (
+  error instanceof z.ZodError
+  || error instanceof SyntaxError
+  || (
+    error instanceof AppDirectoryScopeError
+    && error.code === 'APP_PATH_OUTSIDE_SCOPE'
+  )
+  || (
+    error instanceof Error
+    && 'code' in error
+    && error.code === 'ENOENT'
+  )
+);
 
 const reviewerName = (options: ReviewCommandOptions): string =>
   options.reviewer ?? process.env.USER ?? 'unknown';
@@ -109,9 +114,30 @@ export const runReviewCommand = async (
     return EXIT_CODES.validationFailed;
   }
   const runDirectory = await store.openExistingRun(projectId, current.runId);
-  const evidencePaths = evidenceFromDraftReport(
-    await readRunJson(runDirectory, 'draft/draft-report.json'),
-  );
+  let evidencePaths: string[];
+  try {
+    const draftReport = DraftReportSchema.parse(
+      await readRunJson(runDirectory, 'draft/draft-report.json'),
+    );
+    if (draftReport.projectId !== projectId) {
+      dependencies.stderr.write('Draft report belongs to another project.\n');
+      return EXIT_CODES.validationFailed;
+    }
+    const evidence = draftReviewEvidenceArtifacts(draftReport);
+    for (const artifact of evidence) {
+      if (!await verifyRunArtifact(runDirectory, {scope: 'run', ...artifact})) {
+        dependencies.stderr.write('Draft review evidence is missing or changed.\n');
+        return EXIT_CODES.validationFailed;
+      }
+    }
+    evidencePaths = evidence.map((artifact) => artifact.path);
+  } catch (error) {
+    if (isReviewValidationMiss(error)) {
+      dependencies.stderr.write('Draft review evidence is invalid.\n');
+      return EXIT_CODES.validationFailed;
+    }
+    throw error;
+  }
   const reviewedAt = dependencies.now?.() ?? new Date().toISOString();
   const review = recordReviewApproval({
     projectId,

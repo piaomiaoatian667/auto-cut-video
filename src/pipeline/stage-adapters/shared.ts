@@ -67,7 +67,10 @@ const inventoryMatches = (
 export const isOrdinaryVerificationMiss = (error: unknown): boolean => (
   error instanceof z.ZodError
   || error instanceof PipelineArtifactError
-  || error instanceof AppDirectoryScopeError
+  || (
+    error instanceof AppDirectoryScopeError
+    && error.code === 'APP_PATH_OUTSIDE_SCOPE'
+  )
   || (
     error instanceof Error
     && 'code' in error

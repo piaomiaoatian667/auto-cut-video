@@ -652,7 +652,7 @@ describe('pipeline artifacts', () => {
         ]);
 
         await expect(prompt).rejects.toMatchObject({
-          code: 'APP_PATH_OUTSIDE_SCOPE',
+          code: 'APP_SCOPE_AUTHORITY_CHANGED',
         });
       } finally {
         prototype.read = originalRead;
@@ -726,7 +726,7 @@ describe('pipeline artifacts', () => {
           path: relativePath,
           sha256: sha256(original),
         },
-      })).rejects.toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
+      })).rejects.toMatchObject({code: 'APP_SCOPE_AUTHORITY_CHANGED'});
     } finally {
       prototype.sync = originalSync;
     }
@@ -798,7 +798,7 @@ describe('pipeline artifacts', () => {
     expect(parentSwapped).toBe(true);
     await expect(lstat(orphanPath)).rejects.toMatchObject({code: 'ENOENT'});
     await expect(lstat(targetPath)).rejects.toMatchObject({code: 'ENOENT'});
-    expect(caughtError).toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
+    expect(caughtError).toMatchObject({code: 'APP_SCOPE_AUTHORITY_CHANGED'});
   });
 
   it('reports both a copy failure and rollback failure', async () => {
@@ -880,7 +880,7 @@ describe('pipeline artifacts', () => {
     expect(caughtError).toBeInstanceOf(AggregateError);
     expect((caughtError as AggregateError).errors).toEqual(expect.arrayContaining([
       expect.objectContaining({code: 'ARTIFACT_INVALID'}),
-      expect.objectContaining({code: 'APP_PATH_OUTSIDE_SCOPE'}),
+      expect.objectContaining({code: 'APP_SCOPE_AUTHORITY_CHANGED'}),
     ]));
     expect((caughtError as Error).message).toContain(relativePath);
     expect(targetReplaced).toBe(true);
@@ -960,7 +960,7 @@ describe('pipeline artifacts', () => {
     expect(caughtError).toBeInstanceOf(AggregateError);
     expect((caughtError as AggregateError).errors).toEqual(expect.arrayContaining([
       expect.objectContaining({code: 'ARTIFACT_INVALID'}),
-      expect.objectContaining({code: 'APP_PATH_OUTSIDE_SCOPE'}),
+      expect.objectContaining({code: 'APP_SCOPE_AUTHORITY_CHANGED'}),
     ]));
     expect((caughtError as Error).message).toContain(relativePath);
     expect(targetMutated).toBe(true);

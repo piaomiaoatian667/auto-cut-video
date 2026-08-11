@@ -4,12 +4,14 @@ import type {RunDirectoryScope} from '../../fs/app-directory-scopes';
 import {verifyRunArtifact} from '../artifacts';
 import {fingerprintValue} from '../fingerprint';
 import {
+  PipelineContextError,
   requirePreflight,
   requireRunContext,
   type PipelineStage,
 } from '../stage';
 import {
   DraftReportSchema,
+  draftReviewEvidenceArtifacts,
   type DraftReport,
 } from '../stages/draft';
 import {
@@ -43,10 +45,7 @@ export interface ReviewStageAdapterDependencies {
   evaluateReview?: typeof evaluateReview;
 }
 
-const evidenceFromDraft = (report: DraftReport) => [
-  report.outputs.contactSheet,
-  ...report.outputs.reviewFrames,
-];
+const evidenceFromDraft = draftReviewEvidenceArtifacts;
 
 export const createReviewStage = (
   dependencies: ReviewStageAdapterDependencies = {},
@@ -138,6 +137,13 @@ export const createReviewStage = (
       requirePreflight(context);
       const draft = await readDraftReport(runDirectory);
       const evidence = evidenceFromDraft(draft);
+      for (const artifact of evidence) {
+        if (!await verifyRunArtifact(runDirectory, {scope: 'run', ...artifact})) {
+          throw new PipelineContextError(
+            `Draft review evidence is missing or changed: ${artifact.path}`,
+          );
+        }
+      }
       const review = await readReview(runDirectory);
       const reviewContext: ReviewContext = {
         projectId: context.project.project.id,

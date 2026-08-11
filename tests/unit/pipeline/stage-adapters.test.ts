@@ -7,6 +7,7 @@ import {loadProject} from '../../../src/domain/load-project';
 import type {Review} from '../../../src/domain/review-schema';
 import type {CompiledTimeline} from '../../../src/domain/timeline-schema';
 import {
+  AppDirectoryScopeError,
   createOutputStore,
   createRunStore,
   ensureOutputDirectory,
@@ -18,6 +19,7 @@ import {
 } from '../../../src/fs/app-directory-scopes';
 import {hashRunArtifact} from '../../../src/pipeline/artifacts';
 import {fingerprintValue} from '../../../src/pipeline/fingerprint';
+import {selectReviewFrames} from '../../../src/media/contact-sheet';
 import {
   narrationMasterPath,
   narrationSegmentInputHash,
@@ -50,6 +52,7 @@ import type {
   DraftStageInput,
   DraftStageResult,
 } from '../../../src/pipeline/stages/draft';
+import {draftReviewEvidenceArtifacts} from '../../../src/pipeline/stages/draft';
 import {
   releaseStageFingerprint,
   type ReleaseStageInput,
@@ -103,12 +106,23 @@ const compiledTimeline = (
   },
 });
 
+const draftFrameArtifacts = (
+  timeline: CompiledTimeline = compiledTimeline(),
+) => selectReviewFrames(timeline).map((frame) => ({
+  path: `draft/frames/frame-${String(frame).padStart(6, '0')}.jpg`,
+  sha256: hash(`frame-${frame}`),
+}));
+
 const draftReport = (overrides: Partial<DraftReport['outputs']> = {}): DraftReport => ({
   version: 1,
   projectId: 'demo',
   outputs: {
-    contactSheet: {path: 'draft/contact-sheet.jpg', sha256: hash('contact-sheet')},
-    reviewFrames: [{path: 'draft/frames/frame-000000.jpg', sha256: hash('frame-0')}],
+    draftVideo: {path: 'draft/draft.mp4', sha256: contentHash('draft-video')},
+    contactSheet: {path: 'draft/contact-sheet.jpg', sha256: contentHash('contact-sheet')},
+    reviewFrames: [{
+      path: 'draft/frames/frame-000000.jpg',
+      sha256: contentHash('review-frame'),
+    }],
     audio: {
       filterGraph: {path: 'audio/filter-graph.txt', sha256: hash('filter-graph')},
       mixedAudio: {path: 'audio/mixed-normalized.wav', sha256: hash('mixed-audio')},
@@ -126,7 +140,11 @@ const approvedReview = (overrides: Partial<Review> = {}): Review => ({
   reviewer: 'reviewer',
   reviewedAt: '2026-08-11T01:02:03.000Z',
   reason: 'approved',
-  evidencePaths: ['draft/contact-sheet.jpg', 'draft/frames/frame-000000.jpg'],
+  evidencePaths: [
+    'draft/draft.mp4',
+    'draft/contact-sheet.jpg',
+    'draft/frames/frame-000000.jpg',
+  ],
   ...overrides,
 });
 
@@ -234,6 +252,11 @@ beforeEach(async () => {
   const runStore = createRunStore(tempProject.workspaceRoot);
   sourceRun = await runStore.createRun('demo', 'source-run');
   targetRun = await runStore.createRun('demo', 'target-run');
+  for (const runDirectory of [sourceRun, targetRun]) {
+    await writeRunText(runDirectory, 'draft/draft.mp4', 'draft-video');
+    await writeRunText(runDirectory, 'draft/contact-sheet.jpg', 'contact-sheet');
+    await writeRunText(runDirectory, 'draft/frames/frame-000000.jpg', 'review-frame');
+  }
 });
 
 afterEach(async () => {
@@ -328,6 +351,31 @@ describe('MVP_STAGES', () => {
       review: 'review-stage-v1',
       release: 'release-stage-v1',
     });
+  });
+});
+
+describe('Draft review evidence contract', () => {
+  it('returns draft video, contact sheet, and review frames in stable unique order', () => {
+    const report = draftReport();
+
+    expect(draftReviewEvidenceArtifacts(report)).toEqual([
+      report.outputs.draftVideo,
+      report.outputs.contactSheet,
+      ...report.outputs.reviewFrames,
+    ]);
+  });
+
+  it('rejects duplicate Draft review evidence paths', () => {
+    const report = draftReport({
+      reviewFrames: [{
+        path: 'draft/draft.mp4',
+        sha256: contentHash('draft-video'),
+      }],
+    });
+
+    expect(() => draftReviewEvidenceArtifacts(report)).toThrow(
+      'Draft review evidence paths must be unique',
+    );
   });
 });
 
@@ -609,7 +657,7 @@ describe('adapter fingerprints', () => {
     expect(await stage.fingerprint(context)).not.toBe(before);
   });
 
-  it('changes Release for Compile hashes, Review identity, Preflight environment, profile, and algorithm', async () => {
+  it('changes Release for Compile hashes, Review identity, Preflight environment, and algorithm', async () => {
     let timeline = compiledTimeline();
     let review = approvedReview();
     let persistedPreflight = preflightResult();
@@ -639,8 +687,6 @@ describe('adapter fingerprints', () => {
       environmentFingerprint: hash('persisted-environment-2'),
     });
     expect(await stage.fingerprint(context)).not.toBe(before);
-    expect(await createReleaseStage({...dependencies, profile: {fps: 60}}).fingerprint(context))
-      .not.toBe(before);
     expect(await createReleaseStage({...dependencies, algorithmVersion: 'release-stage-v2'})
       .fingerprint(context)).not.toBe(before);
   });
@@ -830,7 +876,7 @@ describe('adapter artifact inventories', () => {
         mutedVideo: {path: 'draft/muted-video.mp4', sha256: hash('muted')},
         draftVideo: {path: 'draft/draft.mp4', sha256: hash('draft')},
         contactSheet: {path: 'draft/contact-sheet.jpg', sha256: hash('contact')},
-        reviewFrames: [{path: 'draft/frames/frame-000000.jpg', sha256: hash('frame')}],
+        reviewFrames: draftFrameArtifacts(),
         audio: {
           filterGraph: {path: 'audio/filter-graph.txt', sha256: hash('graph')},
           mixedAudio: {path: 'audio/mixed-normalized.wav', sha256: hash('mixed')},
@@ -888,6 +934,27 @@ describe('adapter artifact inventories', () => {
         outputs: preflightResult(),
       })}\n`,
     );
+    const inventoryCatalog: ProjectSourceCatalog = {
+      assets: [
+        {
+          assetId: 'cover',
+          kind: 'image',
+          sourcePath: 'assets/source/cover.png',
+          sizeBytes: 123,
+          sha256: hash('cover'),
+        },
+        {
+          assetId: 'clip',
+          kind: 'video',
+          sourcePath: 'assets/source/clip.mov',
+          sizeBytes: 456,
+          sha256: hash('clip'),
+        },
+      ],
+      totalBytes: 579,
+      fingerprint: hash('inventory-catalog'),
+    };
+    const context = executionContext({sourceCatalog: inventoryCatalog});
 
     const stages = [
       createPreflightStage({runPreflight: async () => preflightResult()}),
@@ -1013,7 +1080,7 @@ describe('adapter artifact inventories', () => {
         'draft/muted-video.mp4',
         'draft/draft.mp4',
         'draft/contact-sheet.jpg',
-        'draft/frames/frame-000000.jpg',
+        ...draftFrameArtifacts().map((frame) => frame.path),
         'audio/filter-graph.txt',
         'audio/mixed-normalized.wav',
         'draft/draft-report.json',
@@ -1032,7 +1099,7 @@ describe('adapter artifact inventories', () => {
     ]);
 
     for (const stage of stages) {
-      const result = await stage.execute(executionContext(), new AbortController().signal);
+      const result = await stage.execute(context, new AbortController().signal);
       expect(result.artifacts.map((artifact) => artifact.path)).toEqual(expected.get(stage.id));
       expect(result.artifacts.every((artifact) => (
         stage.id === 'release'
@@ -1078,7 +1145,7 @@ describe('adapter artifact inventories', () => {
           cover: {
             kind: 'image' as const,
             sourcePath: 'assets/source/cover.png',
-            sourceHash: hash('cover'),
+            sourceHash: sourceCatalog().assets[0]!.sha256,
             renderPath: 'assets/source/cover.png',
             renderScope: 'project' as const,
             compatibility: 'direct' as const,
@@ -1128,7 +1195,7 @@ describe('adapter artifact inventories', () => {
         mutedVideo: {path: 'draft/muted-video.mp4', sha256: hash('muted')},
         draftVideo: {path: 'draft/draft.mp4', sha256: hash('draft')},
         contactSheet: {path: 'draft/contact-sheet.jpg', sha256: hash('contact')},
-        reviewFrames: [{path: 'draft/frames/frame-000000.jpg', sha256: hash('frame')}],
+        reviewFrames: draftFrameArtifacts(),
         audio: {
           filterGraph: {path: 'audio/filter-graph.txt', sha256: hash('graph')},
           mixedAudio: {path: 'audio/mixed-normalized.wav', sha256: hash('mixed')},
@@ -1238,7 +1305,7 @@ describe('adapter artifact inventories', () => {
         mutedVideo: {path: 'draft/muted-video.mp4', sha256: hash('muted')},
         draftVideo: {path: 'draft/draft.mp4', sha256: hash('draft')},
         contactSheet: {path: 'draft/contact-sheet.jpg', sha256: hash('contact')},
-        reviewFrames: [{path: 'draft/frames/frame-000007.jpg', sha256: hash('frame-7')}],
+        reviewFrames: draftFrameArtifacts(),
         audio: {
           filterGraph: {path: 'audio/filter-graph.txt', sha256: hash('graph')},
           mixedAudio: {path: 'audio/mixed-normalized.wav', sha256: hash('mixed')},
@@ -1268,7 +1335,7 @@ describe('adapter artifact inventories', () => {
     await draft.execute(context, new AbortController().signal);
     expect(draft.partialArtifacts(context)).toEqual(expect.arrayContaining([
       ...partialsAfterFailure,
-      {scope: 'run', path: 'draft/frames/frame-000007.jpg'},
+      {scope: 'run', path: draftFrameArtifacts()[0]!.path},
     ]));
   });
 });
@@ -1512,11 +1579,11 @@ describe('adapter verification', () => {
   });
 
   it('requires an empty Review inventory and verifies current Draft evidence as provenance', async () => {
-    await writeRunText(sourceRun, 'draft/contact-sheet.jpg', 'contact-sheet');
-    await writeRunText(sourceRun, 'draft/frames/frame-000000.jpg', 'review-frame');
+    const draftVideo = await hashRunArtifact(sourceRun, 'draft/draft.mp4');
     const contactSheet = await hashRunArtifact(sourceRun, 'draft/contact-sheet.jpg');
     const reviewFrame = await hashRunArtifact(sourceRun, 'draft/frames/frame-000000.jpg');
     const draft = draftReport({
+      draftVideo: {path: draftVideo.path, sha256: draftVideo.sha256},
       contactSheet: {path: contactSheet.path, sha256: contactSheet.sha256},
       reviewFrames: [{path: reviewFrame.path, sha256: reviewFrame.sha256}],
     });
@@ -1531,7 +1598,7 @@ describe('adapter verification', () => {
       fingerprint: await stage.fingerprint(context),
       artifacts: [],
       outputs: {
-        evidence: [draft.outputs.contactSheet, ...draft.outputs.reviewFrames],
+        evidence: draftReviewEvidenceArtifacts(draft),
         review,
       },
     });
@@ -1569,7 +1636,7 @@ describe('adapter verification', () => {
       fingerprint: hash('review'),
       artifacts: [],
       outputs: {
-        evidence: [draft.outputs.contactSheet, ...draft.outputs.reviewFrames],
+        evidence: draftReviewEvidenceArtifacts(draft),
         review,
       },
     });
@@ -1604,7 +1671,7 @@ describe('adapter verification', () => {
         fingerprint: reportFingerprint,
         artifacts: [],
         outputs: {
-          evidence: [draft.outputs.contactSheet, ...draft.outputs.reviewFrames],
+          evidence: draftReviewEvidenceArtifacts(draft),
           review,
         },
       });
@@ -1612,6 +1679,56 @@ describe('adapter verification', () => {
       await expect(stage.verify(planningContext(), report)).rejects.toBe(failure);
     },
   );
+
+  it('does not accept Review approval after Draft evidence changes during execution', async () => {
+    const draft = draftReport();
+    const review = approvedReview({runId: 'target-run'});
+    const stage = createReviewStage({
+      readDraftReport: async () => draft,
+      readReview: async () => review,
+    });
+    await writeFile(
+      path.join(
+        tempProject.workspaceRoot,
+        '.work',
+        'demo',
+        'runs',
+        'target-run',
+        'draft',
+        'draft.mp4',
+      ),
+      'tampered-draft-video',
+    );
+
+    await expect(stage.execute(
+      executionContext(),
+      new AbortController().signal,
+    )).rejects.toBeDefined();
+  });
+
+  it('propagates scoped authority changes during Review verification', async () => {
+    const failure = new AppDirectoryScopeError(
+      'APP_SCOPE_AUTHORITY_CHANGED',
+      'Run authority changed while reading Draft evidence',
+    );
+    const draft = draftReport();
+    const review = approvedReview();
+    const stage = createReviewStage({
+      readDraftReport: async () => { throw failure; },
+      readReview: async () => review,
+    });
+    const report = passedStageReport({
+      stageId: 'review',
+      fingerprint: hash('review'),
+      artifacts: [],
+      outputs: {
+        evidence: draftReviewEvidenceArtifacts(draft),
+        review,
+      },
+    });
+
+    await expect(stage.verify(planningContext(), report)).rejects.toBe(failure);
+  });
 });
 
 describe('Narration compatibility-gated cache seeding', () => {
@@ -1689,7 +1806,17 @@ describe('Narration compatibility-gated cache seeding', () => {
             durationMs: 1000,
           },
         },
-        captions: {version: 1 as const, sourceNarrationHash: hash('master'), cues: []},
+        captions: {
+          version: 1 as const,
+          sourceNarrationHash: hash('master'),
+          cues: [{
+            id: `caption-${segment.id}`,
+            segmentId: segment.id,
+            text: segment.text,
+            startMs: 0,
+            endMs: 1000,
+          }],
+        },
       };
     });
     let providerFingerprint = sourceProviderFingerprint;
@@ -2181,11 +2308,11 @@ describe('provenance hardening regressions', () => {
     ['missing evidence', approvedReview({evidencePaths: ['draft/contact-sheet.jpg']})],
     ['rejected status', approvedReview({status: 'rejected'})],
   ])('does not reuse Review approval with %s', async (_label, review) => {
-    await writeRunText(sourceRun, 'draft/contact-sheet.jpg', 'contact-sheet');
-    await writeRunText(sourceRun, 'draft/frames/frame-000000.jpg', 'review-frame');
+    const draftVideo = await hashRunArtifact(sourceRun, 'draft/draft.mp4');
     const contactSheet = await hashRunArtifact(sourceRun, 'draft/contact-sheet.jpg');
     const reviewFrame = await hashRunArtifact(sourceRun, 'draft/frames/frame-000000.jpg');
     const draft = draftReport({
+      draftVideo: {path: draftVideo.path, sha256: draftVideo.sha256},
       contactSheet: {path: contactSheet.path, sha256: contactSheet.sha256},
       reviewFrames: [{path: reviewFrame.path, sha256: reviewFrame.sha256}],
     });
@@ -2199,7 +2326,7 @@ describe('provenance hardening regressions', () => {
       fingerprint: await stage.fingerprint(context),
       artifacts: [],
       outputs: {
-        evidence: [draft.outputs.contactSheet, ...draft.outputs.reviewFrames],
+        evidence: draftReviewEvidenceArtifacts(draft),
         review,
       },
     });
@@ -2280,6 +2407,84 @@ describe('provenance hardening regressions', () => {
     });
 
     await expect(stage.fingerprint(planningContext())).resolves.toBeNull();
+  });
+
+  it.each(
+    (['preflight', 'compile'] as const).flatMap((stageId) => ([
+      [stageId, 'failed', hash(`${stageId}-failed`)],
+      [stageId, 'cancelled', hash(`${stageId}-cancelled`)],
+      [stageId, 'needs_review', hash(`${stageId}-needs-review`)],
+      [stageId, 'passed', null],
+    ] as const)),
+  )('returns null for a %s prerequisite in state %s with fingerprint %s', async (
+    stageId,
+    state,
+    fingerprint,
+  ) => {
+    const validReader = releaseStageReportReader();
+    const stage = createReleaseStage({
+      readDraftReport: async () => draftReport(),
+      readCompiledTimeline: async () => compiledTimeline(),
+      readReview: async () => approvedReview(),
+      readStageReport: async (runDirectory, requestedStageId) => {
+        const report = await validReader(runDirectory, requestedStageId);
+        if (requestedStageId !== stageId) return report;
+        return {
+          ...report,
+          state,
+          fingerprint,
+          ...(
+            state === 'failed' || state === 'cancelled'
+              ? {error: {code: 'TEST_FAILURE', message: 'not successful'}}
+              : {}
+          ),
+        };
+      },
+    });
+
+    await expect(stage.fingerprint(planningContext())).resolves.toBeNull();
+  });
+
+  it.each(
+    (['preflight', 'compile'] as const).flatMap((stageId) => ([
+      [stageId, 'failed', hash(`${stageId}-failed`)],
+      [stageId, 'cancelled', hash(`${stageId}-cancelled`)],
+      [stageId, 'needs_review', hash(`${stageId}-needs-review`)],
+      [stageId, 'passed', null],
+    ] as const)),
+  )('does not execute Release for a %s prerequisite in state %s with fingerprint %s', async (
+    stageId,
+    state,
+    fingerprint,
+  ) => {
+    const validReader = releaseStageReportReader({runId: 'target-run'});
+    const executeRelease = vi.fn(async () => releaseResult('target-run'));
+    const stage = createReleaseStage({
+      readDraftReport: async () => draftReport(),
+      readCompiledTimeline: async () => compiledTimeline(),
+      readReview: async () => approvedReview({runId: 'target-run'}),
+      readStageReport: async (runDirectory, requestedStageId) => {
+        const report = await validReader(runDirectory, requestedStageId);
+        if (requestedStageId !== stageId) return report;
+        return {
+          ...report,
+          state,
+          fingerprint,
+          ...(
+            state === 'failed' || state === 'cancelled'
+              ? {error: {code: 'TEST_FAILURE', message: 'not successful'}}
+              : {}
+          ),
+        };
+      },
+      runRelease: executeRelease,
+    });
+
+    await expect(stage.execute(
+      executionContext(),
+      new AbortController().signal,
+    )).rejects.toBeDefined();
+    expect(executeRelease).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -2564,7 +2769,17 @@ describe('Narration fingerprint and media tool provenance', () => {
             durationMs: 1000,
           },
         },
-        captions: {version: 1 as const, sourceNarrationHash: hash('master'), cues: []},
+        captions: {
+          version: 1 as const,
+          sourceNarrationHash: hash('master'),
+          cues: [{
+            id: `caption-${segment.id}`,
+            segmentId: segment.id,
+            text: segment.text,
+            startMs: 0,
+            endMs: 1000,
+          }],
+        },
       };
     });
     const stage = createNarrationStage({
@@ -2627,7 +2842,7 @@ describe('Release semantic fingerprinting', () => {
     expect(await stage.fingerprint(context)).not.toBe(before);
   });
 
-  it('passes injected profile and algorithm version into concrete Release fingerprinting', async () => {
+  it('passes the algorithm version into fixed-profile concrete Release fingerprinting', async () => {
     const preflight = preflightResult();
     const store = createStageReportStore();
     await store.writeStage(targetRun, {
@@ -2645,7 +2860,6 @@ describe('Release semantic fingerprinting', () => {
         timeline: compiledTimeline(),
       })),
     }));
-    const profile = {fps: 60, codec: 'injected'};
     const algorithmVersion = 'release-stage-v2';
     const timeline = compiledTimeline();
     const draft = draftReport();
@@ -2657,7 +2871,6 @@ describe('Release semantic fingerprinting', () => {
       compiledTimeline: timeline,
       review,
       preflightEnvironmentFingerprint: preflight.environmentFingerprint,
-      profile,
       algorithmVersion,
     });
     const releaseResultFixture: ReleaseStageResult = {
@@ -2691,7 +2904,6 @@ describe('Release semantic fingerprinting', () => {
     const executeRelease = vi.fn(async () => releaseResultFixture);
     const stage = createReleaseStage({
       algorithmVersion,
-      profile,
       readDraftReport: async () => draft,
       readCompiledTimeline: async () => timeline,
       readReview: async () => review,
@@ -2705,15 +2917,40 @@ describe('Release semantic fingerprinting', () => {
 
     expect(executeRelease).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       publishCurrent: false,
-      profile,
       algorithmVersion,
     }));
+    expect(executeRelease).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.not.objectContaining({profile: expect.anything()}),
+    );
     expect(result.fingerprint).toBe(expectedFingerprint);
     expect(result.outputs).toMatchObject({releaseFingerprint: expectedFingerprint});
+  });
+
+  it('does not expose an injectable Release profile', () => {
+    if (false) {
+      // @ts-expect-error Release always uses RELEASE_FIXED_PROFILE
+      createReleaseStage({profile: {fps: 60}});
+    }
+    expect(true).toBe(true);
   });
 });
 
 describe('exact stage-owned artifact validators', () => {
+  it('rejects an Ingest manifest that omits a current source-catalog asset', async () => {
+    const manifest = {version: 1 as const, assets: {}};
+    await writeRunText(sourceRun, 'asset-manifest.json', `${JSON.stringify(manifest)}\n`);
+    const manifestArtifact = await hashRunArtifact(sourceRun, 'asset-manifest.json');
+    const report = passedStageReport({
+      stageId: 'ingest',
+      artifacts: [manifestArtifact],
+      outputs: {manifestPath: 'asset-manifest.json', manifest},
+    });
+
+    await expect(createIngestStage().verify(planningContext(), report))
+      .resolves.toBe(false);
+  });
+
   it('rejects Ingest Run render paths outside concrete asset naming', async () => {
     const manifest = {
       version: 1 as const,
@@ -2987,10 +3224,148 @@ describe('exact stage-owned artifact validators', () => {
     }).verify(planningContext(), report)).resolves.toBe(false);
   });
 
+  it('rejects a valid-shaped Narration input hash unrelated to the current script', async () => {
+    const providerFingerprint = hash('provider');
+    const inputHash = hash('unrelated-script-input');
+    const cachePath = `audio/cache/${inputHash.slice('sha256:'.length)}.wav`;
+    const segmentPath = `audio/segments/0001-intro-${inputHash.slice('sha256:'.length, 'sha256:'.length + 12)}.wav`;
+    const segment = {
+      id: 'intro',
+      inputHash,
+      audioPath: segmentPath,
+      audioHash: contentHash('segment'),
+      startMs: 0,
+      endMs: 1000,
+      durationMs: 1000,
+      pauseAfterMs: project.script.segments[0]!.pauseAfterMs,
+      sampleRate: 48_000 as const,
+      channels: 1 as const,
+      providerFingerprint,
+    };
+    const masterPath = narrationMasterPath({provider: 'mock', segments: [segment]});
+    const narration = {
+      version: 1 as const,
+      provider: 'mock' as const,
+      segments: [segment],
+      master: {
+        audioPath: masterPath,
+        audioHash: contentHash('master'),
+        durationMs: 1300,
+      },
+    };
+    const captions = {
+      version: 1 as const,
+      sourceNarrationHash: narration.master.audioHash,
+      cues: [{
+        id: 'caption-intro',
+        segmentId: 'intro',
+        text: project.script.segments[0]!.text,
+        startMs: 0,
+        endMs: 1000,
+      }],
+    };
+    const reuseCompatibility = {
+      tts: project.project.tts,
+      providerFingerprint,
+      ffmpegIdentity: preflightResult().toolIdentities.ffmpeg!,
+      ffprobeIdentity: preflightResult().toolIdentities.ffprobe!,
+      algorithmVersion: STAGE_ALGORITHM_VERSIONS.narration,
+    };
+    await Promise.all([
+      writeRunText(sourceRun, cachePath, 'cache'),
+      writeRunText(sourceRun, segmentPath, 'segment'),
+      writeRunText(sourceRun, masterPath, 'master'),
+      writeRunText(sourceRun, 'narration-manifest.json', `${JSON.stringify(narration)}\n`),
+      writeRunText(sourceRun, 'captions.json', `${JSON.stringify(captions)}\n`),
+      writeRunText(sourceRun, 'captions.srt', 'captions'),
+    ]);
+    const artifacts = await Promise.all([
+      cachePath,
+      segmentPath,
+      masterPath,
+      'narration-manifest.json',
+      'captions.json',
+      'captions.srt',
+    ].map(async (relativePath) => await hashRunArtifact(sourceRun, relativePath)));
+    const stage = createNarrationStage({
+      fingerprintTtsProvider: async () => providerFingerprint,
+    });
+    const context = planningContext();
+    const report = passedStageReport({
+      stageId: 'narration',
+      fingerprint: await stage.fingerprint(context),
+      artifacts,
+      outputs: JSON.parse(JSON.stringify({
+        narrationPath: 'narration-manifest.json',
+        captionsPath: 'captions.json',
+        srtPath: 'captions.srt',
+        narration,
+        captions,
+        reuseCompatibility,
+        reuseCompatibilityFingerprint: narrationReuseCompatibilityFingerprint(
+          reuseCompatibility,
+        ),
+      })),
+    });
+
+    await expect(stage.verify(context, report)).resolves.toBe(false);
+  });
+
+  it('rejects a Draft review frame that cannot come from the compiled timeline', async () => {
+    const paths = [
+      'draft/muted-video.mp4',
+      'draft/frames/frame-999999.jpg',
+      'audio/filter-graph.txt',
+      'audio/mixed-normalized.wav',
+      'draft/draft-report.json',
+    ];
+    for (const relativePath of paths) await writeRunText(sourceRun, relativePath, relativePath);
+    const references = new Map(await Promise.all([
+      'draft/muted-video.mp4',
+      'draft/draft.mp4',
+      'draft/contact-sheet.jpg',
+      'draft/frames/frame-999999.jpg',
+      'audio/filter-graph.txt',
+      'audio/mixed-normalized.wav',
+      'draft/draft-report.json',
+    ].map(async (relativePath) => {
+      const artifact = await hashRunArtifact(sourceRun, relativePath);
+      return [relativePath, {path: artifact.path, sha256: artifact.sha256}] as const;
+    })));
+    const outputs = {
+      mutedVideo: references.get('draft/muted-video.mp4')!,
+      draftVideo: references.get('draft/draft.mp4')!,
+      contactSheet: references.get('draft/contact-sheet.jpg')!,
+      reviewFrames: [references.get('draft/frames/frame-999999.jpg')!],
+      audio: {
+        filterGraph: references.get('audio/filter-graph.txt')!,
+        mixedAudio: references.get('audio/mixed-normalized.wav')!,
+      },
+      report: references.get('draft/draft-report.json')!,
+      audioMixFingerprint: hash('audio-mix'),
+    };
+    const report = passedStageReport({
+      stageId: 'draft',
+      artifacts: [
+        outputs.mutedVideo,
+        outputs.draftVideo,
+        outputs.contactSheet,
+        ...outputs.reviewFrames,
+        outputs.audio.filterGraph,
+        outputs.audio.mixedAudio,
+        outputs.report,
+      ].map((artifact) => ({scope: 'run' as const, ...artifact})),
+      outputs: {reportPath: 'draft/draft-report.json', outputs},
+    });
+
+    await expect(createDraftStage({
+      readCompiledTimeline: async () => compiledTimeline(),
+    }).verify(planningContext(), report)).resolves.toBe(false);
+  });
+
   it('rejects Draft fixed paths and duplicate review frames', async () => {
     const paths = [
       'draft/unexpected-muted.mp4',
-      'draft/draft.mp4',
       'draft/unexpected-contact.jpg',
       'draft/frames/frame-000001.jpg',
       'audio/unexpected-filter.txt',
@@ -3002,10 +3377,11 @@ describe('exact stage-owned artifact validators', () => {
       const artifact = await hashRunArtifact(sourceRun, relativePath);
       return [relativePath, {path: artifact.path, sha256: artifact.sha256}] as const;
     })));
+    const existingDraftVideo = await hashRunArtifact(sourceRun, 'draft/draft.mp4');
     const frame = references.get('draft/frames/frame-000001.jpg')!;
     const outputs = {
       mutedVideo: references.get('draft/unexpected-muted.mp4')!,
-      draftVideo: references.get('draft/draft.mp4')!,
+      draftVideo: {path: existingDraftVideo.path, sha256: existingDraftVideo.sha256},
       contactSheet: references.get('draft/unexpected-contact.jpg')!,
       reviewFrames: [frame, frame],
       audio: {

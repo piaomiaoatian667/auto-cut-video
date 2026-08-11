@@ -30,9 +30,11 @@ import {
 import {fingerprintValue} from '../fingerprint';
 import {
   DraftReportSchema,
+  draftReviewEvidenceArtifacts,
   type ArtifactReference,
   type DraftReport,
 } from './draft';
+import {verifyRunArtifact} from '../artifacts';
 import {evaluateReview, ReviewGateError} from './review';
 import {
   runProcess as runSystemProcess,
@@ -71,14 +73,13 @@ export const RELEASE_FIXED_PROFILE = {
 export interface ReleaseStageFingerprintInput {
   draft: Pick<
     DraftReport['outputs'],
-    'contactSheet' | 'reviewFrames' | 'audio' | 'audioMixFingerprint'
+    'draftVideo' | 'contactSheet' | 'reviewFrames' | 'audio' | 'audioMixFingerprint'
   >;
   compileInputHashes: Record<string, string>;
   compileStageFingerprint?: string | null;
   compiledTimeline?: CompiledTimeline;
   review: Review;
   preflightEnvironmentFingerprint: string;
-  profile?: Record<string, unknown>;
   algorithmVersion?: string;
 }
 
@@ -89,11 +90,11 @@ export const releaseStageFingerprint = ({
   compiledTimeline,
   review,
   preflightEnvironmentFingerprint,
-  profile = RELEASE_FIXED_PROFILE,
   algorithmVersion = 'release-stage-v1',
 }: ReleaseStageFingerprintInput): string => fingerprintValue({
   algorithmVersion,
   draftArtifacts: {
+    draftVideo: draft.draftVideo,
     contactSheet: draft.contactSheet,
     reviewFrames: draft.reviewFrames,
     audio: draft.audio,
@@ -106,7 +107,7 @@ export const releaseStageFingerprint = ({
     : fingerprintValue(compiledTimeline),
   approvedReview: review,
   preflightEnvironmentFingerprint,
-  profile,
+  profile: RELEASE_FIXED_PROFILE,
 });
 
 export interface ReleaseToolIdentity {
@@ -156,7 +157,6 @@ export interface ReleaseStageDependencies {
   runProcess?: ReleaseRunner;
   outputStore?: ReturnType<typeof createOutputStore>;
   publishCurrent?: boolean;
-  profile?: Record<string, unknown>;
   algorithmVersion?: string;
 }
 
@@ -355,15 +355,20 @@ const loadApprovedReview = async (
   input: ReleaseStageInput,
   draftReport: DraftReport,
 ): Promise<Review> => {
+  const evidence = draftReviewEvidenceArtifacts(draftReport);
+  for (const artifact of evidence) {
+    if (!await verifyRunArtifact(input.runDirectory, {scope: 'run', ...artifact})) {
+      throw new ReleaseStageError(
+        'RELEASE_ARTIFACT_CHANGED',
+        `Draft review evidence is missing or changed: ${artifact.path}`,
+      );
+    }
+  }
   const review = await readRunJson(input.runDirectory, 'review.json', (value) => ReviewSchema.parse(value));
-  const evidencePaths = [
-    draftReport.outputs.contactSheet.path,
-    ...draftReport.outputs.reviewFrames.map((frame) => frame.path),
-  ];
   const gate = await evaluateReview({
     projectId: input.project.id,
     runId: input.runId,
-    evidencePaths,
+    evidencePaths: evidence.map((artifact) => artifact.path),
     review,
   });
   if (gate.state !== 'passed' || gate.review === undefined) {
@@ -651,7 +656,6 @@ export const runRelease = async (
     compiledTimeline: timeline,
     review,
     preflightEnvironmentFingerprint: input.preflight.environmentFingerprint,
-    profile: dependencies.profile ?? RELEASE_FIXED_PROFILE,
     algorithmVersion: dependencies.algorithmVersion ?? 'release-stage-v1',
   });
   const validationReport = await writeOutputJson(

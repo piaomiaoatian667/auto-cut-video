@@ -5,6 +5,7 @@ import {
   CaptionsManifestSchema,
   NarrationManifestSchema,
 } from '../../domain/manifest-schema';
+import {buildCaptions} from '../../captions/build-captions';
 import type {RunDirectoryScope} from '../../fs/app-directory-scopes';
 import {
   openExistingProjectFile,
@@ -242,7 +243,7 @@ const cachePath = (inputHash: string): string =>
 const safeSegmentId = (segmentId: string): string =>
   segmentId.replace(/[^a-zA-Z0-9-]/gu, '-');
 
-const narrationExpectedArtifacts = (
+const narrationOwnedArtifacts = (
   output: z.infer<typeof NarrationAdapterOutputSchema>,
 ) => {
   if (
@@ -291,6 +292,63 @@ const narrationExpectedArtifacts = (
     return null;
   }
   return expected;
+};
+
+const narrationMatchesCurrentInputs = ({
+  output,
+  context,
+  providerFingerprint,
+  algorithmVersion,
+}: {
+  output: z.infer<typeof NarrationAdapterOutputSchema>;
+  context: StagePlanningContext;
+  providerFingerprint: string;
+  algorithmVersion: string;
+}): boolean => {
+  const ffmpegIdentity = context.preflight?.toolIdentities.ffmpeg;
+  const ffprobeIdentity = context.preflight?.toolIdentities.ffprobe;
+  if (
+    ffmpegIdentity === undefined
+    || ffmpegIdentity === null
+    || ffprobeIdentity === undefined
+    || ffprobeIdentity === null
+    || output.narration.provider !== context.project.project.tts.provider
+  ) return false;
+  const expectedCompatibility = {
+    tts: context.project.project.tts,
+    providerFingerprint,
+    ffmpegIdentity,
+    ffprobeIdentity,
+    algorithmVersion,
+  };
+  if (
+    fingerprintValue(output.reuseCompatibility)
+    !== fingerprintValue(expectedCompatibility)
+    || output.narration.segments.length !== context.project.script.segments.length
+  ) return false;
+  for (const [index, segment] of output.narration.segments.entries()) {
+    const scriptSegment = context.project.script.segments[index];
+    if (
+      scriptSegment === undefined
+      || segment.id !== scriptSegment.id
+      || segment.providerFingerprint !== providerFingerprint
+      || segment.inputHash !== narrationSegmentInputHash(
+        scriptSegment,
+        context.project.project.tts.voice,
+        context.project.project.tts.rate,
+        providerFingerprint,
+      )
+    ) return false;
+  }
+  try {
+    return fingerprintValue(output.captions) === fingerprintValue(buildCaptions({
+      script: context.project.script,
+      narration: output.narration,
+      sourceNarrationHash: output.narration.master.audioHash,
+    }));
+  } catch {
+    return false;
+  }
 };
 
 const preliminaryPartialArtifacts = (
@@ -417,7 +475,20 @@ export const createNarrationStage = (
     verify: async (context, report) => {
       const parsed = NarrationAdapterOutputSchema.safeParse(report.outputs);
       if (!parsed.success) return false;
-      const expected = narrationExpectedArtifacts(parsed.data);
+      const providerFingerprint = await providerIdentity(
+        context.project.project.tts.provider,
+      );
+      if (!narrationMatchesCurrentInputs({
+        output: parsed.data,
+        context,
+        providerFingerprint,
+        algorithmVersion,
+      })) return false;
+      const currentFingerprint = await calculateFingerprint(context, providerFingerprint);
+      if (currentFingerprint === null || report.fingerprint !== currentFingerprint) {
+        return false;
+      }
+      const expected = narrationOwnedArtifacts(parsed.data);
       if (expected === null) return false;
       return await verifyReportedArtifacts({context, report, expected});
     },
@@ -490,7 +561,7 @@ export const createNarrationStage = (
         && sourceOutput.data.reuseCompatibilityFingerprint
           === compatibilityFingerprint
       ) {
-        const sourceExpected = narrationExpectedArtifacts(sourceOutput.data);
+        const sourceExpected = narrationOwnedArtifacts(sourceOutput.data);
         if (
           sourceExpected !== null
           && await verifyReportedArtifacts({
@@ -539,7 +610,15 @@ export const createNarrationStage = (
         reuseCompatibility,
         reuseCompatibilityFingerprint: compatibilityFingerprint,
       });
-      if (narrationExpectedArtifacts(output) === null) {
+      if (
+        narrationOwnedArtifacts(output) === null
+        || !narrationMatchesCurrentInputs({
+          output,
+          context: {...context, preflight},
+          providerFingerprint,
+          algorithmVersion,
+        })
+      ) {
         throw new PipelineContextError('Narration returned invalid owned artifact paths');
       }
       const artifacts: PipelineArtifact[] = [];

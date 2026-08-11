@@ -201,7 +201,7 @@ describe('RunStore', () => {
       await symlink(outsideRoot, workspaceRoot);
 
       await expect(createLater()).rejects.toMatchObject({
-        code: 'APP_PATH_OUTSIDE_SCOPE',
+        code: 'APP_SCOPE_AUTHORITY_CHANGED',
       });
       const escapedPath = owner === 'run'
         ? path.join(outsideRoot, '.work', 'beta', 'runs', 'run-beta')
