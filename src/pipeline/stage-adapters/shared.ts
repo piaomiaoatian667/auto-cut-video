@@ -13,7 +13,7 @@ import {
 } from '../artifacts';
 import type {StagePlanningContext} from '../stage';
 import {
-  StageReportSchema,
+  createStageReportStore,
   StageReportValidationError,
   type StageReport,
 } from '../stage-report';
@@ -140,6 +140,20 @@ export const readRunJson = async <Output>(
   }
 };
 
+export const readRunText = async (
+  runDirectory: RunDirectoryScope,
+  relativePath: string,
+): Promise<string> => {
+  const authority = await openExistingRunFileForRead(runDirectory, relativePath);
+  try {
+    const result = await authority.handle.readFile('utf8');
+    await authority.revalidate();
+    return result;
+  } finally {
+    await authority.close();
+  }
+};
+
 export const readOptionalRunJson = async <Output>(
   runDirectory: RunDirectoryScope,
   relativePath: string,
@@ -158,16 +172,57 @@ export const readOptionalRunJson = async <Output>(
 export const readRunStageReport = async (
   runDirectory: RunDirectoryScope,
   stageId: StageId,
-): Promise<StageReport> => await readRunJson(
+): Promise<StageReport | null> => await createStageReportStore().readStage(
   runDirectory,
-  `reports/${stageId}.json`,
-  (value) => StageReportSchema.parse(value),
+  stageId,
 );
 
-export const planningReportFingerprint = (
-  context: StagePlanningContext,
-  stageId: StageId,
-): string | null => context.sourceRun?.reports.get(stageId)?.fingerprint ?? null;
+export type SuccessfulBoundStageReport = StageReport & {
+  state: 'passed' | 'cached';
+  fingerprint: string;
+};
+
+export type StageReportReader<Stage extends StageId = StageId> = (
+  runDirectory: RunDirectoryScope,
+  stageId: Stage,
+) => Promise<StageReport | null>;
+
+export const loadSuccessfulBoundStageReport = async <Stage extends StageId>({
+  runDirectory,
+  projectId,
+  runId,
+  stageId,
+  readStageReport = readRunStageReport,
+}: {
+  runDirectory: RunDirectoryScope;
+  projectId: string;
+  runId: string;
+  stageId: Stage;
+  readStageReport?: StageReportReader<Stage>;
+}): Promise<SuccessfulBoundStageReport> => {
+  const report = await readStageReport(runDirectory, stageId);
+  if (report === null) {
+    throw new StageReportValidationError(`missing ${stageId} Stage report`);
+  }
+  if (
+    report.projectId !== projectId
+    || report.runId !== runId
+    || report.stageId !== stageId
+  ) {
+    throw new StageReportValidationError(
+      `${stageId} Stage report is not bound to ${projectId}/${runId}`,
+    );
+  }
+  if (
+    (report.state !== 'passed' && report.state !== 'cached')
+    || report.fingerprint === null
+  ) {
+    throw new StageReportValidationError(
+      `${stageId} Stage report must be passed or cached with a fingerprint`,
+    );
+  }
+  return report as SuccessfulBoundStageReport;
+};
 
 export const runArtifact = (
   reference: {path: string; sha256: string},

@@ -80,7 +80,9 @@ export const createReviewStage = (
       const draft = await readPlanningInput(async () => await readDraftReport(
         context.sourceRun!.runDirectory,
       ));
-      return draft === null ? null : fingerprintFromDraft(draft);
+      return draft === null || draft.projectId !== context.project.project.id
+        ? null
+        : fingerprintFromDraft(draft);
     },
     verify: async (context, report) => {
       if (report.state !== 'passed' && report.state !== 'cached') return false;
@@ -89,6 +91,7 @@ export const createReviewStage = (
       if (context.sourceRun === undefined) return false;
       try {
         const currentDraft = await readDraftReport(context.sourceRun.runDirectory);
+        if (currentDraft.projectId !== context.project.project.id) return false;
         const currentEvidence = evidenceFromDraft(currentDraft);
         if (
           fingerprintValue(currentEvidence)
@@ -136,6 +139,9 @@ export const createReviewStage = (
       const {runId, runDirectory} = requireRunContext(context);
       requirePreflight(context);
       const draft = await readDraftReport(runDirectory);
+      if (draft.projectId !== context.project.project.id) {
+        throw new PipelineContextError('Draft report belongs to another project');
+      }
       const evidence = evidenceFromDraft(draft);
       for (const artifact of evidence) {
         if (!await verifyRunArtifact(runDirectory, {scope: 'run', ...artifact})) {

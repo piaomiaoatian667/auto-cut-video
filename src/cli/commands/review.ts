@@ -8,7 +8,10 @@ import {
   type CurrentPointer,
   type RunDirectoryScope,
 } from '../../fs/app-directory-scopes';
-import {verifyRunArtifact} from '../../pipeline/artifacts';
+import {
+  PipelineArtifactError,
+  verifyRunArtifact,
+} from '../../pipeline/artifacts';
 import {
   DraftReportSchema,
   draftReviewEvidenceArtifacts,
@@ -28,6 +31,7 @@ export interface ReviewCommandDependencies {
   stdout: OutputWriter;
   stderr: OutputWriter;
   now?: () => string;
+  verifyRunArtifact?: typeof verifyRunArtifact;
 }
 
 const withHandle = async <Output>(
@@ -70,6 +74,7 @@ const writeRunJson = async (
 const isReviewValidationMiss = (error: unknown): boolean => (
   error instanceof z.ZodError
   || error instanceof SyntaxError
+  || error instanceof PipelineArtifactError
   || (
     error instanceof AppDirectoryScopeError
     && error.code === 'APP_PATH_OUTSIDE_SCOPE'
@@ -114,6 +119,7 @@ export const runReviewCommand = async (
     return EXIT_CODES.validationFailed;
   }
   const runDirectory = await store.openExistingRun(projectId, current.runId);
+  const verifyArtifact = dependencies.verifyRunArtifact ?? verifyRunArtifact;
   let evidencePaths: string[];
   try {
     const draftReport = DraftReportSchema.parse(
@@ -125,7 +131,7 @@ export const runReviewCommand = async (
     }
     const evidence = draftReviewEvidenceArtifacts(draftReport);
     for (const artifact of evidence) {
-      if (!await verifyRunArtifact(runDirectory, {scope: 'run', ...artifact})) {
+      if (!await verifyArtifact(runDirectory, {scope: 'run', ...artifact})) {
         dependencies.stderr.write('Draft review evidence is missing or changed.\n');
         return EXIT_CODES.validationFailed;
       }

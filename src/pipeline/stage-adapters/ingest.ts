@@ -18,6 +18,8 @@ import {
 import type {ProjectSourceCatalog} from '../source-assets';
 import {
   STAGE_ALGORITHM_VERSIONS,
+  readPlanningInput,
+  readRunJson,
   verifyReportedArtifacts,
 } from './shared';
 
@@ -117,9 +119,18 @@ export const createIngestStage = (
     fingerprint,
     verify: async (context, report) => {
       const parsed = IngestAdapterOutputSchema.safeParse(report.outputs);
-      if (!parsed.success) return false;
+      if (!parsed.success || context.sourceRun === undefined) return false;
+      const persistedManifest = await readPlanningInput(async () => await readRunJson(
+        context.sourceRun!.runDirectory,
+        parsed.data.manifestPath,
+        (value) => IngestManifestSchema.parse(value),
+      ));
+      if (
+        persistedManifest === null
+        || fingerprintValue(persistedManifest) !== fingerprintValue(parsed.data.manifest)
+      ) return false;
       const renderPaths = runOwnedRenderPaths(
-        parsed.data.manifest,
+        persistedManifest,
         context.sourceCatalog.assets,
       );
       if (renderPaths === null) return false;

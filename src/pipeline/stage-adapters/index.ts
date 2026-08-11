@@ -40,4 +40,8 @@ export {
   releaseStage,
   type ReleaseStageAdapterDependencies,
 } from './release';
-export {STAGE_ALGORITHM_VERSIONS} from './shared';
+export {
+  loadSuccessfulBoundStageReport,
+  STAGE_ALGORITHM_VERSIONS,
+  type SuccessfulBoundStageReport,
+} from './shared';

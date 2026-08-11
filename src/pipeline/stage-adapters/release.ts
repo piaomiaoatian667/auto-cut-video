@@ -17,7 +17,6 @@ import {
 } from '../stage';
 import {
   createStageReportStore,
-  StageReportValidationError,
   type StageReport,
 } from '../stage-report';
 import {fingerprintValue} from '../fingerprint';
@@ -41,6 +40,7 @@ import {evaluateReview, ReviewGateError} from '../stages/review';
 import {
   STAGE_ALGORITHM_VERSIONS,
   isOrdinaryVerificationMiss,
+  loadSuccessfulBoundStageReport,
   outputArtifact,
   readPlanningInput,
   readRunJson,
@@ -128,40 +128,6 @@ const requireReleaseTools = (preflight: ReleasePreflightSnapshot): void => {
       'Release requires persisted FFmpeg, FFprobe, and qt-faststart identities',
     );
   }
-};
-
-type SuccessfulBoundStageReport = StageReport & {
-  state: 'passed' | 'cached';
-  fingerprint: string;
-};
-
-const requireSuccessfulBoundStageReport = (
-  report: StageReport | null,
-  projectId: string,
-  runId: string,
-  stageId: 'preflight' | 'compile',
-): SuccessfulBoundStageReport => {
-  if (report === null) {
-    throw new StageReportValidationError(`missing ${stageId} Stage report`);
-  }
-  if (
-    report.projectId !== projectId
-    || report.runId !== runId
-    || report.stageId !== stageId
-  ) {
-    throw new StageReportValidationError(
-      `${stageId} Stage report is not bound to ${projectId}/${runId}`,
-    );
-  }
-  if (
-    (report.state !== 'passed' && report.state !== 'cached')
-    || report.fingerprint === null
-  ) {
-    throw new StageReportValidationError(
-      `${stageId} Stage report must be passed or cached with a fingerprint`,
-    );
-  }
-  return report as SuccessfulBoundStageReport;
 };
 
 const releaseExpectedArtifacts = (
@@ -288,22 +254,22 @@ export const createReleaseStage = (
     fingerprint: async (context) => {
       if (context.sourceRun === undefined) return null;
       return await readPlanningInput(async () => {
-        const [preflightReportValue, compileReportValue] = await Promise.all([
-          readStageReport(context.sourceRun!.runDirectory, 'preflight'),
-          readStageReport(context.sourceRun!.runDirectory, 'compile'),
+        const [preflightReport, compileReport] = await Promise.all([
+          loadSuccessfulBoundStageReport({
+            runDirectory: context.sourceRun!.runDirectory,
+            projectId: context.project.project.id,
+            runId: context.sourceRun!.runId,
+            stageId: 'preflight',
+            readStageReport,
+          }),
+          loadSuccessfulBoundStageReport({
+            runDirectory: context.sourceRun!.runDirectory,
+            projectId: context.project.project.id,
+            runId: context.sourceRun!.runId,
+            stageId: 'compile',
+            readStageReport,
+          }),
         ]);
-        const preflightReport = requireSuccessfulBoundStageReport(
-          preflightReportValue,
-          context.project.project.id,
-          context.sourceRun!.runId,
-          'preflight',
-        );
-        const compileReport = requireSuccessfulBoundStageReport(
-          compileReportValue,
-          context.project.project.id,
-          context.sourceRun!.runId,
-          'compile',
-        );
         const preflight = parseReleasePreflightSnapshot(preflightReport.outputs);
         return await calculateFingerprint(
           context.sourceRun!.runDirectory,
@@ -365,22 +331,22 @@ export const createReleaseStage = (
     execute: async (context, signal) => {
       const {runId, runDirectory} = requireRunContext(context);
       const livePreflight = requirePreflight(context);
-      const [preflightReportValue, compileReportValue] = await Promise.all([
-        readStageReport(runDirectory, 'preflight'),
-        readStageReport(runDirectory, 'compile'),
+      const [preflightReport, compileReport] = await Promise.all([
+        loadSuccessfulBoundStageReport({
+          runDirectory,
+          projectId: context.project.project.id,
+          runId,
+          stageId: 'preflight',
+          readStageReport,
+        }),
+        loadSuccessfulBoundStageReport({
+          runDirectory,
+          projectId: context.project.project.id,
+          runId,
+          stageId: 'compile',
+          readStageReport,
+        }),
       ]);
-      const preflightReport = requireSuccessfulBoundStageReport(
-        preflightReportValue,
-        context.project.project.id,
-        runId,
-        'preflight',
-      );
-      const compileReport = requireSuccessfulBoundStageReport(
-        compileReportValue,
-        context.project.project.id,
-        runId,
-        'compile',
-      );
       if (
         fingerprintValue(normalizePreflightAdapterOutput(preflightReport.outputs))
         !== fingerprintValue(normalizePreflightAdapterOutput(livePreflight))

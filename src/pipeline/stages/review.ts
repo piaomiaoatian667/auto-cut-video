@@ -61,12 +61,13 @@ const assertReviewMatchesContext = (context: ReviewContext, review: Review): voi
 };
 
 const assertApprovedEvidence = (context: ReviewContext, review: Review): void => {
-  const evidence = new Set(review.evidencePaths);
-  if (evidence.size !== context.evidencePaths.length) {
+  if (
+    review.evidencePaths.length !== context.evidencePaths.length
+    || new Set(review.evidencePaths).size !== review.evidencePaths.length
+    || new Set(context.evidencePaths).size !== context.evidencePaths.length
+    || review.evidencePaths.some((path, index) => path !== context.evidencePaths[index])
+  ) {
     throw new ReviewGateError('review evidence does not exactly match the Draft evidence');
-  }
-  for (const path of context.evidencePaths) {
-    if (!evidence.has(path)) throw new ReviewGateError(`review is missing evidence path: ${path}`);
   }
 };
 

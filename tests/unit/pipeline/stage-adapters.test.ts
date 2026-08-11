@@ -6,6 +6,7 @@ import type {ProjectInputs} from '../../../src/domain/load-project';
 import {loadProject} from '../../../src/domain/load-project';
 import type {Review} from '../../../src/domain/review-schema';
 import type {CompiledTimeline} from '../../../src/domain/timeline-schema';
+import {formatSrt} from '../../../src/captions/srt';
 import {
   AppDirectoryScopeError,
   createOutputStore,
@@ -47,6 +48,7 @@ import {
 } from '../../../src/pipeline/stage-report';
 import type {PreflightResult} from '../../../src/pipeline/stages/preflight';
 import type {NarrationStageInput} from '../../../src/pipeline/stages/narration';
+import {runCompile as runConcreteCompile} from '../../../src/pipeline/stages/compile';
 import type {
   DraftReport,
   DraftStageInput,
@@ -295,6 +297,46 @@ const executionContext = (
   ...overrides,
 });
 
+const runIdForDirectory = (runDirectory: RunDirectoryScope): string => (
+  runDirectory === sourceRun ? 'source-run' : 'target-run'
+);
+
+const runFilePath = (runId: string, relativePath: string): string => path.join(
+  tempProject.workspaceRoot,
+  '.work',
+  'demo',
+  'runs',
+  runId,
+  ...relativePath.split('/'),
+);
+
+const replaceRunText = async (
+  runId: string,
+  relativePath: string,
+  contents: string,
+): Promise<void> => {
+  const target = runFilePath(runId, relativePath);
+  await mkdir(path.dirname(target), {recursive: true});
+  await writeFile(target, contents, 'utf8');
+};
+
+const successfulStageReportReader = async (
+  runDirectory: RunDirectoryScope,
+  stageId: 'ingest' | 'narration' | 'compile',
+): Promise<StageReport> => passedStageReport({
+  stageId,
+  runId: runIdForDirectory(runDirectory),
+  fingerprint: hash(`${stageId}-report`),
+});
+
+const createBoundCompileStage = (
+  dependencies: Parameters<typeof createCompileStage>[0] = {},
+) => createCompileStage({readStageReport: successfulStageReportReader, ...dependencies});
+
+const createBoundDraftStage = (
+  dependencies: Parameters<typeof createDraftStage>[0] = {},
+) => createDraftStage({readStageReport: successfulStageReportReader, ...dependencies});
+
 const releaseStageReportReader = ({
   preflight = () => preflightResult(),
   compileFingerprint = () => hash('compile-report'),
@@ -522,7 +564,7 @@ describe('adapter fingerprints', () => {
       ['script.json', hash('script')],
       ['edit.json', hash('edit')],
     ]);
-    const stage = createCompileStage({
+    const stage = createBoundCompileStage({
       hashProjectFile: async (_scope, relativePath) => hashes.get(relativePath)!,
     });
     const context = planningContext();
@@ -535,21 +577,31 @@ describe('adapter fingerprints', () => {
     ['Ingest report fingerprint', 'ingest'],
     ['Narration report fingerprint', 'narration'],
   ] as const)('changes Compile for %s', async (_label, stageId) => {
-    const stage = createCompileStage({hashProjectFile: async (_scope, path) => hash(path)});
-    const reports = new Map(planningContext().sourceRun!.reports);
-    const context = planningContext({}, reports);
+    const fingerprints = {
+      ingest: hash('ingest-report'),
+      narration: hash('narration-report'),
+    };
+    const stage = createCompileStage({
+      hashProjectFile: async (_scope, path) => hash(path),
+      readStageReport: async (runDirectory, requestedStageId) => passedStageReport({
+        stageId: requestedStageId,
+        runId: runIdForDirectory(runDirectory),
+        fingerprint: fingerprints[requestedStageId],
+      }),
+    });
+    const context = planningContext();
     const before = await stage.fingerprint(context);
-    reports.set(stageId, passedStageReport({stageId, fingerprint: hash(`${stageId}-2`)}));
+    fingerprints[stageId] = hash(`${stageId}-2`);
     expect(await stage.fingerprint(context)).not.toBe(before);
   });
 
   it('changes Compile for registered component IDs and algorithm version', async () => {
     const context = planningContext();
     const dependencies = {hashProjectFile: async (_scope: unknown, path: string) => hash(path)};
-    expect(await createCompileStage({...dependencies, componentIds: ['basic-title', 'other']})
-      .fingerprint(context)).not.toBe(await createCompileStage(dependencies).fingerprint(context));
-    expect(await createCompileStage({...dependencies, algorithmVersion: 'compile-stage-v2'})
-      .fingerprint(context)).not.toBe(await createCompileStage(dependencies).fingerprint(context));
+    expect(await createBoundCompileStage({...dependencies, componentIds: ['basic-title', 'other']})
+      .fingerprint(context)).not.toBe(await createBoundCompileStage(dependencies).fingerprint(context));
+    expect(await createBoundCompileStage({...dependencies, algorithmVersion: 'compile-stage-v2'})
+      .fingerprint(context)).not.toBe(await createBoundCompileStage(dependencies).fingerprint(context));
   });
 
   it.each([
@@ -561,7 +613,7 @@ describe('adapter fingerprints', () => {
     ['duckAttackMs', (value: ProjectInputs['project']) => { value.audio.duckAttackMs = 121; }],
     ['duckReleaseMs', (value: ProjectInputs['project']) => { value.audio.duckReleaseMs = 251; }],
   ] as const)('changes Draft for project.audio.%s', async (field, mutate) => {
-    const stage = createDraftStage();
+    const stage = createBoundDraftStage();
     const beforeContext = planningContext();
     expect(await stage.fingerprint(mutateProject(beforeContext, mutate))).not.toBe(
       await stage.fingerprint(beforeContext),
@@ -575,10 +627,10 @@ describe('adapter fingerprints', () => {
     ['pixelFormat', (value: ProjectInputs['project']) => { value.render.pixelFormat = 'yuv444p' as 'yuv420p'; }],
   ] as const)('changes Draft for render config field %s', async (_field, mutate) => {
     const context = planningContext();
-    const baseline = await createDraftStage().fingerprint(context);
+    const baseline = await createBoundDraftStage().fingerprint(context);
     const altered = structuredClone(context.project.project);
     mutate(altered);
-    expect(baseline).not.toBe(await createDraftStage().fingerprint({
+    expect(baseline).not.toBe(await createBoundDraftStage().fingerprint({
       ...context,
       project: {...context.project, project: altered},
     }));
@@ -593,8 +645,8 @@ describe('adapter fingerprints', () => {
         realPath: `/tools/${tool}`,
         sha256: hash(`${tool}-2`),
       };
-      expect(await createDraftStage().fingerprint({...context, preflight: changed}))
-        .not.toBe(await createDraftStage().fingerprint(context));
+      expect(await createBoundDraftStage().fingerprint({...context, preflight: changed}))
+        .not.toBe(await createBoundDraftStage().fingerprint(context));
     },
   );
 
@@ -603,19 +655,28 @@ describe('adapter fingerprints', () => {
     async (tool) => {
       const preflight = preflightResult();
       preflight.toolIdentities[tool] = null;
-      await expect(createDraftStage().fingerprint(planningContext({preflight})))
+      await expect(createBoundDraftStage().fingerprint(planningContext({preflight})))
         .resolves.toBeNull();
     },
   );
 
   it('changes Draft for Compile and Stage algorithm versions', async () => {
-    const reports = new Map(planningContext().sourceRun!.reports);
-    const context = planningContext({}, reports);
-    const before = await createDraftStage().fingerprint(context);
-    reports.set('compile', passedStageReport({stageId: 'compile', fingerprint: hash('compile-2')}));
-    expect(await createDraftStage().fingerprint(context)).not.toBe(before);
-    expect(await createDraftStage({algorithmVersion: 'draft-stage-v2'}).fingerprint(context))
-      .not.toBe(await createDraftStage().fingerprint(context));
+    let compileFingerprint = hash('compile-report');
+    const reader = async (runDirectory: RunDirectoryScope) => passedStageReport({
+      stageId: 'compile',
+      runId: runIdForDirectory(runDirectory),
+      fingerprint: compileFingerprint,
+    });
+    const context = planningContext();
+    const before = await createDraftStage({readStageReport: reader}).fingerprint(context);
+    compileFingerprint = hash('compile-2');
+    expect(await createDraftStage({readStageReport: reader}).fingerprint(context)).not.toBe(before);
+    expect(await createDraftStage({
+      readStageReport: reader,
+      algorithmVersion: 'draft-stage-v2',
+    }).fingerprint(context)).not.toBe(
+      await createDraftStage({readStageReport: reader}).fingerprint(context),
+    );
   });
 
   it('changes Review for Draft evidence paths, hashes, and algorithm version', async () => {
@@ -844,6 +905,198 @@ describe('adapter fingerprints', () => {
   });
 });
 
+describe('successful prerequisite reports', () => {
+  const invalidReports = (
+    stageId: 'ingest' | 'narration' | 'compile',
+    runId: string,
+  ): Array<[string, StageReport]> => {
+    const base = passedStageReport({stageId, runId, fingerprint: hash(`${stageId}-report`)});
+    return [
+      ['failed', {...base, state: 'failed', error: {code: 'FAILED', message: 'failed'}}],
+      ['cancelled', {...base, state: 'cancelled', error: {code: 'CANCELLED', message: 'cancelled'}}],
+      ['needs_review', {...base, state: 'needs_review'}],
+      ['null fingerprint', {...base, fingerprint: null}],
+      ['foreign project', {...base, projectId: 'other-project'}],
+      ['foreign run', {...base, runId: 'other-run'}],
+      ['wrong stage', {...base, stageId: stageId === 'ingest' ? 'narration' : 'ingest'}],
+    ];
+  };
+
+  it.each(['ingest', 'narration'] as const)(
+    'maps invalid %s prerequisites to null and blocks Compile execution',
+    async (invalidStageId) => {
+      for (const [label, invalidSourceReport] of invalidReports(
+        invalidStageId,
+        'source-run',
+      )) {
+        const runCompile = vi.fn(async () => ({
+          timelinePath: 'compiled-timeline.json' as const,
+          timeline: compiledTimeline(),
+        }));
+        const readStageReport = async (
+          runDirectory: RunDirectoryScope,
+          stageId: 'ingest' | 'narration',
+        ): Promise<StageReport> => {
+          if (stageId !== invalidStageId) {
+            return await successfulStageReportReader(runDirectory, stageId);
+          }
+          return runDirectory === sourceRun
+            ? invalidSourceReport
+            : {
+              ...invalidSourceReport,
+              runId: invalidSourceReport.runId === 'source-run'
+                ? 'target-run'
+                : invalidSourceReport.runId,
+            };
+        };
+        const stage = createCompileStage({
+          hashProjectFile: async (_scope, relativePath) => hash(relativePath),
+          readStageReport,
+          runCompile,
+          hashRunArtifact: fakeArtifact,
+        });
+
+        await expect(stage.fingerprint(planningContext()), label).resolves.toBeNull();
+        await expect(stage.execute(
+          executionContext(),
+          new AbortController().signal,
+        ), label).rejects.toBeDefined();
+        expect(runCompile, label).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it.each(['ingest', 'narration'] as const)(
+    'maps missing and malformed %s prerequisites to null and blocks Compile execution',
+    async (invalidStageId) => {
+      for (const [label, failure] of [
+        ['missing', null],
+        ['malformed', new SyntaxError('malformed prerequisite report')],
+      ] as const) {
+        const runCompile = vi.fn();
+        const stage = createCompileStage({
+          hashProjectFile: async (_scope, relativePath) => hash(relativePath),
+          readStageReport: async (runDirectory, stageId) => {
+            if (stageId !== invalidStageId) {
+              return await successfulStageReportReader(runDirectory, stageId);
+            }
+            if (failure === null) return null;
+            throw failure;
+          },
+          runCompile,
+        });
+
+        await expect(stage.fingerprint(planningContext()), label).resolves.toBeNull();
+        await expect(stage.execute(
+          executionContext(),
+          new AbortController().signal,
+        ), label).rejects.toBeDefined();
+        expect(runCompile, label).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it('maps invalid Compile prerequisites to null and blocks Draft execution', async () => {
+    for (const [label, invalidSourceReport] of invalidReports('compile', 'source-run')) {
+      const runDraft = vi.fn(async () => ({
+        reportPath: 'draft/draft-report.json' as const,
+        outputs: {
+          mutedVideo: {path: 'draft/muted-video.mp4', sha256: hash('muted')},
+          draftVideo: {path: 'draft/draft.mp4', sha256: hash('draft')},
+          contactSheet: {path: 'draft/contact-sheet.jpg', sha256: hash('contact')},
+          reviewFrames: draftFrameArtifacts(),
+          audio: {
+            filterGraph: {path: 'audio/filter-graph.txt', sha256: hash('graph')},
+            mixedAudio: {path: 'audio/mixed-normalized.wav', sha256: hash('mixed')},
+          },
+          report: {path: 'draft/draft-report.json', sha256: hash('report')},
+          audioMixFingerprint: hash('audio-mix'),
+        },
+      }));
+      const stage = createDraftStage({
+        readStageReport: async (runDirectory) => runDirectory === sourceRun
+          ? invalidSourceReport
+          : {
+            ...invalidSourceReport,
+            runId: invalidSourceReport.runId === 'source-run'
+              ? 'target-run'
+              : invalidSourceReport.runId,
+          },
+        readCompiledTimeline: async () => compiledTimeline(),
+        runDraft,
+      });
+
+      await expect(stage.fingerprint(planningContext()), label).resolves.toBeNull();
+      await expect(stage.execute(
+        executionContext(),
+        new AbortController().signal,
+      ), label).rejects.toBeDefined();
+      expect(runDraft, label).not.toHaveBeenCalled();
+    }
+  });
+
+  it('maps missing and malformed Compile prerequisites to null and blocks Draft execution', async () => {
+    for (const [label, failure] of [
+      ['missing', null],
+      ['malformed', new SyntaxError('malformed Compile report')],
+    ] as const) {
+      const runDraft = vi.fn();
+      const stage = createDraftStage({
+        readStageReport: async () => {
+          if (failure === null) return null;
+          throw failure;
+        },
+        runDraft,
+      });
+
+      await expect(stage.fingerprint(planningContext()), label).resolves.toBeNull();
+      await expect(stage.execute(
+        executionContext(),
+        new AbortController().signal,
+      ), label).rejects.toBeDefined();
+      expect(runDraft, label).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe('Review Draft project binding', () => {
+  it('maps foreign Draft projects to null/false and blocks execution before evaluation', async () => {
+    const foreignDraft = {...draftReport(), projectId: 'other-project'};
+    const sourceReview = approvedReview();
+    const evidence = draftReviewEvidenceArtifacts(foreignDraft);
+    const planningStage = createReviewStage({
+      readDraftReport: async () => foreignDraft,
+      readReview: async () => sourceReview,
+    });
+    const context = planningContext();
+
+    await expect(planningStage.fingerprint(context)).resolves.toBeNull();
+    await expect(planningStage.verify(context, passedStageReport({
+      stageId: 'review',
+      runId: 'source-run',
+      fingerprint: fingerprintValue({
+        algorithmVersion: STAGE_ALGORITHM_VERSIONS.review,
+        evidence,
+      }),
+      artifacts: [],
+      outputs: {evidence, review: sourceReview},
+    }))).resolves.toBe(false);
+
+    const targetReview = approvedReview({runId: 'target-run'});
+    const evaluateReview = vi.fn(async () => ({state: 'passed' as const, review: targetReview}));
+    const executionStage = createReviewStage({
+      readDraftReport: async () => foreignDraft,
+      readReview: async () => targetReview,
+      evaluateReview,
+    });
+    await expect(executionStage.execute(
+      executionContext(),
+      new AbortController().signal,
+    )).rejects.toThrow(/PIPELINE_CONTEXT_INVALID/u);
+    expect(evaluateReview).not.toHaveBeenCalled();
+  });
+});
+
 describe('adapter artifact inventories', () => {
   it('returns only artifacts owned or consumed by each adapter', async () => {
     const narrationInputHash = narrationSegmentInputHash(
@@ -1033,16 +1286,18 @@ describe('adapter artifact inventories', () => {
       }),
       createCompileStage({
         hashProjectFile: async (_scope, path) => hash(path),
-        readStageReport: async (_runDirectory, stageId) => passedStageReport({
+        readStageReport: async (runDirectory, stageId) => passedStageReport({
           stageId,
+          runId: runIdForDirectory(runDirectory),
           fingerprint: hash(`${stageId}-report`),
         }),
         runCompile: async () => ({timelinePath: 'compiled-timeline.json', timeline: compiledTimeline()}),
         hashRunArtifact: fakeArtifact,
       }),
       createDraftStage({
-        readStageReport: async () => passedStageReport({
+        readStageReport: async (runDirectory) => passedStageReport({
           stageId: 'compile',
+          runId: runIdForDirectory(runDirectory),
           fingerprint: hash('compile-report'),
         }),
         readCompiledTimeline: async () => compiledTimeline(),
@@ -1213,8 +1468,9 @@ describe('adapter artifact inventories', () => {
       },
     });
     const stage = createDraftStage({
-      readStageReport: async () => passedStageReport({
+      readStageReport: async (runDirectory) => passedStageReport({
         stageId: 'compile',
+        runId: runIdForDirectory(runDirectory),
         fingerprint: hash('compile-report'),
       }),
       readCompiledTimeline: async () => compiledTimeline(),
@@ -1236,8 +1492,9 @@ describe('adapter artifact inventories', () => {
       preflight.toolIdentities[tool] = null;
       const runDraft = vi.fn();
       const stage = createDraftStage({
-        readStageReport: async () => passedStageReport({
+        readStageReport: async (runDirectory) => passedStageReport({
           stageId: 'compile',
+          runId: runIdForDirectory(runDirectory),
           fingerprint: hash('compile-report'),
         }),
         runDraft,
@@ -1315,8 +1572,9 @@ describe('adapter artifact inventories', () => {
       },
     };
     const draft = createDraftStage({
-      readStageReport: async () => passedStageReport({
+      readStageReport: async (runDirectory) => passedStageReport({
         stageId: 'compile',
+        runId: runIdForDirectory(runDirectory),
         fingerprint: hash('compile-report'),
       }),
       readCompiledTimeline: async () => compiledTimeline(),
@@ -1341,6 +1599,480 @@ describe('adapter artifact inventories', () => {
 });
 
 describe('adapter verification', () => {
+  const compileVerificationFixture = async () => {
+    const assetManifest = {
+      version: 1 as const,
+      assets: {
+        cover: {
+          kind: 'image' as const,
+          sourcePath: 'assets/source/cover.png',
+          sourceHash: hash('cover'),
+          renderPath: 'assets/source/cover.png',
+          renderScope: 'project' as const,
+          compatibility: 'direct' as const,
+          width: 1920,
+          height: 1080,
+        },
+      },
+    };
+    const narrationManifest = {
+      version: 1 as const,
+      provider: 'mock' as const,
+      segments: [{
+        id: 'intro',
+        inputHash: hash('narration-input'),
+        audioPath: 'audio/segments/intro.wav',
+        audioHash: hash('intro-audio'),
+        startMs: 0,
+        endMs: 1000,
+        durationMs: 1000,
+        pauseAfterMs: 300,
+        sampleRate: 48_000 as const,
+        channels: 1 as const,
+        providerFingerprint: hash('provider'),
+      }],
+      master: {
+        audioPath: 'audio/narration.wav',
+        audioHash: hash('narration-master'),
+        durationMs: 1000,
+      },
+    };
+    const captionsManifest = {
+      version: 1 as const,
+      sourceNarrationHash: narrationManifest.master.audioHash,
+      cues: [{
+        id: 'caption-intro',
+        segmentId: 'intro',
+        text: project.script.segments[0]!.text,
+        startMs: 0,
+        endMs: 1000,
+      }],
+    };
+    await Promise.all([
+      replaceRunText('source-run', 'asset-manifest.json', `${JSON.stringify(assetManifest)}\n`),
+      replaceRunText('source-run', 'narration-manifest.json', `${JSON.stringify(narrationManifest)}\n`),
+      replaceRunText('source-run', 'captions.json', `${JSON.stringify(captionsManifest)}\n`),
+      rm(runFilePath('source-run', 'compiled-timeline.json'), {force: true}),
+    ]);
+    const result = await runConcreteCompile({...project, runDirectory: sourceRun});
+    const timelineArtifact = await hashRunArtifact(sourceRun, result.timelinePath);
+    const stage = createCompileStage({readStageReport: successfulStageReportReader});
+    const context = planningContext();
+    const fingerprint = await stage.fingerprint(context);
+    const report = passedStageReport({
+      stageId: 'compile',
+      runId: 'source-run',
+      fingerprint,
+      artifacts: [timelineArtifact],
+      outputs: JSON.parse(JSON.stringify(result)),
+    });
+    return {stage, context, report, result};
+  };
+
+  const draftVerificationFixture = async () => {
+    const timeline = compiledTimeline();
+    const framePaths = selectReviewFrames(timeline).map((frame) =>
+      `draft/frames/frame-${String(frame).padStart(6, '0')}.jpg`);
+    await Promise.all([
+      replaceRunText('source-run', 'compiled-timeline.json', `${JSON.stringify(timeline)}\n`),
+      replaceRunText('source-run', 'draft/muted-video.mp4', 'muted-video'),
+      replaceRunText('source-run', 'audio/filter-graph.txt', 'filter-graph'),
+      replaceRunText('source-run', 'audio/mixed-normalized.wav', 'mixed-audio'),
+      ...framePaths.map(async (framePath) => await replaceRunText(
+        'source-run',
+        framePath,
+        framePath,
+      )),
+    ]);
+    const references = new Map(await Promise.all([
+      'draft/muted-video.mp4',
+      'draft/draft.mp4',
+      'draft/contact-sheet.jpg',
+      ...framePaths,
+      'audio/filter-graph.txt',
+      'audio/mixed-normalized.wav',
+    ].map(async (relativePath) => {
+      const artifact = await hashRunArtifact(sourceRun, relativePath);
+      return [relativePath, {path: artifact.path, sha256: artifact.sha256}] as const;
+    })));
+    const persistedDraft = {
+      version: 1 as const,
+      projectId: 'demo',
+      outputs: {
+        mutedVideo: references.get('draft/muted-video.mp4')!,
+        draftVideo: references.get('draft/draft.mp4')!,
+        contactSheet: references.get('draft/contact-sheet.jpg')!,
+        reviewFrames: framePaths.map((framePath) => references.get(framePath)!),
+        audio: {
+          filterGraph: references.get('audio/filter-graph.txt')!,
+          mixedAudio: references.get('audio/mixed-normalized.wav')!,
+        },
+        audioMixFingerprint: hash('audio-mix'),
+      },
+    };
+    await replaceRunText(
+      'source-run',
+      'draft/draft-report.json',
+      `${JSON.stringify(persistedDraft)}\n`,
+    );
+    const draftReportArtifact = await hashRunArtifact(sourceRun, 'draft/draft-report.json');
+    const outputs = {
+      reportPath: 'draft/draft-report.json' as const,
+      outputs: {
+        ...persistedDraft.outputs,
+        report: {
+          path: draftReportArtifact.path,
+          sha256: draftReportArtifact.sha256,
+        },
+      },
+    };
+    const stage = createDraftStage({readStageReport: successfulStageReportReader});
+    const context = planningContext();
+    const fingerprint = await stage.fingerprint(context);
+    const report = passedStageReport({
+      stageId: 'draft',
+      runId: 'source-run',
+      fingerprint,
+      artifacts: [
+        ...references.values(),
+        outputs.outputs.report,
+      ].map((artifact) => ({scope: 'run' as const, ...artifact})),
+      outputs: JSON.parse(JSON.stringify(outputs)),
+    });
+    return {stage, context, report, persistedDraft, outputs};
+  };
+
+  const narrationVerificationFixture = async () => {
+    const providerFingerprint = hash('provider');
+    const segmentInputHash = narrationSegmentInputHash(
+      project.script.segments[0]!,
+      project.project.tts.voice,
+      project.project.tts.rate,
+      providerFingerprint,
+    );
+    const segmentPath = `audio/segments/0001-intro-${segmentInputHash.slice('sha256:'.length, 'sha256:'.length + 12)}.wav`;
+    const narration = {
+      version: 1 as const,
+      provider: 'mock' as const,
+      segments: [{
+        id: 'intro',
+        inputHash: segmentInputHash,
+        audioPath: segmentPath,
+        audioHash: contentHash('segment'),
+        startMs: 0,
+        endMs: 1000,
+        durationMs: 1000,
+        pauseAfterMs: project.script.segments[0]!.pauseAfterMs,
+        sampleRate: 48_000 as const,
+        channels: 1 as const,
+        providerFingerprint,
+      }],
+      master: {
+        audioPath: '',
+        audioHash: contentHash('master'),
+        durationMs: 1300,
+      },
+    };
+    narration.master.audioPath = narrationMasterPath({
+      provider: narration.provider,
+      segments: narration.segments,
+    });
+    const captions = {
+      version: 1 as const,
+      sourceNarrationHash: narration.master.audioHash,
+      cues: [{
+        id: 'caption-intro',
+        segmentId: 'intro',
+        text: project.script.segments[0]!.text,
+        startMs: 0,
+        endMs: 1000,
+      }],
+    };
+    const reuseCompatibility = {
+      tts: project.project.tts,
+      providerFingerprint,
+      ffmpegIdentity: preflightResult().toolIdentities.ffmpeg!,
+      ffprobeIdentity: preflightResult().toolIdentities.ffprobe!,
+      algorithmVersion: STAGE_ALGORITHM_VERSIONS.narration,
+    };
+    const cachePath = `audio/cache/${segmentInputHash.slice('sha256:'.length)}.wav`;
+    await Promise.all([
+      replaceRunText('source-run', cachePath, 'cache'),
+      replaceRunText('source-run', segmentPath, 'segment'),
+      replaceRunText('source-run', narration.master.audioPath, 'master'),
+      replaceRunText('source-run', 'narration-manifest.json', `${JSON.stringify(narration)}\n`),
+      replaceRunText('source-run', 'captions.json', `${JSON.stringify(captions)}\n`),
+      replaceRunText('source-run', 'captions.srt', formatSrt(captions)),
+    ]);
+    const artifacts = await Promise.all([
+      cachePath,
+      segmentPath,
+      narration.master.audioPath,
+      'narration-manifest.json',
+      'captions.json',
+      'captions.srt',
+    ].map(async (relativePath) => await hashRunArtifact(sourceRun, relativePath)));
+    const stage = createNarrationStage({
+      fingerprintTtsProvider: async () => providerFingerprint,
+    });
+    const context = planningContext();
+    const outputs = {
+      narrationPath: 'narration-manifest.json' as const,
+      captionsPath: 'captions.json' as const,
+      srtPath: 'captions.srt' as const,
+      narration,
+      captions,
+      reuseCompatibility,
+      reuseCompatibilityFingerprint: narrationReuseCompatibilityFingerprint(
+        reuseCompatibility,
+      ),
+    };
+    const report = passedStageReport({
+      stageId: 'narration',
+      runId: 'source-run',
+      fingerprint: await stage.fingerprint(context),
+      artifacts,
+      outputs: JSON.parse(JSON.stringify(outputs)),
+    });
+    return {stage, context, report, narration, captions};
+  };
+
+  it('binds Compile verification to persisted inputs and current authoring semantics', async () => {
+    const {stage, context, report} = await compileVerificationFixture();
+
+    await expect(stage.verify(context, report)).resolves.toBe(true);
+    const changedProject = structuredClone(context.project.project);
+    changedProject.composition.width = 1280 as 1920;
+    await expect(stage.verify({
+      ...context,
+      project: {...context.project, project: changedProject},
+    }, report)).resolves.toBe(false);
+  });
+
+  it('rejects foreign or report-mismatched persisted Compile timelines', async () => {
+    const foreign = await compileVerificationFixture();
+    const foreignTimeline = {...foreign.result.timeline, projectId: 'other-project'};
+    await writeFile(
+      runFilePath('source-run', 'compiled-timeline.json'),
+      `${JSON.stringify(foreignTimeline)}\n`,
+    );
+    const foreignArtifact = await hashRunArtifact(sourceRun, 'compiled-timeline.json');
+    await expect(foreign.stage.verify(foreign.context, {
+      ...foreign.report,
+      artifacts: [foreignArtifact],
+      outputs: JSON.parse(JSON.stringify({
+        timelinePath: 'compiled-timeline.json',
+        timeline: foreignTimeline,
+      })),
+    })).resolves.toBe(false);
+
+    const mismatched = await compileVerificationFixture();
+    await expect(mismatched.stage.verify(mismatched.context, {
+      ...mismatched.report,
+      outputs: JSON.parse(JSON.stringify({
+        timelinePath: 'compiled-timeline.json',
+        timeline: {...mismatched.result.timeline, width: 1280},
+      })),
+    })).resolves.toBe(false);
+  });
+
+  it('maps invalid Compile prerequisites and malformed persisted inputs to false', async () => {
+    const fixture = await compileVerificationFixture();
+    const invalidPrerequisite = createCompileStage({
+      readStageReport: async (runDirectory, stageId) => stageId === 'ingest'
+        ? {
+          ...await successfulStageReportReader(runDirectory, stageId),
+          state: 'failed',
+          error: {code: 'FAILED', message: 'failed'},
+        }
+        : await successfulStageReportReader(runDirectory, stageId),
+    });
+    await expect(invalidPrerequisite.verify(fixture.context, fixture.report))
+      .resolves.toBe(false);
+
+    await writeFile(runFilePath('source-run', 'captions.json'), '{malformed');
+    await expect(fixture.stage.verify(fixture.context, fixture.report)).resolves.toBe(false);
+
+    const prerequisiteFixture = await compileVerificationFixture();
+    for (const failure of [null, new SyntaxError('malformed prerequisite report')]) {
+      const stage = createCompileStage({
+        readStageReport: async (runDirectory, stageId) => {
+          if (stageId !== 'ingest') {
+            return await successfulStageReportReader(runDirectory, stageId);
+          }
+          if (failure === null) return null;
+          throw failure;
+        },
+      });
+      await expect(stage.verify(prerequisiteFixture.context, prerequisiteFixture.report))
+        .resolves.toBe(false);
+    }
+  });
+
+  it('propagates Compile verification I/O and scoped authority failures', async () => {
+    const ioFixture = await compileVerificationFixture();
+    const ioFailure = Object.assign(new Error('authoring read failed'), {code: 'EIO'});
+    const ioStage = createCompileStage({
+      readStageReport: successfulStageReportReader,
+      hashProjectFile: async () => { throw ioFailure; },
+    });
+    await expect(ioStage.verify(ioFixture.context, ioFixture.report)).rejects.toBe(ioFailure);
+
+    const authorityFixture = await compileVerificationFixture();
+    await rename(
+      runFilePath('source-run', ''),
+      path.join(tempProject.workspaceRoot, 'moved-source-run'),
+    );
+    await expect(authorityFixture.stage.verify(
+      authorityFixture.context,
+      authorityFixture.report,
+    )).rejects.toMatchObject({code: 'APP_SCOPE_AUTHORITY_CHANGED'});
+  });
+
+  it('requires Ingest report outputs to match persisted asset-manifest.json', async () => {
+    const persistedManifest = {
+      version: 1 as const,
+      assets: {
+        cover: {
+          kind: 'image' as const,
+          sourcePath: 'assets/source/cover.png',
+          sourceHash: hash('source'),
+          renderPath: 'assets/source/cover.png',
+          renderScope: 'project' as const,
+          compatibility: 'direct' as const,
+          width: 1920,
+          height: 1080,
+        },
+      },
+    };
+    await writeRunText(
+      sourceRun,
+      'asset-manifest.json',
+      `${JSON.stringify(persistedManifest)}\n`,
+    );
+    const artifact = await hashRunArtifact(sourceRun, 'asset-manifest.json');
+    const reportManifest = structuredClone(persistedManifest);
+    reportManifest.assets.cover.width = 1280;
+    const report = passedStageReport({
+      stageId: 'ingest',
+      runId: 'source-run',
+      artifacts: [artifact],
+      outputs: {manifestPath: 'asset-manifest.json', manifest: reportManifest},
+    });
+
+    await expect(createIngestStage().verify(planningContext(), report))
+      .resolves.toBe(false);
+  });
+
+  it('requires Narration report outputs and SRT to match persisted JSON', async () => {
+    const manifestMismatch = await narrationVerificationFixture();
+    await expect(manifestMismatch.stage.verify(
+      manifestMismatch.context,
+      manifestMismatch.report,
+    )).resolves.toBe(true);
+    await writeFile(
+      runFilePath('source-run', 'narration-manifest.json'),
+      `${JSON.stringify({
+        ...manifestMismatch.narration,
+        master: {...manifestMismatch.narration.master, durationMs: 1301},
+      })}\n`,
+    );
+    const narrationArtifact = await hashRunArtifact(sourceRun, 'narration-manifest.json');
+    await expect(manifestMismatch.stage.verify(manifestMismatch.context, {
+      ...manifestMismatch.report,
+      artifacts: manifestMismatch.report.artifacts.map((artifact) => (
+        artifact.path === narrationArtifact.path ? narrationArtifact : artifact
+      )),
+    })).resolves.toBe(false);
+
+    const srtMismatch = await narrationVerificationFixture();
+    await writeFile(runFilePath('source-run', 'captions.srt'), 'tampered subtitles\n');
+    const srtArtifact = await hashRunArtifact(sourceRun, 'captions.srt');
+    await expect(srtMismatch.stage.verify(srtMismatch.context, {
+      ...srtMismatch.report,
+      artifacts: srtMismatch.report.artifacts.map((artifact) => (
+        artifact.path === srtArtifact.path ? srtArtifact : artifact
+      )),
+    })).resolves.toBe(false);
+  });
+
+  it('requires Draft outputs to match the persisted current-project report', async () => {
+    const mismatch = await draftVerificationFixture();
+    await expect(mismatch.stage.verify(mismatch.context, mismatch.report)).resolves.toBe(true);
+    await expect(mismatch.stage.verify(mismatch.context, {
+      ...mismatch.report,
+      outputs: {
+        ...mismatch.outputs,
+        outputs: {
+          ...mismatch.outputs.outputs,
+          audioMixFingerprint: hash('different-audio-mix'),
+        },
+      },
+    })).resolves.toBe(false);
+
+    const foreign = await draftVerificationFixture();
+    await writeFile(
+      runFilePath('source-run', 'draft/draft-report.json'),
+      `${JSON.stringify({...foreign.persistedDraft, projectId: 'other-project'})}\n`,
+    );
+    const reportArtifact = await hashRunArtifact(sourceRun, 'draft/draft-report.json');
+    await expect(foreign.stage.verify(foreign.context, {
+      ...foreign.report,
+      artifacts: foreign.report.artifacts.map((artifact) => (
+        artifact.path === reportArtifact.path ? reportArtifact : artifact
+      )),
+      outputs: {
+        ...foreign.outputs,
+        outputs: {
+          ...foreign.outputs.outputs,
+          report: {path: reportArtifact.path, sha256: reportArtifact.sha256},
+        },
+      },
+    })).resolves.toBe(false);
+  });
+
+  it('maps invalid Draft prerequisites and malformed persisted reports to false', async () => {
+    const invalidPrerequisite = await draftVerificationFixture();
+    const stage = createDraftStage({
+      readStageReport: async (runDirectory) => ({
+        ...await successfulStageReportReader(runDirectory, 'compile'),
+        state: 'cancelled',
+        error: {code: 'CANCELLED', message: 'cancelled'},
+      }),
+    });
+    await expect(stage.verify(invalidPrerequisite.context, invalidPrerequisite.report))
+      .resolves.toBe(false);
+
+    const malformed = await draftVerificationFixture();
+    await writeFile(runFilePath('source-run', 'draft/draft-report.json'), '{malformed');
+    const reportArtifact = await hashRunArtifact(sourceRun, 'draft/draft-report.json');
+    await expect(malformed.stage.verify(malformed.context, {
+      ...malformed.report,
+      artifacts: malformed.report.artifacts.map((artifact) => (
+        artifact.path === reportArtifact.path ? reportArtifact : artifact
+      )),
+      outputs: {
+        ...malformed.outputs,
+        outputs: {
+          ...malformed.outputs.outputs,
+          report: {path: reportArtifact.path, sha256: reportArtifact.sha256},
+        },
+      },
+    })).resolves.toBe(false);
+
+    const prerequisiteFixture = await draftVerificationFixture();
+    for (const failure of [null, new SyntaxError('malformed Compile report')]) {
+      const stage = createDraftStage({
+        readStageReport: async () => {
+          if (failure === null) return null;
+          throw failure;
+        },
+      });
+      await expect(stage.verify(prerequisiteFixture.context, prerequisiteFixture.report))
+        .resolves.toBe(false);
+    }
+  });
+
   const releaseVerificationFixture = async () => {
     const draft = draftReport();
     const timeline = compiledTimeline();
@@ -1438,58 +2170,32 @@ describe('adapter verification', () => {
   };
 
   it('returns false for missing, changed, and cross-scope Run artifacts', async () => {
-    await writeRunText(sourceRun, 'compiled-timeline.json', '{}\n');
-    const artifact = await hashRunArtifact(sourceRun, 'compiled-timeline.json');
-    const baseReport = passedStageReport({
-      stageId: 'compile',
-      artifacts: [artifact],
-      outputs: JSON.parse(JSON.stringify({
-        timelinePath: 'compiled-timeline.json',
-        timeline: compiledTimeline(),
-      })),
-    });
-    const stage = createCompileStage({hashProjectFile: async (_scope, path) => hash(path)});
-    await expect(stage.verify(planningContext(), baseReport)).resolves.toBe(true);
-    await expect(stage.verify(planningContext(), {
-      ...baseReport,
-      artifacts: [{...artifact, path: 'missing.json'}],
+    const {stage, context, report} = await compileVerificationFixture();
+    const [artifact] = report.artifacts;
+    await expect(stage.verify(context, report)).resolves.toBe(true);
+    await expect(stage.verify(context, {
+      ...report,
+      artifacts: [{...artifact!, path: 'missing.json'}],
     })).resolves.toBe(false);
-    await expect(stage.verify(planningContext(), {
-      ...baseReport,
-      artifacts: [{...artifact, sha256: hash('changed')}],
+    await expect(stage.verify(context, {
+      ...report,
+      artifacts: [{...artifact!, sha256: hash('changed')}],
     })).resolves.toBe(false);
-    await expect(stage.verify(planningContext(), {
-      ...baseReport,
-      artifacts: [{...artifact, scope: 'output'}],
+    await expect(stage.verify(context, {
+      ...report,
+      artifacts: [{...artifact!, scope: 'output'}],
     })).resolves.toBe(false);
   });
 
   it('returns false when a Run artifact becomes a cross-scope symlink', async () => {
-    await writeRunText(sourceRun, 'compiled-timeline.json', '{}\n');
-    const artifact = await hashRunArtifact(sourceRun, 'compiled-timeline.json');
-    const report = passedStageReport({
-      stageId: 'compile',
-      artifacts: [artifact],
-      outputs: JSON.parse(JSON.stringify({
-        timelinePath: 'compiled-timeline.json',
-        timeline: compiledTimeline(),
-      })),
-    });
-    const artifactPath = path.join(
-      tempProject.workspaceRoot,
-      '.work',
-      'demo',
-      'runs',
-      'source-run',
-      'compiled-timeline.json',
-    );
+    const {stage, context, report} = await compileVerificationFixture();
+    const artifactPath = runFilePath('source-run', 'compiled-timeline.json');
     const outsidePath = path.join(tempProject.workspaceRoot, 'outside-timeline.json');
     await writeFile(outsidePath, '{}\n', 'utf8');
     await rm(artifactPath);
     await symlink(outsidePath, artifactPath);
 
-    const stage = createCompileStage({hashProjectFile: async (_scope, path) => hash(path)});
-    await expect(stage.verify(planningContext(), report)).resolves.toBe(false);
+    await expect(stage.verify(context, report)).resolves.toBe(false);
   });
 
   it('returns false when a Release output artifact becomes a cross-scope symlink', async () => {
@@ -3317,7 +4023,6 @@ describe('exact stage-owned artifact validators', () => {
       'draft/frames/frame-999999.jpg',
       'audio/filter-graph.txt',
       'audio/mixed-normalized.wav',
-      'draft/draft-report.json',
     ];
     for (const relativePath of paths) await writeRunText(sourceRun, relativePath, relativePath);
     const references = new Map(await Promise.all([
@@ -3327,12 +4032,11 @@ describe('exact stage-owned artifact validators', () => {
       'draft/frames/frame-999999.jpg',
       'audio/filter-graph.txt',
       'audio/mixed-normalized.wav',
-      'draft/draft-report.json',
     ].map(async (relativePath) => {
       const artifact = await hashRunArtifact(sourceRun, relativePath);
       return [relativePath, {path: artifact.path, sha256: artifact.sha256}] as const;
     })));
-    const outputs = {
+    const persistedOutputs = {
       mutedVideo: references.get('draft/muted-video.mp4')!,
       draftVideo: references.get('draft/draft.mp4')!,
       contactSheet: references.get('draft/contact-sheet.jpg')!,
@@ -3341,11 +4045,25 @@ describe('exact stage-owned artifact validators', () => {
         filterGraph: references.get('audio/filter-graph.txt')!,
         mixedAudio: references.get('audio/mixed-normalized.wav')!,
       },
-      report: references.get('draft/draft-report.json')!,
       audioMixFingerprint: hash('audio-mix'),
     };
+    await replaceRunText('source-run', 'draft/draft-report.json', `${JSON.stringify({
+      version: 1,
+      projectId: 'demo',
+      outputs: persistedOutputs,
+    })}\n`);
+    const reportArtifact = await hashRunArtifact(sourceRun, 'draft/draft-report.json');
+    const outputs = {
+      ...persistedOutputs,
+      report: {path: reportArtifact.path, sha256: reportArtifact.sha256},
+    };
+    const stage = createBoundDraftStage({
+      readCompiledTimeline: async () => compiledTimeline(),
+    });
     const report = passedStageReport({
       stageId: 'draft',
+      runId: 'source-run',
+      fingerprint: await stage.fingerprint(planningContext()),
       artifacts: [
         outputs.mutedVideo,
         outputs.draftVideo,
@@ -3355,12 +4073,10 @@ describe('exact stage-owned artifact validators', () => {
         outputs.audio.mixedAudio,
         outputs.report,
       ].map((artifact) => ({scope: 'run' as const, ...artifact})),
-      outputs: {reportPath: 'draft/draft-report.json', outputs},
+      outputs: JSON.parse(JSON.stringify({reportPath: 'draft/draft-report.json', outputs})),
     });
 
-    await expect(createDraftStage({
-      readCompiledTimeline: async () => compiledTimeline(),
-    }).verify(planningContext(), report)).resolves.toBe(false);
+    await expect(stage.verify(planningContext(), report)).resolves.toBe(false);
   });
 
   it('rejects Draft fixed paths and duplicate review frames', async () => {

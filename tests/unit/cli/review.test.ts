@@ -10,8 +10,10 @@ import {
   openExistingRunFile,
   openNewRunFile,
 } from '../../../src/fs/app-directory-scopes';
+import {runReviewCommand} from '../../../src/cli/commands/review';
 import {runVideoctl, type VideoctlDependencies} from '../../../src/cli/videoctl';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
+import {PipelineArtifactError} from '../../../src/pipeline/artifacts';
 import {createEditFixture, createProjectFixture, createScriptFixture} from '../../helpers/temp-project';
 import type {ProjectInputs} from '../../../src/domain/load-project';
 
@@ -189,5 +191,41 @@ describe('videoctl review', () => {
     expect(fixture.stdout()).toBe('');
     await expect(createRunStore(fixture.workspaceRoot).readCurrent('demo'))
       .resolves.toMatchObject({state: 'needs_review'});
+  });
+
+  it('maps concurrent artifact mutation to validation failure', async () => {
+    const fixture = await makeFixture();
+
+    const exitCode = await runReviewCommand(
+      'demo',
+      {approve: true, reason: 'looks good', reviewer: 'tester'},
+      {
+        ...fixture.dependencies,
+        verifyRunArtifact: async () => {
+          throw new PipelineArtifactError(
+            'ARTIFACT_INVALID',
+            'artifact identity changed while reading',
+          );
+        },
+      },
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    await expect(createRunStore(fixture.workspaceRoot).readCurrent('demo'))
+      .resolves.toMatchObject({state: 'needs_review'});
+  });
+
+  it('propagates unrelated artifact verification I/O failures', async () => {
+    const fixture = await makeFixture();
+    const failure = Object.assign(new Error('artifact read failed'), {code: 'EIO'});
+
+    await expect(runReviewCommand(
+      'demo',
+      {approve: true, reason: 'looks good', reviewer: 'tester'},
+      {
+        ...fixture.dependencies,
+        verifyRunArtifact: async () => { throw failure; },
+      },
+    )).rejects.toBe(failure);
   });
 });

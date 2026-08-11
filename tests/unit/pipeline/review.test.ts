@@ -47,6 +47,24 @@ describe('evaluateReview', () => {
     });
   });
 
+  it.each([
+    ['reordered', ['draft/contact-sheet.jpg', 'draft/draft.mp4']],
+    ['duplicated', ['draft/draft.mp4', 'draft/draft.mp4']],
+  ] as const)('rejects %s approval evidence', async (_label, evidencePaths) => {
+    const review = recordReviewApproval({
+      projectId: 'demo',
+      runId: 'run-1',
+      reviewer: 'tester',
+      reason: 'approved',
+      evidencePaths: [...evidencePaths],
+      reviewedAt: '2026-08-10T00:00:00.000Z',
+    });
+
+    await expect(evaluateReview(context({review}))).rejects.toThrow(
+      /review evidence does not exactly match the Draft evidence/u,
+    );
+  });
+
   it('keeps rejected reviews in needs_review state', async () => {
     await expect(evaluateReview(context({review: {
       version: 1,

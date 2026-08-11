@@ -17,13 +17,15 @@ import {
 import type {StageReport} from '../stage-report';
 import {
   ArtifactReferenceSchema,
+  DraftReportSchema,
   runDraft,
+  type DraftReport,
   type DraftStageInput,
   type DraftStageResult,
 } from '../stages/draft';
 import {
   STAGE_ALGORITHM_VERSIONS,
-  planningReportFingerprint,
+  loadSuccessfulBoundStageReport,
   readPlanningInput,
   readRunJson,
   readRunStageReport,
@@ -52,8 +54,9 @@ export interface DraftStageAdapterDependencies {
   readStageReport?: (
     runDirectory: RunDirectoryScope,
     stageId: 'compile',
-  ) => Promise<StageReport>;
+  ) => Promise<StageReport | null>;
   readCompiledTimeline?: (runDirectory: RunDirectoryScope) => Promise<CompiledTimeline>;
+  readDraftReport?: (runDirectory: RunDirectoryScope) => Promise<DraftReport>;
   runDraft?: (input: DraftStageInput) => Promise<DraftStageResult>;
 }
 
@@ -122,6 +125,12 @@ export const createDraftStage = (
       'compiled-timeline.json',
       (value) => CompiledTimelineSchema.parse(value),
     ));
+  const readDraftReport = dependencies.readDraftReport
+    ?? (async (runDirectory: RunDirectoryScope) => await readRunJson(
+      runDirectory,
+      'draft/draft-report.json',
+      (value) => DraftReportSchema.parse(value),
+    ));
   const executeDraft = dependencies.runDraft ?? runDraft;
   const partialArtifactsByRun = new WeakMap<
     RunDirectoryScope,
@@ -156,24 +165,68 @@ export const createDraftStage = (
     id: 'draft',
     displayName: 'Draft',
     prerequisites: ['compile'],
-    fingerprint: async (context) => calculateFingerprint(
-      context,
-      planningReportFingerprint(context, 'compile'),
-    ),
+    fingerprint: async (context) => {
+      if (context.sourceRun === undefined) return null;
+      return await readPlanningInput(async () => {
+        const compileReport = await loadSuccessfulBoundStageReport({
+          runDirectory: context.sourceRun!.runDirectory,
+          projectId: context.project.project.id,
+          runId: context.sourceRun!.runId,
+          stageId: 'compile',
+          readStageReport,
+        });
+        return calculateFingerprint(context, compileReport.fingerprint);
+      });
+    },
     verify: async (context, report) => {
       const parsed = DraftAdapterOutputSchema.safeParse(report.outputs);
       if (!parsed.success) return false;
       if (context.sourceRun === undefined) return false;
-      const timeline = await readPlanningInput(async () => await readTimeline(
-        context.sourceRun!.runDirectory,
-      ));
-      if (timeline === null || timeline.projectId !== context.project.project.id) {
+      const persisted = await readPlanningInput(async () => {
+        const [compileReport, timeline, draftReport] = await Promise.all([
+          loadSuccessfulBoundStageReport({
+            runDirectory: context.sourceRun!.runDirectory,
+            projectId: context.project.project.id,
+            runId: context.sourceRun!.runId,
+            stageId: 'compile',
+            readStageReport,
+          }),
+          readTimeline(context.sourceRun!.runDirectory),
+          readDraftReport(context.sourceRun!.runDirectory),
+        ]);
+        return {compileReport, timeline, draftReport};
+      });
+      if (
+        persisted === null
+        || persisted.timeline.projectId !== context.project.project.id
+        || persisted.draftReport.projectId !== context.project.project.id
+      ) {
         return false;
       }
       const outputs = parsed.data.outputs;
+      const expectedPersistedReport = DraftReportSchema.parse({
+        version: 1,
+        projectId: context.project.project.id,
+        outputs: {
+          mutedVideo: outputs.mutedVideo,
+          draftVideo: outputs.draftVideo,
+          contactSheet: outputs.contactSheet,
+          reviewFrames: outputs.reviewFrames,
+          audio: outputs.audio,
+          audioMixFingerprint: outputs.audioMixFingerprint,
+        },
+      });
+      if (
+        report.fingerprint !== calculateFingerprint(
+          context,
+          persisted.compileReport.fingerprint,
+        )
+        || fingerprintValue(persisted.draftReport)
+          !== fingerprintValue(expectedPersistedReport)
+      ) return false;
       const expected = draftExpectedArtifacts(
         outputs,
-        selectReviewFrames(timeline).map((frame) =>
+        selectReviewFrames(persisted.timeline).map((frame) =>
           `draft/frames/frame-${String(frame).padStart(6, '0')}.jpg`),
       );
       if (expected === null) return false;
@@ -187,7 +240,7 @@ export const createDraftStage = (
       ? baselinePartialArtifacts()
       : partialArtifactsByRun.get(context.runDirectory) ?? baselinePartialArtifacts(),
     execute: async (context, signal) => {
-      const {runDirectory} = requireRunContext(context);
+      const {runId, runDirectory} = requireRunContext(context);
       const preflight = requirePreflight(context);
       const ffmpegIdentity = preflight.toolIdentities.ffmpeg;
       const ffprobeIdentity = preflight.toolIdentities.ffprobe;
@@ -196,7 +249,13 @@ export const createDraftStage = (
           'Draft requires Preflight FFmpeg and FFprobe identities',
         );
       }
-      const compileReport = await readStageReport(runDirectory, 'compile');
+      const compileReport = await loadSuccessfulBoundStageReport({
+        runDirectory,
+        projectId: context.project.project.id,
+        runId,
+        stageId: 'compile',
+        readStageReport,
+      });
       const stageFingerprint = calculateFingerprint(context, compileReport.fingerprint);
       if (stageFingerprint === null) {
         throw new PipelineContextError('Draft requires a passed Compile report');

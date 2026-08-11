@@ -6,6 +6,7 @@ import {
   NarrationManifestSchema,
 } from '../../domain/manifest-schema';
 import {buildCaptions} from '../../captions/build-captions';
+import {formatSrt} from '../../captions/srt';
 import type {RunDirectoryScope} from '../../fs/app-directory-scopes';
 import {
   openExistingProjectFile,
@@ -36,6 +37,9 @@ import {runNarration, type NarrationStageInput} from '../stages/narration';
 import {
   STAGE_ALGORITHM_VERSIONS,
   isOrdinaryVerificationMiss,
+  readPlanningInput,
+  readRunJson,
+  readRunText,
   runArtifact,
   uniqueArtifacts,
   verifyReportedArtifacts,
@@ -474,7 +478,31 @@ export const createNarrationStage = (
     fingerprint,
     verify: async (context, report) => {
       const parsed = NarrationAdapterOutputSchema.safeParse(report.outputs);
-      if (!parsed.success) return false;
+      if (!parsed.success || context.sourceRun === undefined) return false;
+      const persisted = await readPlanningInput(async () => {
+        const [narration, captions, srt] = await Promise.all([
+          readRunJson(
+            context.sourceRun!.runDirectory,
+            parsed.data.narrationPath,
+            (value) => NarrationManifestSchema.parse(value),
+          ),
+          readRunJson(
+            context.sourceRun!.runDirectory,
+            parsed.data.captionsPath,
+            (value) => CaptionsManifestSchema.parse(value),
+          ),
+          readRunText(context.sourceRun!.runDirectory, parsed.data.srtPath),
+        ]);
+        return {narration, captions, srt};
+      });
+      if (
+        persisted === null
+        || fingerprintValue(persisted.narration)
+          !== fingerprintValue(parsed.data.narration)
+        || fingerprintValue(persisted.captions)
+          !== fingerprintValue(parsed.data.captions)
+        || persisted.srt !== formatSrt(persisted.captions)
+      ) return false;
       const providerFingerprint = await providerIdentity(
         context.project.project.tts.provider,
       );
