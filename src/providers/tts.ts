@@ -11,7 +11,7 @@ import {runProcess, type RunProcessOptions} from '../process/run-process';
 
 const FFMPEG_EXECUTABLE = process.env.FFMPEG_PATH ?? '/opt/homebrew/bin/ffmpeg';
 
-type TtsProviderId = 'macos-say' | 'file' | 'mock';
+export type TtsProviderId = 'macos-say' | 'file' | 'mock';
 
 export interface TtsInput {
   segmentId: string;
@@ -43,6 +43,21 @@ export class TtsProviderError extends Error {
 
 export interface TtsProcessRunner {
   (command: string, args: readonly string[], options?: RunProcessOptions): Promise<unknown>;
+}
+
+export interface TtsProviderIdentityDependencies {
+  stat(candidate: string): Promise<{mtimeMs: number; size: number}>;
+}
+
+export async function fingerprintTtsProvider(
+  provider: TtsProviderId,
+  dependencies: TtsProviderIdentityDependencies = {stat},
+): Promise<string> {
+  if (provider === 'macos-say') {
+    const say = await dependencies.stat('/usr/bin/say');
+    return fingerprintValue({provider, algorithm: 'macos-say-v1', say});
+  }
+  return fingerprintValue({provider, algorithm: `${provider}-tts-v1`});
 }
 
 interface RunOutputProviderOptions {
@@ -127,7 +142,7 @@ export class MockTtsProvider implements TtsProvider {
   }
 
   async fingerprint(): Promise<string> {
-    return fingerprintValue({provider: this.id, algorithm: 'mock-tts-v1'});
+    return await fingerprintTtsProvider(this.id);
   }
 
   async synthesize(input: TtsInput, signal: AbortSignal): Promise<TtsResult> {
@@ -165,7 +180,7 @@ export class FileTtsProvider implements TtsProvider {
   }
 
   async fingerprint(): Promise<string> {
-    return fingerprintValue({provider: this.id, algorithm: 'file-tts-v1'});
+    return await fingerprintTtsProvider(this.id);
   }
 
   async synthesize(input: TtsInput, signal: AbortSignal): Promise<TtsResult> {
@@ -217,12 +232,7 @@ export class MacOsSayProvider implements TtsProvider {
   }
 
   async fingerprint(): Promise<string> {
-    const sayStats = await stat('/usr/bin/say');
-    return fingerprintValue({
-      provider: this.id,
-      algorithm: 'macos-say-v1',
-      say: {mtimeMs: sayStats.mtimeMs, size: sayStats.size},
-    });
+    return await fingerprintTtsProvider(this.id);
   }
 
   async synthesize(input: TtsInput, signal: AbortSignal): Promise<TtsResult> {
@@ -257,5 +267,22 @@ export class MacOsSayProvider implements TtsProvider {
       await aiffReadHandle.close();
     }
     return {outputPath: input.outputPath, providerFingerprint: await this.fingerprint()};
+  }
+}
+
+export function createTtsProvider(input: {
+  provider: TtsProviderId;
+  projectDirectory: ProjectDirectoryScope;
+  runDirectory: RunDirectoryScope;
+  ffmpegExecutable?: string;
+  runProcess?: TtsProcessRunner;
+}): TtsProvider {
+  switch (input.provider) {
+    case 'mock':
+      return new MockTtsProvider(input);
+    case 'file':
+      return new FileTtsProvider(input);
+    case 'macos-say':
+      return new MacOsSayProvider(input);
   }
 }

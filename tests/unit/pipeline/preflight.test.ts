@@ -146,6 +146,7 @@ interface FixtureOverrides {
   sourceBytes?: number;
   workDirectoryUsable?: boolean;
   configuredVoice?: string;
+  provider?: 'macos-say' | 'file' | 'mock';
   segmentedWav?: boolean;
   processFailure?: {command: string; args: readonly string[]};
 }
@@ -171,6 +172,7 @@ const toolIdentity = (state: ToolFixtureState): PreflightFileIdentity => ({
 
 const fixture = (overrides: FixtureOverrides = {}) => {
   const project = createProjectFixture();
+  project.tts.provider = overrides.provider ?? project.tts.provider;
   project.tts.voice = overrides.configuredVoice ?? 'Tingting';
   const script = createScriptFixture();
   if (overrides.segmentedWav) {
@@ -1631,7 +1633,10 @@ describe('runPreflight', () => {
   });
 
   it('accepts an installed configured macOS voice', async () => {
-    const {input, dependencies} = fixture({configuredVoice: 'Tingting'});
+    const {input, dependencies} = fixture({
+      provider: 'macos-say',
+      configuredVoice: 'Tingting',
+    });
 
     const result = await runPreflight(input, dependencies);
 
@@ -1644,7 +1649,10 @@ describe('runPreflight', () => {
   });
 
   it('rejects a missing voice without segmented WAV input', async () => {
-    const {input, dependencies} = fixture({configuredVoice: 'Missing Voice'});
+    const {input, dependencies} = fixture({
+      provider: 'macos-say',
+      configuredVoice: 'Missing Voice',
+    });
 
     const result = await runPreflight(input, dependencies);
 
@@ -1653,20 +1661,68 @@ describe('runPreflight', () => {
     });
   });
 
-  it('allows a missing voice when every segment supplies WAV input', async () => {
+  it('still requires a voice for macos-say when segments supply audio', async () => {
     const {input, dependencies} = fixture({
+      provider: 'macos-say',
       configuredVoice: 'Missing Voice',
       segmentedWav: true,
     });
 
     const result = await runPreflight(input, dependencies);
 
-    expect(result.voice).toEqual({
-      configured: 'Missing Voice',
-      available: false,
-      segmentedWavFallback: true,
+    expect(errorCheck(result, 'macos-voice')).toMatchObject({
+      code: 'ENV_VOICE_MISSING',
     });
+  });
+
+  it('does not require a macOS voice for the mock provider', async () => {
+    const {input, dependencies, runProcess} = fixture({
+      provider: 'mock',
+      configuredVoice: 'Missing Voice',
+      voices: '',
+    });
+
+    const result = await runPreflight(input, dependencies);
+
+    expect(runProcess).toHaveBeenCalledWith('/usr/bin/say', ['-v', '?']);
     expect(errorCheck(result, 'macos-voice')).toBeUndefined();
+  });
+
+  it('accepts the file provider when every segment has audioPath', async () => {
+    const {input, dependencies, runProcess} = fixture({
+      provider: 'file',
+      configuredVoice: 'Missing Voice',
+      segmentedWav: true,
+    });
+    input.script.segments.push({
+      ...input.script.segments[0]!,
+      id: 'outro',
+      audioPath: 'assets/source/voice/outro.mp3',
+    });
+
+    const result = await runPreflight(input, dependencies);
+
+    expect(runProcess).not.toHaveBeenCalledWith('/usr/bin/say', ['-v', '?']);
+    expect(errorCheck(result, 'macos-voice')).toBeUndefined();
+  });
+
+  it('requires audioPath on every segment for the file provider', async () => {
+    const {input, dependencies} = fixture({
+      provider: 'file',
+      configuredVoice: 'Tingting',
+      segmentedWav: true,
+    });
+    input.script.segments.push({
+      ...input.script.segments[0]!,
+      id: 'outro',
+      audioPath: undefined,
+    });
+
+    const result = await runPreflight(input, dependencies);
+
+    expect(errorCheck(result, 'macos-voice')).toMatchObject({
+      code: 'ENV_VOICE_MISSING',
+    });
   });
 
   it.each([

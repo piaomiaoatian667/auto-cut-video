@@ -331,10 +331,8 @@ const hasVoice = (output: string, configuredVoice: string): boolean =>
     || line.startsWith(`${configuredVoice}\t`)
   ));
 
-const allSegmentsHaveWav = (script: Script): boolean =>
-  script.segments.every((segment) => (
-    segment.audioPath !== undefined && /\.wav$/iu.test(segment.audioPath)
-  ));
+const allSegmentsHaveAudio = (script: Script): boolean =>
+  script.segments.every((segment) => segment.audioPath !== undefined);
 
 const addInfo = (
   checks: PreflightCheck[],
@@ -736,8 +734,12 @@ export async function runPreflight(
       );
     }
 
-    const sayOutput = await probe(dependencies, '/usr/bin/say', ['-v', '?']);
-    const segmentedWavFallback = allSegmentsHaveWav(input.script);
+    const provider = input.project.tts.provider;
+    const sayOutput = provider === 'file'
+      ? null
+      : await probe(dependencies, '/usr/bin/say', ['-v', '?']);
+    const segmentedWavFallback = provider === 'file'
+      && allSegmentsHaveAudio(input.script);
     const voiceAvailable = sayOutput !== null && hasVoice(
       combinedOutput(sayOutput),
       input.project.tts.voice,
@@ -747,25 +749,50 @@ export async function runPreflight(
       available: voiceAvailable,
       segmentedWavFallback: !voiceAvailable && segmentedWavFallback,
     };
-    if (voiceAvailable) {
-      addInfo(checks, 'macos-voice', 'Configured macOS voice is available.', {
-        value: input.project.tts.voice,
-      });
-    } else if (segmentedWavFallback) {
-      addInfo(
-        checks,
-        'macos-voice',
-        'Segmented WAV input makes the configured macOS voice optional.',
-        {value: input.project.tts.voice},
-      );
-    } else {
-      addError(
-        checks,
-        'macos-voice',
-        'ENV_VOICE_MISSING',
-        'Configured macOS voice is unavailable and no segmented WAV fallback exists.',
-        {value: input.project.tts.voice},
-      );
+    switch (provider) {
+      case 'macos-say':
+        if (voiceAvailable) {
+          addInfo(checks, 'macos-voice', 'Configured macOS voice is available.', {
+            value: input.project.tts.voice,
+          });
+        } else {
+          addError(
+            checks,
+            'macos-voice',
+            'ENV_VOICE_MISSING',
+            'Configured macOS voice is unavailable.',
+            {value: input.project.tts.voice},
+          );
+        }
+        break;
+      case 'file':
+        if (segmentedWavFallback) {
+          addInfo(
+            checks,
+            'macos-voice',
+            'File TTS source audio is configured for every segment.',
+            {value: input.project.tts.voice},
+          );
+        } else {
+          addError(
+            checks,
+            'macos-voice',
+            'ENV_VOICE_MISSING',
+            'File TTS requires audioPath on every segment.',
+            {value: input.project.tts.voice},
+          );
+        }
+        break;
+      case 'mock':
+        addInfo(
+          checks,
+          'macos-voice',
+          voiceAvailable
+            ? 'Configured macOS voice is available for mock diagnostics.'
+            : 'Configured macOS voice is unavailable, but mock TTS does not require it.',
+          {value: input.project.tts.voice},
+        );
+        break;
     }
 
     const fonts: FontIdentity[] = [];

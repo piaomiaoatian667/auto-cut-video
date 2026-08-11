@@ -151,7 +151,7 @@ const createSyntheticMaster = async ({
   }
 };
 
-const segmentInputHash = (
+export const narrationSegmentInputHash = (
   segment: ScriptSegment,
   voice: string,
   rate: number,
@@ -162,7 +162,7 @@ const segmentInputHash = (
   voice,
   rate,
   providerFingerprint,
-  sampleRate: 48000,
+  sampleRate: 48_000,
   channels: 1,
 });
 
@@ -175,7 +175,7 @@ export const buildNarration = async (input: BuildNarrationInput): Promise<Narrat
   let cursorMs = 0;
 
   for (const [index, segment] of input.script.segments.entries()) {
-    const inputHash = segmentInputHash(
+    const inputHash = narrationSegmentInputHash(
       segment,
       input.project.tts.voice,
       input.project.tts.rate,
