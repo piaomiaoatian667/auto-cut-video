@@ -2,6 +2,7 @@ import {createHash} from 'node:crypto';
 import {mkdtemp, mkdir, readFile, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
+import {z} from 'zod';
 import {CompiledTimelineSchema, type CompiledTimeline} from '../../domain/timeline-schema';
 import type {ProjectInputs} from '../../domain/load-project';
 import {
@@ -23,10 +24,28 @@ import {parseFfprobeJson} from '../../media/ffprobe';
 import {runProcess, type RunProcessOptions} from '../../process/run-process';
 import {renderTimelineVideo} from '../../remotion/render';
 
-export interface ArtifactReference {
-  path: string;
-  sha256: string;
-}
+export const ArtifactReferenceSchema = z.object({
+  path: z.string().min(1),
+  sha256: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+}).strict();
+
+export type ArtifactReference = z.infer<typeof ArtifactReferenceSchema>;
+
+export const DraftReportSchema = z.object({
+  version: z.literal(1),
+  projectId: z.string().min(1),
+  outputs: z.object({
+    contactSheet: ArtifactReferenceSchema,
+    reviewFrames: z.array(ArtifactReferenceSchema).min(1),
+    audio: z.object({
+      filterGraph: ArtifactReferenceSchema,
+      mixedAudio: ArtifactReferenceSchema,
+    }).strict(),
+    audioMixFingerprint: z.string().min(1),
+  }).passthrough(),
+}).passthrough();
+
+export type DraftReport = z.infer<typeof DraftReportSchema>;
 
 export interface DraftStageInput extends ProjectInputs {
   runDirectory: RunDirectoryScope;

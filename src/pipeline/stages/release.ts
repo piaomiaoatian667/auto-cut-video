@@ -2,7 +2,6 @@ import {createHash} from 'node:crypto';
 import {mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
-import {z} from 'zod';
 import {formatSrt} from '../../captions/srt';
 import type {ProjectInputs} from '../../domain/load-project';
 import {ReviewSchema, type Review} from '../../domain/review-schema';
@@ -29,6 +28,11 @@ import {
   type ReleaseVerificationReport,
 } from '../../media/release-verify';
 import {fingerprintValue} from '../fingerprint';
+import {
+  DraftReportSchema,
+  type ArtifactReference,
+  type DraftReport,
+} from './draft';
 import {evaluateReview, ReviewGateError} from './review';
 import {
   runProcess as runSystemProcess,
@@ -52,27 +56,52 @@ const RELEASE_STAGE_IDS: CurrentPointer['stageIds'] = [
   'release',
 ];
 
-const ArtifactReferenceSchema = z.object({
-  path: z.string().min(1),
-  sha256: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
-}).strict();
+export const RELEASE_FIXED_PROFILE = {
+  width: 1920,
+  height: 1080,
+  fps: 30,
+  videoCodec: 'h264',
+  pixelFormat: 'yuv420p',
+  audioCodec: 'aac',
+  audioSampleRate: 48_000,
+  audioChannels: 2,
+  container: 'mp4',
+  thumbnailWidth: 1280,
+  thumbnailHeight: 720,
+} as const;
 
-const DraftReportSchema = z.object({
-  version: z.literal(1),
-  projectId: z.string().min(1),
-  outputs: z.object({
-    contactSheet: ArtifactReferenceSchema,
-    reviewFrames: z.array(ArtifactReferenceSchema).min(1),
-    audio: z.object({
-      filterGraph: ArtifactReferenceSchema,
-      mixedAudio: ArtifactReferenceSchema,
-    }).strict(),
-    audioMixFingerprint: z.string().min(1).optional(),
-  }).passthrough(),
-}).passthrough();
+export interface ReleaseStageFingerprintInput {
+  draft: Pick<
+    DraftReport['outputs'],
+    'contactSheet' | 'reviewFrames' | 'audio' | 'audioMixFingerprint'
+  >;
+  compileInputHashes: Record<string, string>;
+  review: Review;
+  preflightEnvironmentFingerprint: string;
+  profile?: Record<string, unknown>;
+  algorithmVersion?: string;
+}
 
-type ArtifactReference = z.infer<typeof ArtifactReferenceSchema>;
-type DraftReport = z.infer<typeof DraftReportSchema>;
+export const releaseStageFingerprint = ({
+  draft,
+  compileInputHashes,
+  review,
+  preflightEnvironmentFingerprint,
+  profile = RELEASE_FIXED_PROFILE,
+  algorithmVersion = 'release-stage-v1',
+}: ReleaseStageFingerprintInput): string => fingerprintValue({
+  algorithmVersion,
+  draftArtifacts: {
+    contactSheet: draft.contactSheet,
+    reviewFrames: draft.reviewFrames,
+    audio: draft.audio,
+    audioMixFingerprint: draft.audioMixFingerprint,
+  },
+  compileInputHashes,
+  approvedReview: review,
+  preflightEnvironmentFingerprint,
+  profile,
+});
 
 export interface ReleaseToolIdentity {
   realPath: string;
@@ -119,6 +148,7 @@ export interface ReleaseStageDependencies {
   runProcess?: ReleaseRunner;
   ffprobeExecutable?: string;
   outputStore?: ReturnType<typeof createOutputStore>;
+  publishCurrent?: boolean;
 }
 
 export interface OutputArtifactReference extends ArtifactReference {
@@ -589,18 +619,11 @@ export const runRelease = async (
     `releases/${input.runId}/review.json`,
     review,
   );
-  const releaseFingerprint = fingerprintValue({
-    timelineInputHashes: timeline.inputHashes,
-    audioArtifacts,
-    audioMixFingerprint: draftReport.outputs.audioMixFingerprint ?? null,
-    preflight: input.preflight,
-    render: {
-      width: timeline.width,
-      height: timeline.height,
-      fps: timeline.fps,
-      videoCodec: input.project.render.videoCodec,
-      pixelFormat: input.project.render.pixelFormat,
-    },
+  const releaseFingerprint = releaseStageFingerprint({
+    draft: draftReport.outputs,
+    compileInputHashes: timeline.inputHashes,
+    review,
+    preflightEnvironmentFingerprint: input.preflight.environmentFingerprint,
   });
   const validationReport = await writeOutputJson(
     outputDirectory,
@@ -637,7 +660,9 @@ export const runRelease = async (
     validationReport,
   ]);
   const current = releasePointer(input.runId, (input.now ?? (() => new Date().toISOString()))());
-  await outputStore.publishCurrent(input.project.id, current);
+  if (dependencies.publishCurrent ?? true) {
+    await outputStore.publishCurrent(input.project.id, current);
+  }
   return {
     outputs: {
       mutedVideo,

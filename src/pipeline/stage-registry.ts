@@ -1,4 +1,13 @@
 import {STAGE_PRESETS} from './presets';
+import {
+  compileStage,
+  draftStage,
+  ingestStage,
+  narrationStage,
+  preflightStage,
+  releaseStage,
+  reviewStage,
+} from './stage-adapters';
 import type {PipelineStage} from './stage';
 
 export class StageRegistryError extends Error {
@@ -66,3 +75,13 @@ export function createStageRegistry(
 
   return Object.freeze(registry);
 }
+
+export const MVP_STAGES = createStageRegistry([
+  preflightStage,
+  ingestStage,
+  narrationStage,
+  compileStage,
+  draftStage,
+  reviewStage,
+  releaseStage,
+]);
