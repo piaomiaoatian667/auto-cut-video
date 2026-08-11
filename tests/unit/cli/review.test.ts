@@ -1,14 +1,19 @@
 import {createHash} from 'node:crypto';
 import {afterEach, describe, expect, it, vi} from 'vitest';
-import {readFile, rm, symlink, writeFile} from 'node:fs/promises';
+import {readdir, readFile, rm, symlink, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {mkdtemp} from 'node:fs/promises';
 import {
   createRunStore,
   ensureRunDirectory,
+  linkRunFile,
   openExistingRunFile,
   openNewRunFile,
+  openNewRunFileForWrite,
+  unlinkRunFile,
+  type AppDirectoryWriteFileAuthority,
+  type RunDirectoryScope,
   type WorkDirectoryScope,
 } from '../../../src/fs/app-directory-scopes';
 import {runReviewCommand} from '../../../src/cli/commands/review';
@@ -203,6 +208,34 @@ const expectNoCanonicalApproval = async (
     .resolves.toBeNull();
 };
 
+const changeDraftVideoEvidence = async (
+  fixture: Awaited<ReturnType<typeof makeFixture>>,
+) => {
+  const draftReport = DraftReportSchema.parse(await readRunJson(
+    fixture.workspaceRoot,
+    fixture.runId,
+    'draft/draft-report.json',
+  ));
+  const changedBytes = 'changed-draft-video';
+  await writeFile(path.join(fixture.runRoot, 'draft/draft.mp4'), changedBytes);
+  const changed = DraftReportSchema.parse({
+    ...draftReport,
+    outputs: {
+      ...draftReport.outputs,
+      draftVideo: {
+        ...draftReport.outputs.draftVideo,
+        sha256: sha256(changedBytes),
+      },
+    },
+  });
+  await writeFile(
+    path.join(fixture.runRoot, 'draft/draft-report.json'),
+    `${JSON.stringify(changed, null, 2)}\n`,
+    'utf8',
+  );
+  return changed;
+};
+
 describe('videoctl review', () => {
   it('approves the current run, writes a canonical Review report, and preserves the attempt', async () => {
     const fixture = await makeFixture();
@@ -270,6 +303,236 @@ describe('videoctl review', () => {
       path.join(fixture.workspaceRoot, '.work', 'demo', 'pipeline.lock'),
       'utf8',
     )).rejects.toMatchObject({code: 'ENOENT'});
+  });
+
+  it.each(['write', 'fsync'] as const)(
+    'rolls back a failed review.json %s and allows a clean retry',
+    async (failurePoint) => {
+      const fixture = await makeFixture();
+      const failure = Object.assign(
+        new Error(`${failurePoint} failed`),
+        {code: failurePoint === 'write' ? 'ENOSPC' : 'EIO'},
+      );
+      const openedPaths: string[] = [];
+      const openReviewTemp = vi.fn(async (
+        run: RunDirectoryScope,
+        relativePath: string,
+      ): Promise<AppDirectoryWriteFileAuthority> => {
+        openedPaths.push(relativePath);
+        const authority = await openNewRunFileForWrite(run, relativePath);
+        if (failurePoint === 'write') {
+          return {
+            ...authority,
+            handle: {
+              writeFile: async () => {
+                await authority.handle.writeFile('{"partial"', 'utf8');
+                throw failure;
+              },
+            } as unknown as AppDirectoryWriteFileAuthority['handle'],
+          };
+        }
+        return {
+          ...authority,
+          syncAndSeal: async () => { throw failure; },
+        };
+      });
+      const dependencies = {
+        ...fixture.dependencies,
+        reviewFileOps: {
+          openNewRunFileForWrite: openReviewTemp,
+          createTempId: () => `failed-${failurePoint}`,
+        },
+      };
+
+      await expect(runReviewCommand(
+        'demo',
+        {approve: true, reason: 'looks good', reviewer: 'tester'},
+        dependencies,
+      )).rejects.toBe(failure);
+
+      expect(openedPaths).toEqual([`.review.json.failed-${failurePoint}.tmp`]);
+      const runEntries = await readdir(fixture.runRoot);
+      expect(runEntries).not.toContain('review.json');
+      expect(runEntries.some((entry) => entry.startsWith('.review.json.'))).toBe(false);
+      await expect(createRunStore(fixture.workspaceRoot).readCurrentReadonly('demo'))
+        .resolves.toMatchObject({state: 'needs_review'});
+      await expectNoCanonicalApproval(fixture);
+
+      const retry = await runReviewCommand(
+        'demo',
+        {approve: true, reason: 'retry accepted', reviewer: 'tester'},
+        {...fixture.dependencies, now: () => '2026-08-11T00:20:00.000Z'},
+      );
+      expect(retry).toBe(EXIT_CODES.success);
+      await expect(readRunJson(fixture.workspaceRoot, fixture.runId, 'review.json'))
+        .resolves.toMatchObject({reason: 'retry accepted'});
+    },
+  );
+
+  it('preserves an unknown review.json commit and replaces the orphan on retry', async () => {
+    const fixture = await makeFixture();
+    const commitSyncFailure = new Error('commit parent sync failed');
+    const recoverySyncFailure = new Error('recovery parent sync failed');
+    let syncCalls = 0;
+    const linkReviewTemp = vi.fn(async (
+      run: RunDirectoryScope,
+      sourceRelativePath: string,
+      targetRelativePath: string,
+      sourceAuthority: AppDirectoryWriteFileAuthority,
+    ) => {
+      const authority = await linkRunFile(
+        run,
+        sourceRelativePath,
+        targetRelativePath,
+        sourceAuthority,
+      );
+      return {
+        ...authority,
+        syncParent: async () => {
+          syncCalls += 1;
+          throw syncCalls === 1 ? commitSyncFailure : recoverySyncFailure;
+        },
+      };
+    });
+    const dependencies = {
+      ...fixture.dependencies,
+      now: () => '2026-08-11T00:10:00.000Z',
+      reviewFileOps: {
+        linkRunFile: linkReviewTemp,
+        createTempId: () => 'unknown-outcome',
+      },
+    };
+
+    await expect(runReviewCommand(
+      'demo',
+      {approve: true, reason: 'first approval', reviewer: 'first-reviewer'},
+      dependencies,
+    )).rejects.toMatchObject({
+      name: 'ReviewApprovalOutcomeError',
+      code: 'REVIEW_APPROVAL_OUTCOME_UNKNOWN',
+      cause: commitSyncFailure,
+      errors: [commitSyncFailure, recoverySyncFailure],
+    });
+
+    await expect(readRunJson(fixture.workspaceRoot, fixture.runId, 'review.json'))
+      .resolves.toMatchObject({reason: 'first approval'});
+    const runEntries = await readdir(fixture.runRoot);
+    expect(runEntries.some((entry) => entry.startsWith('.review.json.'))).toBe(false);
+    const runDirectory = await createRunStore(fixture.workspaceRoot)
+      .openExistingRun('demo', fixture.runId);
+    await expect(createStageReportStore().readStage(runDirectory, 'review'))
+      .resolves.toBeNull();
+    await expect(createRunStore(fixture.workspaceRoot).readCurrentReadonly('demo'))
+      .resolves.toMatchObject({state: 'needs_review'});
+
+    const retry = await runReviewCommand(
+      'demo',
+      {approve: true, reason: 'fresh retry', reviewer: 'second-reviewer'},
+      {...fixture.dependencies, now: () => '2026-08-11T00:20:00.000Z'},
+    );
+
+    expect(retry).toBe(EXIT_CODES.success);
+    await expect(readRunJson(fixture.workspaceRoot, fixture.runId, 'review.json'))
+      .resolves.toMatchObject({
+        reviewer: 'second-reviewer',
+        reason: 'fresh retry',
+        reviewedAt: '2026-08-11T00:20:00.000Z',
+      });
+  });
+
+  it('replaces an orphaned approval when same-path evidence hashes changed', async () => {
+    const fixture = await makeFixture();
+    const oldReview = {
+      version: 1 as const,
+      projectId: 'demo',
+      runId: fixture.runId,
+      status: 'approved' as const,
+      reviewer: 'old-reviewer',
+      reviewedAt: '2026-08-11T00:05:00.000Z',
+      reason: 'old approval',
+      evidencePaths: fixture.evidence.map((artifact) => artifact.path),
+    };
+    await writeRunJson(fixture.workspaceRoot, fixture.runId, 'review.json', oldReview);
+    const changedDraft = await changeDraftVideoEvidence(fixture);
+    const unlinkOrphan = vi.fn(unlinkRunFile);
+    const syncRunDirectory = vi.fn(async () => undefined);
+    const dependencies = {
+      ...fixture.dependencies,
+      now: () => '2026-08-11T00:20:00.000Z',
+      reviewFileOps: {
+        unlinkRunFile: unlinkOrphan,
+        syncRunDirectory,
+      },
+    };
+
+    const exitCode = await runReviewCommand(
+      'demo',
+      {approve: true, reason: 'new evidence accepted', reviewer: 'new-reviewer'},
+      dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.success);
+    expect(unlinkOrphan).toHaveBeenCalledWith(expect.anything(), 'review.json');
+    expect(syncRunDirectory).toHaveBeenCalledTimes(1);
+    const review = await readRunJson(fixture.workspaceRoot, fixture.runId, 'review.json');
+    expect(review).toMatchObject({
+      reviewer: 'new-reviewer',
+      reason: 'new evidence accepted',
+      reviewedAt: '2026-08-11T00:20:00.000Z',
+    });
+    expect(review).not.toEqual(oldReview);
+    const runDirectory = await createRunStore(fixture.workspaceRoot)
+      .openExistingRun('demo', fixture.runId);
+    await expect(createStageReportStore().readStage(runDirectory, 'review'))
+      .resolves.toMatchObject({
+        outputs: {
+          evidence: draftReviewEvidenceArtifacts(changedDraft),
+          review,
+        },
+      });
+  });
+
+  it('returns success with a warning when approval committed before lock release failed', async () => {
+    const fixture = await makeFixture();
+    const releaseFailure = new Error('lock close failed');
+    const release = vi.fn(async () => { throw releaseFailure; });
+    const acquireProjectLock = vi.fn(async (
+      _work: WorkDirectoryScope,
+      runId: string,
+    ): Promise<ProjectLockLease> => ({
+      record: {
+        pid: 1,
+        hostname: 'test',
+        processStart: 'test',
+        createdAt: '2026-08-11T00:09:00.000Z',
+        runId,
+      },
+      release,
+    }));
+    const dependencies = {
+      ...fixture.dependencies,
+      acquireProjectLock,
+      now: () => '2026-08-11T00:10:00.000Z',
+    };
+
+    const exitCode = await runReviewCommand(
+      'demo',
+      {approve: true, reason: 'looks good', reviewer: 'tester'},
+      dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.success);
+    expect(fixture.stdout()).toBe('Review approved: run-review\n');
+    expect(fixture.stderr()).toBe(
+      'Review approved, but the project lock could not be released.\n',
+    );
+    expect(release).toHaveBeenCalledTimes(1);
+    await expect(createRunStore(fixture.workspaceRoot).readCurrentReadonly('demo'))
+      .resolves.toMatchObject({state: 'passed', completedStage: 'review'});
+    const runDirectory = await createRunStore(fixture.workspaceRoot)
+      .openExistingRun('demo', fixture.runId);
+    await expect(createStageReportStore().readStage(runDirectory, 'review'))
+      .resolves.toMatchObject({state: 'passed'});
   });
 
   it('does not approve a stale snapshot after the same Run advances before lock acquisition', async () => {

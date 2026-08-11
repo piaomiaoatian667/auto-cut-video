@@ -1156,6 +1156,43 @@ describe('Pipeline Runner', () => {
     expect(runtime.events).toContain('work:narration:passed');
   });
 
+  it('rejects a forced first-incomplete Stage completed while waiting for the lock', async () => {
+    const sourceRunId = 'run-resume';
+    const project = memoryProject();
+    const runtime = createMemoryRuntime({
+      current: currentPointer(sourceRunId, 'narration'),
+    });
+    runtime.seedRun(sourceRunId, reportsThrough(sourceRunId, 'release', 'narration'));
+    const plan = await buildExecutionPlan(planningContext(runtime, project), {
+      preset: 'release',
+      resume: true,
+      force: 'compile',
+    });
+    expect(plan).toMatchObject({
+      runMode: 'resume',
+      forceStageId: 'compile',
+    });
+    runtime.acquireProjectLock.mockImplementationOnce(async () => {
+      runtime.events.push('acquire-lock');
+      runtime.seedRun(
+        sourceRunId,
+        reportsThrough(sourceRunId, 'release', 'compile'),
+      );
+      await runtime.runStore.publishCurrent(
+        'demo',
+        currentPointer(sourceRunId, 'compile'),
+      );
+      return runtime.lease;
+    });
+
+    await expect(runExecutionPlan(executionInput(plan, project), runtime.dependencies))
+      .rejects.toMatchObject({code: 'PLAN_STALE', stageId: 'compile'});
+
+    expect(runtime.stageCalls).toEqual([]);
+    expect(runtime.reportStore.writeStage).not.toHaveBeenCalled();
+    expect(runtime.release).toHaveBeenCalledOnce();
+  });
+
   it('rejects an invalid report completed while waiting for the lock', async () => {
     const sourceRunId = 'run-resume';
     const project = memoryProject();

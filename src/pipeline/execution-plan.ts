@@ -44,6 +44,7 @@ export interface ExecutionPlan {
   requiresRuntimePreflight: boolean;
   sourceRunId?: string;
   targetRunId?: string;
+  forceStageId?: StageId;
   items: ExecutionPlanItem[];
 }
 
@@ -487,6 +488,15 @@ export async function revalidateExecutionPlan(
   if (selectedIndexes.some((index) => index < 0)) {
     return stalePlan('the Execution Plan contains a Stage outside its Preset');
   }
+  if (
+    plan.forceStageId !== undefined
+    && !plan.stageIds.includes(plan.forceStageId)
+  ) {
+    return stalePlan(
+      `forced Stage ${plan.forceStageId} is outside the selected range`,
+      plan.forceStageId,
+    );
+  }
   const firstSelectedIndex = Math.min(...selectedIndexes);
   const lastSelectedIndex = Math.max(...selectedIndexes);
   const reportStageIds = presetStageIds.slice(0, lastSelectedIndex + 1);
@@ -577,6 +587,15 @@ export async function revalidateExecutionPlan(
         && STAGE_POSITIONS.get(stageId)! <= NEW_RUN_REUSE_LIMIT;
     }
     if (matching) {
+      if (
+        selectedReportAppeared
+        && plan.forceStageId === stageId
+      ) {
+        return stalePlan(
+          `forced Stage ${stageId} completed before execution`,
+          stageId,
+        );
+      }
       if (
         sourcePointer !== undefined
         && stagePosition > authoritativeCompletedPosition
@@ -774,6 +793,7 @@ export async function buildExecutionPlan(
       requiresRuntimePreflight,
       sourceRunId,
       targetRunId: sourceRunId,
+      ...(force === undefined ? {} : {forceStageId: force}),
       items,
     };
   }
@@ -829,6 +849,7 @@ export async function buildExecutionPlan(
       requiresRuntimePreflight,
       ...(sourceRunId === undefined ? {} : {sourceRunId}),
       ...(sourceRunId === undefined ? {} : {targetRunId: sourceRunId}),
+      ...(force === undefined ? {} : {forceStageId: force}),
       items,
     };
   }
@@ -872,6 +893,7 @@ export async function buildExecutionPlan(
     requiresRuntimePreflight,
     ...(sourceRunId === undefined ? {} : {sourceRunId}),
     targetRunId,
+    ...(force === undefined ? {} : {forceStageId: force}),
     items,
   };
 }

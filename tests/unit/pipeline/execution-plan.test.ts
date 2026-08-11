@@ -646,6 +646,7 @@ describe('buildExecutionPlan', () => {
 
     expect(plan.runMode).toBe('resume');
     expect(plan.targetRunId).toBe('run-one');
+    expect(plan).toMatchObject({forceStageId: 'compile'});
     expect(plan.items.find((item) => item.stageId === 'compile')).toMatchObject({
       action: 'resume',
       materialize: false,

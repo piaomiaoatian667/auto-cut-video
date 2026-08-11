@@ -1970,6 +1970,14 @@ const syncWorkDirectory = async (
   relativePath,
 );
 
+export const syncRunDirectory = async (
+  scope: RunDirectoryScope,
+  relativePath = '.',
+): Promise<void> => await syncScopedDirectory(
+  stateFor(runStates, scope, 'RunDirectoryScope'),
+  relativePath,
+);
+
 const syncOutputDirectory = async (
   scope: OutputDirectoryScope,
   relativePath = '.',
