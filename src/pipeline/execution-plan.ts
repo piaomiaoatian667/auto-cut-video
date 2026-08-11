@@ -77,19 +77,24 @@ export class ExecutionPlanError extends Error {
   }
 }
 
-interface SourceRun {
-  pointer: CurrentPointer;
-  workPointer: CurrentPointer | null;
-  outputPointer: CurrentPointer | null;
-  runDirectory: RunDirectoryScope;
-  reports: ReadonlyMap<StageId, StageReport>;
-}
-
 interface LoadedRun {
   runId: string;
   runDirectory: RunDirectoryScope;
   reports: ReadonlyMap<StageId, StageReport>;
+  invalidReports: ReadonlySet<StageId>;
 }
+
+interface SourceRun extends LoadedRun {
+  pointer: CurrentPointer;
+  workPointer: CurrentPointer | null;
+  outputPointer: CurrentPointer | null;
+}
+
+const isSourceRun = (source: LoadedRun): source is SourceRun => (
+  'pointer' in source
+  && 'workPointer' in source
+  && 'outputPointer' in source
+);
 
 interface StageAssessment {
   stage: PipelineStage;
@@ -230,17 +235,21 @@ const loadRun = async (
   }
 
   const reports = new Map<StageId, StageReport>();
+  const invalidReports = new Set<StageId>();
   for (const stageId of reportStageIds) {
     let report: StageReport | null;
     try {
       report = await context.reportStore.readStage(runDirectory, stageId);
     } catch (error) {
-      if (isOrdinaryPlanningMiss(error)) continue;
+      if (isOrdinaryPlanningMiss(error)) {
+        invalidReports.add(stageId);
+        continue;
+      }
       throw error;
     }
     if (report !== null) reports.set(stageId, report);
   }
-  return {runId, runDirectory, reports};
+  return {runId, runDirectory, reports, invalidReports};
 };
 
 const readSourceRun = async (
@@ -258,11 +267,13 @@ const readSourceRun = async (
   return loaded === null
     ? null
     : {
+      runId: loaded.runId,
       pointer,
       workPointer: workCurrent,
       outputPointer: outputCurrent,
       runDirectory: loaded.runDirectory,
       reports: loaded.reports,
+      invalidReports: loaded.invalidReports,
     };
 };
 
@@ -438,11 +449,7 @@ const revalidationSource = async (
   if (current === null || current.pointer.runId !== sourceRunId) {
     return stalePlan('the authoritative current Run changed before execution');
   }
-  return {
-    runId: current.pointer.runId,
-    runDirectory: current.runDirectory,
-    reports: current.reports,
-  };
+  return current;
 };
 
 export async function revalidateExecutionPlan(
@@ -482,13 +489,35 @@ export async function revalidateExecutionPlan(
     {planItem, index},
   ]));
   const fingerprints = new Map<StageId, string | null>();
+  const recoveredSelected = new Set<StageId>();
+  const sourcePointer = source !== null && isSourceRun(source)
+    ? source.pointer
+    : undefined;
+  const authoritativeCompletedPosition = sourcePointer === undefined
+    ? -1
+    : pointerProgress(sourcePointer);
+  let reconciledCompletedPosition = authoritativeCompletedPosition;
   let firstMismatch = -1;
 
   for (const [stageIndex, stageId] of reportStageIds.entries()) {
     const selected = selectedItems.get(stageId);
     const omittedPrerequisite = stageIndex < firstSelectedIndex;
+    const stagePosition = STAGE_POSITIONS.get(stageId)!;
+    const selectedCanRecover = plan.runMode === 'resume'
+      && stageId !== 'preflight'
+      && selected !== undefined
+      && (
+        selected.planItem.action === 'resume'
+        || selected.planItem.action === 'run'
+      );
+    const selectedReportAppeared = selectedCanRecover && (
+      source?.reports.has(stageId) === true
+      || source?.invalidReports.has(stageId) === true
+      || stagePosition <= authoritativeCompletedPosition
+    );
     const requiresVerifiedReport = omittedPrerequisite
-      || selected?.planItem.action === 'cached';
+      || selected?.planItem.action === 'cached'
+      || selectedReportAppeared;
     if (!requiresVerifiedReport && selected === undefined) continue;
     const stage = registry.get(stageId);
     if (stage === undefined) {
@@ -525,7 +554,22 @@ export async function revalidateExecutionPlan(
         && stageId !== 'preflight'
         && STAGE_POSITIONS.get(stageId)! <= NEW_RUN_REUSE_LIMIT;
     }
-    if (matching) continue;
+    if (matching) {
+      if (
+        sourcePointer !== undefined
+        && stagePosition > authoritativeCompletedPosition
+      ) {
+        if (stagePosition !== reconciledCompletedPosition + 1) {
+          return stalePlan(
+            `newly completed Stage ${stageId} is not contiguous with current progress`,
+            stageId,
+          );
+        }
+        reconciledCompletedPosition = stagePosition;
+      }
+      if (selectedReportAppeared) recoveredSelected.add(stageId);
+      continue;
+    }
 
     if (plan.runMode !== 'new' || omittedPrerequisite || selected === undefined) {
       return stalePlan(`planned reusable Stage ${stageId} is no longer valid`, stageId);
@@ -537,6 +581,15 @@ export async function revalidateExecutionPlan(
 
   const items = plan.items.map((planItem, index) => {
     const fingerprint = fingerprints.get(planItem.stageId);
+    if (recoveredSelected.has(planItem.stageId)) {
+      return {
+        ...planItem,
+        action: 'cached' as const,
+        fingerprint: fingerprint ?? planItem.fingerprint,
+        ...(source === null ? {} : {sourceRunId: source.runId}),
+        materialize: false,
+      };
+    }
     if (firstMismatch >= 0 && index >= firstMismatch) {
       const {sourceRunId: _sourceRunId, ...base} = planItem;
       return {
@@ -552,7 +605,11 @@ export async function revalidateExecutionPlan(
       ? {...planItem}
       : {...planItem, fingerprint};
   });
-  return {...plan, items};
+  const requiresProgressReconciliation = plan.requiresProgressReconciliation
+    || [...recoveredSelected].some((stageId) => (
+      STAGE_POSITIONS.get(stageId)! > authoritativeCompletedPosition
+    ));
+  return {...plan, requiresProgressReconciliation, items};
 }
 
 export async function buildExecutionPlan(

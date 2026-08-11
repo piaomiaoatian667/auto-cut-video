@@ -403,10 +403,10 @@ const createMemoryRuntime = (options: MemoryRuntimeOptions = {}) => {
     },
     release,
   };
-  const acquireProjectLock = vi.fn(async () => {
+  const acquireProjectLock = vi.fn<RunnerDependencies['acquireProjectLock']>(async () => {
     events.push('acquire-lock');
     return lease;
-  }) as unknown as RunnerDependencies['acquireProjectLock'];
+  });
   const registry = createStages(events, stageCalls, options);
   const dependencies: RunnerDependencies = {
     registry,
@@ -424,6 +424,7 @@ const createMemoryRuntime = (options: MemoryRuntimeOptions = {}) => {
     dependencies,
     events,
     outputStore,
+    lease,
     registry,
     release,
     reportStore,
@@ -768,6 +769,156 @@ describe('Pipeline Runner', () => {
     expect(runtime.reportStore.writeStage).not.toHaveBeenCalled();
     expect(runtime.runStore.publishCurrent).not.toHaveBeenCalled();
     expect(runtime.release).toHaveBeenCalledOnce();
+  });
+
+  it('reconciles valid contiguous reports completed while waiting for the lock', async () => {
+    const sourceRunId = 'run-resume';
+    const project = memoryProject();
+    const runtime = createMemoryRuntime({
+      current: currentPointer(sourceRunId, 'ingest'),
+    });
+    runtime.seedRun(sourceRunId, reportsThrough(sourceRunId, 'draft', 'ingest'));
+    const plan = await buildExecutionPlan(planningContext(runtime, project), {
+      preset: 'draft',
+      to: 'compile',
+      resume: true,
+    });
+    expect(plan.items.slice(-2)).toMatchObject([
+      {stageId: 'narration', action: 'resume'},
+      {stageId: 'compile', action: 'run'},
+    ]);
+    runtime.acquireProjectLock.mockImplementationOnce(async () => {
+      runtime.events.push('acquire-lock');
+      runtime.seedRun(
+        sourceRunId,
+        reportsThrough(sourceRunId, 'draft', 'compile'),
+      );
+      await runtime.runStore.publishCurrent(
+        'demo',
+        currentPointer(sourceRunId, 'compile', {preset: 'draft'}),
+      );
+      return runtime.lease;
+    });
+
+    const result = await runExecutionPlan(executionInput(plan, project), runtime.dependencies);
+
+    expect(result).toMatchObject({
+      runId: sourceRunId,
+      state: 'passed',
+      completedStage: 'compile',
+    });
+    expect(runtime.stageCalls).toEqual(['preflight']);
+    expect(runtime.reportStore.writeStage).not.toHaveBeenCalled();
+    expect(runtime.report(sourceRunId, 'compile')).toMatchObject({state: 'passed'});
+  });
+
+  it('repairs Work for a contiguous report written while waiting for the lock', async () => {
+    const sourceRunId = 'run-resume';
+    const project = memoryProject();
+    const runtime = createMemoryRuntime({
+      current: currentPointer(sourceRunId, 'ingest'),
+    });
+    runtime.seedRun(sourceRunId, reportsThrough(sourceRunId, 'draft', 'ingest'));
+    const plan = await buildExecutionPlan(planningContext(runtime, project), {
+      preset: 'draft',
+      to: 'narration',
+      resume: true,
+    });
+    runtime.acquireProjectLock.mockImplementationOnce(async () => {
+      runtime.events.push('acquire-lock');
+      runtime.seedRun(
+        sourceRunId,
+        reportsThrough(sourceRunId, 'draft', 'narration'),
+      );
+      return runtime.lease;
+    });
+
+    const result = await runExecutionPlan(executionInput(plan, project), runtime.dependencies);
+
+    expect(result).toMatchObject({
+      runId: sourceRunId,
+      state: 'passed',
+      completedStage: 'narration',
+    });
+    expect(runtime.stageCalls).toEqual(['preflight']);
+    expect(runtime.workCurrent).toMatchObject({
+      runId: sourceRunId,
+      completedStage: 'narration',
+    });
+    expect(runtime.events).toContain('work:narration:passed');
+  });
+
+  it('rejects an invalid report completed while waiting for the lock', async () => {
+    const sourceRunId = 'run-resume';
+    const project = memoryProject();
+    const runtime = createMemoryRuntime({
+      current: currentPointer(sourceRunId, 'ingest'),
+    });
+    runtime.seedRun(sourceRunId, reportsThrough(sourceRunId, 'draft', 'ingest'));
+    const plan = await buildExecutionPlan(planningContext(runtime, project), {
+      preset: 'draft',
+      to: 'narration',
+      resume: true,
+    });
+    runtime.acquireProjectLock.mockImplementationOnce(async () => {
+      runtime.events.push('acquire-lock');
+      runtime.seedRun(sourceRunId, [
+        ...reportsThrough(sourceRunId, 'draft', 'ingest'),
+        makeReport({
+          runId: sourceRunId,
+          preset: 'draft',
+          stageId: 'narration',
+          fingerprint: 'stale-narration',
+        }),
+      ]);
+      await runtime.runStore.publishCurrent(
+        'demo',
+        currentPointer(sourceRunId, 'narration', {preset: 'draft'}),
+      );
+      return runtime.lease;
+    });
+
+    await expect(runExecutionPlan(executionInput(plan, project), runtime.dependencies))
+      .rejects.toMatchObject({code: 'PLAN_STALE', stageId: 'narration'});
+
+    expect(runtime.stageCalls).toEqual([]);
+    expect(runtime.reportStore.writeStage).not.toHaveBeenCalled();
+  });
+
+  it('rejects a noncontiguous report completed while waiting for the lock', async () => {
+    const sourceRunId = 'run-resume';
+    const project = memoryProject();
+    const runtime = createMemoryRuntime({
+      current: currentPointer(sourceRunId, 'ingest'),
+    });
+    runtime.seedRun(sourceRunId, reportsThrough(sourceRunId, 'draft', 'ingest'));
+    const plan = await buildExecutionPlan(planningContext(runtime, project), {
+      preset: 'draft',
+      to: 'compile',
+      resume: true,
+    });
+    expect(plan.items.slice(-2)).toMatchObject([
+      {stageId: 'narration', action: 'resume'},
+      {stageId: 'compile', action: 'run'},
+    ]);
+    runtime.acquireProjectLock.mockImplementationOnce(async () => {
+      runtime.events.push('acquire-lock');
+      runtime.seedRun(sourceRunId, [
+        ...reportsThrough(sourceRunId, 'draft', 'ingest'),
+        makeReport({
+          runId: sourceRunId,
+          preset: 'draft',
+          stageId: 'compile',
+        }),
+      ]);
+      return runtime.lease;
+    });
+
+    await expect(runExecutionPlan(executionInput(plan, project), runtime.dependencies))
+      .rejects.toMatchObject({code: 'PLAN_STALE', stageId: 'compile'});
+
+    expect(runtime.stageCalls).toEqual([]);
+    expect(runtime.reportStore.writeStage).not.toHaveBeenCalled();
   });
 
   it('rejects Output artifacts in a non-Release cached Stage before Run writes', async () => {

@@ -1,12 +1,15 @@
 import {randomUUID} from 'node:crypto';
+import path from 'node:path';
 import {z} from 'zod';
 import {StableIdSchema} from '../domain/schema-primitives';
 import {
   ensureRunDirectory,
   getRunDirectoryIdentity,
+  linkRunFile,
   openExistingRunFileForRead,
   openNewRunFileForWrite,
   unlinkRunFile,
+  type AppDirectoryLinkedFileAuthority,
   type AppDirectoryReadFileAuthority,
   type AppDirectoryWriteFileAuthority,
   type RunDirectoryScope,
@@ -311,39 +314,54 @@ const requireMatchingRunIdentity = (
 const serializeReport = (report: StageReport): string =>
   `${JSON.stringify(report, null, 2)}\n`;
 
-const rollbackReportWrite = async (
+const rollbackReportWrite = async (input: {
   target: AppDirectoryWriteFileAuthority,
-  relativePath: string,
-  primaryError: unknown,
-): Promise<never> => {
+  finalRelativePath: string;
+  linkAuthority?: AppDirectoryLinkedFileAuthority;
+  primaryError: unknown;
+}): Promise<never> => {
   const cleanupErrors: unknown[] = [];
+  if (input.linkAuthority !== undefined) {
+    try {
+      await input.linkAuthority.unlink();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
   try {
-    await target.unlink();
+    await input.target.unlink();
   } catch (error) {
     cleanupErrors.push(error);
   }
   try {
-    await target.syncParent();
+    await input.target.syncParent();
   } catch (error) {
     cleanupErrors.push(error);
   }
+  if (input.linkAuthority !== undefined) {
+    try {
+      await input.linkAuthority.close();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
   try {
-    await target.close();
+    await input.target.close();
   } catch (error) {
     cleanupErrors.push(error);
   }
   if (cleanupErrors.length > 0) {
     throw new AggregateError(
-      [primaryError, ...cleanupErrors],
-      `Stage report rollback failed for ${relativePath}`,
-      {cause: primaryError},
+      [input.primaryError, ...cleanupErrors],
+      `Stage report rollback failed for ${input.finalRelativePath}`,
+      {cause: input.primaryError},
     );
   }
-  throw primaryError;
+  throw input.primaryError;
 };
 
-const closeCommittedReportBestEffort = async (
-  target: AppDirectoryWriteFileAuthority,
+const closeReportBestEffort = async (
+  target: {close(): Promise<void>},
 ): Promise<void> => {
   for (let attempt = 0; attempt < 4; attempt += 1) {
     try {
@@ -353,29 +371,71 @@ const closeCommittedReportBestEffort = async (
   }
 };
 
+const cleanupCommittedReportTempBestEffort = async (
+  run: RunDirectoryScope,
+  target: AppDirectoryWriteFileAuthority,
+  linkAuthority: AppDirectoryLinkedFileAuthority,
+  tempRelativePath: string,
+): Promise<void> => {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      await unlinkRunFile(run, tempRelativePath);
+      break;
+    } catch {}
+  }
+  await closeReportBestEffort(linkAuthority);
+  await closeReportBestEffort(target);
+};
+
+const reportTempPath = (relativePath: string): string => {
+  const directory = path.posix.dirname(relativePath);
+  const basename = path.posix.basename(relativePath);
+  return path.posix.join(
+    directory,
+    `.${basename}.${randomUUID()}.tmp`,
+  );
+};
+
 const writeImmutableReport = async (
   run: RunDirectoryScope,
   relativePath: string,
   report: StageReport,
 ): Promise<void> => {
+  const tempRelativePath = reportTempPath(relativePath);
   let target: AppDirectoryWriteFileAuthority | undefined;
+  let linkAuthority: AppDirectoryLinkedFileAuthority | undefined;
   let committed = false;
   try {
-    target = await openNewRunFileForWrite(run, relativePath);
+    target = await openNewRunFileForWrite(run, tempRelativePath);
     await target.handle.writeFile(serializeReport(report));
     await target.syncAndSeal();
     await target.revalidate();
-    await target.syncParent();
-    await target.revalidate();
+    linkAuthority = await linkRunFile(
+      run,
+      tempRelativePath,
+      relativePath,
+      target,
+    );
+    await linkAuthority.syncParent();
     committed = true;
   } catch (error) {
     if (target !== undefined && !committed) {
-      return await rollbackReportWrite(target, relativePath, error);
+      return await rollbackReportWrite({
+        target,
+        finalRelativePath: relativePath,
+        ...(linkAuthority === undefined ? {} : {linkAuthority}),
+        primaryError: error,
+      });
     }
     throw error;
   }
-  if (target !== undefined && committed) {
-    await closeCommittedReportBestEffort(target);
+  if (target !== undefined && linkAuthority !== undefined && committed) {
+    await cleanupCommittedReportTempBestEffort(
+      run,
+      target,
+      linkAuthority,
+      tempRelativePath,
+    );
   }
 };
 

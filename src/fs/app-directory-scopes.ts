@@ -92,6 +92,12 @@ export interface AppDirectoryWriteFileAuthority {
   close(): Promise<void>;
 }
 
+export interface AppDirectoryLinkedFileAuthority {
+  syncParent(): Promise<void>;
+  unlink(): Promise<void>;
+  close(): Promise<void>;
+}
+
 const workStates = new WeakMap<WorkDirectoryScope, ScopeState>();
 const runStates = new WeakMap<RunDirectoryScope, RunScopeState>();
 const outputStates = new WeakMap<OutputDirectoryScope, ScopeState>();
@@ -1616,7 +1622,14 @@ const linkScopedFile = async (
     if ((await inspectAnchoredEntry(source, sourceRelativePath)).kind !== 'file') {
       throw securityError(`link source must be a regular file: ${sourceRelativePath}`);
     }
-    if ((await inspectAnchoredEntry(target, targetRelativePath)).kind !== 'missing') {
+    const targetKind = (await inspectAnchoredEntry(target, targetRelativePath)).kind;
+    if (targetKind === 'file') {
+      throw Object.assign(
+        new Error(`app-owned link target already exists: ${targetRelativePath}`),
+        {code: 'EEXIST'},
+      );
+    }
+    if (targetKind !== 'missing') {
       throw securityError(`link target must be absent: ${targetRelativePath}`);
     }
     await assertScopedPathAnchorStable(state, source, sourceRelativePath);
@@ -1636,6 +1649,134 @@ const linkScopedFile = async (
   }
 };
 
+const linkScopedFileAuthority = async (
+  state: ScopeState,
+  sourceRelativePath: string,
+  targetRelativePath: string,
+  sourceAuthority: AppDirectoryWriteFileAuthority,
+): Promise<AppDirectoryLinkedFileAuthority> => {
+  const source = await openScopedPathAnchor(state, sourceRelativePath);
+  let target: ScopedPathAnchor | undefined;
+  let linked = false;
+  let transferred = false;
+  try {
+    target = await openScopedPathAnchor(state, targetRelativePath);
+    if (!identityMatchesStats(source.parent.identity, await target.parent.handle.stat({
+      bigint: true,
+    }))) {
+      throw authorityError('hard-link source and target must share a held parent directory');
+    }
+    const heldBeforeLink = await sourceAuthority.handle.stat({bigint: true});
+    const sourceEntry = await inspectAnchoredEntry(source, sourceRelativePath);
+    if (
+      sourceEntry.kind !== 'file'
+      || sourceEntry.stats === undefined
+      || !regularFileIdentityMatches(
+        sourceEntry.stats,
+        regularFileIdentity(heldBeforeLink),
+      )
+    ) {
+      throw authorityError(`link source authority changed: ${sourceRelativePath}`);
+    }
+    const targetKind = (await inspectAnchoredEntry(target, targetRelativePath)).kind;
+    if (targetKind === 'file') {
+      throw Object.assign(
+        new Error(`app-owned link target already exists: ${targetRelativePath}`),
+        {code: 'EEXIST'},
+      );
+    }
+    if (targetKind !== 'missing') {
+      throw securityError(`link target must be absent: ${targetRelativePath}`);
+    }
+    await assertScopedPathAnchorStable(state, source, sourceRelativePath);
+    await assertScopedPathAnchorStable(state, target, targetRelativePath);
+    await link(
+      path.join(source.parent.volumePath, source.basename),
+      path.join(target.parent.volumePath, target.basename),
+    );
+    linked = true;
+    const heldAfterLink = await sourceAuthority.handle.stat({bigint: true});
+    const linkedIdentity = regularFileIdentity(heldAfterLink);
+    const retainedSource = source;
+    const retainedTarget = target;
+    const assertLinkedTarget = async (): Promise<void> => {
+      const current = await inspectAnchoredEntry(retainedTarget, targetRelativePath);
+      if (
+        current.kind !== 'file'
+        || current.stats === undefined
+        || !regularFileIdentityMatches(current.stats, linkedIdentity)
+      ) {
+        throw authorityError(`linked app-owned target changed: ${targetRelativePath}`);
+      }
+    };
+    await assertLinkedTarget();
+
+    let closed = false;
+    let unlinked = false;
+    const result: AppDirectoryLinkedFileAuthority = {
+      syncParent: async () => {
+        if (closed) throw new TypeError('linked file authority is closed');
+        await assertLinkedTarget();
+        await syncHeldDirectoryAnchor(retainedTarget.parent, targetRelativePath);
+        await assertLinkedTarget();
+      },
+      unlink: async () => {
+        if (closed) throw new TypeError('linked file authority is closed');
+        if (unlinked) return;
+        await assertLinkedTarget();
+        await unlink(path.join(
+          retainedTarget.parent.volumePath,
+          retainedTarget.basename,
+        ));
+        if ((await inspectAnchoredEntry(retainedTarget, targetRelativePath)).kind !== 'missing') {
+          throw authorityError(`linked app-owned target remains after cleanup: ${targetRelativePath}`);
+        }
+        unlinked = true;
+      },
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        await closeDirectoryAnchors([
+          retainedSource.parent,
+          retainedTarget.parent,
+        ]);
+      },
+    };
+    target = undefined;
+    transferred = true;
+    return result;
+  } catch (error) {
+    const cleanupErrors: unknown[] = [];
+    if (linked && target !== undefined) {
+      try {
+        await unlink(path.join(target.parent.volumePath, target.basename));
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+      try {
+        await syncHeldDirectoryAnchor(target.parent, targetRelativePath);
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...cleanupErrors],
+        `failed to publish scoped hard link: ${targetRelativePath}`,
+        {cause: error},
+      );
+    }
+    throw error;
+  } finally {
+    if (!transferred) {
+      const anchors = [source.parent, target?.parent].filter(
+        (anchor): anchor is DirectoryAnchor => anchor !== undefined,
+      );
+      await closeDirectoryAnchors(anchors).catch(() => undefined);
+    }
+  }
+};
+
 const syncScopedDirectory = async (
   state: ScopeState,
   relativePath = '.',
@@ -1651,10 +1792,17 @@ const syncScopedDirectory = async (
   if (stats.isSymbolicLink() || !stats.isDirectory()) {
     throw securityError(`directory sync target is not plain: ${relativePath}`);
   }
+  const identity = identityFromStats(target, stats);
   const handle = await open(target, constants.O_RDONLY | O_NOFOLLOW_ANY);
   let syncError: unknown;
   try {
     await handle.sync();
+    const held = await handle.stat({bigint: true});
+    if (!held.isDirectory() || !identityMatchesStats(identity, held)) {
+      throw authorityError(`directory sync authority changed: ${relativePath}`);
+    }
+    await assertScopeStable(state, relativePath);
+    await assertDirectoryIdentityStable(identity, relativePath);
   } catch (error) {
     syncError = error;
   }
@@ -1743,6 +1891,18 @@ const linkWorkFile = async (
   stateFor(workStates, scope, 'WorkDirectoryScope'),
   sourceRelativePath,
   targetRelativePath,
+);
+
+export const linkRunFile = async (
+  scope: RunDirectoryScope,
+  sourceRelativePath: string,
+  targetRelativePath: string,
+  sourceAuthority: AppDirectoryWriteFileAuthority,
+): Promise<AppDirectoryLinkedFileAuthority> => await linkScopedFileAuthority(
+  stateFor(runStates, scope, 'RunDirectoryScope'),
+  sourceRelativePath,
+  targetRelativePath,
+  sourceAuthority,
 );
 
 const linkOutputFile = async (

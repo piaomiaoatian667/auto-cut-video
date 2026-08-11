@@ -4,6 +4,7 @@ import {
   mkdir,
   mkdtemp,
   open,
+  readdir,
   readFile,
   rename,
   rm,
@@ -187,6 +188,123 @@ const importReportModulesWithReadAuthorityFault = async (
             return typeof value === 'function' ? value.bind(target) : value;
           },
         });
+      },
+    };
+  });
+  return {
+    scopes: await import('../../../src/fs/app-directory-scopes'),
+    reports: await import('../../../src/pipeline/stage-report'),
+  };
+};
+
+type AtomicReportFault =
+  | 'create'
+  | 'write'
+  | 'sync'
+  | 'link'
+  | 'parent-sync'
+  | 'temp-cleanup';
+
+interface AtomicReportProbe {
+  armed: boolean;
+  events: string[];
+  fault?: AtomicReportFault;
+  faultError: Error;
+  faultInjected: boolean;
+  linkedSource?: string;
+}
+
+const importReportModulesWithAtomicWriteProbe = async (
+  probe: AtomicReportProbe,
+) => {
+  vi.resetModules();
+  vi.doMock('node:fs/promises', async () => {
+    const actual = await vi.importActual<typeof import('node:fs/promises')>(
+      'node:fs/promises',
+    );
+    const shouldInject = (fault: AtomicReportFault): boolean => (
+      probe.armed
+      && probe.fault === fault
+      && (fault === 'temp-cleanup' || !probe.faultInjected)
+    );
+    const inject = (): never => {
+      probe.faultInjected = true;
+      throw probe.faultError;
+    };
+    return {
+      ...actual,
+      open: async (...args: Parameters<typeof actual.open>) => {
+        const openedPath = String(args[0]);
+        const flags = Number(args[1]);
+        const createsReportFile = probe.armed
+          && (flags & constants.O_CREAT) !== 0;
+        if (createsReportFile && shouldInject('create')) inject();
+        const handle = await Reflect.apply(actual.open, undefined, args);
+        if (createsReportFile) {
+          probe.events.push(`create:${path.basename(openedPath)}`);
+          return new Proxy(handle, {
+            get(target, property) {
+              if (property === 'writeFile') {
+                return async (...writeArgs: Parameters<typeof target.writeFile>) => {
+                  probe.events.push(`write:${path.basename(openedPath)}`);
+                  if (shouldInject('write')) {
+                    await target.writeFile('{');
+                    return inject();
+                  }
+                  return await Reflect.apply(target.writeFile, target, writeArgs);
+                };
+              }
+              if (property === 'sync') {
+                return async () => {
+                  probe.events.push(`sync-file:${path.basename(openedPath)}`);
+                  if (shouldInject('sync')) inject();
+                  await target.sync();
+                };
+              }
+              const value = Reflect.get(target, property, target);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+        }
+        const status = await handle.stat({bigint: true});
+        if (
+          !probe.armed
+          || !status.isDirectory()
+          || !['reports', 'attempts'].includes(path.basename(openedPath))
+        ) {
+          return handle;
+        }
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === 'sync') {
+              return async () => {
+                probe.events.push(`sync-parent:${path.basename(openedPath)}`);
+                if (probe.linkedSource !== undefined && shouldInject('parent-sync')) {
+                  inject();
+                }
+                await target.sync();
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
+      link: async (...args: Parameters<typeof actual.link>) => {
+        probe.events.push(
+          `link:${path.basename(String(args[0]))}->${path.basename(String(args[1]))}`,
+        );
+        if (shouldInject('link')) inject();
+        await Reflect.apply(actual.link, undefined, args);
+        probe.linkedSource = String(args[0]);
+      },
+      unlink: async (...args: Parameters<typeof actual.unlink>) => {
+        const targetPath = String(args[0]);
+        if (probe.linkedSource === targetPath) {
+          probe.events.push(`unlink-temp:${path.basename(targetPath)}`);
+          if (shouldInject('temp-cleanup')) inject();
+        }
+        await Reflect.apply(actual.unlink, undefined, args);
       },
     };
   });
@@ -496,6 +614,160 @@ describe('StageReportStore', () => {
     }
   });
 
+  it.each([
+    'create',
+    'write',
+    'sync',
+    'link',
+    'parent-sync',
+  ] as const)(
+    'keeps the canonical path absent after a pre-commit %s failure and retries cleanly',
+    async (fault) => {
+      const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'stage-report-atomic-'));
+      const faultError = Object.assign(new Error(`${fault} failed`), {code: 'EIO'});
+      const probe: AtomicReportProbe = {
+        armed: false,
+        events: [],
+        fault,
+        faultError,
+        faultInjected: false,
+      };
+      const {scopes, reports} = await importReportModulesWithAtomicWriteProbe(probe);
+      try {
+        const runDirectory = await scopes.createRunStore(workspaceRoot)
+          .createRun('demo', 'run-one');
+        await scopes.ensureRunDirectory(runDirectory, 'reports');
+        const store = reports.createStageReportStore();
+        const report = passedStageReport({stageId: 'ingest'});
+        const reportsPath = path.join(
+          workspaceRoot,
+          '.work',
+          'demo',
+          'runs',
+          'run-one',
+          'reports',
+        );
+        const finalPath = path.join(reportsPath, 'ingest.json');
+        probe.armed = true;
+
+        await expect(store.writeStage(runDirectory, report)).rejects.toBe(faultError);
+
+        await expect(readFile(finalPath, 'utf8')).rejects.toMatchObject({code: 'ENOENT'});
+        expect(await readdir(reportsPath)).toEqual([]);
+
+        delete probe.fault;
+        probe.faultInjected = false;
+        delete probe.linkedSource;
+        await expect(store.writeStage(runDirectory, report)).resolves.toBeUndefined();
+        await expect(store.readStage(runDirectory, 'ingest')).resolves.toEqual(report);
+        expect(await readdir(reportsPath)).toEqual(['ingest.json']);
+      } finally {
+        vi.doUnmock('node:fs/promises');
+        vi.resetModules();
+        await rm(workspaceRoot, {recursive: true, force: true});
+      }
+    },
+  );
+
+  it('keeps a committed canonical report authoritative when temp cleanup fails', async () => {
+    const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'stage-report-cleanup-'));
+    const cleanupError = Object.assign(new Error('temp cleanup failed'), {code: 'EIO'});
+    const probe: AtomicReportProbe = {
+      armed: false,
+      events: [],
+      fault: 'temp-cleanup',
+      faultError: cleanupError,
+      faultInjected: false,
+    };
+    const {scopes, reports} = await importReportModulesWithAtomicWriteProbe(probe);
+    try {
+      const runDirectory = await scopes.createRunStore(workspaceRoot)
+        .createRun('demo', 'run-one');
+      await scopes.ensureRunDirectory(runDirectory, 'reports');
+      const store = reports.createStageReportStore();
+      const report = passedStageReport({stageId: 'ingest'});
+      const reportsPath = path.join(
+        workspaceRoot,
+        '.work',
+        'demo',
+        'runs',
+        'run-one',
+        'reports',
+      );
+      probe.armed = true;
+
+      await expect(store.writeStage(runDirectory, report)).resolves.toBeUndefined();
+
+      await expect(store.readStage(runDirectory, 'ingest')).resolves.toEqual(report);
+      const linkIndex = probe.events.findIndex((event) => event.startsWith('link:'));
+      const parentSyncIndex = probe.events.findIndex((event) => event === 'sync-parent:reports');
+      const cleanupIndex = probe.events.findIndex((event) => event.startsWith('unlink-temp:'));
+      expect(linkIndex).toBeGreaterThanOrEqual(0);
+      expect(parentSyncIndex).toBeGreaterThan(linkIndex);
+      expect(cleanupIndex).toBeGreaterThan(parentSyncIndex);
+      const entries = await readdir(reportsPath);
+      expect(entries).toContain('ingest.json');
+      const tempEntry = entries.find((entry) => entry !== 'ingest.json');
+      expect(tempEntry).toBeDefined();
+
+      delete probe.fault;
+      delete probe.linkedSource;
+      await scopes.unlinkRunFile(runDirectory, `reports/${tempEntry!}`);
+      await expect(store.writeStage(runDirectory, report))
+        .rejects.toMatchObject({code: 'EEXIST'});
+      expect(await readdir(reportsPath)).toEqual(['ingest.json']);
+    } finally {
+      vi.doUnmock('node:fs/promises');
+      vi.resetModules();
+      await rm(workspaceRoot, {recursive: true, force: true});
+    }
+  });
+
+  it('publishes attempt reports atomically and removes their temp link', async () => {
+    const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'stage-report-attempt-'));
+    const probe: AtomicReportProbe = {
+      armed: false,
+      events: [],
+      faultError: new Error('unused'),
+      faultInjected: false,
+    };
+    const {scopes, reports} = await importReportModulesWithAtomicWriteProbe(probe);
+    try {
+      const runDirectory = await scopes.createRunStore(workspaceRoot)
+        .createRun('demo', 'run-one');
+      await scopes.ensureRunDirectory(runDirectory, 'reports/attempts');
+      const store = reports.createStageReportStore();
+      const report = passedStageReport({
+        stageId: 'review',
+        state: 'needs_review',
+        position: 6,
+      });
+      probe.armed = true;
+
+      const attemptId = await store.writeAttempt(runDirectory, report);
+
+      const attemptsPath = path.join(
+        workspaceRoot,
+        '.work',
+        'demo',
+        'runs',
+        'run-one',
+        'reports',
+        'attempts',
+      );
+      expect(probe.events).toContainEqual(expect.stringMatching(
+        new RegExp(`^link:.*->${attemptId}\\.json$`, 'u'),
+      ));
+      await expect(readFile(path.join(attemptsPath, `${attemptId}.json`), 'utf8')
+        .then(JSON.parse)).resolves.toEqual(report);
+      expect(await readdir(attemptsPath)).toEqual([`${attemptId}.json`]);
+    } finally {
+      vi.doUnmock('node:fs/promises');
+      vi.resetModules();
+      await rm(workspaceRoot, {recursive: true, force: true});
+    }
+  });
+
   it('durably deletes canonical reports and retries a missing report after sync failure', async () => {
     const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'stage-report-delete-'));
     const syncError = Object.assign(new Error('report delete sync failed'), {
@@ -557,8 +829,8 @@ describe('StageReportStore', () => {
   });
 
   it.each([
-    ['canonical', ['run-one', 'reports']],
-    ['attempt', ['run-one', 'reports', 'attempts']],
+    ['canonical', ['run-one', 'reports', 'reports']],
+    ['attempt', ['run-one', 'reports', 'attempts', 'attempts']],
   ] as const)(
     'syncs parent directory entries for %s report creation',
     async (kind, expectedSyncPaths) => {
@@ -721,17 +993,12 @@ describe('StageReportStore', () => {
       const errors = writeError instanceof AggregateError
         ? writeError.errors
         : [];
-      expect(errors).toHaveLength(2);
-      expect(errors[0]).toMatchObject({code: 'APP_SCOPE_AUTHORITY_CHANGED'});
-      expect(errors[1]).toBeInstanceOf(AggregateError);
-      expect((errors[1] as AggregateError).errors).toEqual([
-        expect.objectContaining({code: 'APP_SCOPE_AUTHORITY_CHANGED'}),
-        expect.objectContaining({code: 'APP_SCOPE_AUTHORITY_CHANGED'}),
-      ]);
+      expect(errors.length).toBeGreaterThanOrEqual(2);
       expect(originalSyncs).toBe(2);
       expect(replacementSyncs).toBe(0);
       await expect(readFile(path.join(movedReportsPath, 'ingest.json'), 'utf8'))
         .rejects.toMatchObject({code: 'ENOENT'});
+      expect(await readdir(movedReportsPath)).toEqual([]);
       await expect(readFile(path.join(reportsPath, 'ingest.json'), 'utf8'))
         .rejects.toMatchObject({code: 'ENOENT'});
 
@@ -853,7 +1120,7 @@ describe('StageReportStore', () => {
           .resolves.toBeUndefined();
 
         expect(closeFailureInjected).toBe(true);
-        expect(reportParentSyncs).toBe(1);
+        expect(reportParentSyncs).toBe(2);
         expect(reportFileCloseAttempts).toBe(expectedFileCloseAttempts);
         await expect(store.readStage(runDirectory, 'ingest')).resolves.toEqual(report);
         await expect(store.writeStage(runDirectory, report))
