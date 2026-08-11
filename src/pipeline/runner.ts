@@ -35,6 +35,7 @@ import {
 } from './stage';
 import {parsePreflightAdapterOutput} from './stage-adapters';
 import {
+  StageReportOutcomeError,
   StageReportSchema,
   type StageReport,
   type StageReportStore,
@@ -118,6 +119,15 @@ const isOrdinaryReportMiss = (error: unknown): boolean => (
     )
   )
 );
+
+const isStageReportOutcomeError = (
+  error: unknown,
+): error is StageReportOutcomeError => error instanceof StageReportOutcomeError
+  || (
+    error instanceof Error
+    && 'code' in error
+    && error.code === 'PIPELINE_REPORT_OUTCOME_UNKNOWN'
+  );
 
 const planStale = (message: string, stageId?: StageId): never => {
   throw new ExecutionPlanError('PLAN_STALE', message, stageId);
@@ -520,7 +530,12 @@ const materializeCachedStage = async (
     await publishWorkProgress(plan, runId, report, 'passed', dependencies);
     return report;
   } catch (error) {
-    if (error instanceof PipelinePointerOutcomeError) throw error;
+    if (
+      error instanceof PipelinePointerOutcomeError
+      || isStageReportOutcomeError(error)
+    ) {
+      throw error;
+    }
     return await rollbackStageProgress({
       primaryError: error,
       reportStore: dependencies.reportStore,
@@ -971,7 +986,12 @@ export async function runExecutionPlan(
             dependencies,
           );
         } catch (error) {
-          if (error instanceof PipelinePointerOutcomeError) throw error;
+          if (
+            error instanceof PipelinePointerOutcomeError
+            || isStageReportOutcomeError(error)
+          ) {
+            throw error;
+          }
           return await rollbackStageProgress({
             primaryError: error,
             reportStore: dependencies.reportStore,

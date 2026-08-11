@@ -212,6 +212,9 @@ interface AtomicReportProbe {
   faultError: Error;
   faultInjected: boolean;
   linkedSource?: string;
+  linkedTarget?: string;
+  rollbackUnlinkError?: Error;
+  rollbackUnlinkInjected?: boolean;
 }
 
 const importReportModulesWithAtomicWriteProbe = async (
@@ -297,9 +300,20 @@ const importReportModulesWithAtomicWriteProbe = async (
         if (shouldInject('link')) inject();
         await Reflect.apply(actual.link, undefined, args);
         probe.linkedSource = String(args[0]);
+        probe.linkedTarget = String(args[1]);
       },
       unlink: async (...args: Parameters<typeof actual.unlink>) => {
         const targetPath = String(args[0]);
+        if (probe.linkedTarget === targetPath) {
+          probe.events.push(`unlink-final:${path.basename(targetPath)}`);
+          if (
+            probe.rollbackUnlinkError !== undefined
+            && probe.rollbackUnlinkInjected !== true
+          ) {
+            probe.rollbackUnlinkInjected = true;
+            throw probe.rollbackUnlinkError;
+          }
+        }
         if (probe.linkedSource === targetPath) {
           probe.events.push(`unlink-temp:${path.basename(targetPath)}`);
           if (shouldInject('temp-cleanup')) inject();
@@ -669,6 +683,63 @@ describe('StageReportStore', () => {
     },
   );
 
+  it('reports an unknown outcome when a linked canonical report cannot be rolled back', async () => {
+    const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'stage-report-unknown-'));
+    const parentSyncError = Object.assign(new Error('report parent sync failed'), {
+      code: 'EIO',
+    });
+    const rollbackUnlinkError = Object.assign(new Error('report rollback unlink failed'), {
+      code: 'EIO',
+    });
+    const probe: AtomicReportProbe = {
+      armed: false,
+      events: [],
+      fault: 'parent-sync',
+      faultError: parentSyncError,
+      faultInjected: false,
+      rollbackUnlinkError,
+    };
+    const {scopes, reports} = await importReportModulesWithAtomicWriteProbe(probe);
+    try {
+      const runDirectory = await scopes.createRunStore(workspaceRoot)
+        .createRun('demo', 'run-one');
+      await scopes.ensureRunDirectory(runDirectory, 'reports');
+      const store = reports.createStageReportStore();
+      const report = passedStageReport({stageId: 'ingest'});
+      probe.armed = true;
+
+      let writeError: unknown;
+      try {
+        await store.writeStage(runDirectory, report);
+      } catch (error) {
+        writeError = error;
+      }
+
+      expect(writeError).toMatchObject({
+        name: 'StageReportOutcomeError',
+        code: 'PIPELINE_REPORT_OUTCOME_UNKNOWN',
+        cause: parentSyncError,
+      });
+      expect(writeError).toBeInstanceOf(AggregateError);
+      expect((writeError as AggregateError).errors).toEqual(expect.arrayContaining([
+        parentSyncError,
+        rollbackUnlinkError,
+      ]));
+      await expect(store.readStage(runDirectory, 'ingest')).resolves.toEqual(report);
+      await expect(store.writeStage(runDirectory, report))
+        .rejects.toMatchObject({code: 'EEXIST'});
+      expect(probe.events).toEqual(expect.arrayContaining([
+        expect.stringMatching(/^link:.*->ingest\.json$/u),
+        'sync-parent:reports',
+        'unlink-final:ingest.json',
+      ]));
+    } finally {
+      vi.doUnmock('node:fs/promises');
+      vi.resetModules();
+      await rm(workspaceRoot, {recursive: true, force: true});
+    }
+  });
+
   it('keeps a committed canonical report authoritative when temp cleanup fails', async () => {
     const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'stage-report-cleanup-'));
     const cleanupError = Object.assign(new Error('temp cleanup failed'), {code: 'EIO'});
@@ -913,6 +984,11 @@ describe('StageReportStore', () => {
         }
 
         if (failRollbackSync) {
+          expect(writeError).toMatchObject({
+            name: 'StageReportOutcomeError',
+            code: 'PIPELINE_REPORT_OUTCOME_UNKNOWN',
+            cause: createSyncError,
+          });
           expect(writeError).toBeInstanceOf(AggregateError);
           expect((writeError as AggregateError).errors).toEqual([
             createSyncError,

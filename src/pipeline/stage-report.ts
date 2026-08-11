@@ -292,6 +292,23 @@ export class StageReportValidationError extends TypeError {
   }
 }
 
+export class StageReportOutcomeError extends AggregateError {
+  readonly code = 'PIPELINE_REPORT_OUTCOME_UNKNOWN';
+
+  constructor(
+    readonly relativePath: string,
+    primaryError: unknown,
+    rollbackErrors: readonly unknown[],
+  ) {
+    super(
+      [primaryError, ...rollbackErrors],
+      `Stage report publication outcome could not be determined for ${relativePath}`,
+      {cause: primaryError},
+    );
+    this.name = 'StageReportOutcomeError';
+  }
+}
+
 const isMissingFile = (error: unknown): error is NodeJS.ErrnoException =>
   error instanceof Error && 'code' in error && error.code === 'ENOENT';
 
@@ -321,9 +338,12 @@ const rollbackReportWrite = async (input: {
   primaryError: unknown;
 }): Promise<never> => {
   const cleanupErrors: unknown[] = [];
+  let finalRemovalConfirmed = input.linkAuthority === undefined;
+  let rollbackSyncConfirmed = false;
   if (input.linkAuthority !== undefined) {
     try {
       await input.linkAuthority.unlink();
+      finalRemovalConfirmed = true;
     } catch (error) {
       cleanupErrors.push(error);
     }
@@ -335,6 +355,7 @@ const rollbackReportWrite = async (input: {
   }
   try {
     await input.target.syncParent();
+    rollbackSyncConfirmed = true;
   } catch (error) {
     cleanupErrors.push(error);
   }
@@ -349,6 +370,16 @@ const rollbackReportWrite = async (input: {
     await input.target.close();
   } catch (error) {
     cleanupErrors.push(error);
+  }
+  if (
+    input.linkAuthority !== undefined
+    && (!finalRemovalConfirmed || !rollbackSyncConfirmed)
+  ) {
+    throw new StageReportOutcomeError(
+      input.finalRelativePath,
+      input.primaryError,
+      cleanupErrors,
+    );
   }
   if (cleanupErrors.length > 0) {
     throw new AggregateError(
