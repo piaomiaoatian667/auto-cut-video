@@ -2,10 +2,12 @@ import {describe, expect, it} from 'vitest';
 import {
   assertMoovBeforeMdat,
   parseTopLevelMp4Atoms,
+  validateReleaseVerificationReport,
   validateSrtWithinDuration,
   validateReleaseProbe,
 } from '../../../src/media/release-verify';
 import type {MediaProbe} from '../../../src/media/ffprobe';
+import type {ReleaseVerificationReport} from '../../../src/media/release-verify';
 
 const atom = (type: string, payloadBytes = 0): Buffer => {
   const buffer = Buffer.alloc(8 + payloadBytes);
@@ -46,6 +48,17 @@ const releaseProbe = (overrides: Partial<MediaProbe> = {}): MediaProbe => ({
     durationMs: 1025,
   }],
   ...overrides,
+});
+
+const releaseVerificationReport = (): ReleaseVerificationReport => ({
+  sha256: `sha256:${'a'.repeat(64)}`,
+  probe: releaseProbe(),
+  atoms: [
+    {type: 'ftyp', offset: 0, size: 8},
+    {type: 'moov', offset: 8, size: 8},
+    {type: 'mdat', offset: 16, size: 8},
+  ],
+  moovBeforeMdat: true,
 });
 
 describe('parseTopLevelMp4Atoms', () => {
@@ -108,5 +121,49 @@ describe('validateReleaseProbe', () => {
 
   it('rejects excessive A\/V duration difference', () => {
     expect(() => validateReleaseProbe(releaseProbe({audioStreams: [{...releaseProbe().audioStreams[0]!, durationMs: 1200}]}))).toThrow(/RELEASE_DURATION_MISMATCH/);
+  });
+});
+
+describe('validateReleaseVerificationReport', () => {
+  const validSrt = '1\n00:00:00,000 --> 00:00:01,000\n介绍\n';
+
+  it('accepts a semantically valid fixed-profile report', () => {
+    expect(() => validateReleaseVerificationReport(
+      releaseVerificationReport(),
+      validSrt,
+    )).not.toThrow();
+  });
+
+  it.each([
+    ['zero streams', (report: ReleaseVerificationReport) => {
+      report.probe.videoStreams = [];
+      report.probe.audioStreams = [];
+    }],
+    ['wrong fixed profile', (report: ReleaseVerificationReport) => {
+      report.probe.videoStreams[0]!.width = 1280;
+    }],
+    ['empty atoms', (report: ReleaseVerificationReport) => {
+      report.atoms = [];
+    }],
+    ['moov after mdat', (report: ReleaseVerificationReport) => {
+      report.atoms = [
+        {type: 'ftyp', offset: 0, size: 8},
+        {type: 'mdat', offset: 8, size: 8},
+        {type: 'moov', offset: 16, size: 8},
+      ];
+    }],
+  ] as const)('rejects %s', (_label, mutateReport) => {
+    const report = releaseVerificationReport();
+    mutateReport(report);
+
+    expect(() => validateReleaseVerificationReport(report, validSrt))
+      .toThrow(/RELEASE_(?:DECODE_FAILED|DURATION_MISMATCH)/u);
+  });
+
+  it('rejects subtitles beyond the reported duration', () => {
+    expect(() => validateReleaseVerificationReport(
+      releaseVerificationReport(),
+      '1\n00:00:00,000 --> 00:00:02,000\n介绍\n',
+    )).toThrow(/RELEASE_DECODE_FAILED/u);
   });
 });

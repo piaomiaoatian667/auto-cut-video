@@ -94,6 +94,7 @@ export interface ReleaseOutputVerificationInput {
   relativePath: string;
   ffmpegExecutable: string;
   ffprobeExecutable: string;
+  srt: string;
   runProcess?: ReleaseVerifyRunner;
   signal?: AbortSignal;
 }
@@ -153,7 +154,9 @@ export const assertMoovBeforeMdat = (atoms: readonly Mp4Atom[]): void => {
   }
 };
 
-export const validateReleaseProbe = (probe: MediaProbe): void => {
+export const validateReleaseProbe = (
+  probe: MediaProbe | ReleaseVerificationReport['probe'],
+): void => {
   if (probe.videoStreams.length !== 1 || probe.audioStreams.length !== 1) {
     failDecode('release must contain exactly one video stream and one audio stream');
   }
@@ -218,6 +221,21 @@ export const validateSrtWithinDuration = (srt: string, durationMs: number): void
   }
 };
 
+export const validateReleaseVerificationReport = (
+  report: ReleaseVerificationReport,
+  srt: string,
+): void => {
+  validateReleaseProbe(report.probe);
+  const moov = report.atoms.find((atom) => atom.type === 'moov');
+  const mdat = report.atoms.find((atom) => atom.type === 'mdat');
+  assertMoovBeforeMdat(report.atoms);
+  const moovBeforeMdat = moov !== undefined && mdat !== undefined && moov.offset < mdat.offset;
+  if (report.moovBeforeMdat !== moovBeforeMdat) {
+    failDecode('release MP4 atom ordering does not match the verification report');
+  }
+  validateSrtWithinDuration(srt, report.probe.durationMs);
+};
+
 const withOutputRead = async <Output>(
   outputDirectory: OutputDirectoryScope,
   relativePath: string,
@@ -276,19 +294,18 @@ export const verifyReleaseOutputFile = async (
       return wrapDecodeFailure('release final MP4 ffprobe failed', error);
     }
   });
-  validateReleaseProbe(probe);
-
   const bytes = await withOutputRead(
     input.outputDirectory,
     input.relativePath,
     async (handle) => await handle.readFile(),
   );
   const atoms = parseTopLevelMp4Atoms(bytes);
-  assertMoovBeforeMdat(atoms);
-  return ReleaseVerificationReportSchema.parse({
+  const report = ReleaseVerificationReportSchema.parse({
     sha256: sha256(bytes),
     probe,
     atoms,
     moovBeforeMdat: true,
   });
+  validateReleaseVerificationReport(report, input.srt);
+  return report;
 };

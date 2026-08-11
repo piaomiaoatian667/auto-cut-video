@@ -24,7 +24,6 @@ import {
 import {openExistingProjectFile} from '../../fs/project-paths';
 import {parseFfprobeJson} from '../../media/ffprobe';
 import {
-  validateSrtWithinDuration,
   verifyReleaseOutputFile,
   type ReleaseVerificationReport,
 } from '../../media/release-verify';
@@ -772,16 +771,16 @@ export const runRelease = async (
     tools.qtFaststart.realPath,
     runner,
   );
+  const srt = releaseSrtFromTimeline(timeline);
   const verification = await verifyReleaseOutputFile({
     outputDirectory,
     relativePath: finalVideo.path,
     ffmpegExecutable: tools.ffmpeg.realPath,
     ffprobeExecutable: tools.ffprobe.realPath,
+    srt,
     runProcess: runner,
     ...(input.signal === undefined ? {} : {signal: input.signal}),
   });
-  const srt = releaseSrtFromTimeline(timeline);
-  validateSrtWithinDuration(srt, verification.probe.durationMs);
   const subtitles = await writeOutputText(
     outputDirectory,
     releaseOutputPath(input.runId, 'subtitles.srt'),

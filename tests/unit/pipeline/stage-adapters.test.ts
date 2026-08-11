@@ -21,6 +21,7 @@ import {
 import {hashRunArtifact} from '../../../src/pipeline/artifacts';
 import {fingerprintValue} from '../../../src/pipeline/fingerprint';
 import {selectReviewFrames} from '../../../src/media/contact-sheet';
+import type {ReleaseVerificationReport} from '../../../src/media/release-verify';
 import {
   narrationMasterPath,
   narrationSegmentInputHash,
@@ -112,6 +113,60 @@ const compiledTimeline = (
     durationMs: 2000,
   },
 });
+
+const fixedReleaseVerification = (sha256: string) => ({
+  sha256,
+  probe: {
+    durationMs: 1000,
+    formatName: 'mov,mp4,m4a,3gp,3g2,mj2',
+    videoStreams: [{
+      index: 0,
+      codec: 'h264',
+      pixelFormat: 'yuv420p',
+      width: 1920,
+      height: 1080,
+      attachedPicture: false,
+      averageFrameRate: {numerator: 30, denominator: 1, value: 30},
+      realFrameRate: {numerator: 30, denominator: 1, value: 30},
+      rotation: 0,
+      durationMs: 1000,
+      sideDataTypes: [],
+    }],
+    audioStreams: [{
+      index: 1,
+      codec: 'aac',
+      sampleRate: 48_000,
+      channels: 2,
+      durationMs: 1000,
+    }],
+  },
+  atoms: [
+    {type: 'ftyp', offset: 0, size: 8},
+    {type: 'moov', offset: 8, size: 8},
+    {type: 'mdat', offset: 16, size: 8},
+  ],
+  moovBeforeMdat: true,
+}) satisfies ReleaseVerificationReport;
+
+const semanticReleaseVerificationFailures = [
+  ['zero streams', (verification: ReleaseVerificationReport) => {
+    verification.probe.videoStreams = [];
+    verification.probe.audioStreams = [];
+  }],
+  ['wrong fixed profile', (verification: ReleaseVerificationReport) => {
+    verification.probe.videoStreams[0]!.width = 1280;
+  }],
+  ['empty atoms', (verification: ReleaseVerificationReport) => {
+    verification.atoms = [];
+  }],
+  ['moov after mdat', (verification: ReleaseVerificationReport) => {
+    verification.atoms = [
+      {type: 'ftyp', offset: 0, size: 8},
+      {type: 'mdat', offset: 8, size: 8},
+      {type: 'moov', offset: 16, size: 8},
+    ];
+  }],
+] as const;
 
 const draftFrameArtifacts = (
   timeline: CompiledTimeline = compiledTimeline(),
@@ -247,6 +302,7 @@ const materializeReleaseResult = async ({
   review,
   releaseFingerprint,
   outputReview = review,
+  mutateVerification,
   publishedAt = '2026-08-11T01:02:03.000Z',
 }: {
   runId: string;
@@ -256,6 +312,7 @@ const materializeReleaseResult = async ({
   review: Review;
   releaseFingerprint: string;
   outputReview?: Review;
+  mutateVerification?: (verification: ReleaseVerificationReport) => void;
   publishedAt?: string;
 }): Promise<ReleaseStageResult> => {
   const outputDirectory = await createOutputStore(tempProject.workspaceRoot)
@@ -280,12 +337,8 @@ const materializeReleaseResult = async ({
     releaseOutputPath(runId, 'review.json'),
     `${JSON.stringify(outputReview, null, 2)}\n`,
   );
-  const verification = {
-    sha256: finalVideo.sha256,
-    probe: {durationMs: 1000, videoStreams: [], audioStreams: []},
-    moovBeforeMdat: true as const,
-    atoms: [],
-  };
+  const verification = fixedReleaseVerification(finalVideo.sha256);
+  mutateVerification?.(verification);
   const intermediate = {
     path: 'release/final-intermediate.mp4',
     sha256: hash('intermediate'),
@@ -2145,7 +2198,9 @@ describe('adapter verification', () => {
     }
   });
 
-  const releaseVerificationFixture = async () => {
+  const releaseVerificationFixture = async (
+    mutateVerification?: (verification: ReleaseVerificationReport) => void,
+  ) => {
     const draft = draftReport();
     const timeline = compiledTimeline();
     const reviewInput = approvedReview();
@@ -2195,12 +2250,8 @@ describe('adapter verification', () => {
       'releases/source-run/review.json',
       `${JSON.stringify(reviewInput, null, 2)}\n`,
     );
-    const verification = {
-      sha256: finalVideo.sha256,
-      probe: {durationMs: 1000, videoStreams: [], audioStreams: []},
-      moovBeforeMdat: true as const,
-      atoms: [],
-    };
+    const verification = fixedReleaseVerification(finalVideo.sha256);
+    mutateVerification?.(verification);
     const validationMetadata = buildReleaseValidationReport({
       projectId: 'demo',
       runId: 'source-run',
@@ -2332,6 +2383,18 @@ describe('adapter verification', () => {
     )).resolves.toBe(false);
   });
 
+  it.each(semanticReleaseVerificationFailures)(
+    'returns false for semantically invalid persisted Release verification with %s',
+    async (_label, mutateVerification) => {
+      const fixture = await releaseVerificationFixture(mutateVerification);
+
+      await expect(createReleaseStage(fixture.dependencies).verify(
+        planningContext(),
+        fixture.report,
+      )).resolves.toBe(false);
+    },
+  );
+
   it('returns false for missing, changed, and cross-scope Run artifacts', async () => {
     const {stage, context, report} = await compileVerificationFixture();
     const [artifact] = report.artifacts;
@@ -2426,12 +2489,7 @@ describe('adapter verification', () => {
       validationReport: {path: 'releases/source-run/validation-report.json', sha256: hash('validation')},
       checksums: {path: 'releases/source-run/checksums.sha256', sha256: hash('checksums')},
       releaseFingerprint: hash('release'),
-      verification: {
-        sha256: finalVideo.sha256,
-        probe: {durationMs: 1000, videoStreams: [], audioStreams: []},
-        moovBeforeMdat: true,
-        atoms: [],
-      },
+      verification: fixedReleaseVerification(finalVideo.sha256),
     };
     const stage = createReleaseStage({
       openOutputDirectory: async () => output,
@@ -3105,12 +3163,7 @@ describe('provenance hardening regressions', () => {
       },
       checksums: {path: releaseOutputPath(runId, 'checksums.sha256'), sha256: hash('checksums')},
       releaseFingerprint,
-      verification: {
-        sha256: hash('final'),
-        probe: {durationMs: 1000, videoStreams: [], audioStreams: []},
-        moovBeforeMdat: true,
-        atoms: [],
-      },
+      verification: fixedReleaseVerification(hash('final')),
     },
     current: {
       runId,
@@ -3167,9 +3220,11 @@ describe('provenance hardening regressions', () => {
     review,
     stageFingerprint,
     outputReview = review,
+    mutateVerification,
   }: ReturnType<typeof targetReleaseInputs> & {
     preflight: PreflightResult;
     outputReview?: Review;
+    mutateVerification?: (verification: ReleaseVerificationReport) => void;
   }): Promise<ReleaseStageResult> => await materializeReleaseResult({
     runId: 'target-run',
     preflight,
@@ -3178,6 +3233,7 @@ describe('provenance hardening regressions', () => {
     review,
     releaseFingerprint: stageFingerprint,
     outputReview,
+    ...(mutateVerification === undefined ? {} : {mutateVerification}),
   });
 
   it.each([
@@ -3606,6 +3662,31 @@ describe('provenance hardening regressions', () => {
       new AbortController().signal,
     )).rejects.toThrow('Release returned invalid audit metadata');
   });
+
+  it.each(semanticReleaseVerificationFailures)(
+    'rejects semantically invalid Release verification with %s after execution',
+    async (_label, mutateVerification) => {
+      const preflight = preflightResult();
+      await writeTargetReleaseReports(preflight);
+      const inputs = targetReleaseInputs(preflight);
+      const concreteResult = await materializeTargetReleaseResult({
+        ...inputs,
+        preflight,
+        mutateVerification,
+      });
+      const stage = createReleaseStage({
+        readDraftReport: async () => inputs.draft,
+        readCompiledTimeline: async () => inputs.timeline,
+        readReview: async () => inputs.review,
+        runRelease: async () => concreteResult,
+      });
+
+      await expect(stage.execute(
+        executionContext({preflight}),
+        new AbortController().signal,
+      )).rejects.toThrow('Release returned invalid audit metadata');
+    },
+  );
 
   it.each([
     ['wrong Run', (current: ReleaseStageResult['current']) => {
@@ -4434,12 +4515,7 @@ describe('exact stage-owned artifact validators', () => {
       intermediate: {path: intermediate.path, sha256: intermediate.sha256},
       ...outputReferences,
       releaseFingerprint: hash('release'),
-      verification: {
-        sha256: outputReferences.finalVideo.sha256,
-        probe: {durationMs: 1000, videoStreams: [], audioStreams: []},
-        atoms: [],
-        moovBeforeMdat: true,
-      },
+      verification: fixedReleaseVerification(outputReferences.finalVideo.sha256),
     };
     const report = passedStageReport({
       stageId: 'release',

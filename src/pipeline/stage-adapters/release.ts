@@ -10,7 +10,11 @@ import {
   type OutputDirectoryScope,
   type RunDirectoryScope,
 } from '../../fs/app-directory-scopes';
-import {ReleaseVerificationReportSchema} from '../../media/release-verify';
+import {
+  ReleaseVerificationError,
+  ReleaseVerificationReportSchema,
+  validateReleaseVerificationReport,
+} from '../../media/release-verify';
 import {
   PipelineContextError,
   requirePreflight,
@@ -219,6 +223,12 @@ const verifyReleaseAuditMetadata = async ({
     return {review, subtitles, validationReport, checksums};
   });
   if (persisted === null) return false;
+  try {
+    validateReleaseVerificationReport(outputs.verification, persisted.subtitles);
+  } catch (error) {
+    if (error instanceof ReleaseVerificationError) return false;
+    throw error;
+  }
   const expectedValidationReport = buildReleaseValidationReport({
     projectId,
     runId,
