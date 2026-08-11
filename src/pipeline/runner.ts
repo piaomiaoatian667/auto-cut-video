@@ -40,6 +40,7 @@ import {
   type StageReportStore,
 } from './stage-report';
 import type {PreflightResult} from './stages/preflight';
+import {releaseCurrentPointer} from './stages/release';
 import type {ProjectInputs} from '../domain/load-project';
 
 export interface PipelineRunResult {
@@ -83,6 +84,25 @@ interface PreflightExecution {
   finishedAt: string;
 }
 
+type PointerOwner = 'Work' | 'Output';
+
+export class PipelinePointerOutcomeError extends AggregateError {
+  readonly code = 'PIPELINE_POINTER_OUTCOME_UNKNOWN';
+
+  constructor(
+    owner: PointerOwner,
+    primaryError: unknown,
+    readError: unknown,
+  ) {
+    super(
+      [primaryError, readError],
+      `${owner} pointer publication outcome could not be determined`,
+      {cause: primaryError},
+    );
+    this.name = 'PipelinePointerOutcomeError';
+  }
+}
+
 const isMissingPath = (error: unknown): boolean =>
   error instanceof Error && 'code' in error && error.code === 'ENOENT';
 
@@ -101,6 +121,72 @@ const isOrdinaryReportMiss = (error: unknown): boolean => (
 
 const planStale = (message: string, stageId?: StageId): never => {
   throw new ExecutionPlanError('PLAN_STALE', message, stageId);
+};
+
+const pointersEqual = (
+  left: CurrentPointer | null,
+  right: CurrentPointer,
+): boolean => left !== null
+  && left.runId === right.runId
+  && left.relativePath === right.relativePath
+  && left.preset === right.preset
+  && left.stageIds.length === right.stageIds.length
+  && left.stageIds.every((stageId, index) => stageId === right.stageIds[index])
+  && left.completedStage === right.completedStage
+  && left.state === right.state
+  && left.publishedAt === right.publishedAt;
+
+const STAGE_POSITIONS = new Map(
+  STAGE_PRESETS.release.map((stageId, index) => [stageId, index]),
+);
+
+const pointerProgress = (pointer: CurrentPointer | null): number => pointer === null
+  ? -1
+  : (STAGE_POSITIONS.get(pointer.completedStage) ?? -1);
+
+const needsRecoveredWorkProgress = (
+  current: CurrentPointer | null,
+  runId: string,
+  report: StageReport,
+): boolean => current === null
+  || current.runId !== runId
+  || (STAGE_POSITIONS.get(report.stageId) ?? -1) > pointerProgress(current);
+
+const isCanonicalReleasePointer = (
+  pointer: CurrentPointer | null,
+  runId: string,
+): pointer is CurrentPointer => {
+  if (pointer === null) return false;
+  try {
+    return pointersEqual(pointer, releaseCurrentPointer(runId, pointer.publishedAt));
+  } catch {
+    return false;
+  }
+};
+
+const publishCurrentConfirmed = async (input: {
+  owner: PointerOwner;
+  projectId: string;
+  pointer: CurrentPointer;
+  store: Pick<RunStore, 'publishCurrent' | 'readCurrentReadonly'>
+    | Pick<OutputStore, 'publishCurrent' | 'readCurrentReadonly'>;
+}): Promise<void> => {
+  try {
+    await input.store.publishCurrent(input.projectId, input.pointer);
+  } catch (primaryError) {
+    let current: CurrentPointer | null;
+    try {
+      current = await input.store.readCurrentReadonly(input.projectId);
+    } catch (readError) {
+      throw new PipelinePointerOutcomeError(
+        input.owner,
+        primaryError,
+        readError,
+      );
+    }
+    if (pointersEqual(current, input.pointer)) return;
+    throw primaryError;
+  }
 };
 
 const stageById = (
@@ -355,10 +441,27 @@ const publishWorkProgress = async (
   report: StageReport,
   state: CurrentPointer['state'],
   dependencies: RunnerDependencies,
-): Promise<void> => await dependencies.runStore.publishCurrent(
-  plan.projectId,
-  workPointer(plan, runId, report, state),
-);
+): Promise<CurrentPointer> => {
+  const pointer = workPointer(plan, runId, report, state);
+  await publishCurrentConfirmed({
+    owner: 'Work',
+    projectId: plan.projectId,
+    pointer,
+    store: dependencies.runStore,
+  });
+  return pointer;
+};
+
+const publishOutputProgress = async (
+  projectId: string,
+  pointer: CurrentPointer,
+  dependencies: RunnerDependencies,
+): Promise<void> => await publishCurrentConfirmed({
+  owner: 'Output',
+  projectId,
+  pointer,
+  store: dependencies.outputStore,
+});
 
 const requireSourceReport = (
   sourceRun: RunnerSourceRun | undefined,
@@ -417,6 +520,7 @@ const materializeCachedStage = async (
     await publishWorkProgress(plan, runId, report, 'passed', dependencies);
     return report;
   } catch (error) {
+    if (error instanceof PipelinePointerOutcomeError) throw error;
     return await rollbackStageProgress({
       primaryError: error,
       reportStore: dependencies.reportStore,
@@ -666,6 +770,13 @@ export async function runExecutionPlan(
       preflightExecution.preflight,
     );
 
+    let workCurrent = revalidated.runMode === 'resume'
+      ? await dependencies.runStore.readCurrentReadonly(revalidated.projectId)
+      : null;
+    let outputPointerSnapshot = revalidated.runMode === 'resume'
+      ? await dependencies.outputStore.readCurrentReadonly(revalidated.projectId)
+      : null;
+
     const runDirectory = revalidated.runMode === 'resume'
       ? sourceRun?.runDirectory
       : await dependencies.runStore.createRun(revalidated.projectId, lockRunId);
@@ -684,7 +795,7 @@ export async function runExecutionPlan(
         preflightExecution.finishedAt,
       );
       await dependencies.reportStore.writeStage(runDirectory, preflightReport);
-      await publishWorkProgress(
+      workCurrent = await publishWorkProgress(
         revalidated,
         lockRunId,
         preflightReport,
@@ -721,7 +832,84 @@ export async function runExecutionPlan(
           );
           reports.push(cached);
         } else {
-          reports.push(requireSourceReport(sourceRun, item.stageId));
+          const cached = requireSourceReport(sourceRun, item.stageId);
+          if (item.stageId === 'release') {
+            if (cached.state !== 'passed') {
+              return planStale('the recovered Release report is not passed', 'release');
+            }
+            const releaseStage = stageById(dependencies.registry, 'release');
+            let verified = false;
+            try {
+              verified = await releaseStage.verify(
+                executionContext(input, revalidated, dependencies, {
+                  ...(sourceRun === undefined ? {} : {sourceRun}),
+                  preflight: preflightExecution.preflight,
+                  runId: lockRunId,
+                  runDirectory,
+                }),
+                cached,
+              );
+            } catch (error) {
+              if (!isOrdinaryReportMiss(error)) throw error;
+            }
+            if (!verified) {
+              return planStale(
+                'the recovered Release report or audit artifacts are no longer valid',
+                'release',
+              );
+            }
+
+            if (!isCanonicalReleasePointer(outputPointerSnapshot, lockRunId)) {
+              const recoveredOutput = releaseCurrentPointer(
+                lockRunId,
+                cached.finishedAt,
+              );
+              await publishOutputProgress(
+                revalidated.projectId,
+                recoveredOutput,
+                dependencies,
+              );
+              outputPointerSnapshot = recoveredOutput;
+            }
+            releaseOutputCommitted = true;
+            reports.push(cached);
+            const warnings: PipelineRunResult['warnings'] = [];
+            if (needsRecoveredWorkProgress(workCurrent, lockRunId, cached)) {
+              try {
+                workCurrent = await publishWorkProgress(
+                  revalidated,
+                  lockRunId,
+                  cached,
+                  'passed',
+                  dependencies,
+                );
+              } catch (error) {
+                if (error instanceof PipelinePointerOutcomeError) throw error;
+                warnings.push({
+                  code: 'WORK_POINTER_LAGGING',
+                  message: 'Output Release is published, but Work progress metadata is lagging.',
+                });
+              }
+            }
+            return result(revalidated, {
+              runId: lockRunId,
+              state: 'passed',
+              completedStage: 'release',
+              reports,
+              preflight: preflightExecution.preflight,
+              warnings,
+            });
+          }
+          if (needsRecoveredWorkProgress(workCurrent, lockRunId, cached)) {
+            workCurrent = await publishWorkProgress(
+              revalidated,
+              lockRunId,
+              cached,
+              'passed',
+              dependencies,
+            );
+          }
+          reports.push(cached);
         }
         continue;
       }
@@ -749,7 +937,7 @@ export async function runExecutionPlan(
 
       if (stageResult.state === 'needs_review') {
         await dependencies.reportStore.writeAttempt(runDirectory, report);
-        await publishWorkProgress(
+        workCurrent = await publishWorkProgress(
           revalidated,
           lockRunId,
           report,
@@ -776,7 +964,7 @@ export async function runExecutionPlan(
           }
           await dependencies.reportStore.writeStage(runDirectory, report);
           reportWritten = true;
-          await publishWorkProgress(
+          workCurrent = await publishWorkProgress(
             revalidated,
             lockRunId,
             report,
@@ -784,6 +972,7 @@ export async function runExecutionPlan(
             dependencies,
           );
         } catch (error) {
+          if (error instanceof PipelinePointerOutcomeError) throw error;
           return await rollbackStageProgress({
             primaryError: error,
             reportStore: dependencies.reportStore,
@@ -803,12 +992,10 @@ export async function runExecutionPlan(
       const outputCurrent = validateReleaseResult(lockRunId, stageResult);
       await dependencies.reportStore.writeStage(runDirectory, report);
       try {
-        await dependencies.outputStore.publishCurrent(
-          revalidated.projectId,
-          outputCurrent,
-        );
+        await publishOutputProgress(revalidated.projectId, outputCurrent, dependencies);
         releaseOutputCommitted = true;
       } catch (error) {
+        if (error instanceof PipelinePointerOutcomeError) throw error;
         try {
           await deleteCanonicalReport(
             dependencies.reportStore,
@@ -827,14 +1014,15 @@ export async function runExecutionPlan(
       reports.push(report);
       const warnings: PipelineRunResult['warnings'] = [];
       try {
-        await publishWorkProgress(
+        workCurrent = await publishWorkProgress(
           revalidated,
           lockRunId,
           report,
           'passed',
           dependencies,
         );
-      } catch {
+      } catch (error) {
+        if (error instanceof PipelinePointerOutcomeError) throw error;
         warnings.push({
           code: 'WORK_POINTER_LAGGING',
           message: 'Output Release is published, but Work progress metadata is lagging.',

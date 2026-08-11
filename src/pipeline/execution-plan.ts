@@ -93,6 +93,7 @@ interface StageAssessment {
   report: StageReport | null;
   fingerprint: string | null;
   declaredComplete: boolean;
+  recoveredTrailing: boolean;
   reportAvailable: boolean;
   matching: boolean;
 }
@@ -304,6 +305,7 @@ const assessStages = async (
   const completedPosition = source === null
     ? -1
     : pointerProgress(source.pointer);
+  let reconciledCompletedPosition = completedPosition;
   const assessments = new Map<StageId, StageAssessment>();
 
   for (const stageId of presetStageIds) {
@@ -317,7 +319,6 @@ const assessStages = async (
     }
     const report = source?.reports.get(stageId) ?? null;
     const stagePosition = STAGE_POSITIONS.get(stageId)!;
-    const declaredComplete = source !== null && stagePosition <= completedPosition;
     const reportAvailable = source !== null
       && report !== null
       && reportMatchesIdentity(
@@ -327,16 +328,24 @@ const assessStages = async (
         stageId,
       );
     const fingerprint = await calculateFingerprint(stage, planningContext);
-    const matching = declaredComplete
-      && reportAvailable
+    const reportMatching = reportAvailable
       && fingerprint !== null
       && report!.fingerprint === fingerprint
       && await verifyReport(stage, planningContext, report!);
+    const recoveredTrailing = source !== null
+      && stagePosition > completedPosition
+      && stagePosition === reconciledCompletedPosition + 1
+      && reportMatching;
+    if (recoveredTrailing) reconciledCompletedPosition = stagePosition;
+    const declaredComplete = source !== null
+      && (stagePosition <= completedPosition || recoveredTrailing);
+    const matching = declaredComplete && reportMatching;
     assessments.set(stageId, {
       stage,
       report,
       fingerprint,
       declaredComplete,
+      recoveredTrailing,
       reportAvailable,
       matching,
     });
@@ -663,6 +672,9 @@ export async function buildExecutionPlan(
   const firstIncompleteIndex = selectedAssessments.findIndex((assessment) => (
     !assessment.declaredComplete
   ));
+  const firstRecoveredIndex = selectedAssessments.findIndex((assessment) => (
+    assessment.recoveredTrailing
+  ));
   const forceCompleted = force === undefined
     ? false
     : assessments.get(force)!.declaredComplete;
@@ -707,7 +719,12 @@ export async function buildExecutionPlan(
     };
   }
 
-  const boundaries = [firstMismatchIndex, firstIncompleteIndex, forceIndex]
+  const boundaries = [
+    firstMismatchIndex,
+    firstIncompleteIndex,
+    firstRecoveredIndex,
+    forceIndex,
+  ]
     .filter((index) => index >= 0);
   const rerunFrom = boundaries.length === 0
     ? selectedStageIds.length

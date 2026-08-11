@@ -326,6 +326,88 @@ describe('buildExecutionPlan', () => {
     ]);
   });
 
+  it('reconciles contiguous verified reports beyond Work pointer progress', async () => {
+    const plan = await build({
+      current: pointer('ingest'),
+      reports: reportsThrough('compile'),
+    }, {
+      preset: 'release',
+      resume: true,
+    });
+
+    expect(plan.runMode).toBe('resume');
+    expect(plan.items.map((item) => [item.stageId, item.action])).toEqual([
+      ['preflight', 'run'],
+      ['ingest', 'cached'],
+      ['narration', 'cached'],
+      ['compile', 'cached'],
+      ['draft', 'resume'],
+      ['review', 'run'],
+      ['release', 'run'],
+    ]);
+  });
+
+  it('does not materialize recovered trailing reports into a fresh Run', async () => {
+    const plan = await build({
+      current: pointer('ingest'),
+      reports: reportsThrough('narration'),
+    }, {
+      preset: 'draft',
+    });
+
+    expect(plan.runMode).toBe('new');
+    expect(plan.items.map((item) => [
+      item.stageId,
+      item.action,
+      item.materialize,
+    ])).toEqual([
+      ['preflight', 'run', false],
+      ['ingest', 'cached', true],
+      ['narration', 'run', false],
+      ['compile', 'run', false],
+      ['draft', 'run', false],
+    ]);
+  });
+
+  it('stops trailing reconciliation at the first noncontiguous report', async () => {
+    const reports = reportsThrough('compile');
+    reports.delete('narration');
+
+    const plan = await build({
+      current: pointer('ingest'),
+      reports,
+    }, {
+      preset: 'release',
+      resume: true,
+    });
+
+    expect(plan.items.map((item) => [item.stageId, item.action])).toEqual([
+      ['preflight', 'run'],
+      ['ingest', 'cached'],
+      ['narration', 'resume'],
+      ['compile', 'run'],
+      ['draft', 'run'],
+      ['review', 'run'],
+      ['release', 'run'],
+    ]);
+  });
+
+  it('does not reconcile a trailing Release report that fails adapter verification', async () => {
+    const plan = await build({
+      current: pointer('review'),
+      reports: reportsThrough('release'),
+      verified: {release: false},
+    }, {
+      preset: 'release',
+      resume: true,
+    });
+
+    expect(plan.items.at(-1)).toMatchObject({
+      stageId: 'release',
+      action: 'resume',
+    });
+  });
+
   it('creates a new Run for --resume --force compile when Compile already passed', async () => {
     const plan = await build({
       current: pointer('release'),
