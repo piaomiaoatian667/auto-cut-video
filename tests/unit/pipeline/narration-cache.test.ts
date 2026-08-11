@@ -1,7 +1,7 @@
 import {mkdtemp, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
-import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
+import {afterEach, beforeAll, beforeEach, describe, expect, it, vi} from 'vitest';
 import type {NarrationManifest} from '../../../src/domain/manifest-schema';
 import type {Script} from '../../../src/domain/script-schema';
 import {
@@ -14,6 +14,7 @@ import {
 import {narrationSegmentInputHash} from '../../../src/narration/build-narration';
 import {fingerprintValue} from '../../../src/pipeline/fingerprint';
 import {seedNarrationCache} from '../../../src/pipeline/narration-cache';
+import {fingerprintTtsProvider} from '../../../src/providers/tts';
 
 const artifactMocks = vi.hoisted(() => ({
   copyRunArtifact: vi.fn(),
@@ -34,7 +35,15 @@ vi.mock('../../../src/pipeline/artifacts', async (importOriginal) => {
 const tempDirectories: string[] = [];
 const voice = 'fixture';
 const rate = 180;
-const providerFingerprint = fingerprintValue({provider: 'fixture'});
+let providerFingerprint: string;
+let fileProviderFingerprint: string;
+
+beforeAll(async () => {
+  [providerFingerprint, fileProviderFingerprint] = await Promise.all([
+    fingerprintTtsProvider('mock'),
+    fingerprintTtsProvider('file'),
+  ]);
+});
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -80,39 +89,51 @@ const script = (secondText = '第二句'): Script => ({
   ],
 });
 
-const inputHash = (value: Script, index: number): string =>
+const inputHash = (
+  value: Script,
+  index: number,
+  currentProviderFingerprint = providerFingerprint,
+): string =>
   narrationSegmentInputHash(
     value.segments[index]!,
     voice,
     rate,
-    providerFingerprint,
+    currentProviderFingerprint,
   );
 
 const cachePath = (hash: string): string =>
   `audio/cache/${hash.replace(/^sha256:/u, '')}.wav`;
 
-const manifest = (value: Script): NarrationManifest => ({
-  version: 1,
-  provider: 'mock',
-  segments: value.segments.map((segment, index) => ({
-    id: segment.id,
-    inputHash: inputHash(value, index),
-    audioPath: `audio/segments/${segment.id}.wav`,
-    audioHash: fingerprintValue({segment: segment.id}),
-    startMs: index * 1000,
-    endMs: (index + 1) * 1000,
-    durationMs: 1000,
-    pauseAfterMs: segment.pauseAfterMs,
-    sampleRate: 48_000,
-    channels: 1,
-    providerFingerprint,
-  })),
-  master: {
-    audioPath: 'audio/narration.wav',
-    audioHash: fingerprintValue({master: true}),
-    durationMs: 2000,
-  },
-});
+const manifest = (
+  value: Script,
+  provider: 'mock' | 'file' = 'mock',
+): NarrationManifest => {
+  const manifestProviderFingerprint = provider === 'file'
+    ? fileProviderFingerprint
+    : providerFingerprint;
+  return {
+    version: 1,
+    provider,
+    segments: value.segments.map((segment, index) => ({
+      id: segment.id,
+      inputHash: inputHash(value, index, manifestProviderFingerprint),
+      audioPath: `audio/segments/${segment.id}.wav`,
+      audioHash: fingerprintValue({segment: segment.id}),
+      startMs: index * 1000,
+      endMs: (index + 1) * 1000,
+      durationMs: 1000,
+      pauseAfterMs: segment.pauseAfterMs,
+      sampleRate: 48_000,
+      channels: 1,
+      providerFingerprint: manifestProviderFingerprint,
+    })),
+    master: {
+      audioPath: 'audio/narration.wav',
+      audioHash: fingerprintValue({master: true}),
+      durationMs: 2000,
+    },
+  };
+};
 
 const writeRunBytes = async (
   runDirectory: RunDirectoryScope,
@@ -180,9 +201,12 @@ describe('seedNarrationCache', () => {
   it('returns without artifact I/O for a validated file-provider manifest', async () => {
     const {sourceRun, targetRun} = await makeRuns();
     const unchangedScript = script();
-    const sourceManifest = manifest(unchangedScript);
-    sourceManifest.provider = 'file';
-    const firstPath = cachePath(inputHash(unchangedScript, 0));
+    const sourceManifest = manifest(unchangedScript, 'file');
+    const firstPath = cachePath(inputHash(
+      unchangedScript,
+      0,
+      fileProviderFingerprint,
+    ));
     await writeManifest(sourceRun, sourceManifest);
     await writeRunBytes(sourceRun, firstPath, Buffer.from('file cache'));
     await writeRunBytes(targetRun, 'keep.txt', Buffer.from('untouched'));
@@ -193,7 +217,7 @@ describe('seedNarrationCache', () => {
       script: unchangedScript,
       voice,
       rate,
-      providerFingerprint,
+      providerFingerprint: fileProviderFingerprint,
     });
 
     expect(copied).toEqual([]);
@@ -420,7 +444,7 @@ describe('seedNarrationCache', () => {
     const unchangedScript = script();
     const sourceManifest = manifest(unchangedScript);
     const firstPath = cachePath(sourceManifest.segments[0]!.inputHash);
-    sourceManifest.segments[1]!.providerFingerprint = fingerprintValue({provider: 'other'});
+    sourceManifest.segments[1]!.providerFingerprint = fileProviderFingerprint;
     await writeManifest(sourceRun, sourceManifest);
     await writeRunBytes(sourceRun, firstPath, Buffer.from('first cache'));
 
@@ -435,6 +459,44 @@ describe('seedNarrationCache', () => {
     expect(artifactMocks.hashRunArtifact).not.toHaveBeenCalled();
     expect(artifactMocks.copyRunArtifact).not.toHaveBeenCalled();
     await expect(runFileExists(targetRun, firstPath)).resolves.toBe(false);
+  });
+
+  it('rejects a top-level file provider with the current mock fingerprint', async () => {
+    const {sourceRun, targetRun} = await makeRuns();
+    const unchangedScript = script();
+    const sourceManifest = manifest(unchangedScript);
+    sourceManifest.provider = 'file';
+    await writeManifest(sourceRun, sourceManifest);
+
+    await expect(seedNarrationCache({
+      sourceRun,
+      targetRun,
+      script: unchangedScript,
+      voice,
+      rate,
+      providerFingerprint,
+    })).rejects.toThrow(/manifest provider fingerprint/u);
+    expect(artifactMocks.hashRunArtifact).not.toHaveBeenCalled();
+    expect(artifactMocks.copyRunArtifact).not.toHaveBeenCalled();
+  });
+
+  it('rejects a corrupted mock label with the current file fingerprint', async () => {
+    const {sourceRun, targetRun} = await makeRuns();
+    const unchangedScript = script();
+    const sourceManifest = manifest(unchangedScript, 'file');
+    sourceManifest.provider = 'mock';
+    await writeManifest(sourceRun, sourceManifest);
+
+    await expect(seedNarrationCache({
+      sourceRun,
+      targetRun,
+      script: unchangedScript,
+      voice,
+      rate,
+      providerFingerprint: fileProviderFingerprint,
+    })).rejects.toThrow(/manifest provider fingerprint/u);
+    expect(artifactMocks.hashRunArtifact).not.toHaveBeenCalled();
+    expect(artifactMocks.copyRunArtifact).not.toHaveBeenCalled();
   });
 
   it('fails closed when an unchanged cache path is not a regular file', async () => {

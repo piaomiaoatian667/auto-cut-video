@@ -5,6 +5,7 @@ import {
   type RunDirectoryScope,
 } from '../fs/app-directory-scopes';
 import {narrationSegmentInputHash} from '../narration/build-narration';
+import {fingerprintTtsProvider} from '../providers/tts';
 import {
   copyRunArtifact,
   hashRunArtifact,
@@ -81,6 +82,12 @@ export async function seedNarrationCache(input: {
 }): Promise<string[]> {
   const sourceManifest = await readNarrationManifest(input.sourceRun);
   validateCompatibility(sourceManifest, input.providerFingerprint);
+  const manifestProviderFingerprint = await fingerprintTtsProvider(
+    sourceManifest.provider,
+  );
+  if (manifestProviderFingerprint !== input.providerFingerprint) {
+    throw new Error('manifest provider fingerprint does not match current provider');
+  }
   if (sourceManifest.provider === 'file') return [];
 
   const expectedHashesById = new Map(input.script.segments.map((segment) => [
