@@ -484,6 +484,7 @@ interface UnknownReportOutcomeProbe {
   targetReport: string;
   parentSyncErrors: Error[];
   postLinkStatError?: Error;
+  postLinkVerifyError?: Error;
   postLinkFaultInjected?: boolean;
   postLinkCloseErrors?: Error[];
   commitParentHandleId?: number;
@@ -578,6 +579,19 @@ const importPipelineModulesWithUnknownReportOutcomeProbe = async (
           probe.linkedTarget = targetPath;
           probe.events.push(`link:${probe.targetReport}`);
         }
+      },
+      lstat: async (...args: Parameters<typeof actual.lstat>) => {
+        const targetPath = String(args[0]);
+        if (
+          probe.armed
+          && probe.postLinkVerifyError !== undefined
+          && probe.postLinkFaultInjected !== true
+          && probe.linkedTarget === targetPath
+        ) {
+          probe.postLinkFaultInjected = true;
+          throw probe.postLinkVerifyError;
+        }
+        return await Reflect.apply(actual.lstat, undefined, args);
       },
       unlink: async (...args: Parameters<typeof actual.unlink>) => {
         const targetPath = String(args[0]);
@@ -1467,22 +1481,31 @@ describe('Pipeline Runner', () => {
   });
 
   it.each([
-    ['parent-sync', false],
-    ['post-link-stat', true],
+    ['parent-sync', null, false],
+    ['post-link-stat', 'stat', false],
+    ['post-link-verify', 'verify', true],
   ] as const)(
     'preserves ordinary artifacts after a %s report outcome and reconciles on restart',
-    async (_mode, failAfterLink) => {
+    async (_mode, postLinkFault, recoverySyncFails) => {
       const tempProject = await createTempProject();
       tempProjects.push(tempProject);
       const project = await loadProject(tempProject.workspaceRoot, 'demo');
+      const failAfterLink = postLinkFault !== null;
       const primaryError = Object.assign(new Error(
-        failAfterLink
+        postLinkFault === 'stat'
           ? 'compile report post-link stat failed'
-          : 'compile report parent sync failed',
+          : postLinkFault === 'verify'
+            ? 'compile report post-link verification failed'
+            : 'compile report parent sync failed',
       ), {
         code: 'EIO',
       });
       const retrySyncError = Object.assign(new Error('compile report parent retry failed'), {
+        code: 'EIO',
+      });
+      const recoverySyncError = Object.assign(new Error(
+        'compile report post-link recovery sync failed',
+      ), {
         code: 'EIO',
       });
       const closeError = Object.assign(new Error('compile report anchor close failed'), {
@@ -1491,9 +1514,16 @@ describe('Pipeline Runner', () => {
       const probe: UnknownReportOutcomeProbe = {
         armed: false,
         targetReport: 'compile.json',
-        parentSyncErrors: failAfterLink ? [] : [primaryError, retrySyncError],
-        ...(failAfterLink ? {
+        parentSyncErrors: failAfterLink
+          ? (recoverySyncFails ? [recoverySyncError] : [])
+          : [primaryError, retrySyncError],
+        ...(postLinkFault === 'stat' ? {
           postLinkStatError: primaryError,
+        } : {}),
+        ...(postLinkFault === 'verify' ? {
+          postLinkVerifyError: primaryError,
+        } : {}),
+        ...(failAfterLink ? {
           postLinkCloseErrors: [closeError],
         } : {}),
         parentSyncHandleIds: [],
@@ -1612,6 +1642,11 @@ describe('Pipeline Runner', () => {
             primaryError,
             closeError,
           ]);
+          expect((runError as AggregateError).errors).toEqual(
+            recoverySyncFails
+              ? [linkError, recoverySyncError]
+              : [linkError],
+          );
         } else {
           expect(runError).toMatchObject({
             cause: primaryError,
@@ -1631,12 +1666,9 @@ describe('Pipeline Runner', () => {
         await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
           completedStage: 'narration',
         });
-        if (!failAfterLink) {
-          expect(probe.parentSyncHandleIds).toEqual([
-            probe.commitParentHandleId,
-            probe.commitParentHandleId,
-          ]);
-        }
+        expect(probe.parentSyncHandleIds).toEqual(failAfterLink
+          ? [probe.commitParentHandleId]
+          : [probe.commitParentHandleId, probe.commitParentHandleId]);
         expect(probe.events).not.toContain('unlink-final:compile.json');
 
         probe.armed = false;

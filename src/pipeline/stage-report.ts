@@ -476,8 +476,16 @@ const writeImmutableReport = async (
     );
   } catch (error) {
     if (isLinkOutcomeUnknown(error)) {
-      if (target !== undefined) await closeReportBestEffort(target);
-      throw new StageReportOutcomeError(relativePath, error, []);
+      const recoveryErrors: unknown[] = [];
+      if (target !== undefined) {
+        try {
+          await target.syncParent();
+        } catch (syncError) {
+          recoveryErrors.push(syncError);
+        }
+        await closeReportBestEffort(target);
+      }
+      throw new StageReportOutcomeError(relativePath, error, recoveryErrors);
     }
     if (target !== undefined) {
       return await rollbackReportWrite({

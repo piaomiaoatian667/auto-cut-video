@@ -736,6 +736,7 @@ describe('StageReportStore', () => {
         fault,
         faultError,
         faultInjected: false,
+        parentSyncHandleIds: [],
         postLinkCloseErrors: failClose ? [closeError] : [],
       };
       const {scopes, reports} = await importReportModulesWithAtomicWriteProbe(probe);
@@ -777,6 +778,9 @@ describe('StageReportStore', () => {
         await expect(store.readStage(runDirectory, 'ingest')).resolves.toEqual(report);
         const exactReport = await readFile(finalPath, 'utf8');
         expect(JSON.parse(exactReport)).toEqual(report);
+        expect(probe.parentSyncHandleIds).toEqual([
+          probe.commitParentHandleId,
+        ]);
         expect(probe.events).not.toContain('unlink-final:ingest.json');
       } finally {
         vi.doUnmock('node:fs/promises');
@@ -785,6 +789,76 @@ describe('StageReportStore', () => {
       }
     },
   );
+
+  it('preserves the canonical report when post-link recovery sync also fails', async () => {
+    const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'stage-report-post-link-sync-'));
+    const faultError = Object.assign(new Error('post-link verification failed'), {
+      code: 'EIO',
+    });
+    const parentSyncError = Object.assign(new Error('post-link parent sync failed'), {
+      code: 'EIO',
+    });
+    const closeError = Object.assign(new Error('linked report anchor close failed'), {
+      code: 'EIO',
+    });
+    const probe: AtomicReportProbe = {
+      armed: false,
+      events: [],
+      fault: 'post-link-verify',
+      faultError,
+      faultInjected: false,
+      parentSyncErrors: [parentSyncError],
+      parentSyncHandleIds: [],
+      postLinkCloseErrors: [closeError],
+    };
+    const {scopes, reports} = await importReportModulesWithAtomicWriteProbe(probe);
+    try {
+      const runDirectory = await scopes.createRunStore(workspaceRoot)
+        .createRun('demo', 'run-one');
+      await scopes.ensureRunDirectory(runDirectory, 'reports');
+      const store = reports.createStageReportStore();
+      const report = passedStageReport({stageId: 'ingest'});
+      const finalPath = path.join(
+        workspaceRoot,
+        '.work/demo/runs/run-one/reports/ingest.json',
+      );
+      probe.armed = true;
+
+      let writeError: unknown;
+      try {
+        await store.writeStage(runDirectory, report);
+      } catch (error) {
+        writeError = error;
+      }
+
+      expect(writeError).toMatchObject({
+        name: 'StageReportOutcomeError',
+        code: 'PIPELINE_REPORT_OUTCOME_UNKNOWN',
+      });
+      const linkError = (writeError as AggregateError).cause;
+      expect(linkError).toMatchObject({
+        name: 'AppDirectoryLinkOutcomeError',
+        code: 'APP_DIRECTORY_LINK_OUTCOME_UNKNOWN',
+        cause: faultError,
+        errors: [faultError, closeError],
+      });
+      expect((writeError as AggregateError).errors).toEqual([
+        linkError,
+        parentSyncError,
+      ]);
+      expect(probe.parentSyncHandleIds).toEqual([
+        probe.commitParentHandleId,
+      ]);
+      await expect(store.readStage(runDirectory, 'ingest')).resolves.toEqual(report);
+      const exactReport = await readFile(finalPath, 'utf8');
+      expect(JSON.parse(exactReport)).toEqual(report);
+      expect(probe.events).not.toContain('unlink-final:ingest.json');
+    } finally {
+      vi.doUnmock('node:fs/promises');
+      vi.resetModules();
+      await rm(workspaceRoot, {recursive: true, force: true});
+    }
+  });
 
   it('commits the canonical report when the held-parent retry succeeds', async () => {
     const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'stage-report-unknown-'));
