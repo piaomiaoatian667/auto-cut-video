@@ -61,6 +61,12 @@ export type AppDirectoryEntryKind =
   | 'symlink'
   | 'other';
 
+export interface AppDirectoryReadFileAuthority {
+  readonly handle: FileHandle;
+  revalidate(): Promise<void>;
+  close(): Promise<void>;
+}
+
 const workStates = new WeakMap<WorkDirectoryScope, ScopeState>();
 const runStates = new WeakMap<RunDirectoryScope, ScopeState>();
 const outputStates = new WeakMap<OutputDirectoryScope, ScopeState>();
@@ -179,6 +185,37 @@ const identityMatchesStats = (
   stats: BigIntStats,
 ): boolean => stats.dev === identity.dev && stats.ino === identity.ino;
 
+interface RegularFileIdentity {
+  dev: bigint;
+  ino: bigint;
+  nlink: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}
+
+const regularFileIdentity = (stats: BigIntStats): RegularFileIdentity => ({
+  dev: stats.dev,
+  ino: stats.ino,
+  nlink: stats.nlink,
+  size: stats.size,
+  mtimeNs: stats.mtimeNs,
+  ctimeNs: stats.ctimeNs,
+});
+
+const regularFileIdentityMatches = (
+  stats: BigIntStats,
+  identity: RegularFileIdentity,
+): boolean => (
+  stats.isFile()
+  && stats.dev === identity.dev
+  && stats.ino === identity.ino
+  && stats.nlink === identity.nlink
+  && stats.size === identity.size
+  && stats.mtimeNs === identity.mtimeNs
+  && stats.ctimeNs === identity.ctimeNs
+);
+
 const volumePath = (dev: bigint, ino: bigint): string =>
   path.join('/.vol', String(dev), String(ino));
 
@@ -231,6 +268,23 @@ const openDirectoryAnchor = async (
 
 const closeDirectoryAnchor = async (anchor: DirectoryAnchor): Promise<void> => {
   await anchor.handle.close();
+};
+
+const closeDirectoryAnchors = async (
+  anchors: readonly DirectoryAnchor[],
+): Promise<void> => {
+  const errors: unknown[] = [];
+  for (const anchor of [...anchors].reverse()) {
+    try {
+      await closeDirectoryAnchor(anchor);
+    } catch (error) {
+      errors.push(error);
+    }
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) {
+    throw new AggregateError(errors, 'failed to close scoped directory authorities');
+  }
 };
 
 const inspectPlainDirectory = (
@@ -562,10 +616,12 @@ const openExistingScopedFile = async (
 const openExistingScopedReadFile = async (
   state: ScopeState,
   relativePath: string,
-): Promise<FileHandle> => {
+): Promise<AppDirectoryReadFileAuthority> => {
   assertDarwin();
-  const anchor = await openScopedPathAnchor(state, relativePath);
+  const pathAuthority = await openScopedReadPathAuthority(state, relativePath);
+  const anchor = pathAuthority.finalEntry;
   let handle: FileHandle | undefined;
+  let transferred = false;
   try {
     const inspected = await inspectAnchoredEntry(anchor, relativePath);
     if (inspected.kind !== 'file' && inspected.kind !== 'missing') {
@@ -573,7 +629,7 @@ const openExistingScopedReadFile = async (
         `app-owned read target is not a regular file: ${relativePath}`,
       );
     }
-    await assertScopedPathAnchorStable(state, anchor, relativePath);
+    await assertScopedReadPathStable(state, pathAuthority, relativePath);
     handle = await open(
       path.join(anchor.parent.volumePath, anchor.basename),
       constants.O_RDONLY | constants.O_NONBLOCK | O_NOFOLLOW_ANY,
@@ -587,32 +643,69 @@ const openExistingScopedReadFile = async (
       || opened.ino !== inspected.stats.ino
       || opened.nlink !== inspected.stats.nlink
       || opened.size !== inspected.stats.size
+      || opened.mtimeNs !== inspected.stats.mtimeNs
+      || opened.ctimeNs !== inspected.stats.ctimeNs
     ) {
       throw securityError(`app-owned read target changed while opening: ${relativePath}`);
     }
-    await assertScopedPathAnchorStable(state, anchor, relativePath);
-    const current = await inspectAnchoredEntry(anchor, relativePath);
-    if (
-      current.kind !== 'file'
-      || current.stats === undefined
-      || current.stats.dev !== opened.dev
-      || current.stats.ino !== opened.ino
-      || current.stats.nlink !== opened.nlink
-      || current.stats.size !== opened.size
-    ) {
-      throw securityError(`app-owned read target changed after opening: ${relativePath}`);
-    }
-    const result = handle;
+    const identity = regularFileIdentity(opened);
+    const openedHandle = handle;
+    const revalidate = async (): Promise<void> => {
+      await assertScopedReadPathStable(state, pathAuthority, relativePath);
+      const held = await openedHandle.stat({bigint: true});
+      if (!regularFileIdentityMatches(held, identity)) {
+        throw securityError(`app-owned read handle changed: ${relativePath}`);
+      }
+      const current = await inspectAnchoredEntry(anchor, relativePath);
+      if (
+        current.kind !== 'file'
+        || current.stats === undefined
+        || !regularFileIdentityMatches(current.stats, identity)
+      ) {
+        throw securityError(`app-owned read target changed after opening: ${relativePath}`);
+      }
+    };
+    await revalidate();
+    let closed = false;
+    const result: AppDirectoryReadFileAuthority = {
+      handle: openedHandle,
+      revalidate,
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        let fileCloseError: unknown;
+        try {
+          await openedHandle.close();
+        } catch (error) {
+          fileCloseError = error;
+        }
+        try {
+          await closeDirectoryAnchors(pathAuthority.directories);
+        } catch (directoryCloseError) {
+          if (fileCloseError !== undefined) {
+            throw new AggregateError(
+              [fileCloseError, directoryCloseError],
+              'failed to close scoped artifact read authority',
+            );
+          }
+          throw directoryCloseError;
+        }
+        if (fileCloseError !== undefined) throw fileCloseError;
+      },
+    };
     handle = undefined;
+    transferred = true;
     return result;
   } catch (error) {
     if (error instanceof AppDirectoryScopeError) throw error;
     return mapSymlinkError(error, relativePath);
   } finally {
-    try {
-      if (handle !== undefined) await handle.close();
-    } finally {
-      await closeDirectoryAnchor(anchor.parent);
+    if (!transferred) {
+      try {
+        if (handle !== undefined) await handle.close();
+      } finally {
+        await closeDirectoryAnchors(pathAuthority.directories);
+      }
     }
   }
 };
@@ -664,7 +757,7 @@ export const openExistingRunFile = async (
 export const openExistingRunFileForRead = async (
   scope: RunDirectoryScope,
   relativePath: string,
-): Promise<FileHandle> => await openExistingScopedReadFile(
+): Promise<AppDirectoryReadFileAuthority> => await openExistingScopedReadFile(
   stateFor(runStates, scope, 'RunDirectoryScope'),
   relativePath,
 );
@@ -698,7 +791,7 @@ export const openExistingOutputFile = async (
 export const openExistingOutputFileForRead = async (
   scope: OutputDirectoryScope,
   relativePath: string,
-): Promise<FileHandle> => await openExistingScopedReadFile(
+): Promise<AppDirectoryReadFileAuthority> => await openExistingScopedReadFile(
   stateFor(outputStates, scope, 'OutputDirectoryScope'),
   relativePath,
 );
@@ -752,6 +845,84 @@ interface ScopedPathAnchor {
   parent: DirectoryAnchor;
   basename: string;
 }
+
+interface ScopedReadPathAuthority {
+  directories: readonly DirectoryAnchor[];
+  finalEntry: ScopedPathAnchor;
+}
+
+const openScopedReadPathAuthority = async (
+  state: ScopeState,
+  relativePath: string,
+): Promise<ScopedReadPathAuthority> => {
+  const segments = parseRelativePath(relativePath);
+  await assertScopeStable(state, relativePath);
+  const basename = segments.at(-1)!;
+  const parentSegments = segments.slice(0, -1);
+  const directories: DirectoryAnchor[] = [];
+  try {
+    let parent = await openDirectoryAnchor(
+      state.ancestors.at(-1)!,
+      relativePath,
+    );
+    directories.push(parent);
+    for (const segment of parentSegments) {
+      const childPath = path.join(parent.volumePath, segment);
+      const childStats = await lstat(childPath, {bigint: true});
+      if (childStats.isSymbolicLink() || !childStats.isDirectory()) {
+        throw securityError(`app-owned parent is not a plain directory: ${relativePath}`);
+      }
+      const childIdentity = identityFromStats(
+        path.join(parent.identity.path, segment),
+        childStats,
+      );
+      if (!isWithin(state.root, childIdentity.path)) {
+        throw securityError(`path escapes app-owned scope: ${relativePath}`);
+      }
+      await assertDirectoryIdentityStable(childIdentity, relativePath);
+      parent = await openDirectoryAnchor(childIdentity, relativePath);
+      directories.push(parent);
+    }
+    await assertScopeStable(state, relativePath);
+    return {
+      directories,
+      finalEntry: {parent, basename},
+    };
+  } catch (error) {
+    await closeDirectoryAnchors(directories).catch(() => undefined);
+    if (error instanceof AppDirectoryScopeError) throw error;
+    return mapSymlinkError(error, relativePath);
+  }
+};
+
+const assertScopedReadPathStable = async (
+  state: ScopeState,
+  authority: ScopedReadPathAuthority,
+  relativePath: string,
+): Promise<void> => {
+  await assertScopeStable(state, relativePath);
+  for (const [index, directory] of authority.directories.entries()) {
+    await assertDirectoryIdentityStable(directory.identity, relativePath);
+    const held = await directory.handle.stat({bigint: true});
+    if (!held.isDirectory() || !identityMatchesStats(directory.identity, held)) {
+      throw securityError(`app-owned parent changed while held open: ${relativePath}`);
+    }
+    const anchored = await lstat(directory.volumePath, {bigint: true});
+    if (!anchored.isDirectory() || !identityMatchesStats(directory.identity, anchored)) {
+      throw securityError(`Darwin parent anchor changed: ${relativePath}`);
+    }
+    if (index > 0) {
+      const parent = authority.directories[index - 1]!;
+      const child = await lstat(
+        path.join(parent.volumePath, path.basename(directory.identity.path)),
+        {bigint: true},
+      );
+      if (!child.isDirectory() || !identityMatchesStats(directory.identity, child)) {
+        throw securityError(`app-owned parent chain changed: ${relativePath}`);
+      }
+    }
+  }
+};
 
 const openScopedPathAnchor = async (
   state: ScopeState,

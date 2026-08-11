@@ -7,6 +7,7 @@ import {
   openExistingRunFileForRead,
   openNewRunFile,
   unlinkRunFile,
+  type AppDirectoryReadFileAuthority,
   type OutputDirectoryScope,
   type RunDirectoryScope,
 } from '../fs/app-directory-scopes';
@@ -129,13 +130,15 @@ const hashFileHandle = async (handle: FileHandle): Promise<string> => {
 };
 
 const hashScopedFile = async (
-  openFile: () => Promise<FileHandle>,
+  openFile: () => Promise<AppDirectoryReadFileAuthority>,
 ): Promise<string> => {
-  const handle = await openFile();
+  const authority = await openFile();
   try {
-    return await hashFileHandle(handle);
+    const sha256 = await hashFileHandle(authority.handle);
+    await authority.revalidate();
+    return sha256;
   } finally {
-    await handle.close();
+    await authority.close();
   }
 };
 
@@ -244,8 +247,9 @@ export async function copyRunArtifact(input: {
       );
       targetCreated = true;
       try {
-        await copyFileHandles(source, target);
+        await copyFileHandles(source.handle, target);
         await target.sync();
+        await source.revalidate();
       } finally {
         await target.close();
       }

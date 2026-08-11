@@ -2,6 +2,7 @@ import {execFile as execFileCallback} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import {constants, type BigIntStats} from 'node:fs';
 import {
+  chmod,
   lstat,
   mkdir,
   mkdtemp,
@@ -56,6 +57,8 @@ type InterceptedStat = (
   this: object,
   options: {bigint: true},
 ) => Promise<BigIntStats>;
+
+type InterceptedSync = (this: InterceptedReadHandle) => Promise<void>;
 
 afterEach(async () => {
   await Promise.all(tempDirectories.splice(0).map(async (directory) => {
@@ -348,6 +351,179 @@ describe('pipeline artifacts', () => {
     },
   );
 
+  it.each([
+    'hashRunArtifact',
+    'verifyOutputArtifact',
+    'copyRunArtifact',
+  ] as const)(
+    'fails closed when a nested parent is swapped during %s',
+    async (operation) => {
+      const workspaceRoot = await makeWorkspace();
+      const runStore = createRunStore(workspaceRoot);
+      const sourceRun = await runStore.createRun('demo', 'source-run');
+      const targetRun = await runStore.createRun('demo', 'target-run');
+      const outputDirectory = await createOutputStore(workspaceRoot)
+        .openProject('demo');
+      const relativePath = 'nested/parent/stable.bin';
+      const original = Buffer.alloc(128 * 1024, 0x61);
+      const replacement = Buffer.alloc(original.length, 0x62);
+      if (operation === 'verifyOutputArtifact') {
+        await writeOutputBytes(outputDirectory, relativePath, original);
+      } else {
+        await writeRunBytes(sourceRun, relativePath, original);
+      }
+      const sourcePath = operation === 'verifyOutputArtifact'
+        ? path.join(workspaceRoot, 'output', 'demo', relativePath)
+        : path.join(
+          workspaceRoot,
+          '.work',
+          'demo',
+          'runs',
+          'source-run',
+          relativePath,
+        );
+      const nestedRoot = path.dirname(path.dirname(sourcePath));
+      const movedRoot = `${nestedRoot}-original`;
+      const originalStats = await lstat(sourcePath, {bigint: true});
+      const probe = operation === 'verifyOutputArtifact'
+        ? await openFile(sourcePath, constants.O_RDONLY)
+        : await openExistingRunFile(sourceRun, relativePath);
+      const prototype = Object.getPrototypeOf(probe) as {read: InterceptedRead};
+      const originalRead = prototype.read;
+      await probe.close();
+      let parentSwapped = false;
+      prototype.read = async function (buffer, offset, length, position) {
+        const status = await this.stat({bigint: true});
+        const result = await originalRead.call(
+          this,
+          buffer,
+          offset,
+          length,
+          position,
+        );
+        if (
+          !parentSwapped
+          && result.bytesRead > 0
+          && status.dev === originalStats.dev
+          && status.ino === originalStats.ino
+        ) {
+          parentSwapped = true;
+          await rename(nestedRoot, movedRoot);
+          await mkdir(path.dirname(sourcePath), {recursive: true});
+          await writeFile(sourcePath, replacement);
+        }
+        return result;
+      };
+
+      try {
+        const pending = operation === 'hashRunArtifact'
+          ? hashRunArtifact(sourceRun, relativePath)
+          : operation === 'verifyOutputArtifact'
+            ? verifyOutputArtifact(outputDirectory, {
+              scope: 'output',
+              path: relativePath,
+              sha256: sha256(original),
+            })
+            : copyRunArtifact({
+              sourceRun,
+              targetRun,
+              artifact: {
+                scope: 'run',
+                path: relativePath,
+                sha256: sha256(original),
+              },
+            });
+        const prompt = Promise.race([
+          pending,
+          delay(500).then(() => {
+            throw new Error('artifact operation timed out');
+          }),
+        ]);
+
+        await expect(prompt).rejects.toMatchObject({
+          code: 'APP_PATH_OUTSIDE_SCOPE',
+        });
+      } finally {
+        prototype.read = originalRead;
+      }
+      expect(parentSwapped).toBe(true);
+      if (operation === 'copyRunArtifact') {
+        await expect(openExistingRunFile(targetRun, relativePath))
+          .rejects.toMatchObject({code: 'ENOENT'});
+      }
+    },
+  );
+
+  it('fails closed when the source parent is swapped during target sync', async () => {
+    const workspaceRoot = await makeWorkspace();
+    const runStore = createRunStore(workspaceRoot);
+    const sourceRun = await runStore.createRun('demo', 'source-run');
+    const targetRun = await runStore.createRun('demo', 'target-run');
+    const relativePath = 'nested/parent/stable.bin';
+    const original = Buffer.alloc(128 * 1024, 0x61);
+    const replacement = Buffer.alloc(original.length, 0x62);
+    await writeRunBytes(sourceRun, relativePath, original);
+    const sourcePath = path.join(
+      workspaceRoot,
+      '.work',
+      'demo',
+      'runs',
+      'source-run',
+      relativePath,
+    );
+    const targetPath = path.join(
+      workspaceRoot,
+      '.work',
+      'demo',
+      'runs',
+      'target-run',
+      relativePath,
+    );
+    const nestedRoot = path.dirname(path.dirname(sourcePath));
+    const movedRoot = `${nestedRoot}-original`;
+    const probe = await openExistingRunFile(sourceRun, relativePath);
+    const prototype = Object.getPrototypeOf(probe) as {sync: InterceptedSync};
+    const originalSync = prototype.sync;
+    await probe.close();
+    let parentSwapped = false;
+    prototype.sync = async function () {
+      const status = await this.stat({bigint: true});
+      const target = await lstat(targetPath, {bigint: true}).catch((error) => {
+        if (isNodeError(error) && error.code === 'ENOENT') return undefined;
+        throw error;
+      });
+      if (
+        !parentSwapped
+        && target?.isFile()
+        && status.dev === target.dev
+        && status.ino === target.ino
+      ) {
+        parentSwapped = true;
+        await rename(nestedRoot, movedRoot);
+        await mkdir(path.dirname(sourcePath), {recursive: true});
+        await writeFile(sourcePath, replacement);
+      }
+      await originalSync.call(this);
+    };
+
+    try {
+      await expect(copyRunArtifact({
+        sourceRun,
+        targetRun,
+        artifact: {
+          scope: 'run',
+          path: relativePath,
+          sha256: sha256(original),
+        },
+      })).rejects.toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
+    } finally {
+      prototype.sync = originalSync;
+    }
+    expect(parentSwapped).toBe(true);
+    await expect(openExistingRunFile(targetRun, relativePath))
+      .rejects.toMatchObject({code: 'ENOENT'});
+  });
+
   it('reports both a copy failure and rollback failure', async () => {
     const workspaceRoot = await makeWorkspace();
     const runStore = createRunStore(workspaceRoot);
@@ -528,12 +704,41 @@ describe('pipeline artifacts', () => {
       'target-run',
       relativePath,
     );
+    const targetParent = path.dirname(targetPath);
     const probe = await openExistingRunFile(sourceRun, relativePath);
-    const prototype = Object.getPrototypeOf(probe) as {stat: InterceptedStat};
+    const prototype = Object.getPrototypeOf(probe) as {
+      read: InterceptedRead;
+      stat: InterceptedStat;
+    };
+    const originalRead = prototype.read;
     const originalStat = prototype.stat;
     await probe.close();
-    let targetStatCalls = 0;
-    let targetReplaced = false;
+    let targetRead = false;
+    let postReadTargetStats = 0;
+    let cleanupBlocked = false;
+    prototype.read = async function (buffer, offset, length, position) {
+      const status = await this.stat({bigint: true});
+      const target = await lstat(targetPath, {bigint: true}).catch((error) => {
+        if (isNodeError(error) && error.code === 'ENOENT') return undefined;
+        throw error;
+      });
+      const result = await originalRead.call(
+        this,
+        buffer,
+        offset,
+        length,
+        position,
+      );
+      if (
+        result.bytesRead > 0
+        && target?.isFile()
+        && status.dev === target.dev
+        && status.ino === target.ino
+      ) {
+        targetRead = true;
+      }
+      return result;
+    };
     prototype.stat = async function (options) {
       const status = await originalStat.call(this, options);
       const target = await lstat(targetPath, {bigint: true}).catch((error) => {
@@ -541,15 +746,15 @@ describe('pipeline artifacts', () => {
         throw error;
       });
       if (
-        target?.isFile()
+        targetRead
+        && target?.isFile()
         && status.dev === target.dev
         && status.ino === target.ino
       ) {
-        targetStatCalls += 1;
-        if (targetStatCalls === 3) {
-          await rename(targetPath, `${targetPath}.partial`);
-          await mkdir(targetPath);
-          targetReplaced = true;
+        postReadTargetStats += 1;
+        if (postReadTargetStats === 2) {
+          await chmod(targetParent, 0o500);
+          cleanupBlocked = true;
         }
       }
       return status;
@@ -569,16 +774,23 @@ describe('pipeline artifacts', () => {
     } catch (error) {
       caughtError = error;
     } finally {
+      prototype.read = originalRead;
       prototype.stat = originalStat;
+      if (cleanupBlocked) await chmod(targetParent, 0o700);
     }
 
     expect(caughtError).toBeInstanceOf(AggregateError);
-    expect((caughtError as AggregateError).errors).toEqual(expect.arrayContaining([
+    const errors = (caughtError as AggregateError).errors;
+    expect(errors).toEqual(expect.arrayContaining([
       expect.objectContaining({code: 'ARTIFACT_HASH_MISMATCH'}),
-      expect.objectContaining({code: 'APP_PATH_OUTSIDE_SCOPE'}),
     ]));
+    expect(errors.some((error) => (
+      isNodeError(error)
+      && (error.code === 'EACCES' || error.code === 'EPERM')
+    ))).toBe(true);
     expect((caughtError as Error).message).toContain(relativePath);
-    expect(targetReplaced).toBe(true);
-    expect((await lstat(targetPath)).isDirectory()).toBe(true);
+    expect(cleanupBlocked).toBe(true);
+    const remaining = await openExistingRunFile(targetRun, relativePath);
+    await remaining.close();
   });
 });
