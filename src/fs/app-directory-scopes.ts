@@ -94,7 +94,7 @@ export interface AppDirectoryWriteFileAuthority {
 
 export interface AppDirectoryLinkedFileAuthority {
   syncParent(): Promise<void>;
-  unlink(): Promise<void>;
+  unlinkSource(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -1696,7 +1696,7 @@ const linkScopedFileAuthority = async (
     );
     linked = true;
     const heldAfterLink = await sourceAuthority.handle.stat({bigint: true});
-    const linkedIdentity = regularFileIdentity(heldAfterLink);
+    let linkedIdentity = regularFileIdentity(heldAfterLink);
     const retainedSource = source;
     const retainedTarget = target;
     const assertLinkedTarget = async (): Promise<void> => {
@@ -1712,7 +1712,18 @@ const linkScopedFileAuthority = async (
     await assertLinkedTarget();
 
     let closed = false;
-    let unlinked = false;
+    let sourceUnlinked = false;
+    const refreshLinkedIdentityAfterSourceRemoval = async (): Promise<void> => {
+      const held = await sourceAuthority.handle.stat({bigint: true});
+      if (!held.isFile() || held.nlink !== 1n) {
+        throw authorityError(
+          `linked app-owned source removal is incomplete: ${sourceRelativePath}`,
+        );
+      }
+      linkedIdentity = regularFileIdentity(held);
+      await assertLinkedTarget();
+      sourceUnlinked = true;
+    };
     const result: AppDirectoryLinkedFileAuthority = {
       syncParent: async () => {
         if (closed) throw new TypeError('linked file authority is closed');
@@ -1720,18 +1731,35 @@ const linkScopedFileAuthority = async (
         await syncHeldDirectoryAnchor(retainedTarget.parent, targetRelativePath);
         await assertLinkedTarget();
       },
-      unlink: async () => {
+      unlinkSource: async () => {
         if (closed) throw new TypeError('linked file authority is closed');
-        if (unlinked) return;
+        if (sourceUnlinked) return;
+        const sourceEntry = await inspectAnchoredEntry(
+          retainedSource,
+          sourceRelativePath,
+        );
+        if (sourceEntry.kind === 'missing') {
+          await refreshLinkedIdentityAfterSourceRemoval();
+          return;
+        }
+        if (
+          sourceEntry.kind !== 'file'
+          || sourceEntry.stats === undefined
+          || !regularFileIdentityMatches(sourceEntry.stats, linkedIdentity)
+        ) {
+          throw authorityError(`linked app-owned source changed: ${sourceRelativePath}`);
+        }
         await assertLinkedTarget();
         await unlink(path.join(
-          retainedTarget.parent.volumePath,
-          retainedTarget.basename,
+          retainedSource.parent.volumePath,
+          retainedSource.basename,
         ));
-        if ((await inspectAnchoredEntry(retainedTarget, targetRelativePath)).kind !== 'missing') {
-          throw authorityError(`linked app-owned target remains after cleanup: ${targetRelativePath}`);
+        if ((await inspectAnchoredEntry(retainedSource, sourceRelativePath)).kind !== 'missing') {
+          throw authorityError(
+            `linked app-owned source remains after cleanup: ${sourceRelativePath}`,
+          );
         }
-        unlinked = true;
+        await refreshLinkedIdentityAfterSourceRemoval();
       },
       close: async () => {
         if (closed) return;

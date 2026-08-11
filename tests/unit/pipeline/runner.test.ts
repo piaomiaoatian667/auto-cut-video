@@ -482,10 +482,10 @@ const writeRunArtifact = async (
 interface UnknownReportOutcomeProbe {
   armed: boolean;
   targetReport: string;
-  parentSyncError: Error;
-  rollbackUnlinkError: Error;
-  parentSyncFailed: boolean;
-  rollbackUnlinkFailed: boolean;
+  parentSyncErrors: Error[];
+  commitParentHandleId?: number;
+  parentSyncHandleIds: number[];
+  linkedSource?: string;
   linkedTarget?: string;
   events: string[];
 }
@@ -498,6 +498,7 @@ const importPipelineModulesWithUnknownReportOutcomeProbe = async (
     const actual = await vi.importActual<typeof import('node:fs/promises')>(
       'node:fs/promises',
     );
+    let nextDirectoryHandleId = 0;
     return {
       ...actual,
       open: async (...args: Parameters<typeof actual.open>) => {
@@ -508,6 +509,8 @@ const importPipelineModulesWithUnknownReportOutcomeProbe = async (
         if (!status.isDirectory() || path.basename(openedPath) !== 'reports') {
           return handle;
         }
+        const directoryHandleId = nextDirectoryHandleId;
+        nextDirectoryHandleId += 1;
         return new Proxy(handle, {
           get(target, property) {
             if (property === 'sync') {
@@ -516,10 +519,13 @@ const importPipelineModulesWithUnknownReportOutcomeProbe = async (
                 if (
                   probe.linkedTarget !== undefined
                   && path.basename(probe.linkedTarget) === probe.targetReport
-                  && !probe.parentSyncFailed
                 ) {
-                  probe.parentSyncFailed = true;
-                  throw probe.parentSyncError;
+                  probe.commitParentHandleId ??= directoryHandleId;
+                  if (probe.commitParentHandleId === directoryHandleId) {
+                    probe.parentSyncHandleIds.push(directoryHandleId);
+                    const parentSyncError = probe.parentSyncErrors.shift();
+                    if (parentSyncError !== undefined) throw parentSyncError;
+                  }
                 }
                 await target.sync();
               };
@@ -531,22 +537,21 @@ const importPipelineModulesWithUnknownReportOutcomeProbe = async (
       },
       link: async (...args: Parameters<typeof actual.link>) => {
         await Reflect.apply(actual.link, undefined, args);
+        const sourcePath = String(args[0]);
         const targetPath = String(args[1]);
         if (probe.armed && path.basename(targetPath) === probe.targetReport) {
+          probe.linkedSource = sourcePath;
           probe.linkedTarget = targetPath;
           probe.events.push(`link:${probe.targetReport}`);
         }
       },
       unlink: async (...args: Parameters<typeof actual.unlink>) => {
         const targetPath = String(args[0]);
-        if (
-          probe.armed
-          && probe.linkedTarget === targetPath
-          && !probe.rollbackUnlinkFailed
-        ) {
-          probe.rollbackUnlinkFailed = true;
+        if (probe.armed && probe.linkedTarget === targetPath) {
           probe.events.push(`unlink-final:${probe.targetReport}`);
-          throw probe.rollbackUnlinkError;
+        }
+        if (probe.armed && probe.linkedSource === targetPath) {
+          probe.events.push(`unlink-temp:${probe.targetReport}`);
         }
         await Reflect.apply(actual.unlink, undefined, args);
       },
@@ -1376,16 +1381,14 @@ describe('Pipeline Runner', () => {
     const parentSyncError = Object.assign(new Error('compile report parent sync failed'), {
       code: 'EIO',
     });
-    const rollbackUnlinkError = Object.assign(new Error('compile report unlink failed'), {
+    const retrySyncError = Object.assign(new Error('compile report parent retry failed'), {
       code: 'EIO',
     });
     const probe: UnknownReportOutcomeProbe = {
       armed: false,
       targetReport: 'compile.json',
-      parentSyncError,
-      rollbackUnlinkError,
-      parentSyncFailed: false,
-      rollbackUnlinkFailed: false,
+      parentSyncErrors: [parentSyncError, retrySyncError],
+      parentSyncHandleIds: [],
       events: [],
     };
     const modules = await importPipelineModulesWithUnknownReportOutcomeProbe(probe);
@@ -1483,6 +1486,7 @@ describe('Pipeline Runner', () => {
         name: 'StageReportOutcomeError',
         code: 'PIPELINE_REPORT_OUTCOME_UNKNOWN',
         cause: parentSyncError,
+        errors: [parentSyncError, retrySyncError],
       });
 
       await expect(reportStore.readStage(runDirectory, 'compile')).resolves.toMatchObject({
@@ -1497,6 +1501,11 @@ describe('Pipeline Runner', () => {
       await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
         completedStage: 'narration',
       });
+      expect(probe.parentSyncHandleIds).toEqual([
+        probe.commitParentHandleId,
+        probe.commitParentHandleId,
+      ]);
+      expect(probe.events).not.toContain('unlink-final:compile.json');
 
       probe.armed = false;
       const restartPlan = await modules.executionPlan.buildExecutionPlan({
@@ -1550,16 +1559,14 @@ describe('Pipeline Runner', () => {
     const parentSyncError = Object.assign(new Error('cached report parent sync failed'), {
       code: 'EIO',
     });
-    const rollbackUnlinkError = Object.assign(new Error('cached report unlink failed'), {
+    const retrySyncError = Object.assign(new Error('cached report parent retry failed'), {
       code: 'EIO',
     });
     const probe: UnknownReportOutcomeProbe = {
       armed: false,
       targetReport: 'ingest.json',
-      parentSyncError,
-      rollbackUnlinkError,
-      parentSyncFailed: false,
-      rollbackUnlinkFailed: false,
+      parentSyncErrors: [parentSyncError, retrySyncError],
+      parentSyncHandleIds: [],
       events: [],
     };
     const modules = await importPipelineModulesWithUnknownReportOutcomeProbe(probe);
@@ -1657,6 +1664,7 @@ describe('Pipeline Runner', () => {
         name: 'StageReportOutcomeError',
         code: 'PIPELINE_REPORT_OUTCOME_UNKNOWN',
         cause: parentSyncError,
+        errors: [parentSyncError, retrySyncError],
       });
 
       const targetRun = await runStore.openExistingRun('demo', targetRunId);
@@ -1673,6 +1681,11 @@ describe('Pipeline Runner', () => {
         runId: targetRunId,
         completedStage: 'preflight',
       });
+      expect(probe.parentSyncHandleIds).toEqual([
+        probe.commitParentHandleId,
+        probe.commitParentHandleId,
+      ]);
+      expect(probe.events).not.toContain('unlink-final:ingest.json');
 
       probe.armed = false;
       const restartPlan = await modules.executionPlan.buildExecutionPlan({

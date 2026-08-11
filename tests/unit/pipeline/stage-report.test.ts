@@ -211,10 +211,11 @@ interface AtomicReportProbe {
   fault?: AtomicReportFault;
   faultError: Error;
   faultInjected: boolean;
+  parentSyncErrors?: Error[];
+  commitParentHandleId?: number;
+  parentSyncHandleIds?: number[];
   linkedSource?: string;
   linkedTarget?: string;
-  rollbackUnlinkError?: Error;
-  rollbackUnlinkInjected?: boolean;
 }
 
 const importReportModulesWithAtomicWriteProbe = async (
@@ -225,6 +226,7 @@ const importReportModulesWithAtomicWriteProbe = async (
     const actual = await vi.importActual<typeof import('node:fs/promises')>(
       'node:fs/promises',
     );
+    let nextDirectoryHandleId = 0;
     const shouldInject = (fault: AtomicReportFault): boolean => (
       probe.armed
       && probe.fault === fault
@@ -277,13 +279,21 @@ const importReportModulesWithAtomicWriteProbe = async (
         ) {
           return handle;
         }
+        const directoryHandleId = nextDirectoryHandleId;
+        nextDirectoryHandleId += 1;
         return new Proxy(handle, {
           get(target, property) {
             if (property === 'sync') {
               return async () => {
                 probe.events.push(`sync-parent:${path.basename(openedPath)}`);
-                if (probe.linkedSource !== undefined && shouldInject('parent-sync')) {
-                  inject();
+                if (probe.linkedSource !== undefined) {
+                  probe.commitParentHandleId ??= directoryHandleId;
+                  if (probe.commitParentHandleId === directoryHandleId) {
+                    probe.parentSyncHandleIds?.push(directoryHandleId);
+                    const parentSyncError = probe.parentSyncErrors?.shift();
+                    if (parentSyncError !== undefined) throw parentSyncError;
+                    if (shouldInject('parent-sync')) inject();
+                  }
                 }
                 await target.sync();
               };
@@ -306,13 +316,6 @@ const importReportModulesWithAtomicWriteProbe = async (
         const targetPath = String(args[0]);
         if (probe.linkedTarget === targetPath) {
           probe.events.push(`unlink-final:${path.basename(targetPath)}`);
-          if (
-            probe.rollbackUnlinkError !== undefined
-            && probe.rollbackUnlinkInjected !== true
-          ) {
-            probe.rollbackUnlinkInjected = true;
-            throw probe.rollbackUnlinkError;
-          }
         }
         if (probe.linkedSource === targetPath) {
           probe.events.push(`unlink-temp:${path.basename(targetPath)}`);
@@ -633,7 +636,6 @@ describe('StageReportStore', () => {
     'write',
     'sync',
     'link',
-    'parent-sync',
   ] as const)(
     'keeps the canonical path absent after a pre-commit %s failure and retries cleanly',
     async (fault) => {
@@ -683,12 +685,9 @@ describe('StageReportStore', () => {
     },
   );
 
-  it('reports an unknown outcome when a linked canonical report cannot be rolled back', async () => {
+  it('commits the canonical report when the held-parent retry succeeds', async () => {
     const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'stage-report-unknown-'));
     const parentSyncError = Object.assign(new Error('report parent sync failed'), {
-      code: 'EIO',
-    });
-    const rollbackUnlinkError = Object.assign(new Error('report rollback unlink failed'), {
       code: 'EIO',
     });
     const probe: AtomicReportProbe = {
@@ -697,7 +696,7 @@ describe('StageReportStore', () => {
       fault: 'parent-sync',
       faultError: parentSyncError,
       faultInjected: false,
-      rollbackUnlinkError,
+      parentSyncHandleIds: [],
     };
     const {scopes, reports} = await importReportModulesWithAtomicWriteProbe(probe);
     try {
@@ -708,31 +707,81 @@ describe('StageReportStore', () => {
       const report = passedStageReport({stageId: 'ingest'});
       probe.armed = true;
 
-      let writeError: unknown;
-      try {
-        await store.writeStage(runDirectory, report);
-      } catch (error) {
-        writeError = error;
-      }
+      await expect(store.writeStage(runDirectory, report)).resolves.toBeUndefined();
 
-      expect(writeError).toMatchObject({
-        name: 'StageReportOutcomeError',
-        code: 'PIPELINE_REPORT_OUTCOME_UNKNOWN',
-        cause: parentSyncError,
-      });
-      expect(writeError).toBeInstanceOf(AggregateError);
-      expect((writeError as AggregateError).errors).toEqual(expect.arrayContaining([
-        parentSyncError,
-        rollbackUnlinkError,
-      ]));
       await expect(store.readStage(runDirectory, 'ingest')).resolves.toEqual(report);
       await expect(store.writeStage(runDirectory, report))
         .rejects.toMatchObject({code: 'EEXIST'});
-      expect(probe.events).toEqual(expect.arrayContaining([
-        expect.stringMatching(/^link:.*->ingest\.json$/u),
+      expect(probe.parentSyncHandleIds).toEqual([
+        probe.commitParentHandleId,
+        probe.commitParentHandleId,
+      ]);
+      const firstSyncIndex = probe.events.indexOf('sync-parent:reports');
+      const tempUnlinkIndex = probe.events.findIndex((event) => (
+        event.startsWith('unlink-temp:')
+      ));
+      const retrySyncIndex = probe.events.indexOf(
         'sync-parent:reports',
-        'unlink-final:ingest.json',
-      ]));
+        firstSyncIndex + 1,
+      );
+      expect(tempUnlinkIndex).toBeGreaterThan(firstSyncIndex);
+      expect(retrySyncIndex).toBeGreaterThan(tempUnlinkIndex);
+      expect(probe.events).not.toContain('unlink-final:ingest.json');
+    } finally {
+      vi.doUnmock('node:fs/promises');
+      vi.resetModules();
+      await rm(workspaceRoot, {recursive: true, force: true});
+    }
+  });
+
+  it('preserves the complete canonical report when held-parent commit remains unknown', async () => {
+    const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'stage-report-unknown-'));
+    const parentSyncError = Object.assign(new Error('report parent sync failed'), {
+      code: 'EIO',
+    });
+    const retrySyncError = Object.assign(new Error('report parent retry failed'), {
+      code: 'EIO',
+    });
+    const probe: AtomicReportProbe = {
+      armed: false,
+      events: [],
+      faultError: parentSyncError,
+      faultInjected: false,
+      parentSyncErrors: [parentSyncError, retrySyncError],
+      parentSyncHandleIds: [],
+    };
+    const {scopes, reports} = await importReportModulesWithAtomicWriteProbe(probe);
+    try {
+      const runDirectory = await scopes.createRunStore(workspaceRoot)
+        .createRun('demo', 'run-one');
+      await scopes.ensureRunDirectory(runDirectory, 'reports');
+      const store = reports.createStageReportStore();
+      const report = passedStageReport({stageId: 'ingest'});
+      probe.armed = true;
+
+      await expect(store.writeStage(runDirectory, report)).rejects.toMatchObject({
+        name: 'StageReportOutcomeError',
+        code: 'PIPELINE_REPORT_OUTCOME_UNKNOWN',
+        cause: parentSyncError,
+        errors: [parentSyncError, retrySyncError],
+      });
+
+      await expect(store.readStage(runDirectory, 'ingest')).resolves.toEqual(report);
+      expect(probe.parentSyncHandleIds).toEqual([
+        probe.commitParentHandleId,
+        probe.commitParentHandleId,
+      ]);
+      const firstSyncIndex = probe.events.indexOf('sync-parent:reports');
+      const tempUnlinkIndex = probe.events.findIndex((event) => (
+        event.startsWith('unlink-temp:')
+      ));
+      const retrySyncIndex = probe.events.indexOf(
+        'sync-parent:reports',
+        firstSyncIndex + 1,
+      );
+      expect(tempUnlinkIndex).toBeGreaterThan(firstSyncIndex);
+      expect(retrySyncIndex).toBeGreaterThan(tempUnlinkIndex);
+      expect(probe.events).not.toContain('unlink-final:ingest.json');
     } finally {
       vi.doUnmock('node:fs/promises');
       vi.resetModules();
@@ -945,23 +994,23 @@ describe('StageReportStore', () => {
   );
 
   it.each([
-    ['create sync only', false],
-    ['create and rollback sync', true],
+    ['successful held-parent retry', false],
+    ['repeated held-parent sync failure', true],
   ] as const)(
-    'preserves %s failures while removing the report',
-    async (_label, failRollbackSync) => {
+    'preserves the canonical report after %s',
+    async (_label, failRetrySync) => {
       const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'stage-report-sync-'));
       const createSyncError = Object.assign(new Error('report create sync failed'), {
         code: 'EIO',
       });
-      const rollbackSyncError = Object.assign(new Error('report unlink sync failed'), {
+      const retrySyncError = Object.assign(new Error('report commit retry failed'), {
         code: 'EIO',
       });
       const probe: DirectorySyncProbe = {
         armed: false,
         reportFileOpened: false,
-        syncErrors: failRollbackSync
-          ? [createSyncError, rollbackSyncError]
+        syncErrors: failRetrySync
+          ? [createSyncError, retrySyncError]
           : [createSyncError],
         syncPaths: [],
         postCreateSyncPaths: [],
@@ -983,7 +1032,7 @@ describe('StageReportStore', () => {
           writeError = error;
         }
 
-        if (failRollbackSync) {
+        if (failRetrySync) {
           expect(writeError).toMatchObject({
             name: 'StageReportOutcomeError',
             code: 'PIPELINE_REPORT_OUTCOME_UNKNOWN',
@@ -992,19 +1041,16 @@ describe('StageReportStore', () => {
           expect(writeError).toBeInstanceOf(AggregateError);
           expect((writeError as AggregateError).errors).toEqual([
             createSyncError,
-            rollbackSyncError,
+            retrySyncError,
           ]);
         } else {
-          expect(writeError).toBe(createSyncError);
+          expect(writeError).toBeUndefined();
         }
         expect(probe.postCreateSyncPaths.slice(0, 2))
           .toEqual(['reports', 'reports']);
-        await expect(scopes.openExistingRunFile(
-          runDirectory,
-          'reports/ingest.json',
-        )).rejects.toMatchObject({code: 'ENOENT'});
-
-        await expect(store.writeStage(runDirectory, report)).resolves.toBeUndefined();
+        await expect(store.readStage(runDirectory, 'ingest')).resolves.toEqual(report);
+        await expect(store.writeStage(runDirectory, report))
+          .rejects.toMatchObject({code: 'EEXIST'});
       } finally {
         vi.doUnmock('node:fs/promises');
         vi.resetModules();
@@ -1013,7 +1059,7 @@ describe('StageReportStore', () => {
     },
   );
 
-  it('syncs the held report parent again after rollback unlink', async () => {
+  it('preserves the complete report when the held commit directory is replaced', async () => {
     const fixture = await createPipelineRunFixture();
     const reportsPath = path.join(
       fixture.workspaceRoot,
@@ -1065,23 +1111,20 @@ describe('StageReportStore', () => {
     }
 
     try {
-      expect(writeError).toBeInstanceOf(AggregateError);
-      const errors = writeError instanceof AggregateError
-        ? writeError.errors
-        : [];
-      expect(errors.length).toBeGreaterThanOrEqual(2);
+      expect(writeError).toMatchObject({
+        name: 'StageReportOutcomeError',
+        code: 'PIPELINE_REPORT_OUTCOME_UNKNOWN',
+      });
       expect(originalSyncs).toBe(2);
       expect(replacementSyncs).toBe(0);
-      await expect(readFile(path.join(movedReportsPath, 'ingest.json'), 'utf8'))
-        .rejects.toMatchObject({code: 'ENOENT'});
-      expect(await readdir(movedReportsPath)).toEqual([]);
+      const preserved = await readFile(
+        path.join(movedReportsPath, 'ingest.json'),
+        'utf8',
+      );
+      expect(JSON.parse(preserved)).toEqual(report);
+      expect(await readdir(movedReportsPath)).toEqual(['ingest.json']);
       await expect(readFile(path.join(reportsPath, 'ingest.json'), 'utf8'))
         .rejects.toMatchObject({code: 'ENOENT'});
-
-      await expect(createStageReportStore().writeStage(
-        fixture.runDirectory,
-        report,
-      )).resolves.toBeUndefined();
     } finally {
       await fixture.cleanup();
     }
