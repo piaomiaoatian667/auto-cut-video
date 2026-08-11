@@ -60,6 +60,8 @@ export interface SourceMeterStat {
   ino: bigint;
   nlink: bigint;
   size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
   isFile(): boolean;
   isDirectory(): boolean;
 }
@@ -135,7 +137,11 @@ const sameOpenedPath = (
   sameIdentity(actual, expected)
   && actual.isFile() === expected.isFile()
   && actual.isDirectory() === expected.isDirectory()
-  && (!expected.isFile() || actual.size === expected.size)
+  && (!expected.isFile() || (
+    actual.size === expected.size
+    && actual.mtimeNs === expected.mtimeNs
+    && actual.ctimeNs === expected.ctimeNs
+  ))
 );
 
 const validateDirectoryEntryName = (name: string): void => {
@@ -181,6 +187,8 @@ interface SourceFileIdentity {
   ino: bigint;
   nlink: bigint;
   size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
 }
 
 interface MeasuredSourceFile {
@@ -332,6 +340,8 @@ const measureOpenedDirectory = async (
               ino: child.status.ino,
               nlink: child.status.nlink,
               size: child.status.size,
+              mtimeNs: child.status.mtimeNs,
+              ctimeNs: child.status.ctimeNs,
             },
           });
           totalBytes += child.status.size;
@@ -534,7 +544,10 @@ export const createSystemSourceMeterDependencies = (
 });
 
 const identityMatchesStatus = (
-  status: Pick<SourceMeterStat, 'dev' | 'ino' | 'nlink' | 'size'> & {
+  status: Pick<
+    SourceMeterStat,
+    'dev' | 'ino' | 'nlink' | 'size' | 'mtimeNs' | 'ctimeNs'
+  > & {
     isFile(): boolean;
   },
   identity: SourceFileIdentity,
@@ -544,6 +557,8 @@ const identityMatchesStatus = (
   && status.ino === identity.ino
   && status.nlink === identity.nlink
   && status.size === identity.size
+  && status.mtimeNs === identity.mtimeNs
+  && status.ctimeNs === identity.ctimeNs
 );
 
 const sourcePathSegments = (sourcePath: string): string[] => {
@@ -646,13 +661,17 @@ const hashFileHandle = async (
   if (!identityMatchesStatus(before, expectedIdentity)) throw invalidSource();
   const hash = createHash('sha256');
   const buffer = Buffer.allocUnsafe(64 * 1024);
+  const expectedBytes = Number(expectedIdentity.size);
   let position = 0;
-  while (true) {
-    const {bytesRead} = await handle.read(buffer, 0, buffer.length, position);
-    if (bytesRead === 0) break;
+  while (position < expectedBytes) {
+    const length = Math.min(buffer.length, expectedBytes - position);
+    const {bytesRead} = await handle.read(buffer, 0, length, position);
+    if (bytesRead <= 0 || bytesRead > length) throw invalidSource();
     hash.update(buffer.subarray(0, bytesRead));
     position += bytesRead;
   }
+  const trailing = await handle.read(buffer, 0, 1, position);
+  if (trailing.bytesRead !== 0) throw invalidSource();
   const after = await handle.stat();
   if (!identityMatchesStatus(after, expectedIdentity)) throw invalidSource();
   return `sha256:${hash.digest('hex')}`;
@@ -766,10 +785,44 @@ const finalExtensionStem = (sourcePath: string): string => {
     : basename.slice(0, -extension.length);
 };
 
-export async function discoverProjectSourceCatalog(
+const sourceDiscoveryQueues = new WeakMap<
+  SourceCatalogDependencies,
+  WeakMap<ProjectDirectoryScope, Promise<void>>
+>();
+
+const serializeSourceDiscovery = async <Result>(
+  dependencies: SourceCatalogDependencies,
+  projectDirectory: ProjectDirectoryScope,
+  operation: () => Promise<Result>,
+): Promise<Result> => {
+  let projectQueues = sourceDiscoveryQueues.get(dependencies);
+  if (projectQueues === undefined) {
+    projectQueues = new WeakMap<ProjectDirectoryScope, Promise<void>>();
+    sourceDiscoveryQueues.set(dependencies, projectQueues);
+  }
+  const previous = projectQueues.get(projectDirectory) ?? Promise.resolve();
+  const turn = previous.catch(() => undefined);
+  let release!: () => void;
+  const completion = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = turn.then(() => completion);
+  projectQueues.set(projectDirectory, tail);
+  await turn;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (projectQueues.get(projectDirectory) === tail) {
+      projectQueues.delete(projectDirectory);
+    }
+  }
+};
+
+const discoverProjectSourceCatalogUnlocked = async (
   project: ProjectInputs,
-  dependencies: SourceCatalogDependencies = createSystemSourceCatalogDependencies(),
-): Promise<ProjectSourceCatalog> {
+  dependencies: SourceCatalogDependencies,
+): Promise<ProjectSourceCatalog> => {
   const expectedKinds = new Map<string, SourceAssetKind>();
   for (const clip of project.edit.visualClips) {
     addExpectedKind(expectedKinds, clip.assetId, clip.kind);
@@ -868,4 +921,15 @@ export async function discoverProjectSourceCatalog(
     totalBytes: Number(totalBytes),
     fingerprint: fingerprintValue({assets}),
   };
+};
+
+export async function discoverProjectSourceCatalog(
+  project: ProjectInputs,
+  dependencies: SourceCatalogDependencies = createSystemSourceCatalogDependencies(),
+): Promise<ProjectSourceCatalog> {
+  return await serializeSourceDiscovery(
+    dependencies,
+    project.projectDirectory,
+    async () => await discoverProjectSourceCatalogUnlocked(project, dependencies),
+  );
 }

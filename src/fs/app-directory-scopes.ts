@@ -559,6 +559,64 @@ const openExistingScopedFile = async (
   }
 };
 
+const openExistingScopedReadFile = async (
+  state: ScopeState,
+  relativePath: string,
+): Promise<FileHandle> => {
+  assertDarwin();
+  const anchor = await openScopedPathAnchor(state, relativePath);
+  let handle: FileHandle | undefined;
+  try {
+    const inspected = await inspectAnchoredEntry(anchor, relativePath);
+    if (inspected.kind !== 'file' && inspected.kind !== 'missing') {
+      throw securityError(
+        `app-owned read target is not a regular file: ${relativePath}`,
+      );
+    }
+    await assertScopedPathAnchorStable(state, anchor, relativePath);
+    handle = await open(
+      path.join(anchor.parent.volumePath, anchor.basename),
+      constants.O_RDONLY | constants.O_NONBLOCK | O_NOFOLLOW_ANY,
+    );
+    const opened = await handle.stat({bigint: true});
+    if (
+      inspected.kind !== 'file'
+      || inspected.stats === undefined
+      || !opened.isFile()
+      || opened.dev !== inspected.stats.dev
+      || opened.ino !== inspected.stats.ino
+      || opened.nlink !== inspected.stats.nlink
+      || opened.size !== inspected.stats.size
+    ) {
+      throw securityError(`app-owned read target changed while opening: ${relativePath}`);
+    }
+    await assertScopedPathAnchorStable(state, anchor, relativePath);
+    const current = await inspectAnchoredEntry(anchor, relativePath);
+    if (
+      current.kind !== 'file'
+      || current.stats === undefined
+      || current.stats.dev !== opened.dev
+      || current.stats.ino !== opened.ino
+      || current.stats.nlink !== opened.nlink
+      || current.stats.size !== opened.size
+    ) {
+      throw securityError(`app-owned read target changed after opening: ${relativePath}`);
+    }
+    const result = handle;
+    handle = undefined;
+    return result;
+  } catch (error) {
+    if (error instanceof AppDirectoryScopeError) throw error;
+    return mapSymlinkError(error, relativePath);
+  } finally {
+    try {
+      if (handle !== undefined) await handle.close();
+    } finally {
+      await closeDirectoryAnchor(anchor.parent);
+    }
+  }
+};
+
 const openNewScopedFile = async (
   state: ScopeState,
   relativePath: string,
@@ -603,6 +661,14 @@ export const openExistingRunFile = async (
   relativePath,
 );
 
+export const openExistingRunFileForRead = async (
+  scope: RunDirectoryScope,
+  relativePath: string,
+): Promise<FileHandle> => await openExistingScopedReadFile(
+  stateFor(runStates, scope, 'RunDirectoryScope'),
+  relativePath,
+);
+
 export const openNewRunFile = async (
   scope: RunDirectoryScope,
   relativePath: string,
@@ -625,6 +691,14 @@ export const openExistingOutputFile = async (
   scope: OutputDirectoryScope,
   relativePath: string,
 ): Promise<FileHandle> => await openExistingScopedFile(
+  stateFor(outputStates, scope, 'OutputDirectoryScope'),
+  relativePath,
+);
+
+export const openExistingOutputFileForRead = async (
+  scope: OutputDirectoryScope,
+  relativePath: string,
+): Promise<FileHandle> => await openExistingScopedReadFile(
   stateFor(outputStates, scope, 'OutputDirectoryScope'),
   relativePath,
 );

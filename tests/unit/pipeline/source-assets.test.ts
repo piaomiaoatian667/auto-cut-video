@@ -7,11 +7,15 @@ import {
   rename,
   rm,
   symlink as createSymlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
-import {setTimeout as delay} from 'node:timers/promises';
+import {
+  setImmediate as waitForImmediate,
+  setTimeout as delay,
+} from 'node:timers/promises';
 import {promisify} from 'node:util';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import type {ProjectInputs} from '../../../src/domain/load-project';
@@ -338,5 +342,98 @@ describe('discoverProjectSourceCatalog', () => {
       status: 'rejected',
       error: {code: 'PROJECT_SOURCE_INVALID'},
     });
+  });
+
+  it('rejects a same-size in-place rewrite during hashing', async () => {
+    const {project, cameraPath} = await createSystemSourceProject();
+    const original = Buffer.alloc(128 * 1024, 0x61);
+    const replacement = Buffer.alloc(original.length, 0x62);
+    await writeFile(cameraPath, original);
+    const systemMeter = createSystemSourceMeterDependencies();
+    let inventoryComplete = false;
+    let mutated = false;
+    const sourceMeter: SourceMeterDependencies = {
+      ...systemMeter,
+      openAuthority: async (parent, name) => {
+        const handle = await systemMeter.openAuthority(parent, name);
+        if (!inventoryComplete || name !== 'camera-a.mp4') return handle;
+        return {
+          ...handle,
+          read: async (buffer, offset, length, position) => {
+            const result = await handle.read(buffer, offset, length, position);
+            if (!mutated && result.bytesRead > 0) {
+              mutated = true;
+              await writeFile(cameraPath, replacement);
+              const changedTime = new Date(Date.now() + 60_000);
+              await utimes(cameraPath, changedTime, changedTime);
+            }
+            return result;
+          },
+        };
+      },
+    };
+    const systemCatalog = createSystemSourceCatalogDependencies(sourceMeter);
+    const dependencies: SourceCatalogDependencies = {
+      listSourceFiles: async (scope) => {
+        const files = await systemCatalog.listSourceFiles(scope);
+        inventoryComplete = true;
+        return files;
+      },
+      hashProjectFile: systemCatalog.hashProjectFile,
+    };
+
+    await expect(discoverProjectSourceCatalog(project, dependencies))
+      .rejects.toMatchObject({code: 'PROJECT_SOURCE_INVALID'});
+    expect(mutated).toBe(true);
+  });
+
+  it('keeps concurrent discovery snapshots coherent per dependency and project', async () => {
+    let activeGeneration = 0;
+    let hashCalls = 0;
+    let resolveFirstHashStarted!: () => void;
+    let releaseFirstHash!: () => void;
+    const firstHashStarted = new Promise<void>((resolve) => {
+      resolveFirstHashStarted = resolve;
+    });
+    const firstHashRelease = new Promise<void>((resolve) => {
+      releaseFirstHash = resolve;
+    });
+    const sourceFiles = [
+      {sourcePath: 'assets/source/camera-a.mp4', sizeBytes: 10},
+      {sourcePath: 'assets/source/cover.png', sizeBytes: 20},
+      {sourcePath: 'assets/source/music-main.wav', sizeBytes: 30},
+    ];
+    const dependencies: SourceCatalogDependencies = {
+      listSourceFiles: vi.fn(async () => {
+        activeGeneration += 1;
+        return sourceFiles;
+      }),
+      hashProjectFile: vi.fn(async (_scope, sourcePath) => {
+        hashCalls += 1;
+        if (hashCalls === 1) {
+          resolveFirstHashStarted();
+          await firstHashRelease;
+        }
+        return `sha256:g${activeGeneration}:${sourcePath}`;
+      }),
+    };
+
+    const first = discoverProjectSourceCatalog(projectInputs, dependencies);
+    await firstHashStarted;
+    const second = discoverProjectSourceCatalog(projectInputs, dependencies);
+    await waitForImmediate();
+    releaseFirstHash();
+    const [firstCatalog, secondCatalog] = await Promise.all([first, second]);
+
+    expect(firstCatalog.assets.map(({sha256}) => sha256)).toEqual([
+      'sha256:g1:assets/source/camera-a.mp4',
+      'sha256:g1:assets/source/cover.png',
+      'sha256:g1:assets/source/music-main.wav',
+    ]);
+    expect(secondCatalog.assets.map(({sha256}) => sha256)).toEqual([
+      'sha256:g2:assets/source/camera-a.mp4',
+      'sha256:g2:assets/source/cover.png',
+      'sha256:g2:assets/source/music-main.wav',
+    ]);
   });
 });

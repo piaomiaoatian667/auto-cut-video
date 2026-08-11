@@ -393,6 +393,8 @@ interface SourceNodeBase {
   dev: bigint;
   ino: bigint;
   nlink: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
 }
 
 interface SourceDirectoryNode extends SourceNodeBase {
@@ -422,13 +424,23 @@ type SourceNode =
 const sourceDirectory = (
   ino: bigint,
   entries: Record<string, SourceNode>,
-): SourceDirectoryNode => ({kind: 'directory', dev: 1n, ino, nlink: 2n, entries});
+): SourceDirectoryNode => ({
+  kind: 'directory',
+  dev: 1n,
+  ino,
+  nlink: 2n,
+  mtimeNs: ino * 10n,
+  ctimeNs: ino * 10n + 1n,
+  entries,
+});
 
 const sourceFile = (ino: bigint, size: bigint): SourceFileNode => ({
   kind: 'file',
   dev: 1n,
   ino,
   nlink: 1n,
+  mtimeNs: ino * 10n,
+  ctimeNs: ino * 10n + 1n,
   size,
 });
 
@@ -437,12 +449,21 @@ const sourceSymlink = (ino: bigint): SourceSymlinkNode => ({
   dev: 1n,
   ino,
   nlink: 1n,
+  mtimeNs: ino * 10n,
+  ctimeNs: ino * 10n + 1n,
 });
 
 const sourceSpecial = (
   kind: SourceSpecialNode['kind'],
   ino: bigint,
-): SourceSpecialNode => ({kind, dev: 1n, ino, nlink: 1n});
+): SourceSpecialNode => ({
+  kind,
+  dev: 1n,
+  ino,
+  nlink: 1n,
+  mtimeNs: ino * 10n,
+  ctimeNs: ino * 10n + 1n,
+});
 
 const sourceChildPath = (parent: string, name: string): string =>
   parent === '.' ? name : path.posix.join(parent, name);
@@ -530,6 +551,8 @@ const sourceMeterFixture = (
           ino: node.ino,
           nlink: node.nlink,
           size: node.kind === 'file' ? node.size : 0n,
+          mtimeNs: node.mtimeNs,
+          ctimeNs: node.ctimeNs,
           isFile: () => (
             relativePath !== options.statAsNonRegularPath
             && node.kind === 'file'
@@ -1185,6 +1208,8 @@ describe('scoped source measurement', () => {
         ino: 2n,
         nlink: 1n,
         size: 3n,
+        mtimeNs: 4n,
+        ctimeNs: 5n,
         isFile: () => true,
         isDirectory: () => false,
       };
