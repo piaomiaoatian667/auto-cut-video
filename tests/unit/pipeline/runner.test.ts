@@ -771,6 +771,96 @@ describe('Pipeline Runner', () => {
     expect(runtime.release).toHaveBeenCalledOnce();
   });
 
+  it('rejects an incompatible same-Run Stage snapshot published while waiting for the lock', async () => {
+    const sourceRunId = 'run-resume';
+    const project = memoryProject();
+    const runtime = createMemoryRuntime({
+      current: currentPointer(sourceRunId, 'ingest', {
+        preset: 'draft',
+        stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft'],
+      }),
+    });
+    runtime.seedRun(sourceRunId, reportsThrough(sourceRunId, 'draft', 'ingest'));
+    const plan = await buildExecutionPlan(planningContext(runtime, project), {
+      preset: 'draft',
+      to: 'narration',
+      resume: true,
+    });
+    runtime.acquireProjectLock.mockImplementationOnce(async () => {
+      runtime.events.push('acquire-lock');
+      runtime.seedRun(
+        sourceRunId,
+        reportsThrough(sourceRunId, 'draft', 'compile'),
+      );
+      await runtime.runStore.publishCurrent(
+        'demo',
+        currentPointer(sourceRunId, 'compile', {
+          preset: 'draft',
+          stageIds: ['compile'],
+        }),
+      );
+      return runtime.lease;
+    });
+
+    await expect(runExecutionPlan(executionInput(plan, project), runtime.dependencies))
+      .rejects.toMatchObject({code: 'PLAN_STALE'});
+
+    expect(runtime.stageCalls).toEqual([]);
+    expect(runtime.runStore.createRun).not.toHaveBeenCalled();
+    expect(runtime.reportStore.writeStage).not.toHaveBeenCalled();
+    expect(runtime.runStore.publishCurrent).toHaveBeenCalledOnce();
+    expect(runtime.release).toHaveBeenCalledOnce();
+  });
+
+  it('accepts a compatible same-Run sliced Stage snapshot published while waiting for the lock', async () => {
+    const sourceRunId = 'run-resume';
+    const project = memoryProject();
+    const runtime = createMemoryRuntime({
+      current: currentPointer(sourceRunId, 'ingest', {
+        preset: 'draft',
+        stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft'],
+      }),
+    });
+    runtime.seedRun(sourceRunId, reportsThrough(sourceRunId, 'draft', 'ingest'));
+    const plan = await buildExecutionPlan(planningContext(runtime, project), {
+      preset: 'draft',
+      from: 'narration',
+      to: 'compile',
+      resume: true,
+    });
+    runtime.acquireProjectLock.mockImplementationOnce(async () => {
+      runtime.events.push('acquire-lock');
+      runtime.seedRun(
+        sourceRunId,
+        reportsThrough(sourceRunId, 'draft', 'narration'),
+      );
+      await runtime.runStore.publishCurrent(
+        'demo',
+        currentPointer(sourceRunId, 'narration', {
+          preset: 'draft',
+          stageIds: ['narration', 'compile'],
+        }),
+      );
+      return runtime.lease;
+    });
+
+    const result = await runExecutionPlan(executionInput(plan, project), runtime.dependencies);
+
+    expect(result).toMatchObject({
+      runId: sourceRunId,
+      state: 'passed',
+      completedStage: 'compile',
+    });
+    expect(runtime.stageCalls).toEqual(['preflight', 'compile']);
+    expect(runtime.workCurrent).toMatchObject({
+      runId: sourceRunId,
+      preset: 'draft',
+      stageIds: ['narration', 'compile'],
+      completedStage: 'compile',
+    });
+    expect(runtime.release).toHaveBeenCalledOnce();
+  });
+
   it('reconciles valid contiguous reports completed while waiting for the lock', async () => {
     const sourceRunId = 'run-resume';
     const project = memoryProject();
@@ -795,7 +885,10 @@ describe('Pipeline Runner', () => {
       );
       await runtime.runStore.publishCurrent(
         'demo',
-        currentPointer(sourceRunId, 'compile', {preset: 'draft'}),
+        currentPointer(sourceRunId, 'compile', {
+          preset: 'draft',
+          stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft'],
+        }),
       );
       return runtime.lease;
     });
@@ -873,7 +966,10 @@ describe('Pipeline Runner', () => {
       ]);
       await runtime.runStore.publishCurrent(
         'demo',
-        currentPointer(sourceRunId, 'narration', {preset: 'draft'}),
+        currentPointer(sourceRunId, 'narration', {
+          preset: 'draft',
+          stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft'],
+        }),
       );
       return runtime.lease;
     });

@@ -165,6 +165,21 @@ const prefixCompatible = (
   return true;
 };
 
+const pointerSnapshotCompatible = (
+  plan: ExecutionPlan,
+  pointer: CurrentPointer,
+): boolean => {
+  const planPresetStageIds: readonly StageId[] = STAGE_PRESETS[plan.preset];
+  const pointerPresetStageIds: readonly StageId[] = STAGE_PRESETS[pointer.preset];
+  return pointer.stageIds.length > 0
+    && pointer.stageIds.every((stageId) => pointerPresetStageIds.includes(stageId))
+    && prefixCompatible(planPresetStageIds, pointerPresetStageIds)
+    && (
+      prefixCompatible(pointer.stageIds, planPresetStageIds)
+      || prefixCompatible(pointer.stageIds, plan.stageIds)
+    );
+};
+
 const pointerProgress = (pointer: CurrentPointer): number =>
   STAGE_POSITIONS.get(pointer.completedStage) ?? -1;
 
@@ -448,6 +463,9 @@ const revalidationSource = async (
   );
   if (current === null || current.pointer.runId !== sourceRunId) {
     return stalePlan('the authoritative current Run changed before execution');
+  }
+  if (!pointerSnapshotCompatible(plan, current.pointer)) {
+    return stalePlan('the authoritative current Stage snapshot changed before execution');
   }
   return current;
 };
