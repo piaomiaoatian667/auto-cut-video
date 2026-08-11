@@ -1,10 +1,7 @@
 import {z} from 'zod';
 import {ReviewSchema, type Review} from '../../domain/review-schema';
 import type {RunDirectoryScope} from '../../fs/app-directory-scopes';
-import {
-  PipelineArtifactError,
-  verifyRunArtifact,
-} from '../artifacts';
+import {verifyRunArtifact} from '../artifacts';
 import {fingerprintValue} from '../fingerprint';
 import {
   requirePreflight,
@@ -21,6 +18,7 @@ import {
 } from '../stages/review';
 import {
   STAGE_ALGORITHM_VERSIONS,
+  isOrdinaryVerificationMiss,
   readOptionalRunJson,
   readRunJson,
   verifyReportedArtifacts,
@@ -47,16 +45,6 @@ const evidenceFromDraft = (report: DraftReport) => [
   report.outputs.contactSheet,
   ...report.outputs.reviewFrames,
 ];
-
-const isOrdinaryVerificationMiss = (error: unknown): boolean => (
-  error instanceof z.ZodError
-  || error instanceof PipelineArtifactError
-  || (
-    error instanceof Error
-    && 'code' in error
-    && (error.code === 'ENOENT' || error.code === 'APP_PATH_OUTSIDE_SCOPE')
-  )
-);
 
 export const createReviewStage = (
   dependencies: ReviewStageAdapterDependencies = {},

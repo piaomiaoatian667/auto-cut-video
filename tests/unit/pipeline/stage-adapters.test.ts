@@ -1,3 +1,6 @@
+import {createHash} from 'node:crypto';
+import {rename, rm, symlink, writeFile} from 'node:fs/promises';
+import path from 'node:path';
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import type {ProjectInputs} from '../../../src/domain/load-project';
 import {loadProject} from '../../../src/domain/load-project';
@@ -10,6 +13,7 @@ import {
   ensureRunDirectory,
   openNewOutputFile,
   openNewRunFile,
+  type OutputDirectoryScope,
   type RunDirectoryScope,
 } from '../../../src/fs/app-directory-scopes';
 import {hashRunArtifact} from '../../../src/pipeline/artifacts';
@@ -53,6 +57,9 @@ import {
 } from '../../helpers/temp-project';
 
 const hash = (value: unknown): string => fingerprintValue(value);
+
+const contentHash = (value: Buffer | string): string =>
+  `sha256:${createHash('sha256').update(value).digest('hex')}`;
 
 const compiledTimeline = (
   inputHashes: Record<string, string> = {'authoring:project': hash('project')},
@@ -176,6 +183,23 @@ const writeRunText = async (
   } finally {
     await handle.close();
   }
+};
+
+const writeOutputText = async (
+  outputDirectory: OutputDirectoryScope,
+  relativePath: string,
+  contents: string,
+): Promise<{path: string; sha256: string}> => {
+  const parent = relativePath.split('/').slice(0, -1).join('/');
+  if (parent.length > 0) await ensureOutputDirectory(outputDirectory, parent);
+  const handle = await openNewOutputFile(outputDirectory, relativePath);
+  try {
+    await handle.writeFile(contents, 'utf8');
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  return {path: relativePath, sha256: contentHash(contents)};
 };
 
 const fakeArtifact = async (
@@ -1004,6 +1028,77 @@ describe('adapter artifact inventories', () => {
 });
 
 describe('adapter verification', () => {
+  const releaseVerificationFixture = async () => {
+    await writeRunText(sourceRun, 'release/muted-video.mp4', 'muted-video');
+    await writeRunText(sourceRun, 'release/final-intermediate.mp4', 'intermediate');
+    const mutedVideo = await hashRunArtifact(sourceRun, 'release/muted-video.mp4');
+    const intermediate = await hashRunArtifact(sourceRun, 'release/final-intermediate.mp4');
+    const outputDirectory = await createOutputStore(tempProject.workspaceRoot)
+      .createRelease('demo', 'source-run');
+    const finalVideo = await writeOutputText(
+      outputDirectory,
+      'releases/source-run/final.mp4',
+      'final-video',
+    );
+    const subtitles = await writeOutputText(
+      outputDirectory,
+      'releases/source-run/subtitles.srt',
+      'subtitles',
+    );
+    const thumbnail = await writeOutputText(
+      outputDirectory,
+      'releases/source-run/thumbnail.jpg',
+      'thumbnail',
+    );
+    const review = await writeOutputText(
+      outputDirectory,
+      'releases/source-run/review.json',
+      'review',
+    );
+    const validationReport = await writeOutputText(
+      outputDirectory,
+      'releases/source-run/validation-report.json',
+      'validation',
+    );
+    const checksums = await writeOutputText(
+      outputDirectory,
+      'releases/source-run/checksums.sha256',
+      'checksums',
+    );
+    const outputs = {
+      mutedVideo: {path: mutedVideo.path, sha256: mutedVideo.sha256},
+      intermediate: {path: intermediate.path, sha256: intermediate.sha256},
+      finalVideo,
+      subtitles,
+      thumbnail,
+      review,
+      validationReport,
+      checksums,
+      releaseFingerprint: hash('release'),
+      verification: {
+        sha256: finalVideo.sha256,
+        probe: {durationMs: 1000, videoStreams: [], audioStreams: []},
+        moovBeforeMdat: true as const,
+        atoms: [],
+      },
+    };
+    const report = passedStageReport({
+      stageId: 'release',
+      outputs,
+      artifacts: [
+        mutedVideo,
+        intermediate,
+        {scope: 'output', ...finalVideo},
+        {scope: 'output', ...subtitles},
+        {scope: 'output', ...thumbnail},
+        {scope: 'output', ...review},
+        {scope: 'output', ...validationReport},
+        {scope: 'output', ...checksums},
+      ],
+    });
+    return {report, finalVideo};
+  };
+
   it('returns false for missing, changed, and cross-scope Run artifacts', async () => {
     await writeRunText(sourceRun, 'compiled-timeline.json', '{}\n');
     const artifact = await hashRunArtifact(sourceRun, 'compiled-timeline.json');
@@ -1029,6 +1124,72 @@ describe('adapter verification', () => {
       ...baseReport,
       artifacts: [{...artifact, scope: 'output'}],
     })).resolves.toBe(false);
+  });
+
+  it('returns false when a Run artifact becomes a cross-scope symlink', async () => {
+    await writeRunText(sourceRun, 'compiled-timeline.json', '{}\n');
+    const artifact = await hashRunArtifact(sourceRun, 'compiled-timeline.json');
+    const report = passedStageReport({
+      stageId: 'compile',
+      artifacts: [artifact],
+      outputs: JSON.parse(JSON.stringify({
+        timelinePath: 'compiled-timeline.json',
+        timeline: compiledTimeline(),
+      })),
+    });
+    const artifactPath = path.join(
+      tempProject.workspaceRoot,
+      '.work',
+      'demo',
+      'runs',
+      'source-run',
+      'compiled-timeline.json',
+    );
+    const outsidePath = path.join(tempProject.workspaceRoot, 'outside-timeline.json');
+    await writeFile(outsidePath, '{}\n', 'utf8');
+    await rm(artifactPath);
+    await symlink(outsidePath, artifactPath);
+
+    const stage = createCompileStage({hashProjectFile: async (_scope, path) => hash(path)});
+    await expect(stage.verify(planningContext(), report)).resolves.toBe(false);
+  });
+
+  it('returns false when a Release output artifact becomes a cross-scope symlink', async () => {
+    const {report, finalVideo} = await releaseVerificationFixture();
+    const finalVideoPath = path.join(
+      tempProject.workspaceRoot,
+      'output',
+      'demo',
+      finalVideo.path,
+    );
+    const outsidePath = path.join(tempProject.workspaceRoot, 'outside-final.mp4');
+    await writeFile(outsidePath, 'outside-final', 'utf8');
+    await rm(finalVideoPath);
+    await symlink(outsidePath, finalVideoPath);
+
+    await expect(createReleaseStage().verify(planningContext(), report))
+      .resolves.toBe(false);
+  });
+
+  it('returns false when the Release output project root becomes cross-scope', async () => {
+    const {report} = await releaseVerificationFixture();
+    const outputRoot = path.join(tempProject.workspaceRoot, 'output', 'demo');
+    const movedOutputRoot = path.join(tempProject.workspaceRoot, 'escaped-output-demo');
+    await rename(outputRoot, movedOutputRoot);
+    await symlink(movedOutputRoot, outputRoot);
+
+    await expect(createReleaseStage().verify(planningContext(), report))
+      .resolves.toBe(false);
+  });
+
+  it('does not swallow unrelated Release output I/O errors', async () => {
+    const {report} = await releaseVerificationFixture();
+    const failure = Object.assign(new Error('injected output I/O failure'), {code: 'EIO'});
+    const stage = createReleaseStage({
+      openOutputDirectory: async () => { throw failure; },
+    });
+
+    await expect(stage.verify(planningContext(), report)).rejects.toBe(failure);
   });
 
   it('returns false rather than throwing for cross-scope Release artifacts', async () => {

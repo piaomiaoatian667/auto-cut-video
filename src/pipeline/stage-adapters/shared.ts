@@ -1,5 +1,6 @@
 import {z} from 'zod';
 import {
+  AppDirectoryScopeError,
   openExistingRunFileForRead,
   type OutputDirectoryScope,
   type RunDirectoryScope,
@@ -59,9 +60,10 @@ const inventoryMatches = (
   });
 };
 
-const isOrdinaryVerificationMiss = (error: unknown): boolean => (
+export const isOrdinaryVerificationMiss = (error: unknown): boolean => (
   error instanceof z.ZodError
   || error instanceof PipelineArtifactError
+  || error instanceof AppDirectoryScopeError
   || (
     error instanceof Error
     && 'code' in error

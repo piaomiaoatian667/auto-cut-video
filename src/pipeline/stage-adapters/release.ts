@@ -32,6 +32,7 @@ import {
 import {ReviewGateError} from '../stages/review';
 import {
   STAGE_ALGORITHM_VERSIONS,
+  isOrdinaryVerificationMiss,
   outputArtifact,
   readRunJson,
   readRunStageReport,
@@ -175,9 +176,7 @@ export const createReleaseStage = (
           context.project.project.id,
         );
       } catch (error) {
-        if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
-          return false;
-        }
+        if (isOrdinaryVerificationMiss(error)) return false;
         throw error;
       }
       const outputs = parsed.data;
