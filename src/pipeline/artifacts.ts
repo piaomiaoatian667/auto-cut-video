@@ -6,6 +6,7 @@ import {
   openExistingOutputFileForRead,
   openExistingRunFileForRead,
   openNewRunFileForWrite,
+  unlinkRunFile,
   type AppDirectoryReadFileAuthority,
   type AppDirectoryWriteFileAuthority,
   type OutputDirectoryScope,
@@ -195,6 +196,14 @@ export async function verifyRunArtifact(
     if (isNodeError(error) && error.code === 'ENOENT') return false;
     throw error;
   }
+}
+
+export async function deleteRunArtifact(
+  runDirectory: RunDirectoryScope,
+  artifact: PipelineArtifact,
+): Promise<void> {
+  requireArtifactScope(artifact, 'run');
+  await unlinkRunFile(runDirectory, artifact.path);
 }
 
 export async function verifyOutputArtifact(

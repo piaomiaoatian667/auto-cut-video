@@ -38,6 +38,7 @@ import type {ProjectSourceCatalog} from '../../../src/pipeline/source-assets';
 import type {
   PipelineStage,
   StageAction,
+  StageExecutionContext,
   StageExecutionResult,
   StagePlanningContext,
 } from '../../../src/pipeline/stage';
@@ -257,15 +258,13 @@ const createStages = (
   },
 }));
 
-type DeletableStageReportStore = StageReportStore & {
-  deleteStage?(run: RunDirectoryScope, stageId: StageId): Promise<void>;
-};
-
 interface MemoryRuntimeOptions extends StageOptions {
   current?: CurrentPointer | null;
   outputCurrent?: CurrentPointer | null;
   failOutputPublish?: boolean;
   failWorkPublishAt?: StageId;
+  failWorkPublishOnceAt?: StageId;
+  releaseError?: Error;
 }
 
 const createMemoryRuntime = (options: MemoryRuntimeOptions = {}) => {
@@ -277,6 +276,7 @@ const createMemoryRuntime = (options: MemoryRuntimeOptions = {}) => {
   const attempts: StageReport[] = [];
   let workCurrent = options.current ?? null;
   let outputCurrent = options.outputCurrent ?? null;
+  let workPublishFailed = false;
 
   const runIdOf = (run: RunDirectoryScope): string => (
     run as unknown as {runId: string}
@@ -316,7 +316,14 @@ const createMemoryRuntime = (options: MemoryRuntimeOptions = {}) => {
     readCurrentReadonly: vi.fn(async () => workCurrent),
     publishCurrent: vi.fn(async (_projectId: string, pointer: CurrentPointer) => {
       events.push(`work:${pointer.completedStage}:${pointer.state}`);
-      if (options.failWorkPublishAt === pointer.completedStage) {
+      if (
+        options.failWorkPublishAt === pointer.completedStage
+        || (
+          options.failWorkPublishOnceAt === pointer.completedStage
+          && !workPublishFailed
+        )
+      ) {
+        workPublishFailed = true;
         throw new Error('work pointer failed');
       }
       workCurrent = pointer;
@@ -335,7 +342,7 @@ const createMemoryRuntime = (options: MemoryRuntimeOptions = {}) => {
     }),
   } as unknown as OutputStore;
 
-  const reportStore: DeletableStageReportStore = {
+  const reportStore: StageReportStore = {
     readStage: vi.fn(async (run, stageId) => (
       reports.get(runIdOf(run))?.get(stageId) ?? null
     )),
@@ -364,6 +371,7 @@ const createMemoryRuntime = (options: MemoryRuntimeOptions = {}) => {
 
   const release = vi.fn(async () => {
     events.push('release-lock');
+    if (options.releaseError !== undefined) throw options.releaseError;
   });
   const lease: ProjectLockLease = {
     record: {
@@ -795,6 +803,124 @@ describe('Pipeline Runner', () => {
     });
   });
 
+  it('rolls back same-Run report and artifacts when Work publication fails', async () => {
+    const tempProject = await createTempProject();
+    tempProjects.push(tempProject);
+    const project = await loadProject(tempProject.workspaceRoot, 'demo');
+    const normalRunStore = createRunStore(tempProject.workspaceRoot);
+    const outputStore = createOutputStore(tempProject.workspaceRoot);
+    const reportStore = createStageReportStore();
+    const runId = 'run-resume';
+    const runDirectory = await normalRunStore.createRun('demo', runId);
+    await reportStore.writeStage(runDirectory, makeReport({
+      runId,
+      preset: 'draft',
+      stageId: 'preflight',
+    }));
+    await reportStore.writeStage(runDirectory, makeReport({
+      runId,
+      preset: 'draft',
+      stageId: 'ingest',
+    }));
+    await normalRunStore.publishCurrent('demo', currentPointer(runId, 'ingest', {
+      preset: 'draft',
+      stageIds: ['preflight', 'ingest', 'compile'],
+    }));
+    const pointerFailure = new Error('compile pointer failed once');
+    let failCompilePointer = true;
+    const runStore = createRunStore(tempProject.workspaceRoot, {
+      fileOps: {
+        writeFile: async (handle, data) => {
+          const pointer = JSON.parse(data) as CurrentPointer;
+          if (pointer.completedStage === 'compile' && failCompilePointer) {
+            failCompilePointer = false;
+            throw pointerFailure;
+          }
+          await handle.writeFile(data);
+        },
+      },
+    });
+    const events: string[] = [];
+    const stageCalls: StageId[] = [];
+    const artifactPath = 'compiled/retry.json';
+    const registry = createStages(events, stageCalls).map((stage) => (
+      stage.id !== 'compile'
+        ? stage
+        : {
+          ...stage,
+          execute: async (context: StageExecutionContext, signal: AbortSignal) => {
+            const result = await stage.execute(context, signal);
+            if (context.runDirectory === undefined) throw new Error('missing Run');
+            const artifact = await writeRunArtifact(
+              context.runDirectory,
+              artifactPath,
+              'compiled bytes',
+            );
+            return {...result, artifacts: [artifact]};
+          },
+        }
+    ));
+    const release = vi.fn(async () => undefined);
+    const dependencies: RunnerDependencies = {
+      registry,
+      runStore,
+      outputStore,
+      reportStore,
+      acquireProjectLock: vi.fn(async () => ({
+        record: {
+          pid: 1,
+          hostname: 'test',
+          processStart: 'test',
+          createdAt: NOW,
+          runId,
+        },
+        release,
+      })) as unknown as RunnerDependencies['acquireProjectLock'],
+      createRunId: vi.fn(() => runId),
+      now: vi.fn(() => NOW),
+    };
+    const plan = makePlan({
+      preset: 'draft',
+      stageIds: ['preflight', 'ingest', 'compile'],
+      actions: ['run', 'cached', 'resume'],
+      runMode: 'resume',
+      sourceRunId: runId,
+      targetRunId: runId,
+    });
+
+    await expect(runExecutionPlan(executionInput(plan, project), dependencies))
+      .rejects.toBe(pointerFailure);
+
+    await expect(reportStore.readStage(runDirectory, 'compile')).resolves.toBeNull();
+    await expect(readFile(path.join(
+      tempProject.workspaceRoot,
+      '.work/demo/runs/run-resume',
+      artifactPath,
+    ), 'utf8')).rejects.toMatchObject({code: 'ENOENT'});
+    await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
+      completedStage: 'ingest',
+    });
+
+    const retry = await runExecutionPlan(executionInput(plan, project), dependencies);
+
+    expect(retry).toMatchObject({
+      runId,
+      state: 'passed',
+      completedStage: 'compile',
+    });
+    await expect(reportStore.readStage(runDirectory, 'compile')).resolves.toMatchObject({
+      state: 'passed',
+      artifacts: [expect.objectContaining({path: artifactPath})],
+    });
+    await expect(readFile(path.join(
+      tempProject.workspaceRoot,
+      '.work/demo/runs/run-resume',
+      artifactPath,
+    ), 'utf8')).resolves.toBe('compiled bytes');
+    expect(stageCalls).toEqual(['preflight', 'compile', 'preflight', 'compile']);
+    expect(release).toHaveBeenCalledTimes(2);
+  });
+
   it('materializes only listed cached Run artifacts into a new Run', async () => {
     const tempProject = await createTempProject();
     tempProjects.push(tempProject);
@@ -901,6 +1027,180 @@ describe('Pipeline Runner', () => {
       '.work/demo/runs/run-new/assets/manifest.json',
     ), 'utf8')).toBe('ingest-bytes');
     expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('removes earlier cached artifacts when a later copy fails', async () => {
+    const tempProject = await createTempProject();
+    tempProjects.push(tempProject);
+    const project = await loadProject(tempProject.workspaceRoot, 'demo');
+    const runStore = createRunStore(tempProject.workspaceRoot);
+    const outputStore = createOutputStore(tempProject.workspaceRoot);
+    const reportStore = createStageReportStore();
+    const sourceRunId = 'run-old';
+    const targetRunId = 'run-new';
+    const sourceRun = await runStore.createRun('demo', sourceRunId);
+    const firstArtifact = await writeRunArtifact(
+      sourceRun,
+      'assets/first.json',
+      'first bytes',
+    );
+    const secondArtifact = await writeRunArtifact(
+      sourceRun,
+      'assets/second.json',
+      'second bytes',
+    );
+    await reportStore.writeStage(sourceRun, makeReport({
+      runId: sourceRunId,
+      preset: 'assets',
+      stageId: 'preflight',
+    }));
+    await reportStore.writeStage(sourceRun, makeReport({
+      runId: sourceRunId,
+      preset: 'assets',
+      stageId: 'ingest',
+      artifacts: [firstArtifact, {...secondArtifact, sha256: HASH_B}],
+    }));
+    const events: string[] = [];
+    const stageCalls: StageId[] = [];
+    const registry = createStages(events, stageCalls).map((stage) => (
+      stage.id === 'ingest'
+        ? {...stage, verify: async () => true}
+        : stage
+    ));
+    const dependencies: RunnerDependencies = {
+      registry,
+      runStore,
+      outputStore,
+      reportStore,
+      acquireProjectLock: vi.fn(async () => ({
+        record: {
+          pid: 1,
+          hostname: 'test',
+          processStart: 'test',
+          createdAt: NOW,
+          runId: targetRunId,
+        },
+        release: async () => undefined,
+      })) as unknown as RunnerDependencies['acquireProjectLock'],
+      createRunId: vi.fn(() => targetRunId),
+      now: vi.fn(() => NOW),
+    };
+    const plan = makePlan({
+      preset: 'assets',
+      stageIds: ['preflight', 'ingest'],
+      actions: ['run', 'cached'],
+      runMode: 'new',
+      sourceRunId,
+      targetRunId,
+    });
+
+    await expect(runExecutionPlan(executionInput(plan, project), dependencies))
+      .rejects.toMatchObject({code: 'ARTIFACT_HASH_MISMATCH'});
+
+    const targetRun = await runStore.openExistingRun('demo', targetRunId);
+    await expect(reportStore.readStage(targetRun, 'ingest')).resolves.toBeNull();
+    for (const artifact of [firstArtifact, secondArtifact]) {
+      await expect(readFile(path.join(
+        tempProject.workspaceRoot,
+        '.work/demo/runs/run-new',
+        artifact.path,
+      ), 'utf8')).rejects.toMatchObject({code: 'ENOENT'});
+    }
+    await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
+      runId: targetRunId,
+      completedStage: 'preflight',
+    });
+  });
+
+  it('rolls back cached report and artifacts when Work publication fails', async () => {
+    const tempProject = await createTempProject();
+    tempProjects.push(tempProject);
+    const project = await loadProject(tempProject.workspaceRoot, 'demo');
+    const normalRunStore = createRunStore(tempProject.workspaceRoot);
+    const outputStore = createOutputStore(tempProject.workspaceRoot);
+    const reportStore = createStageReportStore();
+    const sourceRunId = 'run-old';
+    const targetRunId = 'run-new';
+    const sourceRun = await normalRunStore.createRun('demo', sourceRunId);
+    const artifacts = [
+      await writeRunArtifact(sourceRun, 'assets/first.json', 'first bytes'),
+      await writeRunArtifact(sourceRun, 'assets/second.json', 'second bytes'),
+    ];
+    await reportStore.writeStage(sourceRun, makeReport({
+      runId: sourceRunId,
+      preset: 'assets',
+      stageId: 'preflight',
+    }));
+    await reportStore.writeStage(sourceRun, makeReport({
+      runId: sourceRunId,
+      preset: 'assets',
+      stageId: 'ingest',
+      artifacts,
+    }));
+    const pointerFailure = new Error('cached pointer failed');
+    let failIngestPointer = true;
+    const runStore = createRunStore(tempProject.workspaceRoot, {
+      fileOps: {
+        writeFile: async (handle, data) => {
+          const pointer = JSON.parse(data) as CurrentPointer;
+          if (pointer.completedStage === 'ingest' && failIngestPointer) {
+            failIngestPointer = false;
+            throw pointerFailure;
+          }
+          await handle.writeFile(data);
+        },
+      },
+    });
+    const events: string[] = [];
+    const stageCalls: StageId[] = [];
+    const registry = createStages(events, stageCalls).map((stage) => (
+      stage.id === 'ingest'
+        ? {...stage, verify: async () => true}
+        : stage
+    ));
+    const dependencies: RunnerDependencies = {
+      registry,
+      runStore,
+      outputStore,
+      reportStore,
+      acquireProjectLock: vi.fn(async () => ({
+        record: {
+          pid: 1,
+          hostname: 'test',
+          processStart: 'test',
+          createdAt: NOW,
+          runId: targetRunId,
+        },
+        release: async () => undefined,
+      })) as unknown as RunnerDependencies['acquireProjectLock'],
+      createRunId: vi.fn(() => targetRunId),
+      now: vi.fn(() => NOW),
+    };
+    const plan = makePlan({
+      preset: 'assets',
+      stageIds: ['preflight', 'ingest'],
+      actions: ['run', 'cached'],
+      runMode: 'new',
+      sourceRunId,
+      targetRunId,
+    });
+
+    await expect(runExecutionPlan(executionInput(plan, project), dependencies))
+      .rejects.toBe(pointerFailure);
+
+    const targetRun = await runStore.openExistingRun('demo', targetRunId);
+    await expect(reportStore.readStage(targetRun, 'ingest')).resolves.toBeNull();
+    for (const artifact of artifacts) {
+      await expect(readFile(path.join(
+        tempProject.workspaceRoot,
+        '.work/demo/runs/run-new',
+        artifact.path,
+      ), 'utf8')).rejects.toMatchObject({code: 'ENOENT'});
+    }
+    await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
+      runId: targetRunId,
+      completedStage: 'preflight',
+    });
   });
 
   it('does not permit Review or Release cross-Run cache materialization', async () => {
@@ -1025,6 +1325,98 @@ describe('Pipeline Runner', () => {
     expect(runtime.release).toHaveBeenCalledOnce();
   });
 
+  it('keeps the Release report when Output cleanup fails after pointer commit', async () => {
+    const tempProject = await createTempProject();
+    tempProjects.push(tempProject);
+    const project = await loadProject(tempProject.workspaceRoot, 'demo');
+    const runStore = createRunStore(tempProject.workspaceRoot);
+    const normalOutputStore = createOutputStore(tempProject.workspaceRoot);
+    const reportStore = createStageReportStore();
+    await normalOutputStore.createRelease('demo', 'run-old');
+    await normalOutputStore.publishCurrent('demo', currentPointer('run-old', 'release', {
+      relativePath: 'releases/run-old',
+    }));
+    const cleanupFailure = new Error('Output cleanup sync failed after commit');
+    let failCleanup = true;
+    const outputStore = createOutputStore(tempProject.workspaceRoot, {
+      fileOps: {
+        syncDirectory: async (operation, phase) => {
+          await operation();
+          if (phase === 'cleanup' && failCleanup) {
+            failCleanup = false;
+            throw cleanupFailure;
+          }
+        },
+      },
+    });
+    const events: string[] = [];
+    const stageCalls: StageId[] = [];
+    const registry = createStages(events, stageCalls).map((stage) => (
+      stage.id !== 'release'
+        ? stage
+        : {
+          ...stage,
+          execute: async (context: StageExecutionContext, signal: AbortSignal) => {
+            await stage.execute(context, signal);
+            if (context.runId === undefined) throw new Error('missing Run');
+            await outputStore.createRelease('demo', context.runId);
+            return {
+              state: 'passed' as const,
+              fingerprint: stageFingerprint('release'),
+              outputs: {release: context.runId},
+              artifacts: [],
+              checks: [],
+              outputCurrent: currentPointer(context.runId, 'release', {
+                relativePath: `releases/${context.runId}`,
+              }),
+            };
+          },
+        }
+    ));
+    const release = vi.fn(async () => undefined);
+    const dependencies: RunnerDependencies = {
+      registry,
+      runStore,
+      outputStore,
+      reportStore,
+      acquireProjectLock: vi.fn(async (_work, runId) => ({
+        record: {
+          pid: 1,
+          hostname: 'test',
+          processStart: 'test',
+          createdAt: NOW,
+          runId,
+        },
+        release,
+      })) as unknown as RunnerDependencies['acquireProjectLock'],
+      createRunId: vi.fn(() => 'run-release'),
+      now: vi.fn(() => NOW),
+    };
+    const plan = makePlan({
+      stageIds: ['preflight', 'release'],
+      actions: ['run', 'run'],
+      runMode: 'new',
+      targetRunId: 'run-release',
+    });
+
+    const result = await runExecutionPlan(executionInput(plan, project), dependencies);
+
+    expect(result).toMatchObject({
+      runId: 'run-release',
+      state: 'passed',
+      completedStage: 'release',
+    });
+    const runDirectory = await runStore.openExistingRun('demo', 'run-release');
+    await expect(reportStore.readStage(runDirectory, 'release')).resolves.toMatchObject({
+      state: 'passed',
+    });
+    await expect(normalOutputStore.readCurrentReadonly('demo')).resolves.toMatchObject({
+      runId: 'run-release',
+      completedStage: 'release',
+    });
+    expect(release).toHaveBeenCalledOnce();
+  });
+
   it('keeps Output authoritative and returns WORK_POINTER_LAGGING after commit', async () => {
     const outputCurrent = currentPointer('run-release', 'release', {
       relativePath: 'releases/run-release',
@@ -1101,6 +1493,73 @@ describe('Pipeline Runner', () => {
     await expect(runExecutionPlan(executionInput(plan), runtime.dependencies))
       .rejects.toThrow('compile failed');
 
+    expect(runtime.release).toHaveBeenCalledOnce();
+  });
+
+  it('preserves a primary Stage failure when lock release also fails', async () => {
+    const releaseError = new Error('lock release failed');
+    const runtime = createMemoryRuntime({
+      throwStage: 'compile',
+      releaseError,
+    });
+    const plan = makePlan({
+      preset: 'draft',
+      stageIds: ['preflight', 'compile'],
+      actions: ['run', 'run'],
+      runMode: 'new',
+      targetRunId: 'run-failure',
+    });
+
+    let caughtError: unknown;
+    try {
+      await runExecutionPlan(executionInput(plan), runtime.dependencies);
+    } catch (error) {
+      caughtError = error;
+    }
+
+    expect(caughtError).toBeInstanceOf(AggregateError);
+    const errors = (caughtError as AggregateError).errors;
+    expect(errors[0]).toEqual(expect.objectContaining({message: 'compile failed'}));
+    expect(errors[1]).toBe(releaseError);
+    expect((caughtError as Error).cause).toBe(errors[0]);
+    expect(runtime.release).toHaveBeenCalledOnce();
+  });
+
+  it('returns committed Release success when lock release fails', async () => {
+    const releaseError = new Error('lock release failed');
+    const outputCurrent = currentPointer('run-release', 'release', {
+      relativePath: 'releases/run-release',
+    });
+    const runtime = createMemoryRuntime({
+      releaseError,
+      results: {
+        release: {
+          state: 'passed',
+          fingerprint: stageFingerprint('release'),
+          outputs: {release: 'run-release'},
+          artifacts: [],
+          checks: [],
+          outputCurrent,
+        },
+      },
+    });
+    const plan = makePlan({
+      stageIds: ['preflight', 'release'],
+      actions: ['run', 'run'],
+      runMode: 'new',
+      targetRunId: 'run-release',
+    });
+
+    const result = await runExecutionPlan(executionInput(plan), runtime.dependencies);
+
+    expect(result).toMatchObject({
+      runId: 'run-release',
+      state: 'passed',
+      completedStage: 'release',
+      warnings: [{code: 'PROJECT_LOCK_RELEASE_FAILED'}],
+    });
+    expect(runtime.outputCurrent).toEqual(outputCurrent);
+    expect(runtime.report('run-release', 'release')).toMatchObject({state: 'passed'});
     expect(runtime.release).toHaveBeenCalledOnce();
   });
 });

@@ -1052,7 +1052,7 @@ describe('app-owned directory scopes', () => {
       if (mutation === 'unlink') await writeFile(outsideRollback, 'outside-rollback');
       armed = true;
 
-      await expect(store.publishCurrent('demo', {
+      const publication = store.publishCurrent('demo', {
         runId: 'run-two',
         relativePath: 'runs/run-two',
         preset: 'release',
@@ -1060,7 +1060,12 @@ describe('app-owned directory scopes', () => {
         completedStage: 'release',
         state: 'passed',
         publishedAt: '2026-08-10T00:01:00.000Z',
-      })).rejects.toBeInstanceOf(Error);
+      });
+      if (mutation === 'unlink') {
+        await expect(publication).resolves.toBeUndefined();
+      } else {
+        await expect(publication).rejects.toBeInstanceOf(Error);
+      }
 
       expect(replaced).toBe(true);
       await expect(readFile(outsideCurrent, 'utf8')).resolves.toBe('outside-current');
@@ -1072,6 +1077,10 @@ describe('app-owned directory scopes', () => {
           .rejects.toMatchObject({code: 'ENOENT'});
       } else if (mutation === 'unlink') {
         await expect(readFile(outsideRollback, 'utf8')).resolves.toBe('outside-rollback');
+        await expect(readFile(
+          path.join(displacedWorkRoot, 'current.json'),
+          'utf8',
+        ).then(JSON.parse)).resolves.toMatchObject({runId: 'run-two'});
       }
     },
   );

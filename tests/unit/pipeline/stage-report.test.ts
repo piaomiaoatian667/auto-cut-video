@@ -529,7 +529,7 @@ describe('StageReportStore', () => {
       probe.armed = true;
       probe.syncErrors.push(syncError);
 
-      await expect(store.deleteStage!(runDirectory, 'ingest'))
+      await expect(store.deleteStage(runDirectory, 'ingest'))
         .rejects.toBe(syncError);
 
       expect(probe.events).toEqual([
@@ -540,7 +540,7 @@ describe('StageReportStore', () => {
       await expect(readFile(reportPath, 'utf8')).rejects.toMatchObject({code: 'ENOENT'});
 
       probe.events.length = 0;
-      await expect(store.deleteStage!(runDirectory, 'ingest'))
+      await expect(store.deleteStage(runDirectory, 'ingest'))
         .resolves.toBeUndefined();
 
       expect(probe.events).toEqual([

@@ -104,6 +104,7 @@ const createContext = (scenario: PlanScenario = {}): {
     }),
     writeStage: vi.fn(async () => undefined),
     writeAttempt: vi.fn(async () => 'unused-attempt'),
+    deleteStage: vi.fn(async () => undefined),
   };
   const registry = STAGE_IDS.map((stageId) => fakeStage(stageId, {
     displayName: stageId[0]!.toUpperCase() + stageId.slice(1),

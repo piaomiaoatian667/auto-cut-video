@@ -279,7 +279,7 @@ export interface StageReportStore {
   ): Promise<StageReport | null>;
   writeStage(run: RunDirectoryScope, report: StageReport): Promise<void>;
   writeAttempt(run: RunDirectoryScope, report: StageReport): Promise<string>;
-  deleteStage?(run: RunDirectoryScope, stageId: StageId): Promise<void>;
+  deleteStage(run: RunDirectoryScope, stageId: StageId): Promise<void>;
 }
 
 export class StageReportValidationError extends TypeError {

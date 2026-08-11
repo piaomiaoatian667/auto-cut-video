@@ -518,6 +518,50 @@ describe('RunStore', () => {
     expect(phases).toEqual(['publish', 'cleanup']);
   });
 
+  it('keeps a committed pointer authoritative when cleanup sync fails', async () => {
+    const workspaceRoot = await makeWorkspace();
+    const normalStore = createRunStore(workspaceRoot);
+    await normalStore.createRun('demo', 'run-one');
+    await normalStore.publishCurrent('demo', pointer('run-one'));
+    await normalStore.createRun('demo', 'run-two');
+    await normalStore.createRun('demo', 'run-three');
+    const cleanupFailure = new Error('injected committed cleanup sync failure');
+    let failCleanup = true;
+    const store = createRunStore(workspaceRoot, {
+      fileOps: {
+        syncDirectory: async (operation, phase) => {
+          await operation();
+          if (phase === 'cleanup' && failCleanup) {
+            failCleanup = false;
+            throw cleanupFailure;
+          }
+        },
+      },
+    });
+    const runTwo = pointer('run-two', {
+      publishedAt: '2026-08-10T00:01:00.000Z',
+    });
+
+    await expect(store.publishCurrent('demo', runTwo)).resolves.toBeUndefined();
+
+    await expect(normalStore.readCurrent('demo')).resolves.toEqual(runTwo);
+    const workRoot = path.join(workspaceRoot, '.work', 'demo');
+    await writeFile(
+      path.join(workRoot, 'current.json.rollback'),
+      'stale rollback scratch',
+    );
+    const runThree = pointer('run-three', {
+      publishedAt: '2026-08-10T00:02:00.000Z',
+    });
+
+    await expect(store.publishCurrent('demo', runThree)).resolves.toBeUndefined();
+
+    await expect(normalStore.readCurrent('demo')).resolves.toEqual(runThree);
+    const entries = await readdir(workRoot);
+    expect(entries).not.toContain('current.json.tmp');
+    expect(entries).not.toContain('current.json.rollback');
+  });
+
   it('syncs the parent directory after failed temporary-file cleanup', async () => {
     const workspaceRoot = await makeWorkspace();
     const normalStore = createRunStore(workspaceRoot);

@@ -2175,6 +2175,7 @@ const publishPointer = async <Scope>(
     }
   } catch (error) {
     await tempHandle?.close().catch(() => undefined);
+    if (committed) return;
     let rollbackError: unknown;
     if (published && !committed) {
       try {

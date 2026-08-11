@@ -1,10 +1,11 @@
 import {randomUUID} from 'node:crypto';
 import {StableIdSchema} from '../domain/schema-primitives';
+import type {RunDirectoryScope} from '../fs/app-directory-scopes';
 import {
-  unlinkRunFile,
-  type RunDirectoryScope,
-} from '../fs/app-directory-scopes';
-import {copyRunArtifact} from './artifacts';
+  copyRunArtifact,
+  deleteRunArtifact,
+  type PipelineArtifact,
+} from './artifacts';
 import {
   ExecutionPlanError,
   revalidateExecutionPlan,
@@ -382,8 +383,6 @@ const materializeCachedStage = async (
     return planStale(`${item.stageId} cannot be cached across Runs`, item.stageId);
   }
   const source = requireSourceReport(sourceRun, item.stageId);
-  const startedAt = dependencies.now();
-  const artifacts = [];
   for (const artifact of source.artifacts) {
     if (artifact.scope !== 'run') {
       return planStale(
@@ -391,25 +390,42 @@ const materializeCachedStage = async (
         item.stageId,
       );
     }
-    artifacts.push(await copyRunArtifact({
-      sourceRun: sourceRun!.runDirectory,
-      targetRun: runDirectory,
-      artifact,
-    }));
   }
-  const finishedAt = dependencies.now();
-  const report = cachedReport(
-    plan,
-    runId,
-    item,
-    source,
-    artifacts,
-    startedAt,
-    finishedAt,
-  );
-  await dependencies.reportStore.writeStage(runDirectory, report);
-  await publishWorkProgress(plan, runId, report, 'passed', dependencies);
-  return report;
+  const startedAt = dependencies.now();
+  const artifacts: PipelineArtifact[] = [];
+  let reportWritten = false;
+  try {
+    for (const artifact of source.artifacts) {
+      artifacts.push(await copyRunArtifact({
+        sourceRun: sourceRun!.runDirectory,
+        targetRun: runDirectory,
+        artifact,
+      }));
+    }
+    const finishedAt = dependencies.now();
+    const report = cachedReport(
+      plan,
+      runId,
+      item,
+      source,
+      artifacts,
+      startedAt,
+      finishedAt,
+    );
+    await dependencies.reportStore.writeStage(runDirectory, report);
+    reportWritten = true;
+    await publishWorkProgress(plan, runId, report, 'passed', dependencies);
+    return report;
+  } catch (error) {
+    return await rollbackStageProgress({
+      primaryError: error,
+      reportStore: dependencies.reportStore,
+      runDirectory,
+      stageId: item.stageId,
+      reportWritten,
+      artifacts,
+    });
+  }
 };
 
 const validateReleaseResult = (
@@ -445,12 +461,44 @@ const deleteCanonicalReport = async (
   reportStore: StageReportStore,
   runDirectory: RunDirectoryScope,
   stageId: StageId,
-): Promise<void> => {
-  if (reportStore.deleteStage !== undefined) {
-    await reportStore.deleteStage(runDirectory, stageId);
-    return;
+): Promise<void> => await reportStore.deleteStage(runDirectory, stageId);
+
+const rollbackStageProgress = async (input: {
+  primaryError: unknown;
+  reportStore: StageReportStore;
+  runDirectory: RunDirectoryScope;
+  stageId: StageId;
+  reportWritten: boolean;
+  artifacts: readonly PipelineArtifact[];
+}): Promise<never> => {
+  const cleanupErrors: unknown[] = [];
+  if (input.reportWritten) {
+    try {
+      await deleteCanonicalReport(
+        input.reportStore,
+        input.runDirectory,
+        input.stageId,
+      );
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
   }
-  await unlinkRunFile(runDirectory, `reports/${stageId}.json`);
+  for (const artifact of [...input.artifacts].reverse()) {
+    if (artifact.scope !== 'run') continue;
+    try {
+      await deleteRunArtifact(input.runDirectory, artifact);
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+  }
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(
+      [input.primaryError, ...cleanupErrors],
+      `Stage progress rollback failed for ${input.stageId}`,
+      {cause: input.primaryError},
+    );
+  }
+  throw input.primaryError;
 };
 
 const result = (
@@ -561,8 +609,12 @@ export async function runExecutionPlan(
   );
   const work = await dependencies.runStore.createWork(plan.projectId);
   let lease: ProjectLockLease | undefined;
-  try {
-    lease = await dependencies.acquireProjectLock(work, lockRunId);
+  let releaseOutputCommitted = false;
+  let outcome:
+    | {ok: true; value: PipelineRunResult}
+    | {ok: false; error: unknown}
+    | undefined;
+  const executeLocked = async (): Promise<PipelineRunResult> => {
     const context: ExecutionPlanContext = {
       project: input.project,
       sourceCatalog: input.sourceCatalog,
@@ -715,19 +767,32 @@ export async function runExecutionPlan(
       }
 
       if (item.stageId !== 'release') {
-        if (stageResult.outputCurrent !== undefined) {
-          throw new PipelineContextError(
-            `${item.stageId} returned an unexpected Output pointer`,
+        let reportWritten = false;
+        try {
+          if (stageResult.outputCurrent !== undefined) {
+            throw new PipelineContextError(
+              `${item.stageId} returned an unexpected Output pointer`,
+            );
+          }
+          await dependencies.reportStore.writeStage(runDirectory, report);
+          reportWritten = true;
+          await publishWorkProgress(
+            revalidated,
+            lockRunId,
+            report,
+            'passed',
+            dependencies,
           );
+        } catch (error) {
+          return await rollbackStageProgress({
+            primaryError: error,
+            reportStore: dependencies.reportStore,
+            runDirectory,
+            stageId: item.stageId,
+            reportWritten,
+            artifacts: stageResult.artifacts,
+          });
         }
-        await dependencies.reportStore.writeStage(runDirectory, report);
-        await publishWorkProgress(
-          revalidated,
-          lockRunId,
-          report,
-          'passed',
-          dependencies,
-        );
         reports.push(report);
         if (sourceRun?.runId === lockRunId) {
           sourceRun.reports.set(report.stageId, report);
@@ -742,6 +807,7 @@ export async function runExecutionPlan(
           revalidated.projectId,
           outputCurrent,
         );
+        releaseOutputCommitted = true;
       } catch (error) {
         try {
           await deleteCanonicalReport(
@@ -793,7 +859,47 @@ export async function runExecutionPlan(
       reports,
       preflight: preflightExecution.preflight,
     });
-  } finally {
-    await lease?.release();
+  };
+  try {
+    lease = await dependencies.acquireProjectLock(work, lockRunId);
+    outcome = {ok: true, value: await executeLocked()};
+  } catch (error) {
+    outcome = {ok: false, error};
   }
+
+  let releaseError: unknown;
+  try {
+    await lease?.release();
+  } catch (error) {
+    releaseError = error;
+  }
+  if (outcome === undefined) {
+    throw new TypeError('Pipeline Runner completed without an outcome');
+  }
+  if (!outcome.ok) {
+    if (releaseError !== undefined) {
+      throw new AggregateError(
+        [outcome.error, releaseError],
+        'Pipeline execution and project lock release both failed',
+        {cause: outcome.error},
+      );
+    }
+    throw outcome.error;
+  }
+  if (releaseError !== undefined) {
+    if (releaseOutputCommitted) {
+      return {
+        ...outcome.value,
+        warnings: [
+          ...outcome.value.warnings,
+          {
+            code: 'PROJECT_LOCK_RELEASE_FAILED',
+            message: 'Output Release is published, but the project lock could not be released.',
+          },
+        ],
+      };
+    }
+    throw releaseError;
+  }
+  return outcome.value;
 }

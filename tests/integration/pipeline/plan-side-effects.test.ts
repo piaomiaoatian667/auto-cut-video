@@ -588,6 +588,7 @@ describe('Execution Plan side effects', () => {
         ),
         writeStage: forbiddenWrites,
         writeAttempt: forbiddenWrites,
+        deleteStage: forbiddenWrites,
       } as unknown as StageReportStore;
       const createRunId = vi.fn(() => 'unused-plan-run');
 
