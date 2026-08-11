@@ -1,9 +1,15 @@
+import {createHash} from 'node:crypto';
+import type {BigIntStats} from 'node:fs';
 import {z} from 'zod';
 import {
   CaptionsManifestSchema,
   NarrationManifestSchema,
 } from '../../domain/manifest-schema';
 import type {RunDirectoryScope} from '../../fs/app-directory-scopes';
+import {
+  openExistingProjectFile,
+  type ProjectDirectoryScope,
+} from '../../fs/project-paths';
 import {narrationSegmentInputHash} from '../../narration/build-narration';
 import {
   createTtsProvider,
@@ -25,18 +31,21 @@ import {
 import {runNarration, type NarrationStageInput} from '../stages/narration';
 import {
   STAGE_ALGORITHM_VERSIONS,
+  isOrdinaryVerificationMiss,
   runArtifact,
   uniqueArtifacts,
   verifyReportedArtifacts,
 } from './shared';
 
-const NarrationAdapterOutputSchema = z.object({
-  narrationPath: z.literal('narration-manifest.json'),
-  captionsPath: z.literal('captions.json'),
-  srtPath: z.literal('captions.srt'),
-  narration: NarrationManifestSchema,
-  captions: CaptionsManifestSchema,
-  reuseCompatibilityFingerprint: z.string().min(1),
+const ToolIdentitySchema = z.object({
+  realPath: z.string().min(1),
+  sha256: z.string().min(1),
+}).strict();
+
+const TtsConfigurationSchema = z.object({
+  provider: z.enum(['macos-say', 'file', 'mock']),
+  voice: z.string().min(1),
+  rate: z.number().int(),
 }).strict();
 
 type NarrationConcreteOutput = Awaited<ReturnType<typeof runNarration>>;
@@ -49,6 +58,11 @@ export interface NarrationReuseCompatibilityInput {
       ? Identity
       : never
     : never;
+  ffprobeIdentity: StagePlanningContext['preflight'] extends infer Result
+    ? Result extends {toolIdentities: {ffprobe: infer Identity}}
+      ? Identity
+      : never
+    : never;
   algorithmVersion: string;
 }
 
@@ -58,30 +72,165 @@ export const narrationReuseCompatibilityFingerprint = (
   tts: input.tts,
   providerFingerprint: input.providerFingerprint,
   ffmpegIdentity: input.ffmpegIdentity,
+  ffprobeIdentity: input.ffprobeIdentity,
   algorithmVersion: input.algorithmVersion,
+});
+
+const NarrationReuseCompatibilitySchema = z.object({
+  tts: TtsConfigurationSchema,
+  providerFingerprint: z.string().min(1),
+  ffmpegIdentity: ToolIdentitySchema,
+  ffprobeIdentity: ToolIdentitySchema,
+  algorithmVersion: z.string().min(1),
+}).strict();
+
+const NarrationAdapterOutputSchema = z.object({
+  narrationPath: z.literal('narration-manifest.json'),
+  captionsPath: z.literal('captions.json'),
+  srtPath: z.literal('captions.srt'),
+  narration: NarrationManifestSchema,
+  captions: CaptionsManifestSchema,
+  reuseCompatibility: NarrationReuseCompatibilitySchema,
+  reuseCompatibilityFingerprint: z.string().min(1),
+}).strict().superRefine((output, context) => {
+  if (
+    narrationReuseCompatibilityFingerprint(output.reuseCompatibility)
+    !== output.reuseCompatibilityFingerprint
+  ) {
+    context.addIssue({
+      code: 'custom',
+      path: ['reuseCompatibilityFingerprint'],
+      message: 'must match the structured Narration reuse compatibility inputs',
+    });
+  }
 });
 
 const narrationFingerprint = ({
   context,
   providerFingerprint,
   algorithmVersion,
+  fileAudioInputs,
 }: {
   context: StagePlanningContext;
   providerFingerprint: string;
   algorithmVersion: string;
+  fileAudioInputs: readonly {id: string; audioPath: string; sha256: string}[];
 }): string | null => {
   const ffmpegIdentity = context.preflight?.toolIdentities.ffmpeg;
-  if (ffmpegIdentity === undefined || ffmpegIdentity === null) return null;
+  const ffprobeIdentity = context.preflight?.toolIdentities.ffprobe;
+  if (
+    ffmpegIdentity === undefined
+    || ffmpegIdentity === null
+    || ffprobeIdentity === undefined
+    || ffprobeIdentity === null
+  ) return null;
   const compatibilityFingerprint = narrationReuseCompatibilityFingerprint({
     tts: context.project.project.tts,
     providerFingerprint,
     ffmpegIdentity,
+    ffprobeIdentity,
     algorithmVersion,
   });
   return fingerprintValue({
     script: context.project.script,
+    fileAudioInputs,
     reuseCompatibilityFingerprint: compatibilityFingerprint,
   });
+};
+
+const MAX_FILE_PROVIDER_AUDIO_BYTES = 512 * 1024 * 1024;
+const FILE_HASH_CHUNK_BYTES = 1024 * 1024;
+
+interface ProjectAudioIdentity {
+  dev: bigint;
+  ino: bigint;
+  nlink: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}
+
+const projectAudioIdentity = (
+  status: BigIntStats,
+): ProjectAudioIdentity => ({
+  dev: status.dev,
+  ino: status.ino,
+  nlink: status.nlink,
+  size: status.size,
+  mtimeNs: status.mtimeNs,
+  ctimeNs: status.ctimeNs,
+});
+
+const sameProjectAudioIdentity = (
+  left: ProjectAudioIdentity,
+  right: ProjectAudioIdentity,
+): boolean => (
+  left.dev === right.dev
+  && left.ino === right.ino
+  && left.nlink === right.nlink
+  && left.size === right.size
+  && left.mtimeNs === right.mtimeNs
+  && left.ctimeNs === right.ctimeNs
+);
+
+const hashProjectAudioFileOnce = async (
+  projectDirectory: ProjectDirectoryScope,
+  relativePath: string,
+): Promise<{identity: ProjectAudioIdentity; sha256: string}> => {
+  const handle = await openExistingProjectFile(projectDirectory, relativePath);
+  try {
+    const beforeStatus = await handle.stat({bigint: true});
+    if (
+      !beforeStatus.isFile()
+      || beforeStatus.size < 0n
+      || beforeStatus.size > BigInt(MAX_FILE_PROVIDER_AUDIO_BYTES)
+    ) {
+      throw new PipelineContextError(`unsafe file-provider audio input: ${relativePath}`);
+    }
+    const before = projectAudioIdentity(beforeStatus);
+    const hash = createHash('sha256');
+    const buffer = Buffer.allocUnsafe(FILE_HASH_CHUNK_BYTES);
+    let position = 0;
+    while (position < Number(before.size)) {
+      const length = Math.min(buffer.byteLength, Number(before.size) - position);
+      const {bytesRead} = await handle.read(buffer, 0, length, position);
+      if (bytesRead <= 0 || bytesRead > length) {
+        throw new PipelineContextError(`unstable file-provider audio input: ${relativePath}`);
+      }
+      hash.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    const trailing = await handle.read(buffer, 0, 1, position);
+    const afterStatus = await handle.stat({bigint: true});
+    if (
+      trailing.bytesRead !== 0
+      || !sameProjectAudioIdentity(before, projectAudioIdentity(afterStatus))
+      || BigInt(position) !== before.size
+    ) {
+      throw new PipelineContextError(`unstable file-provider audio input: ${relativePath}`);
+    }
+    return {
+      identity: before,
+      sha256: `sha256:${hash.digest('hex')}`,
+    };
+  } finally {
+    await handle.close();
+  }
+};
+
+const systemHashProjectAudioFile = async (
+  projectDirectory: ProjectDirectoryScope,
+  relativePath: string,
+): Promise<string> => {
+  const first = await hashProjectAudioFileOnce(projectDirectory, relativePath);
+  const second = await hashProjectAudioFileOnce(projectDirectory, relativePath);
+  if (
+    !sameProjectAudioIdentity(first.identity, second.identity)
+    || first.sha256 !== second.sha256
+  ) {
+    throw new PipelineContextError(`unstable file-provider audio input: ${relativePath}`);
+  }
+  return first.sha256;
 };
 
 const cachePath = (inputHash: string): string =>
@@ -89,6 +238,53 @@ const cachePath = (inputHash: string): string =>
 
 const safeSegmentId = (segmentId: string): string =>
   segmentId.replace(/[^a-zA-Z0-9-]/gu, '-');
+
+const narrationExpectedArtifacts = (
+  output: z.infer<typeof NarrationAdapterOutputSchema>,
+) => {
+  if (
+    output.narrationPath !== 'narration-manifest.json'
+    || output.captionsPath !== 'captions.json'
+    || output.srtPath !== 'captions.srt'
+    || !/^audio\/narration-[0-9a-f]{16}\.wav$/u.test(
+      output.narration.master.audioPath,
+    )
+  ) return null;
+  const expected: Array<{
+    scope: 'run';
+    path: string;
+    sha256?: string;
+  }> = [];
+  for (const [index, segment] of output.narration.segments.entries()) {
+    const inputHashMatch = /^sha256:([0-9a-f]{64})$/u.exec(segment.inputHash);
+    if (inputHashMatch === null) return null;
+    const inputHashHex = inputHashMatch[1]!;
+    const expectedSegmentPath = `audio/segments/${String(index + 1).padStart(4, '0')}-${safeSegmentId(segment.id)}-${inputHashHex.slice(0, 12)}.wav`;
+    if (
+      segment.audioPath !== expectedSegmentPath
+      || segment.providerFingerprint
+        !== output.reuseCompatibility.providerFingerprint
+    ) return null;
+    expected.push(
+      {scope: 'run' as const, path: cachePath(segment.inputHash)},
+      {scope: 'run' as const, path: segment.audioPath, sha256: segment.audioHash},
+    );
+  }
+  expected.push(
+    {
+      scope: 'run' as const,
+      path: output.narration.master.audioPath,
+      sha256: output.narration.master.audioHash,
+    },
+    {scope: 'run' as const, path: output.narrationPath},
+    {scope: 'run' as const, path: output.captionsPath},
+    {scope: 'run' as const, path: output.srtPath},
+  );
+  if (new Set(expected.map((artifact) => artifact.path)).size !== expected.length) {
+    return null;
+  }
+  return expected;
+};
 
 const preliminaryPartialArtifacts = (
   context: StagePlanningContext,
@@ -149,6 +345,7 @@ export interface NarrationStageAdapterDependencies {
   seedNarrationCache?: typeof seedNarrationCache;
   runNarration?: (input: NarrationStageInput) => Promise<NarrationConcreteOutput>;
   hashRunArtifact?: typeof hashRunArtifact;
+  hashProjectAudioFile?: typeof systemHashProjectAudioFile;
 }
 
 export const createNarrationStage = (
@@ -162,19 +359,47 @@ export const createNarrationStage = (
   const seedCache = dependencies.seedNarrationCache ?? seedNarrationCache;
   const executeNarration = dependencies.runNarration ?? runNarration;
   const hashArtifact = dependencies.hashRunArtifact ?? hashRunArtifact;
+  const hashProjectAudioFile = dependencies.hashProjectAudioFile
+    ?? systemHashProjectAudioFile;
   const partialArtifactsByRun = new WeakMap<
     RunDirectoryScope,
     readonly PipelinePartialArtifact[]
   >();
 
-  const fingerprint = async (context: StagePlanningContext): Promise<string | null> => (
-    narrationFingerprint({
+  const calculateFingerprint = async (
+    context: StagePlanningContext,
+    providerFingerprint: string,
+  ): Promise<string | null> => {
+    const fileAudioInputs = context.project.project.tts.provider === 'file'
+      ? await Promise.all(context.project.script.segments.map(async (segment) => {
+        if (segment.audioPath === undefined) {
+          throw new PipelineContextError(
+            `file-provider segment ${segment.id} requires audioPath`,
+          );
+        }
+        return {
+          id: segment.id,
+          audioPath: segment.audioPath,
+          sha256: await hashProjectAudioFile(
+            context.project.projectDirectory,
+            segment.audioPath,
+          ),
+        };
+      }))
+      : [];
+    return narrationFingerprint({
       context,
-      providerFingerprint: await providerIdentity(
-        context.project.project.tts.provider,
-      ),
+      providerFingerprint,
       algorithmVersion,
-    })
+      fileAudioInputs,
+    });
+  };
+
+  const fingerprint = async (context: StagePlanningContext): Promise<string | null> => (
+    await calculateFingerprint(
+      context,
+      await providerIdentity(context.project.project.tts.provider),
+    )
   );
 
   return {
@@ -185,25 +410,8 @@ export const createNarrationStage = (
     verify: async (context, report) => {
       const parsed = NarrationAdapterOutputSchema.safeParse(report.outputs);
       if (!parsed.success) return false;
-      const expected = [
-        ...parsed.data.narration.segments.map((segment) => ({
-          scope: 'run' as const,
-          path: cachePath(segment.inputHash),
-        })),
-        ...parsed.data.narration.segments.map((segment) => ({
-          scope: 'run' as const,
-          path: segment.audioPath,
-          sha256: segment.audioHash,
-        })),
-        {
-          scope: 'run' as const,
-          path: parsed.data.narration.master.audioPath,
-          sha256: parsed.data.narration.master.audioHash,
-        },
-        {scope: 'run' as const, path: parsed.data.narrationPath},
-        {scope: 'run' as const, path: parsed.data.captionsPath},
-        {scope: 'run' as const, path: parsed.data.srtPath},
-      ];
+      const expected = narrationExpectedArtifacts(parsed.data);
+      if (expected === null) return false;
       return await verifyReportedArtifacts({context, report, expected});
     },
     partialArtifacts: (context) => {
@@ -224,8 +432,11 @@ export const createNarrationStage = (
       const {runId, runDirectory} = requireRunContext(context);
       const preflight = requirePreflight(context);
       const ffmpegIdentity = preflight.toolIdentities.ffmpeg;
-      if (ffmpegIdentity === null) {
-        throw new PipelineContextError('Narration requires a Preflight FFmpeg identity');
+      const ffprobeIdentity = preflight.toolIdentities.ffprobe;
+      if (ffmpegIdentity === null || ffprobeIdentity === null) {
+        throw new PipelineContextError(
+          'Narration requires Preflight FFmpeg and FFprobe identities',
+        );
       }
       const providerId = context.project.project.tts.provider;
       const providerFingerprint = await providerIdentity(providerId);
@@ -239,49 +450,71 @@ export const createNarrationStage = (
         runDirectory,
         ffmpegExecutable: ffmpegIdentity.realPath,
       }), providerId, providerFingerprint);
-      const compatibilityFingerprint = narrationReuseCompatibilityFingerprint({
+      const reuseCompatibility = {
         tts: context.project.project.tts,
         providerFingerprint,
         ffmpegIdentity,
+        ffprobeIdentity,
         algorithmVersion,
-      });
-      const stageFingerprint = narrationFingerprint({
-        context: {...context, preflight},
+      };
+      const compatibilityFingerprint = narrationReuseCompatibilityFingerprint(
+        reuseCompatibility,
+      );
+      const stageFingerprint = await calculateFingerprint(
+        {...context, preflight},
         providerFingerprint,
-        algorithmVersion,
-      });
+      );
       if (stageFingerprint === null) {
         throw new PipelineContextError('Narration fingerprint requires Preflight');
       }
       const sourceReport = context.sourceRun?.reports.get('narration');
-      const sourceCompatibility = z.object({
-        reuseCompatibilityFingerprint: z.string().min(1),
-      }).passthrough().safeParse(sourceReport?.outputs);
+      const sourceOutput = NarrationAdapterOutputSchema.safeParse(sourceReport?.outputs);
       if (
         providerId !== 'file'
         && context.sourceRun !== undefined
         && context.sourceRun.runId !== runId
+        && sourceReport?.projectId === context.project.project.id
+        && sourceReport.runId === context.sourceRun.runId
+        && sourceReport.stageId === 'narration'
         && sourceReport?.fingerprint !== null
         && sourceReport?.fingerprint !== undefined
         && sourceReport.fingerprint !== stageFingerprint
-        && sourceCompatibility.success
-        && sourceCompatibility.data.reuseCompatibilityFingerprint
+        && sourceOutput.success
+        && sourceOutput.data.reuseCompatibilityFingerprint
           === compatibilityFingerprint
       ) {
-        await seedCache({
-          sourceRun: context.sourceRun.runDirectory,
-          targetRun: runDirectory,
-          script: context.project.script,
-          voice: context.project.project.tts.voice,
-          rate: context.project.project.tts.rate,
-          providerFingerprint,
-        });
+        const sourceExpected = narrationExpectedArtifacts(sourceOutput.data);
+        if (
+          sourceExpected !== null
+          && await verifyReportedArtifacts({
+            context,
+            report: sourceReport,
+            expected: sourceExpected,
+          })
+        ) {
+          try {
+            await seedCache({
+              sourceRun: context.sourceRun.runDirectory,
+              targetRun: runDirectory,
+              script: context.project.script,
+              voice: context.project.project.tts.voice,
+              rate: context.project.project.tts.rate,
+              providerFingerprint,
+              sourceManifest: sourceOutput.data.narration,
+              sourceArtifacts: sourceReport.artifacts,
+            });
+          } catch (error) {
+            if (!isOrdinaryVerificationMiss(error)) throw error;
+          }
+        }
       }
 
       const result = await executeNarration({
         ...context.project,
         runDirectory,
         provider,
+        ffmpegExecutable: ffmpegIdentity.realPath,
+        ffprobeExecutable: ffprobeIdentity.realPath,
         signal,
         onPartialArtifact: (relativePath) => {
           partialArtifactsByRun.set(runDirectory, uniquePartialArtifacts([
@@ -294,6 +527,14 @@ export const createNarrationStage = (
         ...(partialArtifactsByRun.get(runDirectory) ?? []),
         {scope: 'run', path: result.narration.master.audioPath},
       ]));
+      const output = NarrationAdapterOutputSchema.parse({
+        ...result,
+        reuseCompatibility,
+        reuseCompatibilityFingerprint: compatibilityFingerprint,
+      });
+      if (narrationExpectedArtifacts(output) === null) {
+        throw new PipelineContextError('Narration returned invalid owned artifact paths');
+      }
       const artifacts: PipelineArtifact[] = [];
       for (const segment of result.narration.segments) {
         artifacts.push(await hashArtifact(runDirectory, cachePath(segment.inputHash)));
@@ -325,7 +566,7 @@ export const createNarrationStage = (
       return {
         state: 'passed',
         fingerprint: stageFingerprint,
-        outputs: {...result, reuseCompatibilityFingerprint: compatibilityFingerprint},
+        outputs: output,
         artifacts: ownedArtifacts,
         checks: [],
       };

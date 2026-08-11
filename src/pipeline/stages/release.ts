@@ -76,6 +76,8 @@ export interface ReleaseStageFingerprintInput {
     'contactSheet' | 'reviewFrames' | 'audio' | 'audioMixFingerprint'
   >;
   compileInputHashes: Record<string, string>;
+  compileStageFingerprint?: string | null;
+  compiledTimeline?: CompiledTimeline;
   review: Review;
   preflightEnvironmentFingerprint: string;
   profile?: Record<string, unknown>;
@@ -85,6 +87,8 @@ export interface ReleaseStageFingerprintInput {
 export const releaseStageFingerprint = ({
   draft,
   compileInputHashes,
+  compileStageFingerprint = null,
+  compiledTimeline,
   review,
   preflightEnvironmentFingerprint,
   profile = RELEASE_FIXED_PROFILE,
@@ -98,6 +102,10 @@ export const releaseStageFingerprint = ({
     audioMixFingerprint: draft.audioMixFingerprint ?? null,
   },
   compileInputHashes,
+  compileStageFingerprint,
+  compiledTimelineFingerprint: compiledTimeline === undefined
+    ? null
+    : fingerprintValue(compiledTimeline),
   approvedReview: review,
   preflightEnvironmentFingerprint,
   profile,
@@ -111,6 +119,7 @@ export interface ReleaseToolIdentity {
 export interface ReleasePreflightSnapshot {
   toolIdentities: {
     ffmpeg: ReleaseToolIdentity | null;
+    ffprobe: ReleaseToolIdentity | null;
     qtFaststart: ReleaseToolIdentity | null;
   };
   environmentFingerprint: string;
@@ -133,6 +142,7 @@ export interface ReleaseStageInput extends ProjectInputs {
   runDirectory: RunDirectoryScope;
   runId: string;
   preflight: ReleasePreflightSnapshot;
+  compileStageFingerprint?: string;
   signal?: AbortSignal;
   now?: () => string;
 }
@@ -149,6 +159,8 @@ export interface ReleaseStageDependencies {
   ffprobeExecutable?: string;
   outputStore?: ReturnType<typeof createOutputStore>;
   publishCurrent?: boolean;
+  profile?: Record<string, unknown>;
+  algorithmVersion?: string;
 }
 
 export interface OutputArtifactReference extends ArtifactReference {
@@ -540,7 +552,9 @@ export const runRelease = async (
 ): Promise<ReleaseStageResult> => {
   const tools = assertReleaseTools(input.preflight);
   const runner = dependencies.runProcess ?? runSystemProcess;
-  const ffprobeExecutable = dependencies.ffprobeExecutable ?? FFPROBE_EXECUTABLE;
+  const ffprobeExecutable = dependencies.ffprobeExecutable
+    ?? input.preflight.toolIdentities.ffprobe?.realPath
+    ?? FFPROBE_EXECUTABLE;
   const outputStore = dependencies.outputStore ?? createOutputStore(input.workspaceRoot);
   const timeline = await readRunJson(
     input.runDirectory,
@@ -622,8 +636,12 @@ export const runRelease = async (
   const releaseFingerprint = releaseStageFingerprint({
     draft: draftReport.outputs,
     compileInputHashes: timeline.inputHashes,
+    compileStageFingerprint: input.compileStageFingerprint ?? null,
+    compiledTimeline: timeline,
     review,
     preflightEnvironmentFingerprint: input.preflight.environmentFingerprint,
+    profile: dependencies.profile ?? RELEASE_FIXED_PROFILE,
+    algorithmVersion: dependencies.algorithmVersion ?? 'release-stage-v1',
   });
   const validationReport = await writeOutputJson(
     outputDirectory,

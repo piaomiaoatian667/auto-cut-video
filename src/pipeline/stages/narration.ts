@@ -13,6 +13,8 @@ import type {TtsProvider} from '../../providers/tts';
 export interface NarrationStageInput extends ProjectInputs {
   runDirectory: RunDirectoryScope;
   provider: TtsProvider;
+  ffmpegExecutable?: string;
+  ffprobeExecutable?: string;
   signal?: AbortSignal;
   onPartialArtifact?: (relativePath: string) => void;
 }

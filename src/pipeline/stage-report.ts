@@ -280,11 +280,18 @@ export interface StageReportStore {
   writeAttempt(run: RunDirectoryScope, report: StageReport): Promise<string>;
 }
 
+export class StageReportValidationError extends TypeError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StageReportValidationError';
+  }
+}
+
 const isMissingFile = (error: unknown): error is NodeJS.ErrnoException =>
   error instanceof Error && 'code' in error && error.code === 'ENOENT';
 
-const invalidReport = (message: string): TypeError =>
-  new TypeError(`STAGE_REPORT_INVALID: ${message}`);
+const invalidReport = (message: string): StageReportValidationError =>
+  new StageReportValidationError(`STAGE_REPORT_INVALID: ${message}`);
 
 const requireMatchingRunIdentity = (
   run: RunDirectoryScope,

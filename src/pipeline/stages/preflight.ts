@@ -162,6 +162,7 @@ export interface PreflightResult {
   checks: PreflightCheck[];
   toolIdentities: {
     ffmpeg: ToolIdentity | null;
+    ffprobe: ToolIdentity | null;
     qtFaststart: ToolIdentity | null;
   };
   fonts: FontIdentity[];
@@ -534,6 +535,7 @@ export async function runPreflight(
 
     const toolIdentities: PreflightResult['toolIdentities'] = {
       ffmpeg: null,
+      ffprobe: null,
       qtFaststart: null,
     };
     let ffmpeg: ResolvedExecutable | null = null;
@@ -596,6 +598,10 @@ export async function runPreflight(
     try {
       ffprobe = await resolveExecutableAuthority(ffprobeSelection, dependencies);
       heldAuthorities.push(ffprobe.authority);
+      toolIdentities.ffprobe = {
+        realPath: ffprobe.realPath,
+        sha256: ffprobe.authority.snapshot.sha256,
+      };
     } catch {
       addError(
         checks,
@@ -685,6 +691,8 @@ export async function runPreflight(
     }
 
     if (ffprobeChanged) {
+      toolIdentities.ffprobe = null;
+      versions.ffprobe = null;
       addError(
         checks,
         'ffprobe',
@@ -929,6 +937,22 @@ export async function runPreflight(
         'ENV_TOOL_CHANGED',
         'FFmpeg changed before its environment identity was finalized.',
         {affectedPaths: [ffmpeg.realPath]},
+      );
+    }
+
+    if (
+      ffprobe !== null
+      && toolIdentities.ffprobe !== null
+      && !await safeRevalidate(ffprobe.authority)
+    ) {
+      toolIdentities.ffprobe = null;
+      versions.ffprobe = null;
+      addError(
+        checks,
+        'ffprobe',
+        'ENV_TOOL_CHANGED',
+        'ffprobe changed before its environment identity was finalized.',
+        {affectedPaths: [ffprobe.realPath]},
       );
     }
 

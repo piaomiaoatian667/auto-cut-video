@@ -10,11 +10,17 @@ import {
   type RunDirectoryScope,
 } from '../../fs/app-directory-scopes';
 import {
+  PipelineContextError,
   requirePreflight,
   requireRunContext,
   type PipelineStage,
 } from '../stage';
-import type {StageReport} from '../stage-report';
+import {
+  createStageReportStore,
+  StageReportValidationError,
+  type StageReport,
+} from '../stage-report';
+import {fingerprintValue} from '../fingerprint';
 import {
   ArtifactReferenceSchema,
   DraftReportSchema,
@@ -29,17 +35,17 @@ import {
   type ReleaseStageInput,
   type ReleaseStageResult,
 } from '../stages/release';
-import {ReviewGateError} from '../stages/review';
+import {evaluateReview, ReviewGateError} from '../stages/review';
 import {
   STAGE_ALGORITHM_VERSIONS,
   isOrdinaryVerificationMiss,
   outputArtifact,
+  readPlanningInput,
   readRunJson,
-  readRunStageReport,
   runArtifact,
   verifyReportedArtifacts,
 } from './shared';
-import {parsePreflightAdapterOutput} from './preflight';
+import {normalizePreflightAdapterOutput} from './preflight';
 
 const OutputArtifactReferenceSchema = ArtifactReferenceSchema.extend({
   path: z.string().regex(/^releases\/[^/]+\/[^/]+$/u),
@@ -73,7 +79,10 @@ export interface ReleaseStageAdapterDependencies {
   readDraftReport?: (runDirectory: RunDirectoryScope) => Promise<DraftReport>;
   readCompiledTimeline?: (runDirectory: RunDirectoryScope) => Promise<CompiledTimeline>;
   readReview?: (runDirectory: RunDirectoryScope) => Promise<Review>;
-  readPreflightReport?: (runDirectory: RunDirectoryScope) => Promise<StageReport>;
+  readStageReport?: (
+    runDirectory: RunDirectoryScope,
+    stageId: 'preflight' | 'compile',
+  ) => Promise<StageReport | null>;
   runRelease?: (
     input: ReleaseStageInput,
     dependencies?: ReleaseStageDependencies,
@@ -87,11 +96,69 @@ export interface ReleaseStageAdapterDependencies {
 const parseReleasePreflightSnapshot = (
   value: unknown,
 ): ReleasePreflightSnapshot => {
-  const parsed = parsePreflightAdapterOutput(value);
+  const parsed = normalizePreflightAdapterOutput(value);
   return {
     toolIdentities: parsed.toolIdentities,
     environmentFingerprint: parsed.environmentFingerprint,
   };
+};
+
+const requireBoundStageReport = (
+  report: StageReport | null,
+  projectId: string,
+  runId: string,
+  stageId: 'preflight' | 'compile',
+): StageReport => {
+  if (report === null) {
+    throw new StageReportValidationError(`missing ${stageId} Stage report`);
+  }
+  if (
+    report.projectId !== projectId
+    || report.runId !== runId
+    || report.stageId !== stageId
+  ) {
+    throw new StageReportValidationError(
+      `${stageId} Stage report is not bound to ${projectId}/${runId}`,
+    );
+  }
+  return report;
+};
+
+const releaseExpectedArtifacts = (
+  outputs: {
+    mutedVideo: {path: string; sha256: string};
+    intermediate: {path: string; sha256: string};
+    finalVideo: {path: string; sha256: string};
+    subtitles: {path: string; sha256: string};
+    thumbnail: {path: string; sha256: string};
+    review: {path: string; sha256: string};
+    validationReport: {path: string; sha256: string};
+    checksums: {path: string; sha256: string};
+  },
+  runId: string,
+) => {
+  const references = [
+    {scope: 'run' as const, artifact: outputs.mutedVideo, path: 'release/muted-video.mp4'},
+    {
+      scope: 'run' as const,
+      artifact: outputs.intermediate,
+      path: 'release/final-intermediate.mp4',
+    },
+    {scope: 'output' as const, artifact: outputs.finalVideo, path: `releases/${runId}/final.mp4`},
+    {scope: 'output' as const, artifact: outputs.subtitles, path: `releases/${runId}/subtitles.srt`},
+    {scope: 'output' as const, artifact: outputs.thumbnail, path: `releases/${runId}/thumbnail.jpg`},
+    {scope: 'output' as const, artifact: outputs.review, path: `releases/${runId}/review.json`},
+    {
+      scope: 'output' as const,
+      artifact: outputs.validationReport,
+      path: `releases/${runId}/validation-report.json`,
+    },
+    {scope: 'output' as const, artifact: outputs.checksums, path: `releases/${runId}/checksums.sha256`},
+  ];
+  if (references.some(({artifact, path}) => artifact.path !== path)) return null;
+  const paths = new Set(references.map(({scope, artifact}) => `${scope}:${artifact.path}`));
+  if (paths.size !== references.length) return null;
+  return references.map(({scope, artifact}) => ({scope, ...artifact}));
 };
 
 export const createReleaseStage = (
@@ -118,10 +185,11 @@ export const createReleaseStage = (
       'review.json',
       (value) => ReviewSchema.parse(value),
     ));
-  const readPreflightReport = dependencies.readPreflightReport
-    ?? (async (runDirectory: RunDirectoryScope) => await readRunStageReport(
+  const stageReportStore = createStageReportStore();
+  const readStageReport = dependencies.readStageReport
+    ?? (async (runDirectory, stageId) => await stageReportStore.readStage(
       runDirectory,
-      'preflight',
+      stageId,
     ));
   const executeRelease = dependencies.runRelease ?? runRelease;
   const openOutputDirectory = dependencies.openOutputDirectory
@@ -131,18 +199,40 @@ export const createReleaseStage = (
 
   const calculateFingerprint = async (
     runDirectory: RunDirectoryScope,
+    runId: string,
+    projectId: string,
     preflight: ReleasePreflightSnapshot,
+    compileStageFingerprint: string,
   ): Promise<string | null> => {
     const [draft, timeline, review] = await Promise.all([
       readDraftReport(runDirectory),
       readCompiledTimeline(runDirectory),
       readReview(runDirectory),
     ]);
-    if (review.status !== 'approved') return null;
+    if (draft.projectId !== projectId || timeline.projectId !== projectId) return null;
+    let approvedReview: Review;
+    try {
+      const gate = await evaluateReview({
+        projectId,
+        runId,
+        evidencePaths: [
+          draft.outputs.contactSheet.path,
+          ...draft.outputs.reviewFrames.map((frame) => frame.path),
+        ],
+        review,
+      });
+      if (gate.state !== 'passed' || gate.review === undefined) return null;
+      approvedReview = gate.review;
+    } catch (error) {
+      if (error instanceof ReviewGateError) return null;
+      throw error;
+    }
     return releaseStageFingerprint({
       draft: draft.outputs,
       compileInputHashes: timeline.inputHashes,
-      review,
+      compileStageFingerprint,
+      compiledTimeline: timeline,
+      review: approvedReview,
       preflightEnvironmentFingerprint: preflight.environmentFingerprint,
       profile,
       algorithmVersion,
@@ -155,20 +245,48 @@ export const createReleaseStage = (
     prerequisites: ['review'],
     fingerprint: async (context) => {
       if (context.sourceRun === undefined) return null;
-      const preflightReport = context.sourceRun.reports.get('preflight');
-      if (preflightReport?.outputs === undefined) return null;
-      let preflight: ReleasePreflightSnapshot;
-      try {
-        preflight = parseReleasePreflightSnapshot(preflightReport.outputs);
-      } catch (error) {
-        if (error instanceof z.ZodError) return null;
-        throw error;
-      }
-      return await calculateFingerprint(context.sourceRun.runDirectory, preflight);
+      return await readPlanningInput(async () => {
+        const [preflightReportValue, compileReportValue] = await Promise.all([
+          readStageReport(context.sourceRun!.runDirectory, 'preflight'),
+          readStageReport(context.sourceRun!.runDirectory, 'compile'),
+        ]);
+        const preflightReport = requireBoundStageReport(
+          preflightReportValue,
+          context.project.project.id,
+          context.sourceRun!.runId,
+          'preflight',
+        );
+        const compileReport = requireBoundStageReport(
+          compileReportValue,
+          context.project.project.id,
+          context.sourceRun!.runId,
+          'compile',
+        );
+        const preflight = parseReleasePreflightSnapshot(preflightReport.outputs);
+        return await calculateFingerprint(
+          context.sourceRun!.runDirectory,
+          context.sourceRun!.runId,
+          context.project.project.id,
+          preflight,
+          compileReport.fingerprint!,
+        );
+      });
     },
     verify: async (context, report) => {
       const parsed = ReleaseAdapterOutputSchema.safeParse(report.outputs);
       if (!parsed.success) return false;
+      const expected = releaseExpectedArtifacts(parsed.data, report.runId);
+      if (expected === null) return false;
+      const currentFingerprint = await readPlanningInput(async () => await (
+        context.sourceRun === undefined
+          ? Promise.resolve(null)
+          : createReleaseStage(dependencies).fingerprint(context)
+      ));
+      if (
+        currentFingerprint === null
+        || report.fingerprint !== currentFingerprint
+        || parsed.data.releaseFingerprint !== currentFingerprint
+      ) return false;
       let outputDirectory: OutputDirectoryScope;
       try {
         outputDirectory = await openOutputDirectory(
@@ -179,20 +297,10 @@ export const createReleaseStage = (
         if (isOrdinaryVerificationMiss(error)) return false;
         throw error;
       }
-      const outputs = parsed.data;
       return await verifyReportedArtifacts({
         context,
         report,
-        expected: [
-          {scope: 'run', ...outputs.mutedVideo},
-          {scope: 'run', ...outputs.intermediate},
-          {scope: 'output', ...outputs.finalVideo},
-          {scope: 'output', ...outputs.subtitles},
-          {scope: 'output', ...outputs.thumbnail},
-          {scope: 'output', ...outputs.review},
-          {scope: 'output', ...outputs.validationReport},
-          {scope: 'output', ...outputs.checksums},
-        ],
+        expected,
         outputDirectory,
       });
     },
@@ -214,10 +322,39 @@ export const createReleaseStage = (
     },
     execute: async (context, signal) => {
       const {runId, runDirectory} = requireRunContext(context);
-      requirePreflight(context);
-      const preflightReport = await readPreflightReport(runDirectory);
+      const livePreflight = requirePreflight(context);
+      const [preflightReportValue, compileReportValue] = await Promise.all([
+        readStageReport(runDirectory, 'preflight'),
+        readStageReport(runDirectory, 'compile'),
+      ]);
+      const preflightReport = requireBoundStageReport(
+        preflightReportValue,
+        context.project.project.id,
+        runId,
+        'preflight',
+      );
+      const compileReport = requireBoundStageReport(
+        compileReportValue,
+        context.project.project.id,
+        runId,
+        'compile',
+      );
+      if (
+        fingerprintValue(normalizePreflightAdapterOutput(preflightReport.outputs))
+        !== fingerprintValue(normalizePreflightAdapterOutput(livePreflight))
+      ) {
+        throw new PipelineContextError(
+          'Release Preflight report does not match live Preflight results',
+        );
+      }
       const preflight = parseReleasePreflightSnapshot(preflightReport.outputs);
-      const stageFingerprint = await calculateFingerprint(runDirectory, preflight);
+      const stageFingerprint = await calculateFingerprint(
+        runDirectory,
+        runId,
+        context.project.project.id,
+        preflight,
+        compileReport.fingerprint!,
+      );
       if (stageFingerprint === null) {
         throw new ReviewGateError('Release requires approved Review evidence');
       }
@@ -226,23 +363,30 @@ export const createReleaseStage = (
         runDirectory,
         runId,
         preflight,
+        compileStageFingerprint: compileReport.fingerprint!,
         signal,
         now: context.now,
-      }, {publishCurrent: false});
+      }, {
+        publishCurrent: false,
+        profile,
+        algorithmVersion,
+      });
+      if (result.outputs.releaseFingerprint !== stageFingerprint) {
+        throw new PipelineContextError(
+          'Release output fingerprint does not match adapter inputs',
+        );
+      }
+      const expected = releaseExpectedArtifacts(result.outputs, runId);
+      if (expected === null) {
+        throw new PipelineContextError('Release returned invalid artifact paths');
+      }
       return {
         state: 'passed',
         fingerprint: stageFingerprint,
         outputs: result.outputs,
-        artifacts: [
-          runArtifact(result.outputs.mutedVideo),
-          runArtifact(result.outputs.intermediate),
-          outputArtifact(result.outputs.finalVideo),
-          outputArtifact(result.outputs.subtitles),
-          outputArtifact(result.outputs.thumbnail),
-          outputArtifact(result.outputs.review),
-          outputArtifact(result.outputs.validationReport),
-          outputArtifact(result.outputs.checksums),
-        ],
+        artifacts: expected.map((artifact) => artifact.scope === 'run'
+          ? runArtifact(artifact)
+          : outputArtifact(artifact)),
         checks: [],
         outputCurrent: result.current,
       };

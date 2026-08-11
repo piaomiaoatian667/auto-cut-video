@@ -35,6 +35,7 @@ const successfulResult = (): PreflightResult => ({
   ],
   toolIdentities: {
     ffmpeg: {realPath: '/real/ffmpeg', sha256: 'sha256:ffmpeg'},
+    ffprobe: {realPath: '/real/ffprobe', sha256: 'sha256:ffprobe'},
     qtFaststart: {realPath: '/real/qt-faststart', sha256: 'sha256:faststart'},
   },
   fonts: [{path: 'assets/fonts/font.otf', sha256: 'sha256:font'}],
@@ -154,6 +155,8 @@ describe('videoctl doctor', () => {
       '',
       'FFmpeg real path: /real/ffmpeg',
       'FFmpeg SHA-256: sha256:ffmpeg',
+      'FFprobe real path: /real/ffprobe',
+      'FFprobe SHA-256: sha256:ffprobe',
       'qt-faststart real path: /real/qt-faststart',
       'qt-faststart SHA-256: sha256:faststart',
       'Environment fingerprint: sha256:environment',
@@ -258,6 +261,7 @@ describe('videoctl doctor', () => {
       ok: true,
       toolIdentities: {
         ffmpeg: {realPath: '/real/ffmpeg', sha256: 'sha256:ffmpeg'},
+        ffprobe: {realPath: '/real/ffprobe', sha256: 'sha256:ffprobe'},
         qtFaststart: {
           realPath: '/real/qt-faststart',
           sha256: 'sha256:faststart',
@@ -392,7 +396,7 @@ describe('videoctl doctor', () => {
         code: 'ENV_PREFLIGHT_FAILED',
         message: 'Preflight failed unexpectedly.',
       }],
-      toolIdentities: {ffmpeg: null, qtFaststart: null},
+      toolIdentities: {ffmpeg: null, ffprobe: null, qtFaststart: null},
       environmentFingerprint: null,
     });
   });

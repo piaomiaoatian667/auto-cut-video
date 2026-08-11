@@ -3,6 +3,7 @@ import {readFile} from 'node:fs/promises';
 import path from 'node:path';
 import {afterEach, describe, expect, it} from 'vitest';
 import {loadProject} from '../../../src/domain/load-project';
+import {ReviewSchema} from '../../../src/domain/review-schema';
 import type {CompiledTimeline} from '../../../src/domain/timeline-schema';
 import {
   createOutputStore,
@@ -17,7 +18,11 @@ import {
 } from '../../../src/fs/app-directory-scopes';
 import {parseTopLevelMp4Atoms, assertMoovBeforeMdat} from '../../../src/media/release-verify';
 import {DraftReportSchema} from '../../../src/pipeline/stages/draft';
-import {runRelease, type ReleasePreflightSnapshot} from '../../../src/pipeline/stages/release';
+import {
+  releaseStageFingerprint,
+  runRelease,
+  type ReleasePreflightSnapshot,
+} from '../../../src/pipeline/stages/release';
 import {runProcess, type RunProcessOptions, type ProcessResult} from '../../../src/process/run-process';
 import {
   createEditFixture,
@@ -165,6 +170,7 @@ const compiledTimeline = (): CompiledTimeline => ({
 const preflight = (): ReleasePreflightSnapshot => ({
   toolIdentities: {
     ffmpeg: {realPath: FFMPEG, sha256: 'sha256:ffmpeg'},
+    ffprobe: {realPath: FFPROBE, sha256: 'sha256:ffprobe'},
     qtFaststart: {realPath: QT_FASTSTART, sha256: 'sha256:qt-faststart'},
   },
   environmentFingerprint: 'sha256:environment',
@@ -285,6 +291,8 @@ describe('runRelease', () => {
       return await runProcess(command, args, options);
     };
 
+    const profile = {fps: 60, codec: 'injected-release-profile'};
+    const algorithmVersion = 'release-stage-v2';
     const result = await runRelease({
       ...project,
       runDirectory,
@@ -296,7 +304,25 @@ describe('runRelease', () => {
       runProcess: recordingRunner,
       ffprobeExecutable: FFPROBE,
       outputStore,
+      profile,
+      algorithmVersion,
     });
+
+    const persistedDraft = DraftReportSchema.parse(JSON.parse(
+      (await readRunFile(runDirectory, 'draft/draft-report.json')).toString('utf8'),
+    ));
+    const persistedReview = ReviewSchema.parse(JSON.parse(
+      (await readRunFile(runDirectory, 'review.json')).toString('utf8'),
+    ));
+    expect(result.outputs.releaseFingerprint).toBe(releaseStageFingerprint({
+      draft: persistedDraft.outputs,
+      compileInputHashes: compiledTimeline().inputHashes,
+      compiledTimeline: compiledTimeline(),
+      review: persistedReview,
+      preflightEnvironmentFingerprint: preflight().environmentFingerprint,
+      profile,
+      algorithmVersion,
+    }));
 
     expect(await readRunFile(runDirectory, 'audio/filter-graph.txt')).toEqual(filterGraphBefore);
     expect(await readRunFile(runDirectory, 'audio/mixed-normalized.wav')).toEqual(mixedAudioBefore);

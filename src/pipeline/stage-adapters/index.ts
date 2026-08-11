@@ -1,6 +1,11 @@
 export {
   createPreflightStage,
+  normalizePreflightAdapterOutput,
+  parsePreflightAdapterOutput,
+  PreflightAdapterOutputSchema,
   preflightStage,
+  type CanonicalPreflightAdapterOutput,
+  type PreflightAdapterOutput,
   type PreflightStageAdapterDependencies,
 } from './preflight';
 export {

@@ -8,14 +8,10 @@ import {narrationSegmentInputHash} from '../narration/build-narration';
 import {fingerprintTtsProvider} from '../providers/tts';
 import {
   copyRunArtifact,
-  hashRunArtifact,
   type PipelineArtifact,
 } from './artifacts';
 
 const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/u;
-
-const isMissingFile = (error: unknown): error is NodeJS.ErrnoException =>
-  error instanceof Error && 'code' in error && error.code === 'ENOENT';
 
 const requireSha256 = (value: string, label: string): void => {
   if (!SHA256_PATTERN.test(value)) {
@@ -79,8 +75,11 @@ export async function seedNarrationCache(input: {
   voice: string;
   rate: number;
   providerFingerprint: string;
+  sourceManifest?: NarrationManifest;
+  sourceArtifacts: readonly PipelineArtifact[];
 }): Promise<string[]> {
-  const sourceManifest = await readNarrationManifest(input.sourceRun);
+  const sourceManifest = input.sourceManifest
+    ?? await readNarrationManifest(input.sourceRun);
   validateCompatibility(sourceManifest, input.providerFingerprint);
   const manifestProviderFingerprint = await fingerprintTtsProvider(
     sourceManifest.provider,
@@ -105,15 +104,14 @@ export async function seedNarrationCache(input: {
     .map(narrationCachePath)
     .sort();
   const copiedPaths: string[] = [];
+  const artifactsByPath = new Map(input.sourceArtifacts
+    .filter((artifact) => artifact.scope === 'run')
+    .map((artifact) => [artifact.path, artifact]));
 
   for (const cachePath of cachePaths) {
-    let artifact: PipelineArtifact;
-    try {
-      artifact = await hashRunArtifact(input.sourceRun, cachePath);
-    } catch (error) {
-      if (isMissingFile(error)) continue;
-      throw error;
-    }
+    const artifact = artifactsByPath.get(cachePath);
+    if (artifact === undefined) continue;
+    requireSha256(artifact.sha256, `source artifact hash for ${cachePath}`);
     const copied = await copyRunArtifact({
       sourceRun: input.sourceRun,
       targetRun: input.targetRun,

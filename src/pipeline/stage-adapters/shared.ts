@@ -12,7 +12,11 @@ import {
   type PipelineArtifact,
 } from '../artifacts';
 import type {StagePlanningContext} from '../stage';
-import {StageReportSchema, type StageReport} from '../stage-report';
+import {
+  StageReportSchema,
+  StageReportValidationError,
+  type StageReport,
+} from '../stage-report';
 import type {StageId} from '../run-store';
 
 export const STAGE_ALGORITHM_VERSIONS = {
@@ -70,6 +74,23 @@ export const isOrdinaryVerificationMiss = (error: unknown): boolean => (
     && error.code === 'ENOENT'
   )
 );
+
+export const isOrdinaryPersistedInputMiss = (error: unknown): boolean => (
+  isOrdinaryVerificationMiss(error)
+  || error instanceof SyntaxError
+  || error instanceof StageReportValidationError
+);
+
+export const readPlanningInput = async <Value>(
+  operation: () => Promise<Value>,
+): Promise<Value | null> => {
+  try {
+    return await operation();
+  } catch (error) {
+    if (isOrdinaryPersistedInputMiss(error)) return null;
+    throw error;
+  }
+};
 
 export const verifyReportedArtifacts = async ({
   context,

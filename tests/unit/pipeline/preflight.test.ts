@@ -133,6 +133,7 @@ interface FixtureOverrides {
   filters?: string;
   voices?: string;
   ffmpegBytes?: string;
+  ffprobeBytes?: string;
   qtFaststartBytes?: string;
   fontBytes?: string;
   fontError?: Error;
@@ -199,7 +200,7 @@ const fixture = (overrides: FixtureOverrides = {}) => {
       accessible: overrides.qtFaststartAccessDenied !== true,
     }],
     [FFPROBE_REAL, {
-      bytes: 'ffprobe-binary',
+      bytes: overrides.ffprobeBytes ?? 'ffprobe-binary',
       dev: 1n,
       ino: 103n,
       nlink: 1n,
@@ -1508,6 +1509,10 @@ describe('runPreflight', () => {
     expect(realpath).toHaveBeenCalledWith(FFPROBE_LINK);
     expect(runProcess).toHaveBeenCalledWith(FFPROBE_AUTHORITY, ['-version']);
     expect(result.versions.ffprobe).toBe('8.0');
+    expect(result.toolIdentities.ffprobe).toEqual({
+      realPath: FFPROBE_REAL,
+      sha256: sha256('ffprobe-binary'),
+    });
   });
 
   it('derives qt-faststart only from the canonical FFmpeg directory', async () => {
@@ -1561,9 +1566,10 @@ describe('runPreflight', () => {
     expect(result.toolIdentities.qtFaststart).toBeNull();
   });
 
-  it('exposes both binary hashes and changes the fingerprint with either hash', async () => {
+  it('exposes all binary hashes and changes the fingerprint with any hash', async () => {
     const baselineFixture = fixture();
     const ffmpegChangedFixture = fixture({ffmpegBytes: 'changed-ffmpeg'});
+    const ffprobeChangedFixture = fixture({ffprobeBytes: 'changed-ffprobe'});
     const faststartChangedFixture = fixture({qtFaststartBytes: 'changed-faststart'});
 
     const baseline = await runPreflight(
@@ -1578,15 +1584,22 @@ describe('runPreflight', () => {
       faststartChangedFixture.input,
       faststartChangedFixture.dependencies,
     );
+    const ffprobeChanged = await runPreflight(
+      ffprobeChangedFixture.input,
+      ffprobeChangedFixture.dependencies,
+    );
 
     expect(baseline.toolIdentities).toEqual({
       ffmpeg: {realPath: FFMPEG_REAL, sha256: sha256('ffmpeg-binary')},
+      ffprobe: {realPath: FFPROBE_REAL, sha256: sha256('ffprobe-binary')},
       qtFaststart: {
         realPath: QT_FASTSTART_REAL,
         sha256: sha256('qt-faststart-binary'),
       },
     });
     expect(ffmpegChanged.environmentFingerprint)
+      .not.toBe(baseline.environmentFingerprint);
+    expect(ffprobeChanged.environmentFingerprint)
       .not.toBe(baseline.environmentFingerprint);
     expect(faststartChanged.environmentFingerprint)
       .not.toBe(baseline.environmentFingerprint);

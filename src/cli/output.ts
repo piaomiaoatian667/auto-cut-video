@@ -12,6 +12,7 @@ export interface DoctorFailureReport {
   checks: Array<Omit<PreflightCheck, 'code'> & {code: string}>;
   toolIdentities: {
     ffmpeg: null;
+    ffprobe: null;
     qtFaststart: null;
   };
   fonts: [];
@@ -113,6 +114,12 @@ export const formatDoctorTable = (
   `FFmpeg SHA-256: ${tableIdentityValue(
     result.toolIdentities.ffmpeg?.sha256,
   )}`,
+  `FFprobe real path: ${tableIdentityValue(
+    result.toolIdentities.ffprobe?.realPath,
+  )}`,
+  `FFprobe SHA-256: ${tableIdentityValue(
+    result.toolIdentities.ffprobe?.sha256,
+  )}`,
   `qt-faststart real path: ${tableIdentityValue(
     result.toolIdentities.qtFaststart?.realPath,
   )}`,
@@ -146,7 +153,7 @@ export const createDoctorFailureReport = (
     code: failure.code,
     message: failure.message,
   }],
-  toolIdentities: {ffmpeg: null, qtFaststart: null},
+  toolIdentities: {ffmpeg: null, ffprobe: null, qtFaststart: null},
   fonts: [],
   voice: null,
   versions: null,
@@ -167,6 +174,8 @@ export const formatDoctorFailure = (
     '',
     'FFmpeg real path: unavailable',
     'FFmpeg SHA-256: unavailable',
+    'FFprobe real path: unavailable',
+    'FFprobe SHA-256: unavailable',
     'qt-faststart real path: unavailable',
     'qt-faststart SHA-256: unavailable',
     'Environment fingerprint: unavailable',

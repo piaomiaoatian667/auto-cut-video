@@ -14,12 +14,14 @@ import {
 } from '../stages/draft';
 import {
   evaluateReview,
+  ReviewGateError,
   type ReviewContext,
 } from '../stages/review';
 import {
   STAGE_ALGORITHM_VERSIONS,
   isOrdinaryVerificationMiss,
   readOptionalRunJson,
+  readPlanningInput,
   readRunJson,
   verifyReportedArtifacts,
 } from './shared';
@@ -74,9 +76,13 @@ export const createReviewStage = (
     id: 'review',
     displayName: 'Review',
     prerequisites: ['draft'],
-    fingerprint: async (context) => context.sourceRun === undefined
-      ? null
-      : fingerprintFromDraft(await readDraftReport(context.sourceRun.runDirectory)),
+    fingerprint: async (context) => {
+      if (context.sourceRun === undefined) return null;
+      const draft = await readPlanningInput(async () => await readDraftReport(
+        context.sourceRun!.runDirectory,
+      ));
+      return draft === null ? null : fingerprintFromDraft(draft);
+    },
     verify: async (context, report) => {
       if (report.state !== 'passed' && report.state !== 'cached') return false;
       const parsed = ReviewAdapterOutputSchema.safeParse(report.outputs);
@@ -93,12 +99,20 @@ export const createReviewStage = (
           return false;
         }
         const currentReview = await readReview(context.sourceRun.runDirectory);
-        if (
-          currentReview === undefined
-          || fingerprintValue(currentReview) !== fingerprintValue(parsed.data.review)
-        ) {
+        if (currentReview === undefined) {
           return false;
         }
+        const gate = await evaluate({
+          projectId: context.project.project.id,
+          runId: context.sourceRun.runId,
+          evidencePaths: currentEvidence.map((artifact) => artifact.path),
+          review: currentReview,
+        });
+        if (
+          gate.state !== 'passed'
+          || gate.review === undefined
+          || fingerprintValue(gate.review) !== fingerprintValue(parsed.data.review)
+        ) return false;
         if (!await verifyReportedArtifacts({context, report, expected: []})) {
           return false;
         }
@@ -112,7 +126,9 @@ export const createReviewStage = (
         }
         return true;
       } catch (error) {
-        if (isOrdinaryVerificationMiss(error)) return false;
+        if (error instanceof ReviewGateError || isOrdinaryVerificationMiss(error)) {
+          return false;
+        }
         throw error;
       }
     },

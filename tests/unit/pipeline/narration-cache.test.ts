@@ -1,3 +1,4 @@
+import {createHash} from 'node:crypto';
 import {mkdtemp, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
@@ -14,6 +15,7 @@ import {
 import {narrationSegmentInputHash} from '../../../src/narration/build-narration';
 import {fingerprintValue} from '../../../src/pipeline/fingerprint';
 import {seedNarrationCache} from '../../../src/pipeline/narration-cache';
+import type {PipelineArtifact} from '../../../src/pipeline/artifacts';
 import {fingerprintTtsProvider} from '../../../src/providers/tts';
 
 const artifactMocks = vi.hoisted(() => ({
@@ -33,6 +35,7 @@ vi.mock('../../../src/pipeline/artifacts', async (importOriginal) => {
 });
 
 const tempDirectories: string[] = [];
+const writtenArtifacts = new WeakMap<RunDirectoryScope, Map<string, PipelineArtifact>>();
 const voice = 'fixture';
 const rate = 180;
 let providerFingerprint: string;
@@ -149,7 +152,21 @@ const writeRunBytes = async (
   } finally {
     await handle.close();
   }
+  const artifacts = writtenArtifacts.get(runDirectory) ?? new Map();
+  artifacts.set(relativePath, {
+    scope: 'run',
+    path: relativePath,
+    sha256: `sha256:${createHash('sha256').update(bytes).digest('hex')}`,
+  });
+  writtenArtifacts.set(runDirectory, artifacts);
 };
+
+const seed = async (
+  input: Omit<Parameters<typeof seedNarrationCache>[0], 'sourceArtifacts'>,
+): Promise<string[]> => await seedNarrationCache({
+  ...input,
+  sourceArtifacts: [...(writtenArtifacts.get(input.sourceRun)?.values() ?? [])],
+});
 
 const writeManifest = async (
   runDirectory: RunDirectoryScope,
@@ -211,7 +228,7 @@ describe('seedNarrationCache', () => {
     await writeRunBytes(sourceRun, firstPath, Buffer.from('file cache'));
     await writeRunBytes(targetRun, 'keep.txt', Buffer.from('untouched'));
 
-    const copied = await seedNarrationCache({
+    const copied = await seed({
       sourceRun,
       targetRun,
       script: unchangedScript,
@@ -240,7 +257,7 @@ describe('seedNarrationCache', () => {
     await writeRunBytes(sourceRun, oldSecondPath, Buffer.from('old second cache'));
     await writeRunBytes(sourceRun, stalePath, Buffer.from('stale cache'));
 
-    const copied = await seedNarrationCache({
+    const copied = await seed({
       sourceRun,
       targetRun,
       script: newScript,
@@ -269,7 +286,7 @@ describe('seedNarrationCache', () => {
       await writeRunBytes(sourceRun, cacheFile, Buffer.from(cacheFile));
     }
 
-    const copied = await seedNarrationCache({
+    const copied = await seed({
       sourceRun,
       targetRun,
       script: unchangedScript,
@@ -291,7 +308,7 @@ describe('seedNarrationCache', () => {
     await writeManifest(sourceRun, sourceManifest);
     await writeRunBytes(sourceRun, transplantedPath, Buffer.from('transplanted cache'));
 
-    const copied = await seedNarrationCache({
+    const copied = await seed({
       sourceRun,
       targetRun,
       script: unchangedScript,
@@ -312,7 +329,7 @@ describe('seedNarrationCache', () => {
     await writeManifest(sourceRun, manifest(unchangedScript));
     await writeRunBytes(sourceRun, firstPath, Buffer.from('first cache'));
 
-    const copied = await seedNarrationCache({
+    const copied = await seed({
       sourceRun,
       targetRun,
       script: unchangedScript,
@@ -322,7 +339,7 @@ describe('seedNarrationCache', () => {
     });
 
     expect(copied).toEqual([firstPath]);
-    expect(artifactMocks.hashRunArtifact).toHaveBeenCalledTimes(2);
+    expect(artifactMocks.hashRunArtifact).not.toHaveBeenCalled();
     expect(artifactMocks.copyRunArtifact).toHaveBeenCalledOnce();
     await expect(runFileExists(targetRun, missingPath)).resolves.toBe(false);
   });
@@ -331,7 +348,7 @@ describe('seedNarrationCache', () => {
     const {sourceRun, targetRun} = await makeRuns();
     await writeManifestText(sourceRun, '{"version": 1');
 
-    await expect(seedNarrationCache({
+    await expect(seed({
       sourceRun,
       targetRun,
       script: script(),
@@ -347,7 +364,7 @@ describe('seedNarrationCache', () => {
     const {sourceRun, targetRun} = await makeRuns();
     await writeManifest(sourceRun, {version: 1, provider: 'mock'});
 
-    await expect(seedNarrationCache({
+    await expect(seed({
       sourceRun,
       targetRun,
       script: script(),
@@ -391,7 +408,7 @@ describe('seedNarrationCache', () => {
     mutate(sourceManifest);
     await writeManifest(sourceRun, sourceManifest);
 
-    await expect(seedNarrationCache({
+    await expect(seed({
       sourceRun,
       targetRun,
       script: unchangedScript,
@@ -408,7 +425,7 @@ describe('seedNarrationCache', () => {
     const unchangedScript = script();
     await writeManifest(sourceRun, manifest(unchangedScript));
 
-    await expect(seedNarrationCache({
+    await expect(seed({
       sourceRun,
       targetRun,
       script: unchangedScript,
@@ -427,7 +444,7 @@ describe('seedNarrationCache', () => {
     sourceManifest.segments[1]!.inputHash = sourceManifest.segments[0]!.inputHash;
     await writeManifest(sourceRun, sourceManifest);
 
-    await expect(seedNarrationCache({
+    await expect(seed({
       sourceRun,
       targetRun,
       script: unchangedScript,
@@ -448,7 +465,7 @@ describe('seedNarrationCache', () => {
     await writeManifest(sourceRun, sourceManifest);
     await writeRunBytes(sourceRun, firstPath, Buffer.from('first cache'));
 
-    await expect(seedNarrationCache({
+    await expect(seed({
       sourceRun,
       targetRun,
       script: unchangedScript,
@@ -468,7 +485,7 @@ describe('seedNarrationCache', () => {
     sourceManifest.provider = 'file';
     await writeManifest(sourceRun, sourceManifest);
 
-    await expect(seedNarrationCache({
+    await expect(seed({
       sourceRun,
       targetRun,
       script: unchangedScript,
@@ -487,7 +504,7 @@ describe('seedNarrationCache', () => {
     sourceManifest.provider = 'mock';
     await writeManifest(sourceRun, sourceManifest);
 
-    await expect(seedNarrationCache({
+    await expect(seed({
       sourceRun,
       targetRun,
       script: unchangedScript,
@@ -505,8 +522,15 @@ describe('seedNarrationCache', () => {
     const firstPath = cachePath(inputHash(unchangedScript, 0));
     await writeManifest(sourceRun, manifest(unchangedScript));
     await ensureRunDirectory(sourceRun, firstPath);
+    const artifacts = writtenArtifacts.get(sourceRun) ?? new Map();
+    artifacts.set(firstPath, {
+      scope: 'run',
+      path: firstPath,
+      sha256: fingerprintValue({directory: firstPath}),
+    });
+    writtenArtifacts.set(sourceRun, artifacts);
 
-    await expect(seedNarrationCache({
+    await expect(seed({
       sourceRun,
       targetRun,
       script: unchangedScript,
@@ -514,8 +538,8 @@ describe('seedNarrationCache', () => {
       rate,
       providerFingerprint,
     })).rejects.toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
-    expect(artifactMocks.hashRunArtifact).toHaveBeenCalled();
-    expect(artifactMocks.copyRunArtifact).not.toHaveBeenCalled();
+    expect(artifactMocks.hashRunArtifact).not.toHaveBeenCalled();
+    expect(artifactMocks.copyRunArtifact).toHaveBeenCalledOnce();
     await expect(runFileExists(targetRun, firstPath)).resolves.toBe(false);
   });
 
@@ -527,7 +551,7 @@ describe('seedNarrationCache', () => {
     await writeRunBytes(sourceRun, firstPath, Buffer.from('source cache'));
     await writeRunBytes(targetRun, firstPath, Buffer.from('existing target'));
 
-    await expect(seedNarrationCache({
+    await expect(seed({
       sourceRun,
       targetRun,
       script: unchangedScript,

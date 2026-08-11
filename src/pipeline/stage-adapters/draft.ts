@@ -77,6 +77,37 @@ const uniquePartialArtifacts = (
   return [...byPath.values()];
 };
 
+const draftExpectedArtifacts = (
+  outputs: z.infer<typeof DraftAdapterOutputSchema>['outputs'],
+) => {
+  if (
+    outputs.mutedVideo.path !== 'draft/muted-video.mp4'
+    || outputs.draftVideo.path !== 'draft/draft.mp4'
+    || outputs.contactSheet.path !== 'draft/contact-sheet.jpg'
+    || outputs.audio.filterGraph.path !== 'audio/filter-graph.txt'
+    || outputs.audio.mixedAudio.path !== 'audio/mixed-normalized.wav'
+    || outputs.report.path !== 'draft/draft-report.json'
+  ) return null;
+  const framePaths = outputs.reviewFrames.map((frame) => frame.path);
+  if (
+    framePaths.some((framePath) => !/^draft\/frames\/frame-\d{6}\.jpg$/u.test(framePath))
+    || new Set(framePaths).size !== framePaths.length
+  ) return null;
+  const artifacts = [
+    outputs.mutedVideo,
+    outputs.draftVideo,
+    outputs.contactSheet,
+    ...outputs.reviewFrames,
+    outputs.audio.filterGraph,
+    outputs.audio.mixedAudio,
+    outputs.report,
+  ];
+  if (new Set(artifacts.map((artifact) => artifact.path)).size !== artifacts.length) {
+    return null;
+  }
+  return artifacts.map((artifact) => ({scope: 'run' as const, ...artifact}));
+};
+
 export const createDraftStage = (
   dependencies: DraftStageAdapterDependencies = {},
 ): PipelineStage => {
@@ -122,18 +153,12 @@ export const createDraftStage = (
       const parsed = DraftAdapterOutputSchema.safeParse(report.outputs);
       if (!parsed.success) return false;
       const outputs = parsed.data.outputs;
+      const expected = draftExpectedArtifacts(outputs);
+      if (expected === null) return false;
       return await verifyReportedArtifacts({
         context,
         report,
-        expected: [
-          {scope: 'run', ...outputs.mutedVideo},
-          {scope: 'run', ...outputs.draftVideo},
-          {scope: 'run', ...outputs.contactSheet},
-          ...outputs.reviewFrames.map((frame) => ({scope: 'run' as const, ...frame})),
-          {scope: 'run', ...outputs.audio.filterGraph},
-          {scope: 'run', ...outputs.audio.mixedAudio},
-          {scope: 'run', ...outputs.report},
-        ],
+        expected,
       });
     },
     partialArtifacts: (context) => context.runDirectory === undefined
@@ -162,15 +187,11 @@ export const createDraftStage = (
         }
       }
       const result = await executeDraft({...context.project, runDirectory, signal});
-      const artifacts = [
-        runArtifact(result.outputs.mutedVideo),
-        runArtifact(result.outputs.draftVideo),
-        runArtifact(result.outputs.contactSheet),
-        ...result.outputs.reviewFrames.map(runArtifact),
-        runArtifact(result.outputs.audio.filterGraph),
-        runArtifact(result.outputs.audio.mixedAudio),
-        runArtifact(result.outputs.report),
-      ];
+      const expected = draftExpectedArtifacts(result.outputs);
+      if (expected === null) {
+        throw new PipelineContextError('Draft returned invalid owned artifact paths');
+      }
+      const artifacts = expected.map(runArtifact);
       partialArtifactsByRun.set(
         runDirectory,
         uniquePartialArtifacts([

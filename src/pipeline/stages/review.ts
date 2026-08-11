@@ -62,6 +62,9 @@ const assertReviewMatchesContext = (context: ReviewContext, review: Review): voi
 
 const assertApprovedEvidence = (context: ReviewContext, review: Review): void => {
   const evidence = new Set(review.evidencePaths);
+  if (evidence.size !== context.evidencePaths.length) {
+    throw new ReviewGateError('review evidence does not exactly match the Draft evidence');
+  }
   for (const path of context.evidencePaths) {
     if (!evidence.has(path)) throw new ReviewGateError(`review is missing evidence path: ${path}`);
   }

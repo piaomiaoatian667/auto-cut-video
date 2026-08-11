@@ -75,6 +75,7 @@ export const fakePreflightResult = (): PreflightResult => ({
   checks: [],
   toolIdentities: {
     ffmpeg: null,
+    ffprobe: null,
     qtFaststart: null,
   },
   fonts: [],

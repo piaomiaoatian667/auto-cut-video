@@ -47,12 +47,20 @@ export interface IngestStageAdapterDependencies {
   hashRunArtifact?: typeof hashRunArtifact;
 }
 
-const runOwnedRenderPaths = (manifest: IngestManifest): string[] => (
-  Object.values(manifest.assets)
-    .filter((asset) => asset.renderScope === 'run')
-    .map((asset) => asset.renderPath)
-    .sort()
-);
+const runOwnedRenderPaths = (manifest: IngestManifest): string[] | null => {
+  const paths = new Set<string>();
+  for (const [assetId, asset] of Object.entries(manifest.assets)) {
+    if (asset.renderScope !== 'run') continue;
+    const expectedPath = `assets/${assetId}/render.mp4`;
+    if (
+      asset.kind !== 'video'
+      || asset.renderPath !== expectedPath
+      || paths.has(asset.renderPath)
+    ) return null;
+    paths.add(asset.renderPath);
+  }
+  return [...paths].sort();
+};
 
 export const createIngestStage = (
   dependencies: IngestStageAdapterDependencies = {},
@@ -98,12 +106,14 @@ export const createIngestStage = (
     verify: async (context, report) => {
       const parsed = IngestAdapterOutputSchema.safeParse(report.outputs);
       if (!parsed.success) return false;
+      const renderPaths = runOwnedRenderPaths(parsed.data.manifest);
+      if (renderPaths === null) return false;
       return await verifyReportedArtifacts({
         context,
         report,
         expected: [
           {scope: 'run', path: parsed.data.manifestPath},
-          ...runOwnedRenderPaths(parsed.data.manifest).map((path) => ({
+          ...renderPaths.map((path) => ({
             scope: 'run' as const,
             path,
           })),
@@ -140,10 +150,14 @@ export const createIngestStage = (
         manifestTempPath: INGEST_MANIFEST_TEMP_PATH,
         signal,
       });
+      const renderPaths = runOwnedRenderPaths(result.manifest);
+      if (renderPaths === null) {
+        throw new PipelineContextError('Ingest returned invalid Run-owned render paths');
+      }
       const artifacts: PipelineArtifact[] = [
         await hashArtifact(runDirectory, result.manifestPath),
       ];
-      for (const relativePath of runOwnedRenderPaths(result.manifest)) {
+      for (const relativePath of renderPaths) {
         artifacts.push(await hashArtifact(runDirectory, relativePath));
       }
       const stageFingerprint = await fingerprint({...context, preflight});

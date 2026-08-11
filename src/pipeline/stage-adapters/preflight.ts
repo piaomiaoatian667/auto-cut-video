@@ -22,6 +22,7 @@ export const PreflightAdapterOutputSchema = z.object({
   environmentFingerprint: z.string().min(1),
   toolIdentities: z.object({
     ffmpeg: ToolIdentitySchema.nullable(),
+    ffprobe: ToolIdentitySchema.nullable(),
     qtFaststart: ToolIdentitySchema.nullable(),
   }).strict(),
   fonts: z.array(z.object({
@@ -31,6 +32,25 @@ export const PreflightAdapterOutputSchema = z.object({
 }).passthrough();
 
 export type PreflightAdapterOutput = z.infer<typeof PreflightAdapterOutputSchema>;
+
+export interface CanonicalPreflightAdapterOutput {
+  environmentFingerprint: string;
+  toolIdentities: PreflightAdapterOutput['toolIdentities'];
+  fonts: PreflightAdapterOutput['fonts'];
+}
+
+export const normalizePreflightAdapterOutput = (
+  value: unknown,
+): CanonicalPreflightAdapterOutput => {
+  const parsed = PreflightAdapterOutputSchema.parse(value);
+  return {
+    environmentFingerprint: parsed.environmentFingerprint,
+    toolIdentities: parsed.toolIdentities,
+    fonts: [...parsed.fonts].sort((left, right) => (
+      left.path.localeCompare(right.path) || left.sha256.localeCompare(right.sha256)
+    )),
+  };
+};
 
 export const parsePreflightAdapterOutput = (
   value: unknown,
@@ -94,12 +114,9 @@ export const createPreflightStage = (
       if (context.preflight === undefined) return false;
       const parsed = PreflightAdapterOutputSchema.safeParse(report.outputs);
       if (!parsed.success) return false;
-      if (
-        parsed.data.environmentFingerprint
-        !== context.preflight.environmentFingerprint
-      ) {
-        return false;
-      }
+      const persisted = normalizePreflightAdapterOutput(parsed.data);
+      const live = normalizePreflightAdapterOutput(context.preflight);
+      if (fingerprintValue(persisted) !== fingerprintValue(live)) return false;
       if (
         report.fingerprint
         !== preflightFingerprint(context, context.preflight, algorithmVersion)
