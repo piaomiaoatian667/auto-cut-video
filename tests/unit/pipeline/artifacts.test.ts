@@ -27,6 +27,8 @@ import {
   openExistingRunFile,
   openNewOutputFile,
   openNewRunFile,
+  type AppDirectoryReadFileAuthority,
+  type AppDirectoryWriteFileAuthority,
   type OutputDirectoryScope,
   type RunDirectoryScope,
 } from '../../../src/fs/app-directory-scopes';
@@ -64,6 +66,7 @@ type InterceptedSync = (this: InterceptedReadHandle) => Promise<void>;
 
 afterEach(async () => {
   vi.doUnmock('node:fs/promises');
+  vi.doUnmock('../../../src/fs/app-directory-scopes');
   vi.resetModules();
   await Promise.all(tempDirectories.splice(0).map(async (directory) => {
     await rm(directory, {recursive: true, force: true});
@@ -78,6 +81,126 @@ const makeWorkspace = async (): Promise<string> => {
 
 const sha256 = (bytes: Buffer): string =>
   `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+
+const stableFileStats = (size: number, ino: bigint): BigIntStats => ({
+  dev: 1n,
+  ino,
+  nlink: 1n,
+  size: BigInt(size),
+  mtimeNs: 1n,
+  ctimeNs: 1n,
+  isFile: () => true,
+}) as BigIntStats;
+
+const stableReadHandle = (
+  bytes: Buffer,
+  events: string[],
+  label: string,
+  ino: bigint,
+): FileHandle => {
+  const stats = stableFileStats(bytes.length, ino);
+  return {
+    stat: async () => {
+      events.push(`${label}:stat`);
+      return stats;
+    },
+    read: async (
+      buffer: Uint8Array,
+      offset: number,
+      length: number,
+      position: number,
+    ) => {
+      events.push(`${label}:read`);
+      const bytesRead = Math.max(0, Math.min(length, bytes.length - position));
+      bytes.copy(buffer as Buffer, offset, position, position + bytesRead);
+      return {bytesRead, buffer};
+    },
+  } as unknown as FileHandle;
+};
+
+const importArtifactsWithCopyAuthorityProbe = async (options: {
+  sourceBytes: Buffer;
+  hashBytes?: Buffer;
+  unlinkError?: unknown;
+  syncParentError?: unknown;
+  closeError?: unknown;
+}) => {
+  vi.resetModules();
+  const events: string[] = [];
+  const sourceAuthority: AppDirectoryReadFileAuthority = {
+    handle: stableReadHandle(options.sourceBytes, events, 'source', 1n),
+    revalidate: async () => {
+      events.push('source-revalidate');
+    },
+    close: async () => {
+      events.push('source-close');
+    },
+  };
+  const targetAuthority: AppDirectoryWriteFileAuthority = {
+    handle: {
+      write: async (
+        buffer: Uint8Array,
+        offset: number,
+        length: number,
+      ) => {
+        events.push('target-write');
+        return {bytesWritten: length, buffer: buffer.subarray(offset, offset + length)};
+      },
+    } as unknown as FileHandle,
+    syncAndSeal: async () => {
+      events.push('target-seal');
+    },
+    syncParent: async () => {
+      events.push('target-sync-parent');
+      if (options.syncParentError !== undefined) throw options.syncParentError;
+    },
+    openForRead: async () => {
+      events.push('target-open-read');
+      return {
+        handle: stableReadHandle(
+          options.hashBytes ?? options.sourceBytes,
+          events,
+          'target-read',
+          2n,
+        ),
+        revalidate: async () => {
+          events.push('target-read-revalidate');
+        },
+        close: async () => {
+          events.push('target-read-close');
+        },
+      };
+    },
+    revalidate: async () => {
+      events.push('target-revalidate');
+    },
+    unlink: async () => {
+      events.push('target-unlink');
+      if (options.unlinkError !== undefined) throw options.unlinkError;
+    },
+    close: async () => {
+      events.push('target-close');
+      if (options.closeError !== undefined) throw options.closeError;
+    },
+  };
+  vi.doMock('../../../src/fs/app-directory-scopes', async () => {
+    const actual = await vi.importActual<
+      typeof import('../../../src/fs/app-directory-scopes')
+    >('../../../src/fs/app-directory-scopes');
+    return {
+      ...actual,
+      ensureRunDirectory: async () => {
+        events.push('ensure-directory');
+      },
+      openExistingRunFileForRead: async () => sourceAuthority,
+      openNewRunFileForWrite: async () => targetAuthority,
+    };
+  });
+  return {
+    artifacts: await import('../../../src/pipeline/artifacts'),
+    events,
+  };
+};
 
 const writeRunBytes = async (
   runDirectory: RunDirectoryScope,
@@ -140,6 +263,76 @@ describe('pipeline artifacts', () => {
     } finally {
       await copied.close();
     }
+  });
+
+  it('syncs the copied directory entry after verification and before close', async () => {
+    const sourceBytes = Buffer.from('durable copied artifact');
+    const {artifacts, events} = await importArtifactsWithCopyAuthorityProbe({
+      sourceBytes,
+    });
+
+    await artifacts.copyRunArtifact({
+      sourceRun: {} as RunDirectoryScope,
+      targetRun: {} as RunDirectoryScope,
+      artifact: {
+        scope: 'run',
+        path: 'cache/copied.bin',
+        sha256: sha256(sourceBytes),
+      },
+    });
+    events.push('success');
+
+    expect(events.indexOf('target-seal'))
+      .toBeLessThan(events.indexOf('target-read-revalidate'));
+    expect(events.indexOf('target-read-revalidate'))
+      .toBeLessThan(events.indexOf('target-sync-parent'));
+    expect(events.indexOf('target-sync-parent'))
+      .toBeLessThan(events.indexOf('target-close'));
+    expect(events.indexOf('target-close'))
+      .toBeLessThan(events.indexOf('success'));
+  });
+
+  it('syncs rollback unlink before close and preserves every cleanup failure', async () => {
+    const sourceBytes = Buffer.from('source bytes');
+    const unlinkError = new Error('rollback unlink failed');
+    const syncParentError = new Error('rollback parent sync failed');
+    const closeError = new Error('rollback close failed');
+    const {artifacts, events} = await importArtifactsWithCopyAuthorityProbe({
+      sourceBytes,
+      hashBytes: Buffer.from('changed bytes'),
+      unlinkError,
+      syncParentError,
+      closeError,
+    });
+
+    let caughtError: unknown;
+    try {
+      await artifacts.copyRunArtifact({
+        sourceRun: {} as RunDirectoryScope,
+        targetRun: {} as RunDirectoryScope,
+        artifact: {
+          scope: 'run',
+          path: 'cache/rollback.bin',
+          sha256: sha256(sourceBytes),
+        },
+      });
+    } catch (error) {
+      caughtError = error;
+    }
+
+    expect(caughtError).toBeInstanceOf(AggregateError);
+    const errors = (caughtError as AggregateError).errors;
+    expect(errors).toEqual([
+      expect.objectContaining({code: 'ARTIFACT_HASH_MISMATCH'}),
+      unlinkError,
+      syncParentError,
+      closeError,
+    ]);
+    expect((caughtError as Error).cause).toBe(errors[0]);
+    expect(events.indexOf('target-unlink'))
+      .toBeLessThan(events.indexOf('target-sync-parent'));
+    expect(events.indexOf('target-sync-parent'))
+      .toBeLessThan(events.indexOf('target-close'));
   });
 
   it('refuses an output artifact in the Run copy API', async () => {
@@ -798,7 +991,11 @@ describe('pipeline artifacts', () => {
     expect(parentSwapped).toBe(true);
     await expect(lstat(orphanPath)).rejects.toMatchObject({code: 'ENOENT'});
     await expect(lstat(targetPath)).rejects.toMatchObject({code: 'ENOENT'});
-    expect(caughtError).toMatchObject({code: 'APP_SCOPE_AUTHORITY_CHANGED'});
+    expect(caughtError).toBeInstanceOf(AggregateError);
+    const errors = (caughtError as AggregateError).errors;
+    expect(errors[0]).toMatchObject({code: 'APP_SCOPE_AUTHORITY_CHANGED'});
+    expect(errors[1]).toBeInstanceOf(AggregateError);
+    expect((caughtError as Error).cause).toBe(errors[0]);
   });
 
   it('reports both a copy failure and rollback failure', async () => {

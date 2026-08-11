@@ -411,6 +411,7 @@ const revalidationSource = async (
 export async function revalidateExecutionPlan(
   plan: ExecutionPlan,
   context: ExecutionPlanContext,
+  livePreflight?: PreflightResult,
 ): Promise<ExecutionPlan> {
   if (plan.projectId !== context.project.project.id) {
     return stalePlan('the Execution Plan belongs to another project');
@@ -425,11 +426,12 @@ export async function revalidateExecutionPlan(
   const reportStageIds = presetStageIds.slice(0, lastSelectedIndex + 1);
   const source = await revalidationSource(plan, context, reportStageIds);
   const registry = new Map(context.registry.map((stage) => [stage.id, stage]));
-  const preflight = persistedPreflight(source?.reports.get('preflight'));
+  const sourcePreflight = persistedPreflight(source?.reports.get('preflight'));
+  const planningPreflight = livePreflight ?? sourcePreflight;
   const planningContext: StagePlanningContext = {
     project: context.project,
     sourceCatalog: context.sourceCatalog,
-    ...(preflight === undefined ? {} : {preflight}),
+    ...(planningPreflight === undefined ? {} : {preflight: planningPreflight}),
     ...(source === null ? {} : {
       sourceRun: {
         runId: source.runId,
@@ -465,7 +467,7 @@ export async function revalidateExecutionPlan(
       && reportMatchesIdentity(report, plan.projectId, source.runId, stageId);
     let matching = reportAvailable;
     if (matching && stageId === 'preflight') {
-      matching = preflight !== undefined;
+      matching = sourcePreflight !== undefined;
     } else if (matching) {
       matching = fingerprint !== null
         && report!.fingerprint === fingerprint

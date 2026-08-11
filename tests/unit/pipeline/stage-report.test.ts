@@ -88,6 +88,65 @@ const importReportModulesWithDirectorySyncProbe = async (
   };
 };
 
+interface DeleteDurabilityProbe {
+  armed: boolean;
+  events: string[];
+  syncErrors: unknown[];
+}
+
+const importReportModulesWithDeleteDurabilityProbe = async (
+  probe: DeleteDurabilityProbe,
+) => {
+  vi.resetModules();
+  vi.doMock('node:fs/promises', async () => {
+    const actual = await vi.importActual<typeof import('node:fs/promises')>(
+      'node:fs/promises',
+    );
+    return {
+      ...actual,
+      open: async (...args: Parameters<typeof actual.open>) => {
+        const handle = await Reflect.apply(actual.open, undefined, args);
+        if (!probe.armed) return handle;
+        const openedPath = String(args[0]);
+        const status = await handle.stat({bigint: true});
+        if (!status.isDirectory() || path.basename(openedPath) !== 'reports') {
+          return handle;
+        }
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === 'sync') {
+              return async () => {
+                probe.events.push('sync:reports');
+                const syncError = probe.syncErrors.shift();
+                if (syncError !== undefined) throw syncError;
+                await target.sync();
+              };
+            }
+            if (property === 'close') {
+              return async () => {
+                probe.events.push('close:reports');
+                await target.close();
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
+      unlink: async (...args: Parameters<typeof actual.unlink>) => {
+        if (probe.armed) {
+          probe.events.push(`unlink:${path.basename(String(args[0]))}`);
+        }
+        await Reflect.apply(actual.unlink, undefined, args);
+      },
+    };
+  });
+  return {
+    scopes: await import('../../../src/fs/app-directory-scopes'),
+    reports: await import('../../../src/pipeline/stage-report'),
+  };
+};
+
 interface ReadAuthorityFaultProbe {
   armed: boolean;
   closeError: unknown;
@@ -434,6 +493,66 @@ describe('StageReportStore', () => {
         .rejects.toMatchObject({code: 'EEXIST'});
     } finally {
       await fixture.cleanup();
+    }
+  });
+
+  it('durably deletes canonical reports and retries a missing report after sync failure', async () => {
+    const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'stage-report-delete-'));
+    const syncError = Object.assign(new Error('report delete sync failed'), {
+      code: 'EIO',
+    });
+    const probe: DeleteDurabilityProbe = {
+      armed: false,
+      events: [],
+      syncErrors: [],
+    };
+    const {scopes, reports} = await importReportModulesWithDeleteDurabilityProbe(
+      probe,
+    );
+    try {
+      const runDirectory = await scopes.createRunStore(workspaceRoot)
+        .createRun('demo', 'run-one');
+      const store = reports.createStageReportStore();
+      await store.writeStage(
+        runDirectory,
+        passedStageReport({stageId: 'ingest'}),
+      );
+      const reportPath = path.join(
+        workspaceRoot,
+        '.work',
+        'demo',
+        'runs',
+        'run-one',
+        'reports',
+        'ingest.json',
+      );
+      probe.armed = true;
+      probe.syncErrors.push(syncError);
+
+      await expect(store.deleteStage!(runDirectory, 'ingest'))
+        .rejects.toBe(syncError);
+
+      expect(probe.events).toEqual([
+        'unlink:ingest.json',
+        'sync:reports',
+        'close:reports',
+      ]);
+      await expect(readFile(reportPath, 'utf8')).rejects.toMatchObject({code: 'ENOENT'});
+
+      probe.events.length = 0;
+      await expect(store.deleteStage!(runDirectory, 'ingest'))
+        .resolves.toBeUndefined();
+
+      expect(probe.events).toEqual([
+        'sync:reports',
+        'close:reports',
+      ]);
+      probe.armed = false;
+      await expect(store.readStage(runDirectory, 'ingest')).resolves.toBeNull();
+    } finally {
+      vi.doUnmock('node:fs/promises');
+      vi.resetModules();
+      await rm(workspaceRoot, {recursive: true, force: true});
     }
   });
 

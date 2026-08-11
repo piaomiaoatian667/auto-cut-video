@@ -509,7 +509,7 @@ export async function runExecutionPlan(
   }
 
   if (plan.runMode === 'noop') {
-    const revalidated = await revalidateExecutionPlan(plan, {
+    const context: ExecutionPlanContext = {
       project: input.project,
       sourceCatalog: input.sourceCatalog,
       registry: dependencies.registry,
@@ -517,7 +517,8 @@ export async function runExecutionPlan(
       outputStore: dependencies.outputStore,
       reportStore: dependencies.reportStore,
       createRunId: dependencies.createRunId,
-    });
+    };
+    let revalidated = await revalidateExecutionPlan(plan, context);
     const sourceRun = await loadSourceRun(revalidated, dependencies);
     let preflight: PreflightResult | undefined;
     if (revalidated.requiresRuntimePreflight) {
@@ -532,6 +533,11 @@ export async function runExecutionPlan(
         dependencies,
         sourceRun,
         execution,
+      );
+      revalidated = await revalidateExecutionPlan(
+        revalidated,
+        context,
+        execution.preflight,
       );
     }
     const reports = noopReports(revalidated, sourceRun);
@@ -566,7 +572,7 @@ export async function runExecutionPlan(
       reportStore: dependencies.reportStore,
       createRunId: dependencies.createRunId,
     };
-    const revalidated = await revalidateExecutionPlan(plan, context);
+    let revalidated = await revalidateExecutionPlan(plan, context);
     const sourceRun = await loadSourceRun(revalidated, dependencies);
     if (
       revalidated.runMode === 'new'
@@ -602,6 +608,11 @@ export async function runExecutionPlan(
         preflightExecution,
       );
     }
+    revalidated = await revalidateExecutionPlan(
+      revalidated,
+      context,
+      preflightExecution.preflight,
+    );
 
     const runDirectory = revalidated.runMode === 'resume'
       ? sourceRun?.runDirectory

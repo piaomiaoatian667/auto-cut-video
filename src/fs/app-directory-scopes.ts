@@ -1539,14 +1539,23 @@ const unlinkScopedFile = async (
   const anchor = await openScopedPathAnchor(state, relativePath);
   try {
     const {kind} = await inspectAnchoredEntry(anchor, relativePath);
-    if (kind === 'missing') return;
+    if (kind === 'missing') {
+      await assertScopedPathAnchorStable(state, anchor, relativePath);
+      await syncHeldDirectoryAnchor(anchor.parent, relativePath);
+      return;
+    }
     if (kind !== 'file') {
       throw securityError(`refusing to unlink non-file app entry: ${relativePath}`);
     }
     await assertScopedPathAnchorStable(state, anchor, relativePath);
-    await unlink(path.join(anchor.parent.volumePath, anchor.basename));
+    try {
+      await unlink(path.join(anchor.parent.volumePath, anchor.basename));
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== 'ENOENT') throw error;
+    }
     await assertScopeStable(state, relativePath);
     await assertDirectoryIdentityStable(anchor.parent.identity, relativePath);
+    await syncHeldDirectoryAnchor(anchor.parent, relativePath);
   } finally {
     await closeDirectoryAnchor(anchor.parent);
   }

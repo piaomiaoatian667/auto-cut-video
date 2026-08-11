@@ -247,6 +247,11 @@ const rollbackRunArtifact = async (
     cleanupErrors.push(cleanupError);
   }
   try {
+    await target.syncParent();
+  } catch (cleanupError) {
+    cleanupErrors.push(cleanupError);
+  }
+  try {
     await target.close();
   } catch (cleanupError) {
     cleanupErrors.push(cleanupError);
@@ -301,6 +306,8 @@ export async function copyRunArtifact(input: {
         'copied Run artifact does not match its source report',
       );
     }
+    await targetAuthority.syncParent();
+    await targetAuthority.revalidate();
     await targetAuthority.close();
     target = undefined;
     return copied;

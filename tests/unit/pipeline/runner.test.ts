@@ -197,6 +197,10 @@ const makePlan = ({
 
 interface StageOptions {
   preflight?: PreflightResult;
+  fingerprints?: Partial<Record<
+    StageId,
+    (context: StagePlanningContext) => string | null
+  >>;
   results?: Partial<Record<StageId, StageExecutionResult>>;
   verify?: Partial<Record<StageId, boolean>>;
   throwStage?: StageId;
@@ -212,13 +216,19 @@ const createStages = (
   prerequisites: [],
   fingerprint: async (context) => {
     events.push(`fingerprint:${stageId}`);
+    const configured = options.fingerprints?.[stageId];
+    if (configured !== undefined) return configured(context);
     if (stageId === 'preflight' && context.preflight === undefined) return null;
     return stageFingerprint(stageId);
   },
-  verify: async (_context, report) => {
+  verify: async (context, report) => {
     events.push(`verify:${stageId}`);
+    const configured = options.fingerprints?.[stageId];
+    const expected = configured === undefined
+      ? stageFingerprint(stageId)
+      : configured(context);
     return options.verify?.[stageId]
-      ?? report.fingerprint === stageFingerprint(stageId);
+      ?? (expected !== null && report.fingerprint === expected);
   },
   partialArtifacts: () => [],
   execute: async () => {
@@ -348,6 +358,7 @@ const createMemoryRuntime = (options: MemoryRuntimeOptions = {}) => {
     deleteStage: vi.fn(async (run, stageId) => {
       events.push(`delete-report:${stageId}`);
       reports.get(runIdOf(run))?.delete(stageId);
+      events.push(`sync-report-parent:${stageId}`);
     }),
   };
 
@@ -526,6 +537,170 @@ describe('Pipeline Runner', () => {
       .toBeLessThan(runtime.events.indexOf('execute:preflight'));
     expect(runtime.events.indexOf('execute:preflight'))
       .toBeLessThan(runtime.events.indexOf('create-run:run-new'));
+    expect(runtime.release).toHaveBeenCalledOnce();
+  });
+
+  it('downgrades cached stages against live Preflight before creating a new Run', async () => {
+    const sourceRunId = 'run-old';
+    const persistedPreflight = fakePreflightResult();
+    const livePreflight = {
+      ...persistedPreflight,
+      environmentFingerprint: HASH_B,
+    };
+    const preflightFingerprint = (
+      stageId: StageId,
+      context: StagePlanningContext,
+    ): string => `${stageId}:${context.preflight?.environmentFingerprint ?? 'missing'}`;
+    const runtime = createMemoryRuntime({
+      preflight: livePreflight,
+      fingerprints: {
+        ingest: (context) => preflightFingerprint('ingest', context),
+        narration: (context) => preflightFingerprint('narration', context),
+      },
+    });
+    runtime.seedRun(sourceRunId, [
+      makeReport({
+        runId: sourceRunId,
+        preset: 'draft',
+        stageId: 'preflight',
+        outputs: persistedPreflight as unknown as StageReport['outputs'],
+      }),
+      makeReport({
+        runId: sourceRunId,
+        preset: 'draft',
+        stageId: 'ingest',
+        fingerprint: `ingest:${persistedPreflight.environmentFingerprint}`,
+      }),
+      makeReport({
+        runId: sourceRunId,
+        preset: 'draft',
+        stageId: 'narration',
+        fingerprint: `narration:${persistedPreflight.environmentFingerprint}`,
+      }),
+    ]);
+    const plan = makePlan({
+      preset: 'draft',
+      stageIds: ['preflight', 'ingest', 'narration', 'compile'],
+      actions: ['run', 'cached', 'cached', 'run'],
+      runMode: 'new',
+      sourceRunId,
+      targetRunId: 'run-new',
+    });
+
+    const result = await runExecutionPlan(executionInput(plan), runtime.dependencies);
+
+    expect(result.runId).toBe('run-new');
+    expect(runtime.stageCalls).toEqual(['preflight', 'ingest', 'narration', 'compile']);
+    expect(runtime.report('run-new', 'ingest')).toMatchObject({state: 'passed'});
+    expect(runtime.report('run-new', 'narration')).toMatchObject({state: 'passed'});
+    const ingestFingerprints = runtime.events
+      .map((event, index) => ({event, index}))
+      .filter(({event}) => event === 'fingerprint:ingest');
+    expect(ingestFingerprints).toHaveLength(2);
+    expect(runtime.events.indexOf('execute:preflight'))
+      .toBeLessThan(ingestFingerprints.at(-1)!.index);
+    expect(ingestFingerprints.at(-1)!.index)
+      .toBeLessThan(runtime.events.indexOf('create-run:run-new'));
+    expect(runtime.release).toHaveBeenCalledOnce();
+  });
+
+  it('rejects resume when live Preflight invalidates a cached completed Stage', async () => {
+    const sourceRunId = 'run-resume';
+    const persistedPreflight = fakePreflightResult();
+    const livePreflight = {
+      ...persistedPreflight,
+      environmentFingerprint: HASH_B,
+    };
+    const runtime = createMemoryRuntime({
+      current: currentPointer(sourceRunId, 'ingest'),
+      preflight: livePreflight,
+      fingerprints: {
+        ingest: (context) => `ingest:${context.preflight?.environmentFingerprint}`,
+      },
+    });
+    runtime.seedRun(sourceRunId, [
+      makeReport({
+        runId: sourceRunId,
+        preset: 'release',
+        stageId: 'preflight',
+        outputs: persistedPreflight as unknown as StageReport['outputs'],
+      }),
+      makeReport({
+        runId: sourceRunId,
+        preset: 'release',
+        stageId: 'ingest',
+        fingerprint: `ingest:${persistedPreflight.environmentFingerprint}`,
+      }),
+    ]);
+    const plan = makePlan({
+      stageIds: ['preflight', 'ingest', 'compile'],
+      actions: ['run', 'cached', 'resume'],
+      runMode: 'resume',
+      sourceRunId,
+      targetRunId: sourceRunId,
+    });
+
+    await expect(runExecutionPlan(executionInput(plan), runtime.dependencies))
+      .rejects.toMatchObject({code: 'PLAN_STALE', stageId: 'ingest'});
+
+    expect(runtime.stageCalls).toEqual(['preflight']);
+    expect(runtime.runStore.createRun).not.toHaveBeenCalled();
+    expect(runtime.reportStore.writeStage).not.toHaveBeenCalled();
+    expect(runtime.runStore.publishCurrent).not.toHaveBeenCalled();
+    expect(runtime.release).toHaveBeenCalledOnce();
+  });
+
+  it('rejects omitted Preflight when its live identity invalidates a prerequisite', async () => {
+    const sourceRunId = 'run-old';
+    const persistedPreflight = fakePreflightResult();
+    const livePreflight = {
+      ...persistedPreflight,
+      environmentFingerprint: HASH_B,
+    };
+    const runtime = createMemoryRuntime({
+      preflight: livePreflight,
+      fingerprints: {
+        ingest: (context) => `ingest:${context.preflight?.environmentFingerprint}`,
+        narration: (context) => `narration:${context.preflight?.environmentFingerprint}`,
+      },
+    });
+    runtime.seedRun(sourceRunId, [
+      makeReport({
+        runId: sourceRunId,
+        preset: 'draft',
+        stageId: 'preflight',
+        outputs: persistedPreflight as unknown as StageReport['outputs'],
+      }),
+      makeReport({
+        runId: sourceRunId,
+        preset: 'draft',
+        stageId: 'ingest',
+        fingerprint: `ingest:${persistedPreflight.environmentFingerprint}`,
+      }),
+      makeReport({
+        runId: sourceRunId,
+        preset: 'draft',
+        stageId: 'narration',
+        fingerprint: `narration:${persistedPreflight.environmentFingerprint}`,
+      }),
+    ]);
+    const plan = makePlan({
+      preset: 'draft',
+      stageIds: ['compile'],
+      actions: ['run'],
+      runMode: 'new',
+      sourceRunId,
+      targetRunId: 'run-new',
+      requiresRuntimePreflight: true,
+    });
+
+    await expect(runExecutionPlan(executionInput(plan), runtime.dependencies))
+      .rejects.toMatchObject({code: 'PLAN_STALE', stageId: 'ingest'});
+
+    expect(runtime.stageCalls).toEqual(['preflight']);
+    expect(runtime.runStore.createRun).not.toHaveBeenCalled();
+    expect(runtime.reportStore.writeStage).not.toHaveBeenCalled();
+    expect(runtime.runStore.publishCurrent).not.toHaveBeenCalled();
     expect(runtime.release).toHaveBeenCalledOnce();
   });
 
@@ -842,6 +1017,10 @@ describe('Pipeline Runner', () => {
       .toBeLessThan(runtime.events.indexOf('output:release'));
     expect(runtime.events.indexOf('output:release'))
       .toBeLessThan(runtime.events.indexOf('delete-report:release'));
+    expect(runtime.events.indexOf('delete-report:release'))
+      .toBeLessThan(runtime.events.indexOf('sync-report-parent:release'));
+    expect(runtime.events.indexOf('sync-report-parent:release'))
+      .toBeLessThan(runtime.events.indexOf('release-lock'));
     expect(runtime.events).not.toContain('work:release:passed');
     expect(runtime.release).toHaveBeenCalledOnce();
   });
