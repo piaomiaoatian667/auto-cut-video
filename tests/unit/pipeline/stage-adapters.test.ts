@@ -56,6 +56,11 @@ import type {
 } from '../../../src/pipeline/stages/draft';
 import {draftReviewEvidenceArtifacts} from '../../../src/pipeline/stages/draft';
 import {
+  buildReleaseValidationReport,
+  formatReleaseChecksums,
+  releaseChecksumArtifacts,
+  releaseOutputPath,
+  releaseSrtFromTimeline,
   releaseStageFingerprint,
   type ReleaseStageInput,
   type ReleaseStageResult,
@@ -217,11 +222,11 @@ const writeRunText = async (
   }
 };
 
-const writeOutputText = async (
+const writeOutputText = async <RelativePath extends string>(
   outputDirectory: OutputDirectoryScope,
-  relativePath: string,
+  relativePath: RelativePath,
   contents: string,
-): Promise<{path: string; sha256: string}> => {
+): Promise<{path: RelativePath; sha256: string}> => {
   const parent = relativePath.split('/').slice(0, -1).join('/');
   if (parent.length > 0) await ensureOutputDirectory(outputDirectory, parent);
   const handle = await openNewOutputFile(outputDirectory, relativePath);
@@ -232,6 +237,113 @@ const writeOutputText = async (
     await handle.close();
   }
   return {path: relativePath, sha256: contentHash(contents)};
+};
+
+const materializeReleaseResult = async ({
+  runId,
+  preflight,
+  draft,
+  timeline,
+  review,
+  releaseFingerprint,
+  outputReview = review,
+  publishedAt = '2026-08-11T01:02:03.000Z',
+}: {
+  runId: string;
+  preflight: PreflightResult;
+  draft: DraftReport;
+  timeline: CompiledTimeline;
+  review: Review;
+  releaseFingerprint: string;
+  outputReview?: Review;
+  publishedAt?: string;
+}): Promise<ReleaseStageResult> => {
+  const outputDirectory = await createOutputStore(tempProject.workspaceRoot)
+    .createRelease('demo', runId);
+  const finalVideo = await writeOutputText(
+    outputDirectory,
+    releaseOutputPath(runId, 'final.mp4'),
+    'final-video',
+  );
+  const subtitles = await writeOutputText(
+    outputDirectory,
+    releaseOutputPath(runId, 'subtitles.srt'),
+    releaseSrtFromTimeline(timeline),
+  );
+  const thumbnail = await writeOutputText(
+    outputDirectory,
+    releaseOutputPath(runId, 'thumbnail.jpg'),
+    'thumbnail',
+  );
+  const releaseReview = await writeOutputText(
+    outputDirectory,
+    releaseOutputPath(runId, 'review.json'),
+    `${JSON.stringify(outputReview, null, 2)}\n`,
+  );
+  const verification = {
+    sha256: finalVideo.sha256,
+    probe: {durationMs: 1000, videoStreams: [], audioStreams: []},
+    moovBeforeMdat: true as const,
+    atoms: [],
+  };
+  const intermediate = {
+    path: 'release/final-intermediate.mp4',
+    sha256: hash('intermediate'),
+  };
+  const validationReport = await writeOutputText(
+    outputDirectory,
+    releaseOutputPath(runId, 'validation-report.json'),
+    `${JSON.stringify(buildReleaseValidationReport({
+      projectId: 'demo',
+      runId,
+      releaseFingerprint,
+      preflight: {
+        toolIdentities: preflight.toolIdentities,
+        environmentFingerprint: preflight.environmentFingerprint,
+      },
+      draftAudio: draft.outputs.audio,
+      intermediate,
+      finalVideo,
+      subtitles,
+      thumbnail,
+      review: releaseReview,
+      verification,
+    }), null, 2)}\n`,
+  );
+  const checksums = await writeOutputText(
+    outputDirectory,
+    releaseOutputPath(runId, 'checksums.sha256'),
+    formatReleaseChecksums(releaseChecksumArtifacts({
+      finalVideo,
+      subtitles,
+      thumbnail,
+      review: releaseReview,
+      validationReport,
+    })),
+  );
+  return {
+    outputs: {
+      mutedVideo: {path: 'release/muted-video.mp4', sha256: hash('release-muted')},
+      intermediate,
+      finalVideo,
+      subtitles,
+      thumbnail,
+      review: releaseReview,
+      validationReport,
+      checksums,
+      releaseFingerprint,
+      verification,
+    },
+    current: {
+      runId,
+      relativePath: `releases/${runId}`,
+      preset: 'release',
+      stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft', 'review', 'release'],
+      completedStage: 'release',
+      state: 'passed',
+      publishedAt,
+    },
+  };
 };
 
 const fakeArtifact = async (
@@ -821,34 +933,14 @@ describe('adapter fingerprints', () => {
       preflightEnvironmentFingerprint: currentPersisted.environmentFingerprint,
       algorithmVersion: STAGE_ALGORITHM_VERSIONS.release,
     });
-    const releaseResult: ReleaseStageResult = {
-      outputs: {
-        mutedVideo: {path: 'release/muted-video.mp4', sha256: hash('release-muted')},
-        intermediate: {path: 'release/final-intermediate.mp4', sha256: hash('intermediate')},
-        finalVideo: {path: 'releases/target-run/final.mp4', sha256: hash('final')},
-        subtitles: {path: 'releases/target-run/subtitles.srt', sha256: hash('subtitles')},
-        thumbnail: {path: 'releases/target-run/thumbnail.jpg', sha256: hash('thumbnail')},
-        review: {path: 'releases/target-run/review.json', sha256: hash('review-output')},
-        validationReport: {path: 'releases/target-run/validation-report.json', sha256: hash('validation')},
-        checksums: {path: 'releases/target-run/checksums.sha256', sha256: hash('checksums')},
-        releaseFingerprint: targetFingerprint,
-        verification: {
-          sha256: hash('final'),
-          probe: {durationMs: 1000, videoStreams: [], audioStreams: []},
-          moovBeforeMdat: true,
-          atoms: [],
-        },
-      },
-      current: {
-        runId: 'target-run',
-        relativePath: 'releases/target-run',
-        preset: 'release',
-        stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft', 'review', 'release'],
-        completedStage: 'release',
-        state: 'passed',
-        publishedAt: '2026-08-11T01:02:03.000Z',
-      },
-    };
+    const releaseResult = await materializeReleaseResult({
+      runId: 'target-run',
+      preflight: currentPersisted,
+      draft,
+      timeline,
+      review: targetReview,
+      releaseFingerprint: targetFingerprint,
+    });
     const executeRelease = vi.fn(async () => releaseResult);
     const store = createStageReportStore();
     await store.writeStage(targetRun, {
@@ -1149,34 +1241,14 @@ describe('adapter artifact inventories', () => {
       preflightEnvironmentFingerprint: preflightResult().environmentFingerprint,
       algorithmVersion: STAGE_ALGORITHM_VERSIONS.release,
     });
-    const releaseResult: ReleaseStageResult = {
-      outputs: {
-        mutedVideo: {path: 'release/muted-video.mp4', sha256: hash('release-muted')},
-        intermediate: {path: 'release/final-intermediate.mp4', sha256: hash('intermediate')},
-        finalVideo: {path: 'releases/target-run/final.mp4', sha256: hash('final')},
-        subtitles: {path: 'releases/target-run/subtitles.srt', sha256: hash('subtitles')},
-        thumbnail: {path: 'releases/target-run/thumbnail.jpg', sha256: hash('thumbnail')},
-        review: {path: 'releases/target-run/review.json', sha256: hash('review-output')},
-        validationReport: {path: 'releases/target-run/validation-report.json', sha256: hash('validation')},
-        checksums: {path: 'releases/target-run/checksums.sha256', sha256: hash('checksums')},
-        releaseFingerprint,
-        verification: {
-          sha256: hash('final'),
-          probe: {durationMs: 1000, videoStreams: [], audioStreams: []},
-          moovBeforeMdat: true,
-          atoms: [],
-        },
-      },
-      current: {
-        runId: 'target-run',
-        relativePath: 'releases/target-run',
-        preset: 'release',
-        stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft', 'review', 'release'],
-        completedStage: 'release',
-        state: 'passed',
-        publishedAt: '2026-08-11T01:02:03.000Z',
-      },
-    };
+    const releaseResult = await materializeReleaseResult({
+      runId: 'target-run',
+      preflight: preflightResult(),
+      draft: draftReport(),
+      timeline: compiledTimeline(),
+      review: releaseReview,
+      releaseFingerprint,
+    });
     const runReleaseAdapter = vi.fn(async () => releaseResult);
     await writeRunText(
       targetRun,
@@ -2111,7 +2183,7 @@ describe('adapter verification', () => {
     const subtitles = await writeOutputText(
       outputDirectory,
       'releases/source-run/subtitles.srt',
-      'subtitles',
+      releaseSrtFromTimeline(timeline),
     );
     const thumbnail = await writeOutputText(
       outputDirectory,
@@ -2121,17 +2193,45 @@ describe('adapter verification', () => {
     const review = await writeOutputText(
       outputDirectory,
       'releases/source-run/review.json',
-      'review',
+      `${JSON.stringify(reviewInput, null, 2)}\n`,
     );
+    const verification = {
+      sha256: finalVideo.sha256,
+      probe: {durationMs: 1000, videoStreams: [], audioStreams: []},
+      moovBeforeMdat: true as const,
+      atoms: [],
+    };
+    const validationMetadata = buildReleaseValidationReport({
+      projectId: 'demo',
+      runId: 'source-run',
+      releaseFingerprint: stageFingerprint,
+      preflight: {
+        toolIdentities: persistedPreflight.toolIdentities,
+        environmentFingerprint: persistedPreflight.environmentFingerprint,
+      },
+      draftAudio: draft.outputs.audio,
+      intermediate: {path: intermediate.path, sha256: intermediate.sha256},
+      finalVideo,
+      subtitles,
+      thumbnail,
+      review,
+      verification,
+    });
     const validationReport = await writeOutputText(
       outputDirectory,
       'releases/source-run/validation-report.json',
-      'validation',
+      `${JSON.stringify(validationMetadata, null, 2)}\n`,
     );
     const checksums = await writeOutputText(
       outputDirectory,
       'releases/source-run/checksums.sha256',
-      'checksums',
+      formatReleaseChecksums(releaseChecksumArtifacts({
+        finalVideo,
+        subtitles,
+        thumbnail,
+        review,
+        validationReport,
+      })),
     );
     const outputs = {
       mutedVideo: {path: mutedVideo.path, sha256: mutedVideo.sha256},
@@ -2143,12 +2243,7 @@ describe('adapter verification', () => {
       validationReport,
       checksums,
       releaseFingerprint: stageFingerprint,
-      verification: {
-        sha256: finalVideo.sha256,
-        probe: {durationMs: 1000, videoStreams: [], audioStreams: []},
-        moovBeforeMdat: true as const,
-        atoms: [],
-      },
+      verification,
     };
     const report = passedStageReport({
       stageId: 'release',
@@ -2166,8 +2261,76 @@ describe('adapter verification', () => {
         {scope: 'output', ...checksums},
       ],
     });
-    return {report, finalVideo, dependencies};
+    return {
+      report,
+      outputs,
+      finalVideo,
+      dependencies,
+      validationMetadata,
+      reviewInput,
+      timeline,
+    };
   };
+
+  it.each([
+    ['review.json', 'review', async ({reviewInput}: Awaited<ReturnType<typeof releaseVerificationFixture>>) => (
+      `${JSON.stringify({...reviewInput, reviewer: 'tampered-reviewer'}, null, 2)}\n`
+    )],
+    ['subtitles.srt', 'subtitles', async () => 'tampered subtitles\n'],
+    [
+      'validation-report.json',
+      'validationReport',
+      async ({validationMetadata}: Awaited<ReturnType<typeof releaseVerificationFixture>>) => (
+        `${JSON.stringify({
+          ...validationMetadata,
+          verification: {
+            ...validationMetadata.verification,
+            durationMs: validationMetadata.verification.durationMs + 1,
+          },
+        }, null, 2)}\n`
+      ),
+    ],
+    ['checksums.sha256', 'checksums', async () => '0'.repeat(64) + '  releases/source-run/final.mp4\n'],
+  ] as const)(
+    'returns false when Release %s content is semantically inconsistent despite matching its reported hash',
+    async (_fileName, outputKey, tamperedContents) => {
+      const fixture = await releaseVerificationFixture();
+      const reference = fixture.outputs[outputKey];
+      const contents = await tamperedContents(fixture);
+      await writeFile(
+        path.join(tempProject.workspaceRoot, 'output', 'demo', reference.path),
+        contents,
+        'utf8',
+      );
+      const changedReference = {...reference, sha256: contentHash(contents)};
+      const changedOutputs = {...fixture.outputs, [outputKey]: changedReference};
+      const changedReport = {
+        ...fixture.report,
+        outputs: changedOutputs,
+        artifacts: fixture.report.artifacts.map((artifact) => (
+          artifact.path === changedReference.path
+            ? {...artifact, sha256: changedReference.sha256}
+            : artifact
+        )),
+      };
+
+      await expect(createReleaseStage(fixture.dependencies).verify(
+        planningContext(),
+        changedReport,
+      )).resolves.toBe(false);
+    },
+  );
+
+  it('returns false for malformed Release verification stream metadata', async () => {
+    const fixture = await releaseVerificationFixture();
+    const invalidOutputs = JSON.parse(JSON.stringify(fixture.outputs));
+    invalidOutputs.verification.probe.videoStreams = [{codec: 'h264'}];
+
+    await expect(createReleaseStage(fixture.dependencies).verify(
+      planningContext(),
+      {...fixture.report, outputs: invalidOutputs},
+    )).resolves.toBe(false);
+  });
 
   it('returns false for missing, changed, and cross-scope Run artifacts', async () => {
     const {stage, context, report} = await compileVerificationFixture();
@@ -2448,6 +2611,10 @@ describe('Narration compatibility-gated cache seeding', () => {
     injectedProviderFingerprint = currentProviderFingerprint,
     tamperSourceCache = false,
     tamperCompatibility = false,
+    coordinatedManifestArtifactTamper = false,
+    sourceReportState = 'passed',
+    readPersistedNarrationFiles,
+    beforeExecute,
   }: {
     sourceProject: ProjectInputs;
     currentProject: ProjectInputs;
@@ -2458,6 +2625,10 @@ describe('Narration compatibility-gated cache seeding', () => {
     injectedProviderFingerprint?: string;
     tamperSourceCache?: boolean;
     tamperCompatibility?: boolean;
+    coordinatedManifestArtifactTamper?: boolean;
+    sourceReportState?: StageReport['state'];
+    readPersistedNarrationFiles?: () => Promise<never>;
+    beforeExecute?: () => Promise<void>;
   }) => {
     const withFfprobe = (value: PreflightResult): PreflightResult => {
       const next = structuredClone(value) as PreflightResult & {
@@ -2540,6 +2711,9 @@ describe('Narration compatibility-gated cache seeding', () => {
       runNarration,
       hashRunArtifact: fakeArtifact,
       hashProjectAudioFile: async (_projectDirectory, audioPath) => hash(audioPath),
+      ...(readPersistedNarrationFiles === undefined
+        ? {}
+        : {readPersistedNarrationFiles}),
     });
     const sourceCompatibility = narrationReuseCompatibilityFingerprint({
       tts: sourceProject.project.tts,
@@ -2607,7 +2781,7 @@ describe('Narration compatibility-gated cache seeding', () => {
     };
     await writeRunText(sourceRun, 'narration-manifest.json', `${JSON.stringify(sourceNarration)}\n`);
     await writeRunText(sourceRun, 'captions.json', `${JSON.stringify(sourceCaptions)}\n`);
-    await writeRunText(sourceRun, 'captions.srt', '');
+    await writeRunText(sourceRun, 'captions.srt', formatSrt(sourceCaptions));
     const sourceArtifacts = await Promise.all([
       sourceCachePath,
       sourceSegmentPath,
@@ -2636,6 +2810,25 @@ describe('Narration compatibility-gated cache seeding', () => {
         reuseCompatibilityFingerprint: sourceCompatibility,
       })),
     });
+    sourceNarrationReport.state = sourceReportState;
+    if (coordinatedManifestArtifactTamper) {
+      await replaceRunText('source-run', 'narration-manifest.json', `${JSON.stringify({
+        ...sourceNarration,
+        master: {
+          ...sourceNarration.master,
+          durationMs: sourceNarration.master.durationMs + 1,
+        },
+      })}\n`);
+      const changedManifestArtifact = await hashRunArtifact(
+        sourceRun,
+        'narration-manifest.json',
+      );
+      sourceNarrationReport.artifacts = sourceNarrationReport.artifacts.map((artifact) => (
+        artifact.path === changedManifestArtifact.path
+          ? changedManifestArtifact
+          : artifact
+      ));
+    }
     if (tamperSourceCache) {
       await writeFile(
         path.join(
@@ -2652,6 +2845,7 @@ describe('Narration compatibility-gated cache seeding', () => {
     }
     providerFingerprint = currentProviderFingerprint;
     canonicalFingerprint.mockClear();
+    await beforeExecute?.();
     const context = executionContext({
       project: currentProject,
       preflight: normalizedCurrentPreflight,
@@ -2827,6 +3021,70 @@ describe('Narration compatibility-gated cache seeding', () => {
     });
     expect(result.seedNarrationCache).not.toHaveBeenCalled();
   });
+
+  it('does not seed from a source Narration report that is not passed or cached', async () => {
+    const providerFingerprint = hash('provider');
+    const result = await executeCase({
+      sourceProject: project,
+      currentProject: {...project, script: createScriptFixture('changed script')},
+      sourcePreflight: preflightResult(),
+      currentPreflight: preflightResult(),
+      sourceProviderFingerprint: providerFingerprint,
+      currentProviderFingerprint: providerFingerprint,
+      sourceReportState: 'needs_review',
+    });
+
+    expect(result.seedNarrationCache).not.toHaveBeenCalled();
+  });
+
+  it('does not seed when persisted Narration JSON and its artifact hash diverge from report outputs', async () => {
+    const providerFingerprint = hash('provider');
+    const result = await executeCase({
+      sourceProject: project,
+      currentProject: {...project, script: createScriptFixture('changed script')},
+      sourcePreflight: preflightResult(),
+      currentPreflight: preflightResult(),
+      sourceProviderFingerprint: providerFingerprint,
+      currentProviderFingerprint: providerFingerprint,
+      coordinatedManifestArtifactTamper: true,
+    });
+
+    expect(result.seedNarrationCache).not.toHaveBeenCalled();
+  });
+
+  it('propagates EIO while reading persisted Narration seed provenance', async () => {
+    const providerFingerprint = hash('provider');
+    const failure = Object.assign(new Error('source Narration read failed'), {code: 'EIO'});
+
+    await expect(executeCase({
+      sourceProject: project,
+      currentProject: {...project, script: createScriptFixture('changed script')},
+      sourcePreflight: preflightResult(),
+      currentPreflight: preflightResult(),
+      sourceProviderFingerprint: providerFingerprint,
+      currentProviderFingerprint: providerFingerprint,
+      readPersistedNarrationFiles: async () => { throw failure; },
+    })).rejects.toBe(failure);
+  });
+
+  it('propagates source Run authority changes while validating seed provenance', async () => {
+    const providerFingerprint = hash('provider');
+
+    await expect(executeCase({
+      sourceProject: project,
+      currentProject: {...project, script: createScriptFixture('changed script')},
+      sourcePreflight: preflightResult(),
+      currentPreflight: preflightResult(),
+      sourceProviderFingerprint: providerFingerprint,
+      currentProviderFingerprint: providerFingerprint,
+      beforeExecute: async () => {
+        await rename(
+          runFilePath('source-run', ''),
+          path.join(tempProject.workspaceRoot, 'moved-narration-source-run'),
+        );
+      },
+    })).rejects.toMatchObject({code: 'APP_SCOPE_AUTHORITY_CHANGED'});
+  });
 });
 
 describe('provenance hardening regressions', () => {
@@ -2837,15 +3095,15 @@ describe('provenance hardening regressions', () => {
     outputs: {
       mutedVideo: {path: 'release/muted-video.mp4', sha256: hash('release-muted')},
       intermediate: {path: 'release/final-intermediate.mp4', sha256: hash('intermediate')},
-      finalVideo: {path: `releases/${runId}/final.mp4`, sha256: hash('final')},
-      subtitles: {path: `releases/${runId}/subtitles.srt`, sha256: hash('subtitles')},
-      thumbnail: {path: `releases/${runId}/thumbnail.jpg`, sha256: hash('thumbnail')},
-      review: {path: `releases/${runId}/review.json`, sha256: hash('review-output')},
+      finalVideo: {path: releaseOutputPath(runId, 'final.mp4'), sha256: hash('final')},
+      subtitles: {path: releaseOutputPath(runId, 'subtitles.srt'), sha256: hash('subtitles')},
+      thumbnail: {path: releaseOutputPath(runId, 'thumbnail.jpg'), sha256: hash('thumbnail')},
+      review: {path: releaseOutputPath(runId, 'review.json'), sha256: hash('review-output')},
       validationReport: {
-        path: `releases/${runId}/validation-report.json`,
+        path: releaseOutputPath(runId, 'validation-report.json'),
         sha256: hash('validation'),
       },
-      checksums: {path: `releases/${runId}/checksums.sha256`, sha256: hash('checksums')},
+      checksums: {path: releaseOutputPath(runId, 'checksums.sha256'), sha256: hash('checksums')},
       releaseFingerprint,
       verification: {
         sha256: hash('final'),
@@ -2901,6 +3159,26 @@ describe('provenance hardening regressions', () => {
     });
     return {draft, timeline, review, stageFingerprint};
   };
+
+  const materializeTargetReleaseResult = async ({
+    preflight,
+    draft,
+    timeline,
+    review,
+    stageFingerprint,
+    outputReview = review,
+  }: ReturnType<typeof targetReleaseInputs> & {
+    preflight: PreflightResult;
+    outputReview?: Review;
+  }): Promise<ReleaseStageResult> => await materializeReleaseResult({
+    runId: 'target-run',
+    preflight,
+    draft,
+    timeline,
+    review,
+    releaseFingerprint: stageFingerprint,
+    outputReview,
+  });
 
   it.each([
     ['FFmpeg real path', (value: Record<string, any>) => {
@@ -3292,7 +3570,7 @@ describe('provenance hardening regressions', () => {
     const preflight = preflightResult();
     await writeTargetReleaseReports(preflight);
     const inputs = targetReleaseInputs(preflight);
-    const concreteResult = releaseResult('target-run', inputs.stageFingerprint);
+    const concreteResult = await materializeTargetReleaseResult({...inputs, preflight});
     concreteResult.outputs.verification.sha256 = verificationSha256;
     const stage = createReleaseStage({
       readDraftReport: async () => inputs.draft,
@@ -3305,6 +3583,28 @@ describe('provenance hardening regressions', () => {
       executionContext({preflight}),
       new AbortController().signal,
     )).rejects.toBeDefined();
+  });
+
+  it('rejects semantically inconsistent Release audit metadata after execution', async () => {
+    const preflight = preflightResult();
+    await writeTargetReleaseReports(preflight);
+    const inputs = targetReleaseInputs(preflight);
+    const concreteResult = await materializeTargetReleaseResult({
+      ...inputs,
+      preflight,
+      outputReview: {...inputs.review, reviewer: 'tampered-reviewer'},
+    });
+    const stage = createReleaseStage({
+      readDraftReport: async () => inputs.draft,
+      readCompiledTimeline: async () => inputs.timeline,
+      readReview: async () => inputs.review,
+      runRelease: async () => concreteResult,
+    });
+
+    await expect(stage.execute(
+      executionContext({preflight}),
+      new AbortController().signal,
+    )).rejects.toThrow('Release returned invalid audit metadata');
   });
 
   it.each([
@@ -3322,7 +3622,7 @@ describe('provenance hardening regressions', () => {
     const preflight = preflightResult();
     await writeTargetReleaseReports(preflight);
     const inputs = targetReleaseInputs(preflight);
-    const concreteResult = releaseResult('target-run', inputs.stageFingerprint);
+    const concreteResult = await materializeTargetReleaseResult({...inputs, preflight});
     mutate(concreteResult.current);
     const stage = createReleaseStage({
       readDraftReport: async () => inputs.draft,
@@ -3341,7 +3641,7 @@ describe('provenance hardening regressions', () => {
     const preflight = preflightResult();
     await writeTargetReleaseReports(preflight);
     const inputs = targetReleaseInputs(preflight);
-    const concreteResult = releaseResult('target-run', inputs.stageFingerprint);
+    const concreteResult = await materializeTargetReleaseResult({...inputs, preflight});
     const now = vi.fn()
       .mockReturnValueOnce('2026-08-11T01:02:03.000Z')
       .mockReturnValue('2026-08-11T01:02:04.000Z');
@@ -3579,34 +3879,14 @@ describe('Release semantic fingerprinting', () => {
       preflightEnvironmentFingerprint: preflight.environmentFingerprint,
       algorithmVersion,
     });
-    const releaseResultFixture: ReleaseStageResult = {
-      outputs: {
-        mutedVideo: {path: 'release/muted-video.mp4', sha256: hash('muted')},
-        intermediate: {path: 'release/final-intermediate.mp4', sha256: hash('intermediate')},
-        finalVideo: {path: 'releases/target-run/final.mp4', sha256: hash('final')},
-        subtitles: {path: 'releases/target-run/subtitles.srt', sha256: hash('subtitles')},
-        thumbnail: {path: 'releases/target-run/thumbnail.jpg', sha256: hash('thumbnail')},
-        review: {path: 'releases/target-run/review.json', sha256: hash('review')},
-        validationReport: {path: 'releases/target-run/validation-report.json', sha256: hash('validation')},
-        checksums: {path: 'releases/target-run/checksums.sha256', sha256: hash('checksums')},
-        releaseFingerprint: expectedFingerprint,
-        verification: {
-          sha256: hash('final'),
-          probe: {durationMs: 1000, videoStreams: [], audioStreams: []},
-          atoms: [],
-          moovBeforeMdat: true as const,
-        },
-      },
-      current: {
-        runId: 'target-run',
-        relativePath: 'releases/target-run',
-        preset: 'release' as const,
-        stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft', 'review', 'release'],
-        completedStage: 'release' as const,
-        state: 'passed' as const,
-        publishedAt: '2026-08-11T01:02:03.000Z',
-      },
-    };
+    const releaseResultFixture = await materializeReleaseResult({
+      runId: 'target-run',
+      preflight,
+      draft,
+      timeline,
+      review,
+      releaseFingerprint: expectedFingerprint,
+    });
     const executeRelease = vi.fn(async () => releaseResultFixture);
     const stage = createReleaseStage({
       algorithmVersion,

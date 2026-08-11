@@ -6,9 +6,11 @@ import {
 } from '../../domain/timeline-schema';
 import {
   createOutputStore,
+  openExistingOutputFileForRead,
   type OutputDirectoryScope,
   type RunDirectoryScope,
 } from '../../fs/app-directory-scopes';
+import {ReleaseVerificationReportSchema} from '../../media/release-verify';
 import {
   PipelineContextError,
   requirePreflight,
@@ -28,8 +30,15 @@ import {
   type DraftReport,
 } from '../stages/draft';
 import {
+  buildReleaseValidationReport,
+  formatReleaseChecksums,
+  releaseChecksumArtifacts,
   releaseCurrentPointer,
+  releaseOutputPath,
+  releaseSrtFromTimeline,
   releaseStageFingerprint,
+  ReleaseOutputArtifactReferenceSchema,
+  ReleaseValidationReportSchema,
   runRelease,
   type ReleasePreflightSnapshot,
   type ReleaseStageDependencies,
@@ -49,32 +58,19 @@ import {
 } from './shared';
 import {normalizePreflightAdapterOutput} from './preflight';
 
-const OutputArtifactReferenceSchema = ArtifactReferenceSchema.extend({
-  path: z.string().regex(/^releases\/[^/]+\/[^/]+$/u),
-}).strict();
-
 const HashSchema = z.string().regex(/^sha256:[0-9a-f]{64}$/u);
 
 const ReleaseAdapterOutputSchema = z.object({
   mutedVideo: ArtifactReferenceSchema,
   intermediate: ArtifactReferenceSchema,
-  finalVideo: OutputArtifactReferenceSchema,
-  subtitles: OutputArtifactReferenceSchema,
-  thumbnail: OutputArtifactReferenceSchema,
-  review: OutputArtifactReferenceSchema,
-  validationReport: OutputArtifactReferenceSchema,
-  checksums: OutputArtifactReferenceSchema,
+  finalVideo: ReleaseOutputArtifactReferenceSchema,
+  subtitles: ReleaseOutputArtifactReferenceSchema,
+  thumbnail: ReleaseOutputArtifactReferenceSchema,
+  review: ReleaseOutputArtifactReferenceSchema,
+  validationReport: ReleaseOutputArtifactReferenceSchema,
+  checksums: ReleaseOutputArtifactReferenceSchema,
   releaseFingerprint: HashSchema,
-  verification: z.object({
-    sha256: HashSchema,
-    probe: z.object({
-      durationMs: z.number().nonnegative(),
-      videoStreams: z.array(z.unknown()),
-      audioStreams: z.array(z.unknown()),
-    }).passthrough(),
-    atoms: z.array(z.unknown()),
-    moovBeforeMdat: z.literal(true),
-  }).passthrough(),
+  verification: ReleaseVerificationReportSchema,
 }).strict().superRefine((outputs, context) => {
   if (outputs.verification.sha256 !== outputs.finalVideo.sha256) {
     context.addIssue({
@@ -130,6 +126,26 @@ const requireReleaseTools = (preflight: ReleasePreflightSnapshot): void => {
   }
 };
 
+const readOutputText = async (
+  outputDirectory: OutputDirectoryScope,
+  relativePath: string,
+): Promise<string> => {
+  const authority = await openExistingOutputFileForRead(outputDirectory, relativePath);
+  try {
+    const contents = await authority.handle.readFile('utf8');
+    await authority.revalidate();
+    return contents;
+  } finally {
+    await authority.close();
+  }
+};
+
+const readOutputJson = async <Output>(
+  outputDirectory: OutputDirectoryScope,
+  relativePath: string,
+  parse: (value: unknown) => Output,
+): Promise<Output> => parse(JSON.parse(await readOutputText(outputDirectory, relativePath)));
+
 const releaseExpectedArtifacts = (
   outputs: {
     mutedVideo: {path: string; sha256: string};
@@ -150,21 +166,77 @@ const releaseExpectedArtifacts = (
       artifact: outputs.intermediate,
       path: 'release/final-intermediate.mp4',
     },
-    {scope: 'output' as const, artifact: outputs.finalVideo, path: `releases/${runId}/final.mp4`},
-    {scope: 'output' as const, artifact: outputs.subtitles, path: `releases/${runId}/subtitles.srt`},
-    {scope: 'output' as const, artifact: outputs.thumbnail, path: `releases/${runId}/thumbnail.jpg`},
-    {scope: 'output' as const, artifact: outputs.review, path: `releases/${runId}/review.json`},
+    {scope: 'output' as const, artifact: outputs.finalVideo, path: releaseOutputPath(runId, 'final.mp4')},
+    {scope: 'output' as const, artifact: outputs.subtitles, path: releaseOutputPath(runId, 'subtitles.srt')},
+    {scope: 'output' as const, artifact: outputs.thumbnail, path: releaseOutputPath(runId, 'thumbnail.jpg')},
+    {scope: 'output' as const, artifact: outputs.review, path: releaseOutputPath(runId, 'review.json')},
     {
       scope: 'output' as const,
       artifact: outputs.validationReport,
-      path: `releases/${runId}/validation-report.json`,
+      path: releaseOutputPath(runId, 'validation-report.json'),
     },
-    {scope: 'output' as const, artifact: outputs.checksums, path: `releases/${runId}/checksums.sha256`},
+    {scope: 'output' as const, artifact: outputs.checksums, path: releaseOutputPath(runId, 'checksums.sha256')},
   ];
   if (references.some(({artifact, path}) => artifact.path !== path)) return null;
   const paths = new Set(references.map(({scope, artifact}) => `${scope}:${artifact.path}`));
   if (paths.size !== references.length) return null;
   return references.map(({scope, artifact}) => ({scope, ...artifact}));
+};
+
+interface ReleasePlan {
+  draft: DraftReport;
+  timeline: CompiledTimeline;
+  review: Review;
+  fingerprint: string;
+}
+
+const verifyReleaseAuditMetadata = async ({
+  outputDirectory,
+  projectId,
+  runId,
+  preflight,
+  plan,
+  outputs,
+}: {
+  outputDirectory: OutputDirectoryScope;
+  projectId: string;
+  runId: string;
+  preflight: ReleasePreflightSnapshot;
+  plan: ReleasePlan;
+  outputs: z.infer<typeof ReleaseAdapterOutputSchema>;
+}): Promise<boolean> => {
+  const persisted = await readPlanningInput(async () => {
+    const [review, subtitles, validationReport, checksums] = await Promise.all([
+      readOutputJson(outputDirectory, outputs.review.path, (value) => ReviewSchema.parse(value)),
+      readOutputText(outputDirectory, outputs.subtitles.path),
+      readOutputJson(
+        outputDirectory,
+        outputs.validationReport.path,
+        (value) => ReleaseValidationReportSchema.parse(value),
+      ),
+      readOutputText(outputDirectory, outputs.checksums.path),
+    ]);
+    return {review, subtitles, validationReport, checksums};
+  });
+  if (persisted === null) return false;
+  const expectedValidationReport = buildReleaseValidationReport({
+    projectId,
+    runId,
+    releaseFingerprint: outputs.releaseFingerprint,
+    preflight,
+    draftAudio: plan.draft.outputs.audio,
+    intermediate: outputs.intermediate,
+    finalVideo: outputs.finalVideo,
+    subtitles: outputs.subtitles,
+    thumbnail: outputs.thumbnail,
+    review: outputs.review,
+    verification: outputs.verification,
+  });
+  return fingerprintValue(persisted.review) === fingerprintValue(plan.review)
+    && persisted.subtitles === releaseSrtFromTimeline(plan.timeline)
+    && fingerprintValue(persisted.validationReport)
+      === fingerprintValue(expectedValidationReport)
+    && persisted.checksums === formatReleaseChecksums(releaseChecksumArtifacts(outputs));
 };
 
 export const createReleaseStage = (
@@ -202,13 +274,13 @@ export const createReleaseStage = (
       workspaceRoot,
     ).openProject(projectId));
 
-  const calculateFingerprint = async (
+  const calculatePlan = async (
     runDirectory: RunDirectoryScope,
     runId: string,
     projectId: string,
     preflight: ReleasePreflightSnapshot,
     compileStageFingerprint: string,
-  ): Promise<string | null> => {
+  ): Promise<ReleasePlan | null> => {
     if (!releaseToolsAvailable(preflight)) return null;
     const [draft, timeline, review] = await Promise.all([
       readDraftReport(runDirectory),
@@ -236,7 +308,11 @@ export const createReleaseStage = (
       if (error instanceof ReviewGateError) return null;
       throw error;
     }
-    return releaseStageFingerprint({
+    return {
+      draft,
+      timeline,
+      review: approvedReview,
+      fingerprint: releaseStageFingerprint({
       draft: draft.outputs,
       compileInputHashes: timeline.inputHashes,
       compileStageFingerprint,
@@ -244,7 +320,8 @@ export const createReleaseStage = (
       review: approvedReview,
       preflightEnvironmentFingerprint: preflight.environmentFingerprint,
       algorithmVersion,
-    });
+      }),
+    };
   };
 
   return {
@@ -271,13 +348,14 @@ export const createReleaseStage = (
           }),
         ]);
         const preflight = parseReleasePreflightSnapshot(preflightReport.outputs);
-        return await calculateFingerprint(
+        const plan = await calculatePlan(
           context.sourceRun!.runDirectory,
           context.sourceRun!.runId,
           context.project.project.id,
           preflight,
           compileReport.fingerprint,
         );
+        return plan?.fingerprint ?? null;
       });
     },
     verify: async (context, report) => {
@@ -285,15 +363,38 @@ export const createReleaseStage = (
       if (!parsed.success) return false;
       const expected = releaseExpectedArtifacts(parsed.data, report.runId);
       if (expected === null) return false;
-      const currentFingerprint = await readPlanningInput(async () => await (
-        context.sourceRun === undefined
-          ? Promise.resolve(null)
-          : createReleaseStage(dependencies).fingerprint(context)
-      ));
+      if (context.sourceRun === undefined) return false;
+      const planning = await readPlanningInput(async () => {
+        const [preflightReport, compileReport] = await Promise.all([
+          loadSuccessfulBoundStageReport({
+            runDirectory: context.sourceRun!.runDirectory,
+            projectId: context.project.project.id,
+            runId: context.sourceRun!.runId,
+            stageId: 'preflight',
+            readStageReport,
+          }),
+          loadSuccessfulBoundStageReport({
+            runDirectory: context.sourceRun!.runDirectory,
+            projectId: context.project.project.id,
+            runId: context.sourceRun!.runId,
+            stageId: 'compile',
+            readStageReport,
+          }),
+        ]);
+        const preflight = parseReleasePreflightSnapshot(preflightReport.outputs);
+        const plan = await calculatePlan(
+          context.sourceRun!.runDirectory,
+          context.sourceRun!.runId,
+          context.project.project.id,
+          preflight,
+          compileReport.fingerprint,
+        );
+        return plan === null ? null : {preflight, plan};
+      });
       if (
-        currentFingerprint === null
-        || report.fingerprint !== currentFingerprint
-        || parsed.data.releaseFingerprint !== currentFingerprint
+        planning === null
+        || report.fingerprint !== planning.plan.fingerprint
+        || parsed.data.releaseFingerprint !== planning.plan.fingerprint
       ) return false;
       let outputDirectory: OutputDirectoryScope;
       try {
@@ -305,6 +406,14 @@ export const createReleaseStage = (
         if (isOrdinaryVerificationMiss(error)) return false;
         throw error;
       }
+      if (!await verifyReleaseAuditMetadata({
+        outputDirectory,
+        projectId: context.project.project.id,
+        runId: context.sourceRun.runId,
+        preflight: planning.preflight,
+        plan: planning.plan,
+        outputs: parsed.data,
+      })) return false;
       return await verifyReportedArtifacts({
         context,
         report,
@@ -320,12 +429,12 @@ export const createReleaseStage = (
       if (context.runId === undefined) return artifacts;
       return [
         ...artifacts,
-        {scope: 'output' as const, path: `releases/${context.runId}/final.mp4`},
-        {scope: 'output' as const, path: `releases/${context.runId}/subtitles.srt`},
-        {scope: 'output' as const, path: `releases/${context.runId}/thumbnail.jpg`},
-        {scope: 'output' as const, path: `releases/${context.runId}/review.json`},
-        {scope: 'output' as const, path: `releases/${context.runId}/validation-report.json`},
-        {scope: 'output' as const, path: `releases/${context.runId}/checksums.sha256`},
+        {scope: 'output' as const, path: releaseOutputPath(context.runId, 'final.mp4')},
+        {scope: 'output' as const, path: releaseOutputPath(context.runId, 'subtitles.srt')},
+        {scope: 'output' as const, path: releaseOutputPath(context.runId, 'thumbnail.jpg')},
+        {scope: 'output' as const, path: releaseOutputPath(context.runId, 'review.json')},
+        {scope: 'output' as const, path: releaseOutputPath(context.runId, 'validation-report.json')},
+        {scope: 'output' as const, path: releaseOutputPath(context.runId, 'checksums.sha256')},
       ];
     },
     execute: async (context, signal) => {
@@ -357,16 +466,17 @@ export const createReleaseStage = (
       }
       const preflight = parseReleasePreflightSnapshot(preflightReport.outputs);
       requireReleaseTools(preflight);
-      const stageFingerprint = await calculateFingerprint(
+      const plan = await calculatePlan(
         runDirectory,
         runId,
         context.project.project.id,
         preflight,
         compileReport.fingerprint,
       );
-      if (stageFingerprint === null) {
+      if (plan === null) {
         throw new ReviewGateError('Release requires approved Review evidence');
       }
+      const stageFingerprint = plan.fingerprint;
       const publishedAt = context.now();
       const outputCurrent = releaseCurrentPointer(runId, publishedAt);
       const result = await executeRelease({
@@ -396,6 +506,23 @@ export const createReleaseStage = (
       const expected = releaseExpectedArtifacts(parsedOutputs.data, runId);
       if (expected === null) {
         throw new PipelineContextError('Release returned invalid artifact paths');
+      }
+      const outputDirectory = await readPlanningInput(async () => await openOutputDirectory(
+        context.project.workspaceRoot,
+        context.project.project.id,
+      ));
+      if (
+        outputDirectory === null
+        || !await verifyReleaseAuditMetadata({
+          outputDirectory,
+          projectId: context.project.project.id,
+          runId,
+          preflight,
+          plan,
+          outputs: parsedOutputs.data,
+        })
+      ) {
+        throw new PipelineContextError('Release returned invalid audit metadata');
       }
       return {
         state: 'passed',

@@ -2,6 +2,7 @@ import {createHash} from 'node:crypto';
 import {mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
+import {z} from 'zod';
 import {formatSrt} from '../../captions/srt';
 import type {ProjectInputs} from '../../domain/load-project';
 import {ReviewSchema, type Review} from '../../domain/review-schema';
@@ -29,6 +30,7 @@ import {
 } from '../../media/release-verify';
 import {fingerprintValue} from '../fingerprint';
 import {
+  ArtifactReferenceSchema,
   DraftReportSchema,
   draftReviewEvidenceArtifacts,
   type ArtifactReference,
@@ -160,8 +162,25 @@ export interface ReleaseStageDependencies {
   algorithmVersion?: string;
 }
 
+export type ReleaseOutputPath = `releases/${string}/${string}`;
+
+export const releaseOutputPath = <RunId extends string, FileName extends string>(
+  runId: RunId,
+  fileName: FileName,
+): `releases/${RunId}/${FileName}` => {
+  if (
+    runId.length === 0
+    || fileName.length === 0
+    || runId.includes('/')
+    || fileName.includes('/')
+  ) {
+    throw new TypeError('Release output paths require non-empty single-segment names');
+  }
+  return `releases/${runId}/${fileName}` as const;
+};
+
 export interface OutputArtifactReference extends ArtifactReference {
-  path: `releases/${string}/${string}`;
+  path: ReleaseOutputPath;
 }
 
 export interface ReleaseStageOutputs {
@@ -181,6 +200,141 @@ export interface ReleaseStageResult {
   outputs: ReleaseStageOutputs;
   current: CurrentPointer;
 }
+
+export const ReleaseOutputPathSchema = z.string().transform((value, context) => {
+  const match = /^releases\/([^/]+)\/([^/]+)$/u.exec(value);
+  if (match === null) {
+    context.addIssue({
+      code: 'custom',
+      message: 'must be a release output path',
+    });
+    return z.NEVER;
+  }
+  return releaseOutputPath(match[1]!, match[2]!);
+});
+
+export const ReleaseOutputArtifactReferenceSchema = ArtifactReferenceSchema.extend({
+  path: ReleaseOutputPathSchema,
+}).strict();
+
+const ReleaseToolIdentitySchema = z.object({
+  realPath: z.string().min(1),
+  sha256: z.string().min(1),
+}).strict();
+
+const ReleasePreflightSnapshotSchema = z.object({
+  toolIdentities: z.object({
+    ffmpeg: ReleaseToolIdentitySchema.nullable(),
+    ffprobe: ReleaseToolIdentitySchema.nullable(),
+    qtFaststart: ReleaseToolIdentitySchema.nullable(),
+  }).strict(),
+  environmentFingerprint: z.string().min(1),
+}).strict();
+
+export const ReleaseValidationReportSchema = z.object({
+  version: z.literal(1),
+  projectId: z.string().min(1),
+  runId: z.string().min(1),
+  releaseFingerprint: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  inputs: z.object({
+    preflight: ReleasePreflightSnapshotSchema,
+    draftAudio: z.object({
+      filterGraph: ArtifactReferenceSchema,
+      mixedAudio: ArtifactReferenceSchema,
+    }).strict(),
+    intermediate: ArtifactReferenceSchema,
+  }).strict(),
+  outputs: z.object({
+    finalVideo: ReleaseOutputArtifactReferenceSchema,
+    subtitles: ReleaseOutputArtifactReferenceSchema,
+    thumbnail: ReleaseOutputArtifactReferenceSchema,
+    review: z.object({
+      path: ReleaseOutputPathSchema.refine((value) => value.endsWith('/review.json'), {
+        message: 'must be a Release review path',
+      }),
+    }).strict(),
+  }).strict(),
+  verification: z.object({
+    finalSha256: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    durationMs: z.number().nonnegative(),
+    moovBeforeMdat: z.literal(true),
+    atomTypes: z.array(z.string()),
+  }).strict(),
+}).strict();
+
+export type ReleaseValidationReport = z.infer<typeof ReleaseValidationReportSchema>;
+
+export const buildReleaseValidationReport = ({
+  projectId,
+  runId,
+  releaseFingerprint,
+  preflight,
+  draftAudio,
+  intermediate,
+  finalVideo,
+  subtitles,
+  thumbnail,
+  review,
+  verification,
+}: {
+  projectId: string;
+  runId: string;
+  releaseFingerprint: string;
+  preflight: ReleasePreflightSnapshot;
+  draftAudio: DraftReport['outputs']['audio'];
+  intermediate: ArtifactReference;
+  finalVideo: OutputArtifactReference;
+  subtitles: OutputArtifactReference;
+  thumbnail: OutputArtifactReference;
+  review: OutputArtifactReference;
+  verification: ReleaseVerificationReport;
+}): ReleaseValidationReport => ReleaseValidationReportSchema.parse({
+  version: 1,
+  projectId,
+  runId,
+  releaseFingerprint,
+  inputs: {
+    preflight,
+    draftAudio,
+    intermediate,
+  },
+  outputs: {
+    finalVideo,
+    subtitles,
+    thumbnail,
+    review: {path: review.path},
+  },
+  verification: {
+    finalSha256: verification.sha256,
+    durationMs: verification.probe.durationMs,
+    moovBeforeMdat: verification.moovBeforeMdat,
+    atomTypes: verification.atoms.map((atom) => atom.type),
+  },
+});
+
+export const releaseChecksumArtifacts = ({
+  finalVideo,
+  subtitles,
+  thumbnail,
+  review,
+  validationReport,
+}: Pick<
+  ReleaseStageOutputs,
+  'finalVideo' | 'subtitles' | 'thumbnail' | 'review' | 'validationReport'
+>): OutputArtifactReference[] => [
+  finalVideo,
+  subtitles,
+  thumbnail,
+  review,
+  validationReport,
+];
+
+export const formatReleaseChecksums = (
+  artifacts: readonly OutputArtifactReference[],
+): string => `${artifacts
+  .map((artifact) => `${artifact.sha256.slice('sha256:'.length)}  ${artifact.path}`)
+  .sort((left, right) => left.localeCompare(right))
+  .join('\n')}\n`;
 
 const hashBytes = (bytes: Buffer | string): string =>
   `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
@@ -447,7 +601,7 @@ const faststartFinal = async (
   qtFaststartExecutable: string,
   runner: ReleaseRunner,
 ): Promise<OutputArtifactReference> => {
-  const finalPath = `releases/${input.runId}/final.mp4` as const;
+  const finalPath = releaseOutputPath(input.runId, 'final.mp4');
   const inputHandle = await openExistingRunFile(input.runDirectory, 'release/final-intermediate.mp4');
   const outputHandle = await openNewOutputReadWriteFile(outputDirectory, finalPath);
   try {
@@ -471,7 +625,7 @@ const generateThumbnail = async (
   ffprobeExecutable: string,
   runner: ReleaseRunner,
 ): Promise<OutputArtifactReference> => {
-  const thumbnailPath = `releases/${input.runId}/thumbnail.jpg` as const;
+  const thumbnailPath = releaseOutputPath(input.runId, 'thumbnail.jpg');
   const inputHandle = await openExistingRunFile(input.runDirectory, reviewFramePath);
   const outputHandle = await openNewOutputReadWriteFile(outputDirectory, thumbnailPath);
   try {
@@ -521,13 +675,10 @@ const writeChecksums = async (
   runId: string,
   artifacts: readonly OutputArtifactReference[],
 ): Promise<OutputArtifactReference> => {
-  const lines = artifacts
-    .map((artifact) => `${artifact.sha256.slice('sha256:'.length)}  ${artifact.path}`)
-    .sort((left, right) => left.localeCompare(right));
   return await writeOutputText(
     outputDirectory,
-    `releases/${runId}/checksums.sha256`,
-    `${lines.join('\n')}\n`,
+    releaseOutputPath(runId, 'checksums.sha256'),
+    formatReleaseChecksums(artifacts),
   );
 };
 
@@ -553,7 +704,7 @@ export const releaseCurrentPointer = (
   };
 };
 
-const releaseSrtFromTimeline = (timeline: CompiledTimeline): string => formatSrt({
+export const releaseSrtFromTimeline = (timeline: CompiledTimeline): string => formatSrt({
   version: 1,
   sourceNarrationHash: timeline.narration.audioPath,
   cues: timeline.captions.map((caption) => ({
@@ -633,7 +784,7 @@ export const runRelease = async (
   validateSrtWithinDuration(srt, verification.probe.durationMs);
   const subtitles = await writeOutputText(
     outputDirectory,
-    `releases/${input.runId}/subtitles.srt`,
+    releaseOutputPath(input.runId, 'subtitles.srt'),
     srt,
   );
   const thumbnail = await generateThumbnail(
@@ -646,7 +797,7 @@ export const runRelease = async (
   );
   const releaseReview = await writeOutputJson(
     outputDirectory,
-    `releases/${input.runId}/review.json`,
+    releaseOutputPath(input.runId, 'review.json'),
     review,
   );
   const releaseFingerprint = releaseStageFingerprint({
@@ -660,38 +811,28 @@ export const runRelease = async (
   });
   const validationReport = await writeOutputJson(
     outputDirectory,
-    `releases/${input.runId}/validation-report.json`,
-    {
-      version: 1,
+    releaseOutputPath(input.runId, 'validation-report.json'),
+    buildReleaseValidationReport({
       projectId: input.project.id,
       runId: input.runId,
       releaseFingerprint,
-      inputs: {
-        preflight: input.preflight,
-        draftAudio: audioArtifacts,
-        intermediate,
-      },
-      outputs: {
-        finalVideo,
-        subtitles,
-        thumbnail,
-        review: {path: `releases/${input.runId}/review.json`},
-      },
-      verification: {
-        finalSha256: verification.sha256,
-        durationMs: verification.probe.durationMs,
-        moovBeforeMdat: verification.moovBeforeMdat,
-        atomTypes: verification.atoms.map((atom) => atom.type),
-      },
-    },
+      preflight: input.preflight,
+      draftAudio: audioArtifacts,
+      intermediate,
+      finalVideo,
+      subtitles,
+      thumbnail,
+      review: releaseReview,
+      verification,
+    }),
   );
-  const checksums = await writeChecksums(outputDirectory, input.runId, [
+  const checksums = await writeChecksums(outputDirectory, input.runId, releaseChecksumArtifacts({
     finalVideo,
     subtitles,
     thumbnail,
-    releaseReview,
+    review: releaseReview,
     validationReport,
-  ]);
+  }));
   const current = releaseCurrentPointer(
     input.runId,
     (input.now ?? (() => new Date().toISOString()))(),

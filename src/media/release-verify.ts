@@ -1,4 +1,5 @@
 import {createHash} from 'node:crypto';
+import {z} from 'zod';
 import type {MediaProbe} from './ffprobe';
 import {parseFfprobeJson} from './ffprobe';
 import {
@@ -28,12 +29,65 @@ export interface Mp4Atom {
   size: number;
 }
 
-export interface ReleaseVerificationReport {
-  sha256: string;
-  probe: MediaProbe;
-  atoms: Mp4Atom[];
-  moovBeforeMdat: true;
-}
+const FrameRateRationalSchema = z.object({
+  numerator: z.number().finite(),
+  denominator: z.number().finite(),
+  value: z.number().finite(),
+}).strict();
+
+const VideoStreamProbeSchema = z.object({
+  index: z.number().int().nonnegative(),
+  codec: z.string().min(1),
+  profile: z.string().min(1).optional(),
+  codecTag: z.string().min(1).optional(),
+  pixelFormat: z.string().min(1),
+  width: z.number().int().positive(),
+  height: z.number().int().positive(),
+  attachedPicture: z.boolean(),
+  averageFrameRate: FrameRateRationalSchema,
+  realFrameRate: FrameRateRationalSchema,
+  colorPrimaries: z.string().min(1).optional(),
+  colorTransfer: z.string().min(1).optional(),
+  colorSpace: z.string().min(1).optional(),
+  colorRange: z.string().min(1).optional(),
+  rotation: z.number().finite(),
+  durationMs: z.number().nonnegative().optional(),
+  frameCount: z.number().int().nonnegative().optional(),
+  bitsPerRawSample: z.number().int().nonnegative().optional(),
+  bitsPerCodedSample: z.number().int().nonnegative().optional(),
+  sideDataTypes: z.array(z.string().min(1)),
+}).strict();
+
+const AudioStreamProbeSchema = z.object({
+  index: z.number().int().nonnegative(),
+  codec: z.string().min(1),
+  profile: z.string().min(1).optional(),
+  sampleFormat: z.string().min(1).optional(),
+  sampleRate: z.number().positive().optional(),
+  channels: z.number().int().positive().optional(),
+  channelLayout: z.string().min(1).optional(),
+  durationMs: z.number().nonnegative().optional(),
+}).strict();
+
+const MediaProbeSchema = z.object({
+  durationMs: z.number().nonnegative(),
+  formatName: z.string().min(1).optional(),
+  videoStreams: z.array(VideoStreamProbeSchema),
+  audioStreams: z.array(AudioStreamProbeSchema),
+}).strict();
+
+export const ReleaseVerificationReportSchema = z.object({
+  sha256: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  probe: MediaProbeSchema,
+  atoms: z.array(z.object({
+    type: z.string().min(1),
+    offset: z.number().int().nonnegative(),
+    size: z.number().int().positive(),
+  }).strict()),
+  moovBeforeMdat: z.literal(true),
+}).strict();
+
+export type ReleaseVerificationReport = z.infer<typeof ReleaseVerificationReportSchema>;
 
 export interface ReleaseOutputVerificationInput {
   outputDirectory: OutputDirectoryScope;
@@ -231,5 +285,10 @@ export const verifyReleaseOutputFile = async (
   );
   const atoms = parseTopLevelMp4Atoms(bytes);
   assertMoovBeforeMdat(atoms);
-  return {sha256: sha256(bytes), probe, atoms, moovBeforeMdat: true};
+  return ReleaseVerificationReportSchema.parse({
+    sha256: sha256(bytes),
+    probe,
+    atoms,
+    moovBeforeMdat: true,
+  });
 };

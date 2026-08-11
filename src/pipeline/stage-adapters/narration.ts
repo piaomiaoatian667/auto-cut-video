@@ -113,6 +113,37 @@ const NarrationAdapterOutputSchema = z.object({
   }
 });
 
+interface PersistedNarrationFiles {
+  narration: z.infer<typeof NarrationManifestSchema>;
+  captions: z.infer<typeof CaptionsManifestSchema>;
+  srt: string;
+}
+
+type PersistedNarrationFilesReader = (
+  runDirectory: RunDirectoryScope,
+  output: z.infer<typeof NarrationAdapterOutputSchema>,
+) => Promise<PersistedNarrationFiles>;
+
+const systemReadPersistedNarrationFiles: PersistedNarrationFilesReader = async (
+  runDirectory,
+  output,
+) => {
+  const [narration, captions, srt] = await Promise.all([
+    readRunJson(
+      runDirectory,
+      output.narrationPath,
+      (value) => NarrationManifestSchema.parse(value),
+    ),
+    readRunJson(
+      runDirectory,
+      output.captionsPath,
+      (value) => CaptionsManifestSchema.parse(value),
+    ),
+    readRunText(runDirectory, output.srtPath),
+  ]);
+  return {narration, captions, srt};
+};
+
 const narrationFingerprint = ({
   context,
   providerFingerprint,
@@ -298,6 +329,32 @@ const narrationOwnedArtifacts = (
   return expected;
 };
 
+const verifyPersistedNarrationOutput = async ({
+  context,
+  report,
+  output,
+  readPersistedNarrationFiles,
+}: {
+  context: StagePlanningContext;
+  report: Parameters<typeof verifyReportedArtifacts>[0]['report'];
+  output: z.infer<typeof NarrationAdapterOutputSchema>;
+  readPersistedNarrationFiles: PersistedNarrationFilesReader;
+}): Promise<boolean> => {
+  if (context.sourceRun === undefined) return false;
+  const persisted = await readPersistedNarrationFiles(
+    context.sourceRun.runDirectory,
+    output,
+  );
+  if (
+    fingerprintValue(persisted.narration) !== fingerprintValue(output.narration)
+    || fingerprintValue(persisted.captions) !== fingerprintValue(output.captions)
+    || persisted.srt !== formatSrt(persisted.captions)
+  ) return false;
+  const expected = narrationOwnedArtifacts(output);
+  return expected !== null
+    && await verifyReportedArtifacts({context, report, expected});
+};
+
 const narrationMatchesCurrentInputs = ({
   output,
   context,
@@ -415,6 +472,7 @@ export interface NarrationStageAdapterDependencies {
   runNarration?: (input: NarrationStageInput) => Promise<NarrationConcreteOutput>;
   hashRunArtifact?: typeof hashRunArtifact;
   hashProjectAudioFile?: typeof systemHashProjectAudioFile;
+  readPersistedNarrationFiles?: PersistedNarrationFilesReader;
 }
 
 export const createNarrationStage = (
@@ -430,6 +488,8 @@ export const createNarrationStage = (
   const hashArtifact = dependencies.hashRunArtifact ?? hashRunArtifact;
   const hashProjectAudioFile = dependencies.hashProjectAudioFile
     ?? systemHashProjectAudioFile;
+  const readPersistedNarrationFiles = dependencies.readPersistedNarrationFiles
+    ?? systemReadPersistedNarrationFiles;
   const partialArtifactsByRun = new WeakMap<
     RunDirectoryScope,
     readonly PipelinePartialArtifact[]
@@ -479,30 +539,15 @@ export const createNarrationStage = (
     verify: async (context, report) => {
       const parsed = NarrationAdapterOutputSchema.safeParse(report.outputs);
       if (!parsed.success || context.sourceRun === undefined) return false;
-      const persisted = await readPlanningInput(async () => {
-        const [narration, captions, srt] = await Promise.all([
-          readRunJson(
-            context.sourceRun!.runDirectory,
-            parsed.data.narrationPath,
-            (value) => NarrationManifestSchema.parse(value),
-          ),
-          readRunJson(
-            context.sourceRun!.runDirectory,
-            parsed.data.captionsPath,
-            (value) => CaptionsManifestSchema.parse(value),
-          ),
-          readRunText(context.sourceRun!.runDirectory, parsed.data.srtPath),
-        ]);
-        return {narration, captions, srt};
-      });
-      if (
-        persisted === null
-        || fingerprintValue(persisted.narration)
-          !== fingerprintValue(parsed.data.narration)
-        || fingerprintValue(persisted.captions)
-          !== fingerprintValue(parsed.data.captions)
-        || persisted.srt !== formatSrt(persisted.captions)
-      ) return false;
+      const persistedIsValid = await readPlanningInput(async () => (
+        await verifyPersistedNarrationOutput({
+          context,
+          report,
+          output: parsed.data,
+          readPersistedNarrationFiles,
+        })
+      ));
+      if (persistedIsValid !== true) return false;
       const providerFingerprint = await providerIdentity(
         context.project.project.tts.provider,
       );
@@ -516,9 +561,7 @@ export const createNarrationStage = (
       if (currentFingerprint === null || report.fingerprint !== currentFingerprint) {
         return false;
       }
-      const expected = narrationOwnedArtifacts(parsed.data);
-      if (expected === null) return false;
-      return await verifyReportedArtifacts({context, report, expected});
+      return true;
     },
     partialArtifacts: (context) => {
       if (context.runDirectory === undefined) {
@@ -582,6 +625,7 @@ export const createNarrationStage = (
         && sourceReport?.projectId === context.project.project.id
         && sourceReport.runId === context.sourceRun.runId
         && sourceReport.stageId === 'narration'
+        && (sourceReport.state === 'passed' || sourceReport.state === 'cached')
         && sourceReport?.fingerprint !== null
         && sourceReport?.fingerprint !== undefined
         && sourceReport.fingerprint !== stageFingerprint
@@ -589,15 +633,15 @@ export const createNarrationStage = (
         && sourceOutput.data.reuseCompatibilityFingerprint
           === compatibilityFingerprint
       ) {
-        const sourceExpected = narrationOwnedArtifacts(sourceOutput.data);
-        if (
-          sourceExpected !== null
-          && await verifyReportedArtifacts({
+        const sourceIsValid = await readPlanningInput(async () => (
+          await verifyPersistedNarrationOutput({
             context,
             report: sourceReport,
-            expected: sourceExpected,
+            output: sourceOutput.data,
+            readPersistedNarrationFiles,
           })
-        ) {
+        ));
+        if (sourceIsValid === true) {
           try {
             await seedCache({
               sourceRun: context.sourceRun.runDirectory,
