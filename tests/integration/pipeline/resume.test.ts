@@ -301,6 +301,49 @@ describe('Pipeline resume', () => {
         path.join(attemptDirectory, attemptNamesBefore[0]!),
       );
 
+      executionCalls.length = 0;
+      reviewEvaluations.mockClear();
+      const preApprovalPlan = await buildExecutionPlan(
+        planningContext(() => 'run-replacement'),
+        {preset: 'release', resume: true},
+      );
+      expect(preApprovalPlan).toMatchObject({
+        runMode: 'resume',
+        sourceRunId: 'run-review',
+        targetRunId: 'run-review',
+      });
+      expect(preApprovalPlan.items.find((item) => item.stageId === 'review'))
+        .toMatchObject({action: 'resume', materialize: false});
+      expect(preApprovalPlan.items.find((item) => item.stageId === 'release'))
+        .toMatchObject({action: 'run', materialize: false});
+
+      const awaitingApproval = await runExecutionPlan({
+        plan: preApprovalPlan,
+        project,
+        sourceCatalog,
+        signal,
+      }, dependencies);
+
+      expect(awaitingApproval).toMatchObject({
+        state: 'needs_review',
+        runId: 'run-review',
+        completedStage: 'review',
+      });
+      await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
+        runId: 'run-review',
+        completedStage: 'review',
+        state: 'needs_review',
+      });
+      expect(executionCalls).toEqual(['preflight', 'review']);
+      expect(executionCalls).not.toContain('release');
+      expect(reviewEvaluations).toHaveBeenCalled();
+      const attemptNamesAwaitingApproval = await readdir(attemptDirectory);
+      expect(attemptNamesAwaitingApproval).toHaveLength(2);
+      expect(attemptNamesAwaitingApproval).toContain(attemptNamesBefore[0]);
+      await expect(readFile(
+        path.join(attemptDirectory, attemptNamesBefore[0]!),
+      )).resolves.toEqual(attemptBytesBefore);
+
       let reviewStdout = '';
       let reviewStderr = '';
       const approval = await runReviewCommand(
@@ -338,14 +381,10 @@ describe('Pipeline resume', () => {
         completedStage: 'review',
         state: 'passed',
       });
-      await runStore.publishCurrent('demo', {
-        ...pointerAfterApproval!,
-        state: 'needs_review',
-      });
       const attemptNamesAfter = await readdir(attemptDirectory);
-      expect(attemptNamesAfter).toEqual(attemptNamesBefore);
+      expect(attemptNamesAfter.sort()).toEqual(attemptNamesAwaitingApproval.sort());
       await expect(readFile(
-        path.join(attemptDirectory, attemptNamesAfter[0]!),
+        path.join(attemptDirectory, attemptNamesBefore[0]!),
       )).resolves.toEqual(attemptBytesBefore);
 
       executionCalls.length = 0;
@@ -383,7 +422,7 @@ describe('Pipeline resume', () => {
         runId: 'run-review',
         completedStage: 'release',
       });
-      expect(releaseLock).toHaveBeenCalledTimes(2);
+      expect(releaseLock).toHaveBeenCalledTimes(3);
     } finally {
       await tempProject.cleanup();
     }

@@ -180,8 +180,12 @@ const pointerSnapshotCompatible = (
     );
 };
 
-const pointerProgress = (pointer: CurrentPointer): number =>
-  STAGE_POSITIONS.get(pointer.completedStage) ?? -1;
+const pointerProgress = (pointer: CurrentPointer): number => {
+  const completedPosition = STAGE_POSITIONS.get(pointer.completedStage) ?? -1;
+  return pointer.state === 'needs_review'
+    ? Math.max(-1, completedPosition - 1)
+    : completedPosition;
+};
 
 const reconcileCurrentPointer = (
   work: CurrentPointer | null,

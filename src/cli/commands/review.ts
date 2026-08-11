@@ -24,6 +24,10 @@ import {
   draftReviewEvidenceArtifacts,
 } from '../../pipeline/stages/draft';
 import {recordReviewApproval} from '../../pipeline/stages/review';
+import {
+  acquireProjectLock,
+  type ProjectLockLease,
+} from '../../pipeline/project-lock';
 import {EXIT_CODES} from '../exit-codes';
 import type {OutputWriter} from '../videoctl';
 
@@ -40,6 +44,7 @@ export interface ReviewCommandDependencies {
   stderr: OutputWriter;
   now?: () => string;
   verifyRunArtifact?: typeof verifyRunArtifact;
+  acquireProjectLock?: typeof acquireProjectLock;
 }
 
 const readRunJson = async (
@@ -214,9 +219,10 @@ export const runReviewCommand = async (
     dependencies.stderr.write('--reason is required.\n');
     return EXIT_CODES.validationFailed;
   }
+  const reason = options.reason;
 
   const store = createRunStore(dependencies.workspaceRoot);
-  const current = await store.readCurrent(projectId);
+  const current = await store.readCurrentReadonly(projectId);
   if (current === null) {
     dependencies.stderr.write(`No current run for project ${projectId}.\n`);
     return EXIT_CODES.validationFailed;
@@ -229,83 +235,133 @@ export const runReviewCommand = async (
     dependencies.stderr.write('Current run is not awaiting review.\n');
     return EXIT_CODES.validationFailed;
   }
-  const runDirectory = await store.openExistingRun(projectId, current.runId);
-  const verifyArtifact = dependencies.verifyRunArtifact ?? verifyRunArtifact;
-  let evidence: ReturnType<typeof draftReviewEvidenceArtifacts>;
-  try {
-    const draftReport = DraftReportSchema.parse(
-      await readRunJson(runDirectory, 'draft/draft-report.json'),
-    );
-    if (draftReport.projectId !== projectId) {
-      dependencies.stderr.write('Draft report belongs to another project.\n');
+  const work = await store.openExistingWork(projectId);
+  if (work === null) {
+    dependencies.stderr.write('Current run changed before review approval.\n');
+    return EXIT_CODES.validationFailed;
+  }
+
+  const approveLocked = async (): Promise<number> => {
+    const lockedCurrent = await store.readCurrentReadonly(projectId);
+    if (!pointersEqual(lockedCurrent, current)) {
+      dependencies.stderr.write('Current run changed before review approval.\n');
       return EXIT_CODES.validationFailed;
     }
-    evidence = draftReviewEvidenceArtifacts(draftReport);
-    for (const artifact of evidence) {
-      if (!await verifyArtifact(runDirectory, {scope: 'run', ...artifact})) {
-        dependencies.stderr.write('Draft review evidence is missing or changed.\n');
+    const runDirectory = await store.openExistingRun(projectId, current.runId);
+    const verifyArtifact = dependencies.verifyRunArtifact ?? verifyRunArtifact;
+    let evidence: ReturnType<typeof draftReviewEvidenceArtifacts>;
+    try {
+      const draftReport = DraftReportSchema.parse(
+        await readRunJson(runDirectory, 'draft/draft-report.json'),
+      );
+      if (draftReport.projectId !== projectId) {
+        dependencies.stderr.write('Draft report belongs to another project.\n');
         return EXIT_CODES.validationFailed;
       }
+      evidence = draftReviewEvidenceArtifacts(draftReport);
+      for (const artifact of evidence) {
+        if (!await verifyArtifact(runDirectory, {scope: 'run', ...artifact})) {
+          dependencies.stderr.write('Draft review evidence is missing or changed.\n');
+          return EXIT_CODES.validationFailed;
+        }
+      }
+    } catch (error) {
+      if (isReviewValidationMiss(error)) {
+        dependencies.stderr.write('Draft review evidence is invalid.\n');
+        return EXIT_CODES.validationFailed;
+      }
+      throw error;
     }
-  } catch (error) {
-    if (isReviewValidationMiss(error)) {
-      dependencies.stderr.write('Draft review evidence is invalid.\n');
+    const currentAfterEvidence = await store.readCurrentReadonly(projectId);
+    if (!pointersEqual(currentAfterEvidence, current)) {
+      dependencies.stderr.write('Current run changed while review evidence was verified.\n');
       return EXIT_CODES.validationFailed;
     }
-    throw error;
-  }
-  const currentAfterEvidence = await store.readCurrentReadonly(projectId);
-  if (!pointersEqual(currentAfterEvidence, current)) {
-    dependencies.stderr.write('Current run changed while review evidence was verified.\n');
-    return EXIT_CODES.validationFailed;
-  }
-  const evidencePaths = evidence.map((artifact) => artifact.path);
-  let review: Review;
-  try {
-    const existingReview = await readOptionalReview(runDirectory);
-    if (existingReview === undefined) {
-      review = recordReviewApproval({
+    const evidencePaths = evidence.map((artifact) => artifact.path);
+    let review: Review;
+    try {
+      const existingReview = await readOptionalReview(runDirectory);
+      if (existingReview === undefined) {
+        review = recordReviewApproval({
+          projectId,
+          runId: current.runId,
+          reviewer: reviewerName(options),
+          reason,
+          evidencePaths,
+          reviewedAt: dependencies.now?.() ?? new Date().toISOString(),
+        });
+        await writeRunJson(runDirectory, 'review.json', review);
+      } else if (reviewsMatchEvidence(
+        existingReview,
         projectId,
-        runId: current.runId,
-        reviewer: reviewerName(options),
-        reason: options.reason,
+        current.runId,
         evidencePaths,
-        reviewedAt: dependencies.now?.() ?? new Date().toISOString(),
-      });
-      await writeRunJson(runDirectory, 'review.json', review);
-    } else if (reviewsMatchEvidence(
-      existingReview,
+      )) {
+        review = existingReview;
+      } else {
+        dependencies.stderr.write('Existing review approval does not match current evidence.\n');
+        return EXIT_CODES.validationFailed;
+      }
+    } catch (error) {
+      if (isReviewValidationMiss(error)) {
+        dependencies.stderr.write('Existing review approval is invalid.\n');
+        return EXIT_CODES.validationFailed;
+      }
+      throw error;
+    }
+    const reviewReport = canonicalReviewReport({
+      current,
       projectId,
-      current.runId,
-      evidencePaths,
-    )) {
-      review = existingReview;
-    } else {
-      dependencies.stderr.write('Existing review approval does not match current evidence.\n');
+      review,
+      evidence,
+    });
+    const reportStore = createStageReportStore();
+    const existingReport = await reportStore.readStage(runDirectory, 'review');
+    if (existingReport === null) {
+      await reportStore.writeStage(runDirectory, reviewReport);
+    } else if (!canonicalReportsEquivalent(existingReport, reviewReport)) {
+      dependencies.stderr.write('Canonical Review report already exists with different evidence.\n');
       return EXIT_CODES.validationFailed;
     }
+    await store.publishCurrent(projectId, passedPointer(current, review.reviewedAt));
+    return EXIT_CODES.success;
+  };
+
+  const acquireLock = dependencies.acquireProjectLock ?? acquireProjectLock;
+  let lease: ProjectLockLease | undefined;
+  let outcome:
+    | {ok: true; value: number}
+    | {ok: false; error: unknown}
+    | undefined;
+  try {
+    lease = await acquireLock(work, current.runId);
+    outcome = {ok: true, value: await approveLocked()};
   } catch (error) {
-    if (isReviewValidationMiss(error)) {
-      dependencies.stderr.write('Existing review approval is invalid.\n');
-      return EXIT_CODES.validationFailed;
+    outcome = {ok: false, error};
+  }
+
+  let releaseError: unknown;
+  try {
+    await lease?.release();
+  } catch (error) {
+    releaseError = error;
+  }
+  if (outcome === undefined) {
+    throw new TypeError('Review approval completed without an outcome');
+  }
+  if (!outcome.ok) {
+    if (releaseError !== undefined) {
+      throw new AggregateError(
+        [outcome.error, releaseError],
+        'Review approval and project lock release both failed',
+        {cause: outcome.error},
+      );
     }
-    throw error;
+    throw outcome.error;
   }
-  const reviewReport = canonicalReviewReport({
-    current,
-    projectId,
-    review,
-    evidence,
-  });
-  const reportStore = createStageReportStore();
-  const existingReport = await reportStore.readStage(runDirectory, 'review');
-  if (existingReport === null) {
-    await reportStore.writeStage(runDirectory, reviewReport);
-  } else if (!canonicalReportsEquivalent(existingReport, reviewReport)) {
-    dependencies.stderr.write('Canonical Review report already exists with different evidence.\n');
-    return EXIT_CODES.validationFailed;
+  if (releaseError !== undefined) throw releaseError;
+  if (outcome.value === EXIT_CODES.success) {
+    dependencies.stdout.write(`Review approved: ${current.runId}\n`);
   }
-  await store.publishCurrent(projectId, passedPointer(current, review.reviewedAt));
-  dependencies.stdout.write(`Review approved: ${current.runId}\n`);
-  return EXIT_CODES.success;
+  return outcome.value;
 };

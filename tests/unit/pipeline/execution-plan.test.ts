@@ -410,6 +410,34 @@ describe('buildExecutionPlan', () => {
     ]);
   });
 
+  it('treats needs_review Review as the first incomplete Stage', async () => {
+    const {context, createRunId} = createContext({
+      current: pointer('review', {state: 'needs_review'}),
+      reports: reportsThrough('draft'),
+    });
+
+    const plan = await buildExecutionPlan(context, {
+      preset: 'release',
+      resume: true,
+    });
+
+    expect(plan).toMatchObject({
+      runMode: 'resume',
+      sourceRunId: 'run-one',
+      targetRunId: 'run-one',
+    });
+    expect(createRunId).not.toHaveBeenCalled();
+    expect(plan.items.map((item) => [item.stageId, item.action])).toEqual([
+      ['preflight', 'run'],
+      ['ingest', 'cached'],
+      ['narration', 'cached'],
+      ['compile', 'cached'],
+      ['draft', 'cached'],
+      ['review', 'resume'],
+      ['release', 'run'],
+    ]);
+  });
+
   it('reconciles contiguous verified reports beyond Work pointer progress', async () => {
     const plan = await build({
       current: pointer('ingest'),

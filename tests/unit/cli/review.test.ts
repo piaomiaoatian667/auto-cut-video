@@ -1,6 +1,6 @@
 import {createHash} from 'node:crypto';
 import {afterEach, describe, expect, it, vi} from 'vitest';
-import {rm, symlink, writeFile} from 'node:fs/promises';
+import {readFile, rm, symlink, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {mkdtemp} from 'node:fs/promises';
@@ -9,6 +9,7 @@ import {
   ensureRunDirectory,
   openExistingRunFile,
   openNewRunFile,
+  type WorkDirectoryScope,
 } from '../../../src/fs/app-directory-scopes';
 import {runReviewCommand} from '../../../src/cli/commands/review';
 import {runVideoctl, type VideoctlDependencies} from '../../../src/cli/videoctl';
@@ -21,6 +22,7 @@ import {
   StageReportSchema,
 } from '../../../src/pipeline/stage-report';
 import {STAGE_ALGORITHM_VERSIONS} from '../../../src/pipeline/stage-adapters/shared';
+import type {ProjectLockLease} from '../../../src/pipeline/project-lock';
 import {
   DraftReportSchema,
   draftReviewEvidenceArtifacts,
@@ -190,6 +192,17 @@ const makeFixture = async () => {
   };
 };
 
+const expectNoCanonicalApproval = async (
+  fixture: Awaited<ReturnType<typeof makeFixture>>,
+): Promise<void> => {
+  await expect(readFile(path.join(fixture.runRoot, 'review.json'), 'utf8'))
+    .rejects.toMatchObject({code: 'ENOENT'});
+  const runDirectory = await createRunStore(fixture.workspaceRoot)
+    .openExistingRun('demo', fixture.runId);
+  await expect(createStageReportStore().readStage(runDirectory, 'review'))
+    .resolves.toBeNull();
+};
+
 describe('videoctl review', () => {
   it('approves the current run, writes a canonical Review report, and preserves the attempt', async () => {
     const fixture = await makeFixture();
@@ -253,6 +266,155 @@ describe('videoctl review', () => {
       completedStage: beforePointer!.completedStage,
       state: 'passed',
     });
+    await expect(readFile(
+      path.join(fixture.workspaceRoot, '.work', 'demo', 'pipeline.lock'),
+      'utf8',
+    )).rejects.toMatchObject({code: 'ENOENT'});
+  });
+
+  it('does not approve a stale snapshot after the same Run advances before lock acquisition', async () => {
+    const fixture = await makeFixture();
+    const store = createRunStore(fixture.workspaceRoot);
+    const current = await store.readCurrentReadonly('demo');
+    const advanced = {
+      ...current!,
+      completedStage: 'release' as const,
+      state: 'passed' as const,
+      publishedAt: '2026-08-11T00:10:00.000Z',
+    };
+    const release = vi.fn(async () => undefined);
+    const verifyArtifact = vi.fn(async () => true);
+    const acquireProjectLock = vi.fn(async (
+      _work: WorkDirectoryScope,
+      runId: string,
+    ): Promise<ProjectLockLease> => {
+      await store.publishCurrent('demo', advanced);
+      return {
+        record: {
+          pid: 1,
+          hostname: 'test',
+          processStart: 'test',
+          createdAt: '2026-08-11T00:09:00.000Z',
+          runId,
+        },
+        release,
+      };
+    });
+    const dependencies = {
+      ...fixture.dependencies,
+      acquireProjectLock,
+      verifyRunArtifact: verifyArtifact,
+    };
+
+    const exitCode = await runReviewCommand(
+      'demo',
+      {approve: true, reason: 'looks good', reviewer: 'tester'},
+      dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(fixture.stdout()).toBe('');
+    expect(fixture.stderr()).toBe('Current run changed before review approval.\n');
+    expect(acquireProjectLock).toHaveBeenCalledWith(expect.anything(), fixture.runId);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(verifyArtifact).not.toHaveBeenCalled();
+    await expect(store.readCurrentReadonly('demo')).resolves.toEqual(advanced);
+    await expectNoCanonicalApproval(fixture);
+  });
+
+  it('does not approve a stale snapshot after current switches Runs before lock acquisition', async () => {
+    const fixture = await makeFixture();
+    const store = createRunStore(fixture.workspaceRoot);
+    await store.createRun('demo', 'run-next');
+    const current = await store.readCurrentReadonly('demo');
+    const switched = {
+      ...current!,
+      runId: 'run-next',
+      relativePath: 'runs/run-next',
+      completedStage: 'compile' as const,
+      state: 'passed' as const,
+      publishedAt: '2026-08-11T00:10:00.000Z',
+    };
+    const release = vi.fn(async () => undefined);
+    const verifyArtifact = vi.fn(async () => true);
+    const acquireProjectLock = vi.fn(async (
+      _work: WorkDirectoryScope,
+      runId: string,
+    ): Promise<ProjectLockLease> => {
+      await store.publishCurrent('demo', switched);
+      return {
+        record: {
+          pid: 1,
+          hostname: 'test',
+          processStart: 'test',
+          createdAt: '2026-08-11T00:09:00.000Z',
+          runId,
+        },
+        release,
+      };
+    });
+    const dependencies = {
+      ...fixture.dependencies,
+      acquireProjectLock,
+      verifyRunArtifact: verifyArtifact,
+    };
+
+    const exitCode = await runReviewCommand(
+      'demo',
+      {approve: true, reason: 'looks good', reviewer: 'tester'},
+      dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(fixture.stdout()).toBe('');
+    expect(fixture.stderr()).toBe('Current run changed before review approval.\n');
+    expect(acquireProjectLock).toHaveBeenCalledWith(expect.anything(), fixture.runId);
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(verifyArtifact).not.toHaveBeenCalled();
+    await expect(store.readCurrentReadonly('demo')).resolves.toEqual(switched);
+    await expectNoCanonicalApproval(fixture);
+  });
+
+  it('preserves approval and lock-release failures together', async () => {
+    const fixture = await makeFixture();
+    const primaryFailure = Object.assign(new Error('artifact read failed'), {code: 'EIO'});
+    const releaseFailure = new Error('lock release failed');
+    const release = vi.fn(async () => { throw releaseFailure; });
+    const acquireProjectLock = vi.fn(async (
+      _work: WorkDirectoryScope,
+      runId: string,
+    ): Promise<ProjectLockLease> => ({
+      record: {
+        pid: 1,
+        hostname: 'test',
+        processStart: 'test',
+        createdAt: '2026-08-11T00:09:00.000Z',
+        runId,
+      },
+      release,
+    }));
+    const dependencies = {
+      ...fixture.dependencies,
+      acquireProjectLock,
+      verifyRunArtifact: async () => { throw primaryFailure; },
+    };
+
+    let caught: unknown;
+    try {
+      await runReviewCommand(
+        'demo',
+        {approve: true, reason: 'looks good', reviewer: 'tester'},
+        dependencies,
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(AggregateError);
+    expect((caught as AggregateError).errors).toEqual([primaryFailure, releaseFailure]);
+    expect((caught as Error).cause).toBe(primaryFailure);
+    expect(release).toHaveBeenCalledTimes(1);
+    await expectNoCanonicalApproval(fixture);
   });
 
   it('rejects simultaneous approval and rejection', async () => {
