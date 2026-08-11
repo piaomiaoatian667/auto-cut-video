@@ -333,12 +333,24 @@ const rollbackReportWrite = async (
   throw primaryError;
 };
 
+const closeCommittedReportBestEffort = async (
+  target: AppDirectoryWriteFileAuthority,
+): Promise<void> => {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      await target.close();
+      return;
+    } catch {}
+  }
+};
+
 const writeImmutableReport = async (
   run: RunDirectoryScope,
   relativePath: string,
   report: StageReport,
 ): Promise<void> => {
   let target: AppDirectoryWriteFileAuthority | undefined;
+  let committed = false;
   try {
     target = await openNewRunFileForWrite(run, relativePath);
     await target.handle.writeFile(serializeReport(report));
@@ -346,13 +358,15 @@ const writeImmutableReport = async (
     await target.revalidate();
     await target.syncParent();
     await target.revalidate();
-    await target.close();
-    target = undefined;
+    committed = true;
   } catch (error) {
-    if (target !== undefined) {
+    if (target !== undefined && !committed) {
       return await rollbackReportWrite(target, relativePath, error);
     }
     throw error;
+  }
+  if (target !== undefined && committed) {
+    await closeCommittedReportBestEffort(target);
   }
 };
 

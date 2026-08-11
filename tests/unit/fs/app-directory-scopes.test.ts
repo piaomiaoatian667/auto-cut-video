@@ -281,6 +281,57 @@ const importScopesWithDirectoryCreationSwap = async (
   return await import('../../../src/fs/app-directory-scopes');
 };
 
+interface FailOnceDirectorySyncProbe {
+  armed: boolean;
+  error: Error;
+  failed: boolean;
+  syncAttempts: number;
+  target?: {dev: bigint; ino: bigint};
+}
+
+const importScopesWithFailOnceDirectorySync = async (
+  probe: FailOnceDirectorySyncProbe,
+): Promise<typeof import('../../../src/fs/app-directory-scopes')> => {
+  vi.resetModules();
+  vi.doMock('node:fs/promises', async () => {
+    const actual = await vi.importActual<typeof import('node:fs/promises')>(
+      'node:fs/promises',
+    );
+    return {
+      ...actual,
+      open: async (...args: Parameters<typeof actual.open>) => {
+        const handle = await Reflect.apply(actual.open, undefined, args);
+        if (!probe.armed) return handle;
+        const opened = await handle.stat({bigint: true});
+        if (!opened.isDirectory()) return handle;
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === 'sync') {
+              return async () => {
+                const stats = await target.stat({bigint: true});
+                const isTarget = probe.target !== undefined
+                  && stats.dev === probe.target.dev
+                  && stats.ino === probe.target.ino;
+                if (isTarget) {
+                  probe.syncAttempts += 1;
+                  if (!probe.failed) {
+                    probe.failed = true;
+                    throw probe.error;
+                  }
+                }
+                await target.sync();
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
+    };
+  });
+  return await import('../../../src/fs/app-directory-scopes');
+};
+
 const withInode = (stats: BigIntStats, ino: bigint): BigIntStats => {
   Object.defineProperty(stats, 'ino', {
     configurable: true,
@@ -831,8 +882,52 @@ describe('app-owned directory scopes', () => {
         run,
         createReportsFirst ? 'reports/attempts' : 'reports',
       )).resolves.toBeUndefined();
-      expect(probe.originalSyncs).toBe(syncCount);
+      expect(probe.originalSyncs).toBe(syncCount + 1);
       expect(probe.replacementSyncs).toBe(0);
+    },
+  );
+
+  it.each([
+    ['reports', 'reports', false],
+    ['attempts', 'reports/attempts', true],
+  ] as const)(
+    'retries held-parent fsync when ensuring existing %s directory',
+    async (_label, relativePath, createReportsFirst) => {
+      const workspaceRoot = await makeTempDirectory('app-scopes-sync-retry-');
+      const syncError = Object.assign(new Error('parent sync failed once'), {
+        code: 'EIO',
+      });
+      const probe: FailOnceDirectorySyncProbe = {
+        armed: false,
+        error: syncError,
+        failed: false,
+        syncAttempts: 0,
+      };
+      const scopes = await importScopesWithFailOnceDirectorySync(probe);
+      const run = await scopes.createRunStore(workspaceRoot)
+        .createRun('demo', 'run-one');
+      const runRoot = path.join(
+        workspaceRoot,
+        '.work',
+        'demo',
+        'runs',
+        'run-one',
+      );
+      if (createReportsFirst) await scopes.ensureRunDirectory(run, 'reports');
+      const parentPath = createReportsFirst
+        ? path.join(runRoot, 'reports')
+        : runRoot;
+      const parent = await lstat(parentPath, {bigint: true});
+      probe.target = {dev: parent.dev, ino: parent.ino};
+      probe.armed = true;
+
+      await expect(scopes.ensureRunDirectory(run, relativePath))
+        .rejects.toBe(syncError);
+      expect(probe.syncAttempts).toBe(1);
+
+      await expect(scopes.ensureRunDirectory(run, relativePath))
+        .resolves.toBeUndefined();
+      expect(probe.syncAttempts).toBe(2);
     },
   );
 
@@ -891,60 +986,6 @@ describe('app-owned directory scopes', () => {
     const retry = await scopes.openNewRunFileForWrite(run, relativePath);
     await retry.unlink();
     await retry.close();
-  });
-
-  it('preserves Run directory sync and authority-close failures', async () => {
-    const workspaceRoot = await makeTempDirectory('app-scopes-directory-sync-');
-    const syncError = Object.assign(new Error('directory sync failed'), {code: 'EIO'});
-    const closeError = Object.assign(new Error('directory close failed'), {code: 'EIO'});
-    let armed = false;
-    let proxied = false;
-    vi.resetModules();
-    vi.doMock('node:fs/promises', async () => {
-      const actual = await vi.importActual<typeof import('node:fs/promises')>(
-        'node:fs/promises',
-      );
-      return {
-        ...actual,
-        open: async (...args: Parameters<typeof actual.open>) => {
-          const handle = await Reflect.apply(actual.open, undefined, args);
-          if (!armed || proxied) return handle;
-          const status = await handle.stat({bigint: true});
-          if (!status.isDirectory()) return handle;
-          proxied = true;
-          return new Proxy(handle, {
-            get(target, property) {
-              if (property === 'sync') return async () => { throw syncError; };
-              if (property === 'close') {
-                return async () => {
-                  await target.close();
-                  throw closeError;
-                };
-              }
-              const value = Reflect.get(target, property, target);
-              return typeof value === 'function' ? value.bind(target) : value;
-            },
-          });
-        },
-      };
-    });
-    const scopes = await import('../../../src/fs/app-directory-scopes');
-    const run = await scopes.createRunStore(workspaceRoot)
-      .createRun('demo', 'run-one');
-    armed = true;
-
-    let caughtError: unknown;
-    try {
-      await scopes.syncRunDirectory(run);
-    } catch (error) {
-      caughtError = error;
-    }
-
-    expect(caughtError).toBeInstanceOf(AggregateError);
-    expect((caughtError as AggregateError).errors).toEqual([
-      syncError,
-      closeError,
-    ]);
   });
 
   it.each(['work', 'run', 'output'] as const)(

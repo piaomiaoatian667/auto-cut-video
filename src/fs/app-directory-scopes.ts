@@ -433,12 +433,8 @@ const ensurePlainDirectory = async (
       throw securityError(`app-owned directory is not a plain directory: ${name}`);
     }
     identity = identityFromStats(path.join(parent.path, name), stats);
-    if (created) {
-      syncAttempted = true;
-      await syncHeldDirectoryAnchor(anchor, name);
-    } else {
-      await assertDirectoryAnchorStable(anchor, name);
-    }
+    syncAttempted = true;
+    await syncHeldDirectoryAnchor(anchor, name);
     await assertDirectoryIdentityStable(identity, name);
   } catch (error) {
     if (error instanceof AppDirectoryScopeError) {
@@ -1646,14 +1642,6 @@ const syncWorkDirectory = async (
   relativePath = '.',
 ): Promise<void> => await syncScopedDirectory(
   stateFor(workStates, scope, 'WorkDirectoryScope'),
-  relativePath,
-);
-
-export const syncRunDirectory = async (
-  scope: RunDirectoryScope,
-  relativePath = '.',
-): Promise<void> => await syncScopedDirectory(
-  stateFor(runStates, scope, 'RunDirectoryScope'),
   relativePath,
 );
 

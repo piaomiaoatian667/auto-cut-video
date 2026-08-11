@@ -625,123 +625,127 @@ describe('StageReportStore', () => {
     }
   });
 
-  it('removes a canonical report when directory-authority close fails', async () => {
-    const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'stage-report-close-'));
-    const closeError = Object.assign(new Error('directory authority close failed'), {
-      code: 'EIO',
-    });
-    let armed = false;
-    let directoryProxied = false;
-    let directoryCloseFailed = false;
-    let reportFileOpened = false;
-    let reportFileClosed = false;
-    let reportParentSyncs = 0;
-    let reportsIdentity: {dev: bigint; ino: bigint} | undefined;
-    vi.resetModules();
-    vi.doMock('node:fs/promises', async () => {
-      const actual = await vi.importActual<typeof import('node:fs/promises')>(
-        'node:fs/promises',
-      );
-      return {
-        ...actual,
-        open: async (...args: Parameters<typeof actual.open>) => {
-          const handle = await Reflect.apply(actual.open, undefined, args);
-          if (!armed) return handle;
-          const flags = Number(args[1]);
-          if ((flags & constants.O_CREAT) !== 0) {
-            reportFileOpened = true;
+  it.each([
+    ['path authority', 'path', 1],
+    ['retained parent', 'parent', 1],
+    ['report file', 'file', 2],
+  ] as const)(
+    'treats post-commit %s close failures as cleanup-only',
+    async (_label, failureTarget, expectedFileCloseAttempts) => {
+      const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'stage-report-close-'));
+      const closeError = Object.assign(new Error(`${failureTarget} close failed`), {
+        code: 'EIO',
+      });
+      let armed = false;
+      let closeFailureInjected = false;
+      let reportFileOpened = false;
+      let reportFileCloseAttempts = 0;
+      let reportParentSyncs = 0;
+      let reportsDirectoryOpens = 0;
+      let reportsIdentity: {dev: bigint; ino: bigint} | undefined;
+      vi.resetModules();
+      vi.doMock('node:fs/promises', async () => {
+        const actual = await vi.importActual<typeof import('node:fs/promises')>(
+          'node:fs/promises',
+        );
+        return {
+          ...actual,
+          open: async (...args: Parameters<typeof actual.open>) => {
+            const handle = await Reflect.apply(actual.open, undefined, args);
+            if (!armed) return handle;
+            const flags = Number(args[1]);
+            if ((flags & constants.O_CREAT) !== 0) {
+              reportFileOpened = true;
+              return new Proxy(handle, {
+                get(target, property) {
+                  if (property === 'close') {
+                    return async () => {
+                      reportFileCloseAttempts += 1;
+                      await target.close();
+                      if (failureTarget === 'file' && !closeFailureInjected) {
+                        closeFailureInjected = true;
+                        throw closeError;
+                      }
+                    };
+                  }
+                  const value = Reflect.get(target, property, target);
+                  return typeof value === 'function' ? value.bind(target) : value;
+                },
+              });
+            }
+            const status = await handle.stat({bigint: true});
+            if (!status.isDirectory()) return handle;
+            const isReports = reportsIdentity !== undefined
+              && status.dev === reportsIdentity.dev
+              && status.ino === reportsIdentity.ino;
+            const reportsRole = isReports ? ++reportsDirectoryOpens : 0;
             return new Proxy(handle, {
               get(target, property) {
+                if (property === 'sync') {
+                  return async () => {
+                    if (isReports) reportParentSyncs += 1;
+                    await target.sync();
+                  };
+                }
                 if (property === 'close') {
                   return async () => {
                     await target.close();
-                    reportFileClosed = true;
+                    const targetMatches = failureTarget === 'path'
+                      ? reportsRole === 1
+                      : failureTarget === 'parent' && reportsRole === 2;
+                    if (
+                      reportFileOpened
+                      && targetMatches
+                      && !closeFailureInjected
+                    ) {
+                      closeFailureInjected = true;
+                      throw closeError;
+                    }
                   };
                 }
                 const value = Reflect.get(target, property, target);
                 return typeof value === 'function' ? value.bind(target) : value;
               },
             });
-          }
-          const status = await handle.stat({bigint: true});
-          if (!status.isDirectory()) return handle;
-          directoryProxied = true;
-          return new Proxy(handle, {
-            get(target, property) {
-              if (property === 'sync') {
-                return async () => {
-                  const current = await target.stat({bigint: true});
-                  if (
-                    reportsIdentity !== undefined
-                    && current.dev === reportsIdentity.dev
-                    && current.ino === reportsIdentity.ino
-                  ) {
-                    reportParentSyncs += 1;
-                  }
-                  await target.sync();
-                };
-              }
-              if (property === 'close') {
-                return async () => {
-                  await target.close();
-                  if (reportFileOpened && !directoryCloseFailed) {
-                    directoryCloseFailed = true;
-                    throw closeError;
-                  }
-                };
-              }
-              const value = Reflect.get(target, property, target);
-              return typeof value === 'function' ? value.bind(target) : value;
-            },
-          });
-        },
-      };
-    });
+          },
+        };
+      });
 
-    try {
-      const scopes = await import('../../../src/fs/app-directory-scopes');
-      const reports = await import('../../../src/pipeline/stage-report');
-      const runDirectory = await scopes.createRunStore(workspaceRoot)
-        .createRun('demo', 'run-one');
-      await scopes.ensureRunDirectory(runDirectory, 'reports');
-      const reportsStats = await lstat(path.join(
-        workspaceRoot,
-        '.work',
-        'demo',
-        'runs',
-        'run-one',
-        'reports',
-      ), {bigint: true});
-      reportsIdentity = {dev: reportsStats.dev, ino: reportsStats.ino};
-      const store = reports.createStageReportStore();
-      const report = passedStageReport({stageId: 'ingest'});
-      armed = true;
-
-      let writeError: unknown;
       try {
-        await store.writeStage(runDirectory, report);
-      } catch (error) {
-        writeError = error;
+        const scopes = await import('../../../src/fs/app-directory-scopes');
+        const reports = await import('../../../src/pipeline/stage-report');
+        const runDirectory = await scopes.createRunStore(workspaceRoot)
+          .createRun('demo', 'run-one');
+        await scopes.ensureRunDirectory(runDirectory, 'reports');
+        const reportsStats = await lstat(path.join(
+          workspaceRoot,
+          '.work',
+          'demo',
+          'runs',
+          'run-one',
+          'reports',
+        ), {bigint: true});
+        reportsIdentity = {dev: reportsStats.dev, ino: reportsStats.ino};
+        const store = reports.createStageReportStore();
+        const report = passedStageReport({stageId: 'ingest'});
+        armed = true;
+
+        await expect(store.writeStage(runDirectory, report))
+          .resolves.toBeUndefined();
+
+        expect(closeFailureInjected).toBe(true);
+        expect(reportParentSyncs).toBe(1);
+        expect(reportFileCloseAttempts).toBe(expectedFileCloseAttempts);
+        await expect(store.readStage(runDirectory, 'ingest')).resolves.toEqual(report);
+        await expect(store.writeStage(runDirectory, report))
+          .rejects.toMatchObject({code: 'EEXIST'});
+      } finally {
+        vi.doUnmock('node:fs/promises');
+        vi.resetModules();
+        await rm(workspaceRoot, {recursive: true, force: true});
       }
-
-      expect(writeError).toBe(closeError);
-      expect(directoryProxied).toBe(true);
-      expect(directoryCloseFailed).toBe(true);
-      expect(reportFileClosed).toBe(true);
-      expect(reportParentSyncs).toBe(2);
-      await expect(scopes.openExistingRunFile(
-        runDirectory,
-        'reports/ingest.json',
-      )).rejects.toMatchObject({code: 'ENOENT'});
-
-      await expect(store.writeStage(runDirectory, report)).resolves.toBeUndefined();
-      await expect(store.readStage(runDirectory, 'ingest')).resolves.toEqual(report);
-    } finally {
-      vi.doUnmock('node:fs/promises');
-      vi.resetModules();
-      await rm(workspaceRoot, {recursive: true, force: true});
-    }
-  });
+    },
+  );
 
   it('writes review attempts outside the canonical report path', async () => {
     const fixture = await createPipelineRunFixture();
