@@ -568,6 +568,107 @@ describe('app-owned directory scopes', () => {
       .rejects.toMatchObject({code: 'ENOENT'});
   });
 
+  it('unlinks the exact created inode when its basename is swapped', async () => {
+    const workspaceRoot = await makeTempDirectory('app-scopes-exact-unlink-');
+    const relativePath = 'nested/artifact.bin';
+    const targetPath = path.join(
+      workspaceRoot,
+      '.work',
+      'demo',
+      'runs',
+      'run-one',
+      relativePath,
+    );
+    const movedPath = `${targetPath}.moved`;
+    const replacement = 'replacement';
+    let armed = false;
+    let swapped = false;
+    const scopes = await importScopesWithMutationProbe('unlink', async () => {
+      if (!armed || swapped) return;
+      swapped = true;
+      await rename(targetPath, movedPath);
+      await writeFile(targetPath, replacement);
+    });
+    const run = await scopes.createRunStore(workspaceRoot)
+      .createRun('demo', 'run-one');
+    await scopes.ensureRunDirectory(run, 'nested');
+    const authority = await scopes.openNewRunFileForWrite(run, relativePath);
+    await authority.handle.writeFile('created');
+    await authority.syncAndSeal();
+    armed = true;
+
+    let unlinkError: unknown;
+    try {
+      await authority.unlink();
+    } catch (error) {
+      unlinkError = error;
+    } finally {
+      await authority.close();
+    }
+
+    expect(swapped).toBe(true);
+    await expect(readFile(targetPath, 'utf8')).resolves.toBe(replacement);
+    await expect(readFile(movedPath, 'utf8')).rejects.toMatchObject({code: 'ENOENT'});
+    expect(unlinkError).toBeUndefined();
+  });
+
+  it('retries identity acquisition to clean up after the first created-file stat fails', async () => {
+    const workspaceRoot = await makeTempDirectory('app-scopes-created-stat-');
+    const relativePath = 'nested/artifact.bin';
+    const targetPath = path.join(
+      workspaceRoot,
+      '.work',
+      'demo',
+      'runs',
+      'run-one',
+      relativePath,
+    );
+    const statError = Object.assign(new Error('created file stat failed'), {code: 'EIO'});
+    let firstCreatedHandleSeen = false;
+    let createdStatCalls = 0;
+    vi.resetModules();
+    vi.doMock('node:fs/promises', async () => {
+      const actual = await vi.importActual<typeof import('node:fs/promises')>(
+        'node:fs/promises',
+      );
+      return {
+        ...actual,
+        open: async (...args: Parameters<typeof actual.open>) => {
+          const handle = await Reflect.apply(actual.open, undefined, args);
+          const flags = Number(args[1]);
+          if (firstCreatedHandleSeen || (flags & constants.O_CREAT) === 0) return handle;
+          firstCreatedHandleSeen = true;
+          return new Proxy(handle, {
+            get(target, property) {
+              if (property === 'stat') {
+                return async (...statArgs: Parameters<FileHandle['stat']>) => {
+                  createdStatCalls += 1;
+                  if (createdStatCalls === 1) throw statError;
+                  return await Reflect.apply(target.stat, target, statArgs);
+                };
+              }
+              const value = Reflect.get(target, property, target);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+        },
+      };
+    });
+    const scopes = await import('../../../src/fs/app-directory-scopes');
+    const run = await scopes.createRunStore(workspaceRoot)
+      .createRun('demo', 'run-one');
+    await scopes.ensureRunDirectory(run, 'nested');
+
+    await expect(scopes.openNewRunFileForWrite(run, relativePath))
+      .rejects.toBe(statError);
+
+    await expect(readFile(targetPath)).rejects.toMatchObject({code: 'ENOENT'});
+    expect(createdStatCalls).toBeGreaterThanOrEqual(2);
+    const retry = await scopes.openNewRunFileForWrite(run, relativePath);
+    await retry.unlink();
+    await retry.close();
+  });
+
   it.each(['work', 'run', 'output'] as const)(
     'fails closed after lexical %s root replacement',
     async (kind) => {

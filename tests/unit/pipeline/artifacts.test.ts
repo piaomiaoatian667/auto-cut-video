@@ -3,6 +3,7 @@ import {createHash} from 'node:crypto';
 import {constants, type BigIntStats} from 'node:fs';
 import {
   chmod,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -11,12 +12,13 @@ import {
   rm,
   utimes,
   writeFile,
+  type FileHandle,
 } from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
 import {promisify} from 'node:util';
-import {afterEach, describe, expect, it} from 'vitest';
+import {afterEach, describe, expect, it, vi} from 'vitest';
 import {
   createOutputStore,
   createRunStore,
@@ -61,6 +63,8 @@ type InterceptedStat = (
 type InterceptedSync = (this: InterceptedReadHandle) => Promise<void>;
 
 afterEach(async () => {
+  vi.doUnmock('node:fs/promises');
+  vi.resetModules();
   await Promise.all(tempDirectories.splice(0).map(async (directory) => {
     await rm(directory, {recursive: true, force: true});
   }));
@@ -350,6 +354,213 @@ describe('pipeline artifacts', () => {
       expect(changedStats.size).toBe(originalStats.size);
     },
   );
+
+  it.each(['hashRunArtifact', 'copyRunArtifact'] as const)(
+    'preserves %s operation and authority-close failures',
+    async (operation) => {
+      const workspaceRoot = await makeWorkspace();
+      const relativePath = 'media/close-failure.bin';
+      const original = Buffer.alloc(128 * 1024, 0x61);
+      const replacement = Buffer.alloc(original.length, 0x62);
+      const sourcePath = path.join(
+        workspaceRoot,
+        '.work',
+        'demo',
+        'runs',
+        'source-run',
+        relativePath,
+      );
+      const closeError = Object.assign(new Error('artifact authority close failed'), {
+        code: 'EIO',
+      });
+      let sourceIdentity: Pick<BigIntStats, 'dev' | 'ino'> | undefined;
+      let mutationHandle: FileHandle | undefined;
+      let mutated = false;
+      let closeFailed = false;
+      vi.resetModules();
+      vi.doMock('node:fs/promises', async () => {
+        const actual = await vi.importActual<typeof import('node:fs/promises')>(
+          'node:fs/promises',
+        );
+        return {
+          ...actual,
+          open: async (...args: Parameters<typeof actual.open>) => {
+            const handle = await Reflect.apply(actual.open, undefined, args);
+            if (sourceIdentity === undefined) return handle;
+            const status = await handle.stat({bigint: true});
+            if (
+              !status.isFile()
+              || status.dev !== sourceIdentity.dev
+              || status.ino !== sourceIdentity.ino
+            ) {
+              return handle;
+            }
+            return new Proxy(handle, {
+              get(target, property) {
+                if (property === 'read') {
+                  return async (
+                    buffer: Uint8Array,
+                    offset: number,
+                    length: number,
+                    position: number,
+                  ) => {
+                    const result = await target.read(buffer, offset, length, position);
+                    if (!mutated && result.bytesRead > 0) {
+                      mutated = true;
+                      await mutationHandle!.write(replacement, 0, replacement.length, 0);
+                      await mutationHandle!.sync();
+                      const changedTime = new Date(Date.now() + 60_000);
+                      await actual.utimes(sourcePath, changedTime, changedTime);
+                    }
+                    return result;
+                  };
+                }
+                if (property === 'close') {
+                  return async () => {
+                    await target.close();
+                    if (!closeFailed) {
+                      closeFailed = true;
+                      throw closeError;
+                    }
+                  };
+                }
+                const value = Reflect.get(target, property, target);
+                return typeof value === 'function' ? value.bind(target) : value;
+              },
+            });
+          },
+        };
+      });
+      const scopes = await import('../../../src/fs/app-directory-scopes');
+      const artifacts = await import('../../../src/pipeline/artifacts');
+      const runStore = scopes.createRunStore(workspaceRoot);
+      const sourceRun = await runStore.createRun('demo', 'source-run');
+      const targetRun = await runStore.createRun('demo', 'target-run');
+      await scopes.ensureRunDirectory(sourceRun, 'media');
+      const sourceHandle = await scopes.openNewRunFile(sourceRun, relativePath);
+      await sourceHandle.writeFile(original);
+      await sourceHandle.sync();
+      await sourceHandle.close();
+      sourceIdentity = await lstat(sourcePath, {bigint: true});
+      mutationHandle = await openFile(sourcePath, constants.O_WRONLY);
+
+      let caughtError: unknown;
+      try {
+        if (operation === 'hashRunArtifact') {
+          await artifacts.hashRunArtifact(sourceRun, relativePath);
+        } else {
+          await artifacts.copyRunArtifact({
+            sourceRun,
+            targetRun,
+            artifact: {
+              scope: 'run',
+              path: relativePath,
+              sha256: sha256(original),
+            },
+          });
+        }
+      } catch (error) {
+        caughtError = error;
+      } finally {
+        await mutationHandle.close();
+      }
+
+      expect(caughtError).toBeInstanceOf(AggregateError);
+      const errors = (caughtError as AggregateError).errors;
+      expect(errors).toEqual(expect.arrayContaining([
+        expect.objectContaining({code: 'ARTIFACT_INVALID'}),
+        closeError,
+      ]));
+      expect(mutated).toBe(true);
+      expect(closeFailed).toBe(true);
+      if (operation === 'copyRunArtifact') {
+        await expect(scopes.openExistingRunFile(targetRun, relativePath))
+          .rejects.toMatchObject({code: 'ENOENT'});
+      }
+    },
+  );
+
+  it('preserves hash mismatch and target write-authority close failure', async () => {
+    const workspaceRoot = await makeWorkspace();
+    const relativePath = 'media/write-close-failure.bin';
+    const bytes = Buffer.from('copied bytes');
+    const closeError = Object.assign(new Error('target write authority close failed'), {
+      code: 'EIO',
+    });
+    let armTargetClose = false;
+    let targetProxied = false;
+    let closeFailed = false;
+    vi.resetModules();
+    vi.doMock('node:fs/promises', async () => {
+      const actual = await vi.importActual<typeof import('node:fs/promises')>(
+        'node:fs/promises',
+      );
+      return {
+        ...actual,
+        open: async (...args: Parameters<typeof actual.open>) => {
+          const handle = await Reflect.apply(actual.open, undefined, args);
+          const flags = Number(args[1]);
+          if (
+            !armTargetClose
+            || targetProxied
+            || (flags & constants.O_CREAT) === 0
+          ) {
+            return handle;
+          }
+          targetProxied = true;
+          return new Proxy(handle, {
+            get(target, property) {
+              if (property === 'close') {
+                return async () => {
+                  await target.close();
+                  closeFailed = true;
+                  throw closeError;
+                };
+              }
+              const value = Reflect.get(target, property, target);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+        },
+      };
+    });
+    const scopes = await import('../../../src/fs/app-directory-scopes');
+    const artifacts = await import('../../../src/pipeline/artifacts');
+    const runStore = scopes.createRunStore(workspaceRoot);
+    const sourceRun = await runStore.createRun('demo', 'source-run');
+    const targetRun = await runStore.createRun('demo', 'target-run');
+    await scopes.ensureRunDirectory(sourceRun, 'media');
+    const sourceHandle = await scopes.openNewRunFile(sourceRun, relativePath);
+    await sourceHandle.writeFile(bytes);
+    await sourceHandle.sync();
+    await sourceHandle.close();
+    armTargetClose = true;
+
+    let caughtError: unknown;
+    try {
+      await artifacts.copyRunArtifact({
+        sourceRun,
+        targetRun,
+        artifact: {
+          scope: 'run',
+          path: relativePath,
+          sha256: sha256(Buffer.from('different bytes')),
+        },
+      });
+    } catch (error) {
+      caughtError = error;
+    }
+
+    expect(caughtError).toBeInstanceOf(AggregateError);
+    expect((caughtError as AggregateError).errors).toEqual(expect.arrayContaining([
+      expect.objectContaining({code: 'ARTIFACT_HASH_MISMATCH'}),
+      closeError,
+    ]));
+    expect(targetProxied).toBe(true);
+    expect(closeFailed).toBe(true);
+    await expect(scopes.openExistingRunFile(targetRun, relativePath))
+      .rejects.toMatchObject({code: 'ENOENT'});
+  });
 
   it.each([
     'hashRunArtifact',
@@ -642,6 +853,7 @@ describe('pipeline artifacts', () => {
         const changedTime = new Date(Date.now() + 60_000);
         await utimes(sourcePath, changedTime, changedTime);
         await rename(targetPath, `${targetPath}.partial`);
+        await link(`${targetPath}.partial`, `${targetPath}.hardlink`);
         await mkdir(targetPath);
         targetReplaced = true;
       }
@@ -722,6 +934,7 @@ describe('pipeline artifacts', () => {
         const changedTime = new Date(Date.now() + 60_000);
         await utimes(targetPath, changedTime, changedTime);
         await rename(targetPath, `${targetPath}.partial`);
+        await link(`${targetPath}.partial`, `${targetPath}.hardlink`);
         await mkdir(targetPath);
       }
       return result;

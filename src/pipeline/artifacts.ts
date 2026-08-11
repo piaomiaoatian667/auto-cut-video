@@ -129,17 +129,44 @@ const hashFileHandle = async (handle: FileHandle): Promise<string> => {
   return `sha256:${hash.digest('hex')}`;
 };
 
+const withAuthorityClose = async <Result>(
+  operation: () => Promise<Result>,
+  close: () => Promise<void>,
+  message: string,
+): Promise<Result> => {
+  let failed = false;
+  let primaryError: unknown;
+  try {
+    return await operation();
+  } catch (error) {
+    failed = true;
+    primaryError = error;
+    throw error;
+  } finally {
+    try {
+      await close();
+    } catch (closeError) {
+      if (failed) {
+        throw new AggregateError(
+          [primaryError, closeError],
+          message,
+          {cause: primaryError},
+        );
+      }
+      throw closeError;
+    }
+  }
+};
+
 const hashScopedFile = async (
   openFile: () => Promise<AppDirectoryReadFileAuthority>,
 ): Promise<string> => {
   const authority = await openFile();
-  try {
+  return await withAuthorityClose(async () => {
     const sha256 = await hashFileHandle(authority.handle);
     await authority.revalidate();
     return sha256;
-  } finally {
-    await authority.close();
-  }
+  }, async () => await authority.close(), 'artifact read authority close failed');
 };
 
 export async function hashRunArtifact(
@@ -249,7 +276,7 @@ export async function copyRunArtifact(input: {
       input.sourceRun,
       input.artifact.path,
     );
-    try {
+    await withAuthorityClose(async () => {
       target = await openNewRunFileForWrite(
         input.targetRun,
         input.artifact.path,
@@ -257,22 +284,24 @@ export async function copyRunArtifact(input: {
       await copyFileHandles(source.handle, target.handle);
       await target.syncAndSeal();
       await source.revalidate();
-    } finally {
-      await source.close();
+    }, async () => await source.close(), 'artifact source authority close failed');
+    const targetAuthority = target;
+    if (targetAuthority === undefined) {
+      throw new TypeError('artifact target authority was not created');
     }
     const copied: PipelineArtifact = {
       scope: 'run',
       path: input.artifact.path,
-      sha256: await hashScopedFile(async () => await target!.openForRead()),
+      sha256: await hashScopedFile(async () => await targetAuthority.openForRead()),
     };
-    await target.revalidate();
+    await targetAuthority.revalidate();
     if (copied.sha256 !== input.artifact.sha256) {
       throw new PipelineArtifactError(
         'ARTIFACT_HASH_MISMATCH',
         'copied Run artifact does not match its source report',
       );
     }
-    await target.close();
+    await targetAuthority.close();
     target = undefined;
     return copied;
   } catch (error) {

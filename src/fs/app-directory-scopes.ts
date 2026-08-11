@@ -1028,31 +1028,26 @@ const inspectAnchoredEntry = async (
   }
 };
 
-const unlinkAnchoredCreatedFile = async (
-  anchor: ScopedPathAnchor,
+const unlinkHeldCreatedFile = async (
   identity: RegularFileIdentity,
   handle: FileHandle,
   relativePath: string,
 ): Promise<void> => {
-  const current = await inspectAnchoredEntry(anchor, relativePath);
-  if (current.kind === 'missing') {
-    const held = await handle.stat({bigint: true});
-    if (held.nlink === 0n) return;
-    throw securityError(`created app-owned file moved before cleanup: ${relativePath}`);
-  }
-  if (
-    current.kind !== 'file'
-    || current.stats === undefined
-    || !sameRegularFileObject(current.stats, identity)
-  ) {
-    throw securityError(`created app-owned file changed before cleanup: ${relativePath}`);
-  }
-  await unlink(path.join(anchor.parent.volumePath, anchor.basename));
-  if ((await inspectAnchoredEntry(anchor, relativePath)).kind !== 'missing') {
-    throw securityError(`created app-owned file remained after cleanup: ${relativePath}`);
-  }
   const held = await handle.stat({bigint: true});
-  if (held.nlink !== 0n) {
+  if (
+    !held.isFile()
+    || held.dev !== identity.dev
+    || held.ino !== identity.ino
+  ) {
+    throw securityError(`created app-owned file identity changed before cleanup: ${relativePath}`);
+  }
+  if (held.nlink === 0n) return;
+  if (held.nlink !== 1n) {
+    throw securityError(`created app-owned file has unexpected hard links: ${relativePath}`);
+  }
+  await unlink(volumePath(held.dev, held.ino));
+  const removed = await handle.stat({bigint: true});
+  if (removed.nlink !== 0n) {
     throw securityError(`created app-owned file remains linked after cleanup: ${relativePath}`);
   }
 };
@@ -1066,6 +1061,7 @@ const openNewScopedWriteFileAuthority = async (
   const anchor = pathAuthority.finalEntry;
   let handle: FileHandle | undefined;
   let createdIdentity: RegularFileIdentity | undefined;
+  let fileCreated = false;
   let transferred = false;
   try {
     await assertScopedReadPathStable(state, pathAuthority, relativePath);
@@ -1074,6 +1070,7 @@ const openNewScopedWriteFileAuthority = async (
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | O_NOFOLLOW_ANY,
       0o600,
     );
+    fileCreated = true;
     const created = await handle.stat({bigint: true});
     if (!created.isFile() || created.nlink !== 1n) {
       throw securityError(`created app-owned target is not a regular file: ${relativePath}`);
@@ -1172,8 +1169,7 @@ const openNewScopedWriteFileAuthority = async (
       syncAndSeal,
       openForRead,
       revalidate,
-      unlink: async () => await unlinkAnchoredCreatedFile(
-        anchor,
+      unlink: async () => await unlinkHeldCreatedFile(
         openedIdentity,
         openedHandle,
         relativePath,
@@ -1207,11 +1203,30 @@ const openNewScopedWriteFileAuthority = async (
     return result;
   } catch (error) {
     const cleanupErrors: unknown[] = [];
-    if (handle !== undefined && createdIdentity !== undefined) {
+    let cleanupIdentity = createdIdentity;
+    if (fileCreated && handle !== undefined && cleanupIdentity === undefined) {
       try {
-        await unlinkAnchoredCreatedFile(
-          anchor,
-          createdIdentity,
+        const recovered = await handle.stat({bigint: true});
+        if (
+          !recovered.isFile()
+          || (recovered.nlink !== 0n && recovered.nlink !== 1n)
+        ) {
+          throw securityError(
+            `created app-owned file identity is unsafe for cleanup: ${relativePath}`,
+          );
+        }
+        cleanupIdentity = regularFileIdentity(recovered);
+      } catch (identityError) {
+        cleanupErrors.push(securityError(
+          `created app-owned file identity could not be recovered for cleanup: ${relativePath}`,
+          identityError,
+        ));
+      }
+    }
+    if (handle !== undefined && cleanupIdentity !== undefined) {
+      try {
+        await unlinkHeldCreatedFile(
+          cleanupIdentity,
           handle,
           relativePath,
         );
