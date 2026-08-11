@@ -883,8 +883,7 @@ export async function runExecutionPlan(
                   'passed',
                   dependencies,
                 );
-              } catch (error) {
-                if (error instanceof PipelinePointerOutcomeError) throw error;
+              } catch {
                 warnings.push({
                   code: 'WORK_POINTER_LAGGING',
                   message: 'Output Release is published, but Work progress metadata is lagging.',
@@ -1021,8 +1020,7 @@ export async function runExecutionPlan(
           'passed',
           dependencies,
         );
-      } catch (error) {
-        if (error instanceof PipelinePointerOutcomeError) throw error;
+      } catch {
         warnings.push({
           code: 'WORK_POINTER_LAGGING',
           message: 'Output Release is published, but Work progress metadata is lagging.',

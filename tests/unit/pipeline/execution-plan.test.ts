@@ -295,6 +295,7 @@ describe('buildExecutionPlan', () => {
     });
 
     expect(plan.runMode).toBe('noop');
+    expect(plan.requiresProgressReconciliation).toBe(false);
     expect(plan.items.map((item) => [
       item.stageId,
       item.action,
@@ -302,6 +303,89 @@ describe('buildExecutionPlan', () => {
     ])).toEqual([
       ['compile', 'cached', false],
       ['draft', 'cached', false],
+    ]);
+  });
+
+  it('uses executable resume for sliced ordinary progress recovered beyond Work', async () => {
+    const plan = await build({
+      current: pointer('ingest', {
+        preset: 'draft',
+        stageIds: [...STAGE_PRESETS.draft],
+      }),
+      reports: reportsThrough('narration'),
+    }, {
+      preset: 'draft',
+      from: 'narration',
+      to: 'narration',
+      resume: true,
+    });
+
+    expect(plan).toMatchObject({
+      runMode: 'resume',
+      requiresProgressReconciliation: true,
+      requiresRuntimePreflight: true,
+      sourceRunId: 'run-one',
+      targetRunId: 'run-one',
+    });
+    expect(plan.items).toEqual([
+      expect.objectContaining({
+        stageId: 'narration',
+        action: 'cached',
+        materialize: false,
+      }),
+    ]);
+  });
+
+  it('uses executable resume for a sliced recovered Release without Output', async () => {
+    const plan = await build({
+      current: pointer('review'),
+      outputCurrent: null,
+      reports: reportsThrough('release'),
+    }, {
+      preset: 'release',
+      from: 'release',
+      to: 'release',
+      resume: true,
+    });
+
+    expect(plan).toMatchObject({
+      runMode: 'resume',
+      requiresProgressReconciliation: true,
+      requiresRuntimePreflight: true,
+      sourceRunId: 'run-one',
+      targetRunId: 'run-one',
+    });
+    expect(plan.items).toEqual([
+      expect.objectContaining({
+        stageId: 'release',
+        action: 'cached',
+        materialize: false,
+      }),
+    ]);
+  });
+
+  it('uses executable resume when Output is committed but Work is behind', async () => {
+    const plan = await build({
+      current: pointer('review'),
+      outputCurrent: pointer('release', {
+        relativePath: 'releases/run-one',
+      }),
+      reports: reportsThrough('release'),
+    }, {
+      preset: 'release',
+      from: 'release',
+      to: 'release',
+      resume: true,
+    });
+
+    expect(plan).toMatchObject({
+      runMode: 'resume',
+      requiresProgressReconciliation: true,
+      sourceRunId: 'run-one',
+      targetRunId: 'run-one',
+    });
+    expect(plan.items).toEqual([
+      expect.objectContaining({stageId: 'release', action: 'cached'}),
     ]);
   });
 
@@ -582,7 +666,8 @@ describe('buildExecutionPlan', () => {
     });
 
     expect(plan).toMatchObject({
-      runMode: 'noop',
+      runMode: 'resume',
+      requiresProgressReconciliation: true,
       sourceRunId: 'run-one',
       targetRunId: 'run-one',
       requiresRuntimePreflight: true,
@@ -621,7 +706,8 @@ describe('buildExecutionPlan', () => {
     });
 
     expect(plan).toMatchObject({
-      runMode: 'noop',
+      runMode: 'resume',
+      requiresProgressReconciliation: true,
       sourceRunId: 'release-new',
       targetRunId: 'release-new',
     });
@@ -732,7 +818,8 @@ describe('buildExecutionPlan', () => {
     });
 
     expect(plan.sourceRunId).toBe('same-run');
-    expect(plan.runMode).toBe('noop');
+    expect(plan.runMode).toBe('resume');
+    expect(plan.requiresProgressReconciliation).toBe(true);
   });
 
   it('uses same-Run Output authority for equal Release progress', async () => {

@@ -65,6 +65,7 @@ const plan = ({
   preset,
   stageIds: [...stageIds],
   runMode,
+  requiresProgressReconciliation: false,
   requiresRuntimePreflight: false,
   ...(sourceRunId === undefined ? {} : {sourceRunId}),
   ...(targetRunId === undefined ? {} : {targetRunId}),

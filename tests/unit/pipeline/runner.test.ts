@@ -15,6 +15,7 @@ import {
   type PipelineArtifact,
 } from '../../../src/pipeline/artifacts';
 import {
+  buildExecutionPlan,
   revalidateExecutionPlan,
   type ExecutionPlan,
   type ExecutionPlanContext,
@@ -161,6 +162,7 @@ const makePlan = ({
   runMode,
   sourceRunId,
   targetRunId,
+  requiresProgressReconciliation = false,
   requiresRuntimePreflight = false,
 }: {
   preset?: PipelinePreset;
@@ -169,6 +171,7 @@ const makePlan = ({
   runMode: ExecutionPlan['runMode'];
   sourceRunId?: string;
   targetRunId?: string;
+  requiresProgressReconciliation?: boolean;
   requiresRuntimePreflight?: boolean;
 }): ExecutionPlan => ({
   version: 1,
@@ -176,6 +179,7 @@ const makePlan = ({
   preset,
   stageIds: [...stageIds],
   runMode,
+  requiresProgressReconciliation,
   requiresRuntimePreflight,
   ...(sourceRunId === undefined ? {} : {sourceRunId}),
   ...(targetRunId === undefined ? {} : {targetRunId}),
@@ -441,6 +445,19 @@ const executionInput = (plan: ExecutionPlan, project = memoryProject()) => ({
   project,
   sourceCatalog,
   signal: new AbortController().signal,
+});
+
+const planningContext = (
+  runtime: ReturnType<typeof createMemoryRuntime>,
+  project = memoryProject(),
+): ExecutionPlanContext => ({
+  project,
+  sourceCatalog,
+  registry: runtime.registry,
+  runStore: runtime.dependencies.runStore,
+  outputStore: runtime.dependencies.outputStore,
+  reportStore: runtime.dependencies.reportStore,
+  createRunId: runtime.dependencies.createRunId,
 });
 
 const writeRunArtifact = async (
@@ -851,21 +868,63 @@ describe('Pipeline Runner', () => {
     expect(runtime.reportStore.writeStage).toHaveBeenCalledOnce();
   });
 
+  it('executes sliced ordinary reconciliation without recreating the recovered report', async () => {
+    const runId = 'run-resume';
+    const project = memoryProject();
+    const runtime = createMemoryRuntime({
+      current: currentPointer(runId, 'ingest', {
+        preset: 'draft',
+        stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft'],
+      }),
+    });
+    runtime.seedRun(runId, reportsThrough(runId, 'draft', 'narration'));
+    const plan = await buildExecutionPlan(planningContext(runtime, project), {
+      preset: 'draft',
+      from: 'narration',
+      to: 'narration',
+      resume: true,
+    });
+
+    expect(plan).toMatchObject({
+      runMode: 'resume',
+      requiresProgressReconciliation: true,
+    });
+    const result = await runExecutionPlan(executionInput(plan, project), runtime.dependencies);
+
+    expect(result).toMatchObject({
+      runId,
+      state: 'passed',
+      completedStage: 'narration',
+    });
+    expect(runtime.stageCalls).toEqual(['preflight']);
+    expect(runtime.reportStore.writeStage).not.toHaveBeenCalled();
+    expect(runtime.workCurrent).toMatchObject({
+      runId,
+      completedStage: 'narration',
+    });
+    expect(runtime.acquireProjectLock).toHaveBeenCalledOnce();
+  });
+
   it('recovers a durable Release report by publishing Output without re-executing', async () => {
     const runId = 'run-release';
+    const project = memoryProject();
     const runtime = createMemoryRuntime({
       current: currentPointer(runId, 'review'),
     });
     runtime.seedRun(runId, reportsThrough(runId, 'release', 'release'));
-    const plan = makePlan({
-      stageIds: STAGE_IDS,
-      actions: ['run', 'cached', 'cached', 'cached', 'cached', 'cached', 'cached'],
-      runMode: 'resume',
-      sourceRunId: runId,
-      targetRunId: runId,
+    const plan = await buildExecutionPlan(planningContext(runtime, project), {
+      preset: 'release',
+      from: 'release',
+      to: 'release',
+      resume: true,
     });
 
-    const result = await runExecutionPlan(executionInput(plan), runtime.dependencies);
+    expect(plan).toMatchObject({
+      runMode: 'resume',
+      requiresProgressReconciliation: true,
+    });
+
+    const result = await runExecutionPlan(executionInput(plan, project), runtime.dependencies);
 
     expect(result).toMatchObject({
       runId,
@@ -884,10 +943,44 @@ describe('Pipeline Runner', () => {
     });
     expect(runtime.events.filter((event) => event === 'verify:release').length)
       .toBeGreaterThan(1);
+    expect(runtime.acquireProjectLock).toHaveBeenCalledOnce();
+  });
+
+  it('returns recovered Release success when Work read-back is unreadable', async () => {
+    const runId = 'run-release';
+    const project = memoryProject();
+    const runtime = createMemoryRuntime({
+      current: currentPointer(runId, 'review'),
+      failWorkPublishAt: 'release',
+      failWorkReadAfterPublish: new Error('recovered Work pointer unreadable'),
+    });
+    runtime.seedRun(runId, reportsThrough(runId, 'release', 'release'));
+    const plan = await buildExecutionPlan(planningContext(runtime, project), {
+      preset: 'release',
+      from: 'release',
+      to: 'release',
+      resume: true,
+    });
+
+    const result = await runExecutionPlan(executionInput(plan, project), runtime.dependencies);
+
+    expect(result).toMatchObject({
+      runId,
+      state: 'passed',
+      completedStage: 'release',
+      warnings: [{code: 'WORK_POINTER_LAGGING'}],
+    });
+    expect(runtime.outputCurrent).toMatchObject({
+      runId,
+      completedStage: 'release',
+    });
+    expect(runtime.report(runId, 'release')).toMatchObject({state: 'passed'});
+    expect(runtime.stageCalls).toEqual(['preflight']);
   });
 
   it('reconciles lagging Work when Output Release is already committed', async () => {
     const runId = 'run-release';
+    const project = memoryProject();
     const outputCurrent = currentPointer(runId, 'release', {
       relativePath: `releases/${runId}`,
     });
@@ -896,15 +989,19 @@ describe('Pipeline Runner', () => {
       outputCurrent,
     });
     runtime.seedRun(runId, reportsThrough(runId, 'release', 'release'));
-    const plan = makePlan({
-      stageIds: STAGE_IDS,
-      actions: ['run', 'cached', 'cached', 'cached', 'cached', 'cached', 'cached'],
-      runMode: 'resume',
-      sourceRunId: runId,
-      targetRunId: runId,
+    const plan = await buildExecutionPlan(planningContext(runtime, project), {
+      preset: 'release',
+      from: 'release',
+      to: 'release',
+      resume: true,
     });
 
-    const result = await runExecutionPlan(executionInput(plan), runtime.dependencies);
+    expect(plan).toMatchObject({
+      runMode: 'resume',
+      requiresProgressReconciliation: true,
+    });
+
+    const result = await runExecutionPlan(executionInput(plan, project), runtime.dependencies);
 
     expect(result).toMatchObject({
       runId,
@@ -1912,7 +2009,7 @@ describe('Pipeline Runner', () => {
     expect(runtime.release).toHaveBeenCalledOnce();
   });
 
-  it('throws unknown Work outcome after Output commit without deleting Release state', async () => {
+  it('returns Release success when Work outcome is unreadable after Output commit', async () => {
     const readFailure = new Error('committed Release Work pointer unreadable');
     const outputCurrent = currentPointer('run-release', 'release', {
       relativePath: 'releases/run-release',
@@ -1938,12 +2035,14 @@ describe('Pipeline Runner', () => {
       targetRunId: 'run-release',
     });
 
-    await expect(runExecutionPlan(executionInput(plan), runtime.dependencies))
-      .rejects.toMatchObject({
-        code: 'PIPELINE_POINTER_OUTCOME_UNKNOWN',
-        cause: expect.objectContaining({message: 'work pointer failed'}),
-      });
+    const result = await runExecutionPlan(executionInput(plan), runtime.dependencies);
 
+    expect(result).toMatchObject({
+      runId: 'run-release',
+      state: 'passed',
+      completedStage: 'release',
+      warnings: [{code: 'WORK_POINTER_LAGGING'}],
+    });
     expect(runtime.outputCurrent).toEqual(outputCurrent);
     expect(runtime.report('run-release', 'release')).toMatchObject({state: 'passed'});
     expect(runtime.events).not.toContain('delete-report:release');

@@ -40,6 +40,7 @@ export interface ExecutionPlan {
   preset: PipelinePreset;
   stageIds: StageId[];
   runMode: 'new' | 'resume' | 'noop';
+  requiresProgressReconciliation: boolean;
   requiresRuntimePreflight: boolean;
   sourceRunId?: string;
   targetRunId?: string;
@@ -78,6 +79,8 @@ export class ExecutionPlanError extends Error {
 
 interface SourceRun {
   pointer: CurrentPointer;
+  workPointer: CurrentPointer | null;
+  outputPointer: CurrentPointer | null;
   runDirectory: RunDirectoryScope;
   reports: ReadonlyMap<StageId, StageReport>;
 }
@@ -254,7 +257,13 @@ const readSourceRun = async (
   const loaded = await loadRun(context, projectId, pointer.runId, reportStageIds);
   return loaded === null
     ? null
-    : {pointer, runDirectory: loaded.runDirectory, reports: loaded.reports};
+    : {
+      pointer,
+      workPointer: workCurrent,
+      outputPointer: outputCurrent,
+      runDirectory: loaded.runDirectory,
+      reports: loaded.reports,
+    };
 };
 
 const calculateFingerprint = async (
@@ -358,6 +367,25 @@ const staleRange = (stageId: StageId, description: string): never => planError(
   `${description}; widen --from to ${stageId} or remove --from`,
   stageId,
 );
+
+const needsProgressReconciliation = (
+  source: SourceRun | null,
+  assessments: readonly StageAssessment[],
+): boolean => {
+  if (source === null) return false;
+  const workProgress = source.workPointer?.runId === source.pointer.runId
+    ? pointerProgress(source.workPointer)
+    : -1;
+  const workBehind = assessments.some((assessment) => (
+    assessment.declaredComplete
+    && STAGE_POSITIONS.get(assessment.stage.id)! > workProgress
+  ));
+  const releaseComplete = assessments.some((assessment) => (
+    assessment.stage.id === 'release' && assessment.declaredComplete
+  ));
+  const outputPublished = source.outputPointer?.runId === source.pointer.runId;
+  return workBehind || (releaseComplete && !outputPublished);
+};
 
 const item = (
   assessment: StageAssessment,
@@ -593,6 +621,13 @@ export async function buildExecutionPlan(
   );
   const omittedPrerequisites = presetStageIds.slice(0, fromIndex);
   const requiresRuntimePreflight = fromIndex > 0;
+  const selectedAssessments = selectedStageIds.map((stageId) => (
+    assessments.get(stageId)!
+  ));
+  const requiresProgressReconciliation = needsProgressReconciliation(
+    source,
+    selectedAssessments,
+  );
 
   if (omittedPrerequisites.length > 0) {
     for (const stageId of omittedPrerequisites) {
@@ -622,6 +657,7 @@ export async function buildExecutionPlan(
       !assessments.get(stageId)!.declaredComplete
     ));
     const runMode: ExecutionPlan['runMode'] = firstIncompleteIndex < 0
+      && !requiresProgressReconciliation
       ? 'noop'
       : 'resume';
     const sourceRunId = source?.pointer.runId;
@@ -655,6 +691,7 @@ export async function buildExecutionPlan(
       preset,
       stageIds: [...selectedStageIds],
       runMode,
+      requiresProgressReconciliation,
       requiresRuntimePreflight,
       sourceRunId,
       targetRunId: sourceRunId,
@@ -663,9 +700,6 @@ export async function buildExecutionPlan(
   }
 
   const sourceRunId = source?.pointer.runId;
-  const selectedAssessments = selectedStageIds.map((stageId) => (
-    assessments.get(stageId)!
-  ));
   const firstMismatchIndex = selectedAssessments.findIndex((assessment) => (
     assessment.declaredComplete && !assessment.matching
   ));
@@ -712,6 +746,7 @@ export async function buildExecutionPlan(
       preset,
       stageIds: [...selectedStageIds],
       runMode,
+      requiresProgressReconciliation,
       requiresRuntimePreflight,
       ...(sourceRunId === undefined ? {} : {sourceRunId}),
       ...(sourceRunId === undefined ? {} : {targetRunId: sourceRunId}),
@@ -754,6 +789,7 @@ export async function buildExecutionPlan(
     preset,
     stageIds: [...selectedStageIds],
     runMode,
+    requiresProgressReconciliation: false,
     requiresRuntimePreflight,
     ...(sourceRunId === undefined ? {} : {sourceRunId}),
     targetRunId,
