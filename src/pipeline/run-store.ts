@@ -9,9 +9,12 @@ export {
   type CurrentPointerState,
   type FileOps,
   type FileOpsPhase,
+  type OutputDirectoryScope,
   type PipelinePreset,
+  type RunDirectoryScope,
   type RunDirectoryIdentity,
   type RunStoreErrorCode,
   type RunStoreOptions,
   type StageId,
+  type WorkDirectoryScope,
 } from '../fs/app-directory-scopes';

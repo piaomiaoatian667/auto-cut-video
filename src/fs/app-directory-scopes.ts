@@ -421,6 +421,19 @@ const inspectPlainChildDirectory = async (
   }
 };
 
+const inspectOptionalPlainChildDirectory = async (
+  parent: DirectoryIdentity,
+  name: string,
+  label: string,
+): Promise<DirectoryIdentity | null> => {
+  try {
+    return await inspectPlainChildDirectory(parent, name, label);
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ENOENT') return null;
+    throw error;
+  }
+};
+
 const ensurePlainDirectory = async (
   parent: DirectoryIdentity,
   name: string,
@@ -565,6 +578,56 @@ const createWorkScope = async (
   return scope;
 };
 
+const mintExistingWorkScope = async (
+  workspace: DirectoryIdentity,
+  projectId: string,
+): Promise<WorkDirectoryScope> => {
+  const validatedProjectId = StableIdSchema.parse(projectId);
+  await assertDirectoryIdentityStable(workspace, 'workspace root');
+  const workContainer = await inspectPlainChildDirectory(
+    workspace,
+    '.work',
+    'Work directory',
+  );
+  const workRoot = await inspectPlainChildDirectory(
+    workContainer,
+    validatedProjectId,
+    `Work project ${validatedProjectId}`,
+  );
+  const scope = mintWorkDirectoryScope();
+  workStates.set(scope, {
+    root: workRoot.path,
+    ancestors: [workspace, workContainer, workRoot],
+  });
+  return scope;
+};
+
+const openExistingWorkScope = async (
+  workspace: DirectoryIdentity,
+  projectId: string,
+): Promise<WorkDirectoryScope | null> => {
+  const validatedProjectId = StableIdSchema.parse(projectId);
+  await assertDirectoryIdentityStable(workspace, 'workspace root');
+  const workContainer = await inspectOptionalPlainChildDirectory(
+    workspace,
+    '.work',
+    'Work directory',
+  );
+  if (workContainer === null) return null;
+  const workRoot = await inspectOptionalPlainChildDirectory(
+    workContainer,
+    validatedProjectId,
+    `Work project ${validatedProjectId}`,
+  );
+  if (workRoot === null) return null;
+  const scope = mintWorkDirectoryScope();
+  workStates.set(scope, {
+    root: workRoot.path,
+    ancestors: [workspace, workContainer, workRoot],
+  });
+  return scope;
+};
+
 export const createWorkDirectoryScope = async (
   workspaceRoot: string,
   projectId: string,
@@ -581,11 +644,15 @@ const mintRunScope = async (
 ): Promise<RunDirectoryScope> => {
   const validatedProjectId = StableIdSchema.parse(projectId);
   const validatedRunId = StableIdSchema.parse(runId);
-  const work = await createWorkScope(workspace, validatedProjectId);
+  const work = mode === 'create'
+    ? await createWorkScope(workspace, validatedProjectId)
+    : await mintExistingWorkScope(workspace, validatedProjectId);
   const workState = stateFor(workStates, work, 'WorkDirectoryScope');
   await assertScopeStable(workState, `runs/${validatedRunId}`);
   const workRoot = workState.ancestors.at(-1)!;
-  const runsRoot = await ensurePlainDirectory(workRoot, 'runs');
+  const runsRoot = mode === 'create'
+    ? await ensurePlainDirectory(workRoot, 'runs')
+    : await inspectPlainChildDirectory(workRoot, 'runs', 'Work runs directory');
   const runRoot = mode === 'create'
     ? await ensurePlainDirectory(runsRoot, validatedRunId, {exclusive: true})
     : await inspectPlainChildDirectory(
@@ -621,6 +688,32 @@ const mintOutputScope = async (
   await assertDirectoryIdentityStable(workspace, 'workspace root');
   const outputContainer = await ensurePlainDirectory(workspace, 'output');
   const outputRoot = await ensurePlainDirectory(outputContainer, validatedProjectId);
+  const scope = mintOutputDirectoryScope();
+  outputStates.set(scope, {
+    root: outputRoot.path,
+    ancestors: [workspace, outputContainer, outputRoot],
+  });
+  return scope;
+};
+
+const openExistingOutputScope = async (
+  workspace: DirectoryIdentity,
+  projectId: string,
+): Promise<OutputDirectoryScope | null> => {
+  const validatedProjectId = StableIdSchema.parse(projectId);
+  await assertDirectoryIdentityStable(workspace, 'workspace root');
+  const outputContainer = await inspectOptionalPlainChildDirectory(
+    workspace,
+    'output',
+    'Output directory',
+  );
+  if (outputContainer === null) return null;
+  const outputRoot = await inspectOptionalPlainChildDirectory(
+    outputContainer,
+    validatedProjectId,
+    `Output project ${validatedProjectId}`,
+  );
+  if (outputRoot === null) return null;
   const scope = mintOutputDirectoryScope();
   outputStates.set(scope, {
     root: outputRoot.path,
@@ -2156,6 +2249,10 @@ export class RunStore {
     return await createWorkScope(this.#workspace, projectId);
   }
 
+  async openExistingWork(projectId: string): Promise<WorkDirectoryScope | null> {
+    return await openExistingWorkScope(this.#workspace, projectId);
+  }
+
   async createRun(projectId: string, runId: string): Promise<RunDirectoryScope> {
     return await mintRunScope(this.#workspace, projectId, runId, 'create');
   }
@@ -2169,6 +2266,13 @@ export class RunStore {
 
   async readCurrent(projectId: string): Promise<CurrentPointer | null> {
     const work = await createWorkScope(this.#workspace, projectId);
+    const raw = await readPointerRaw(work, WORK_POINTER_AUTHORITY);
+    return raw === null ? null : parsePointer(raw, 'work');
+  }
+
+  async readCurrentReadonly(projectId: string): Promise<CurrentPointer | null> {
+    const work = await openExistingWorkScope(this.#workspace, projectId);
+    if (work === null) return null;
     const raw = await readPointerRaw(work, WORK_POINTER_AUTHORITY);
     return raw === null ? null : parsePointer(raw, 'work');
   }
@@ -2199,6 +2303,12 @@ export class OutputStore {
     return await mintOutputScope(this.#workspace, projectId);
   }
 
+  async openExistingProject(
+    projectId: string,
+  ): Promise<OutputDirectoryScope | null> {
+    return await openExistingOutputScope(this.#workspace, projectId);
+  }
+
   async createRelease(
     projectId: string,
     runId: string,
@@ -2213,6 +2323,13 @@ export class OutputStore {
 
   async readCurrent(projectId: string): Promise<CurrentPointer | null> {
     const output = await mintOutputScope(this.#workspace, projectId);
+    const raw = await readPointerRaw(output, OUTPUT_POINTER_AUTHORITY);
+    return raw === null ? null : parsePointer(raw, 'output');
+  }
+
+  async readCurrentReadonly(projectId: string): Promise<CurrentPointer | null> {
+    const output = await openExistingOutputScope(this.#workspace, projectId);
+    if (output === null) return null;
     const raw = await readPointerRaw(output, OUTPUT_POINTER_AUTHORITY);
     return raw === null ? null : parsePointer(raw, 'output');
   }

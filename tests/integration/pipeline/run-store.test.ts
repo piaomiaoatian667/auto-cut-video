@@ -1,5 +1,6 @@
 import {
   lstat,
+  mkdir,
   mkdtemp,
   readFile,
   readdir,
@@ -177,6 +178,71 @@ describe('RunStore', () => {
       .rejects.toMatchObject({code: 'EEXIST'});
     await expect(createRunStore(workspaceRoot).openExistingRun('demo', 'missing'))
       .rejects.toMatchObject({code: 'ENOENT'});
+  });
+
+  it('opens missing Work and Output scopes without creating directories', async () => {
+    const workspaceRoot = await makeWorkspace();
+    const runStore = createRunStore(workspaceRoot);
+    const outputStore = createOutputStore(workspaceRoot);
+
+    await expect(runStore.openExistingWork('demo')).resolves.toBeNull();
+    await expect(runStore.readCurrentReadonly('demo')).resolves.toBeNull();
+    await expect(outputStore.openExistingProject('demo')).resolves.toBeNull();
+    await expect(outputStore.readCurrentReadonly('demo')).resolves.toBeNull();
+
+    await expect(lstat(path.join(workspaceRoot, '.work')))
+      .rejects.toMatchObject({code: 'ENOENT'});
+    await expect(lstat(path.join(workspaceRoot, 'output')))
+      .rejects.toMatchObject({code: 'ENOENT'});
+  });
+
+  it('does not create missing child directories while opening existing scopes', async () => {
+    const workspaceRoot = await makeWorkspace();
+    await mkdir(path.join(workspaceRoot, '.work', 'demo'), {recursive: true});
+    await mkdir(path.join(workspaceRoot, 'output', 'demo'), {recursive: true});
+    const runStore = createRunStore(workspaceRoot);
+    const outputStore = createOutputStore(workspaceRoot);
+
+    await expect(runStore.openExistingWork('demo')).resolves.not.toBeNull();
+    await expect(runStore.readCurrentReadonly('demo')).resolves.toBeNull();
+    await expect(outputStore.openExistingProject('demo')).resolves.not.toBeNull();
+    await expect(outputStore.readCurrentReadonly('demo')).resolves.toBeNull();
+
+    await expect(lstat(path.join(workspaceRoot, '.work', 'demo', 'runs')))
+      .rejects.toMatchObject({code: 'ENOENT'});
+    await expect(lstat(path.join(workspaceRoot, 'output', 'demo', 'releases')))
+      .rejects.toMatchObject({code: 'ENOENT'});
+  });
+
+  it('reads current pointers without repairing scratch files', async () => {
+    const workspaceRoot = await makeWorkspace();
+    const runStore = createRunStore(workspaceRoot);
+    const outputStore = createOutputStore(workspaceRoot);
+    await runStore.createRun('demo', 'run-one');
+    await outputStore.createRelease('demo', 'run-one');
+    const workCurrent = pointer('run-one');
+    const outputCurrent = pointer('run-one', {relativePath: 'releases/run-one'});
+    await runStore.publishCurrent('demo', workCurrent);
+    await outputStore.publishCurrent('demo', outputCurrent);
+    const workRoot = path.join(workspaceRoot, '.work', 'demo');
+    const outputRoot = path.join(workspaceRoot, 'output', 'demo');
+    await Promise.all([
+      writeFile(path.join(workRoot, 'current.json.tmp'), 'stale temp'),
+      writeFile(path.join(workRoot, 'current.json.rollback'), 'stale rollback'),
+      writeFile(path.join(outputRoot, 'current.json.tmp'), 'stale temp'),
+      writeFile(path.join(outputRoot, 'current.json.rollback'), 'stale rollback'),
+    ]);
+
+    await expect(runStore.readCurrentReadonly('demo')).resolves.toEqual(workCurrent);
+    await expect(outputStore.readCurrentReadonly('demo')).resolves.toEqual(outputCurrent);
+    expect(await readdir(workRoot)).toEqual(expect.arrayContaining([
+      'current.json.tmp',
+      'current.json.rollback',
+    ]));
+    expect(await readdir(outputRoot)).toEqual(expect.arrayContaining([
+      'current.json.tmp',
+      'current.json.rollback',
+    ]));
   });
 
   it.each(['run', 'output'] as const)(
