@@ -603,6 +603,64 @@ type FaultInjectedPipelineModules = Awaited<
   ReturnType<typeof importPipelineModulesWithUnknownReportOutcomeProbe>
 >;
 
+interface PointerRollbackSyncProbe {
+  armed: boolean;
+  pointerRootSuffix: string;
+  syncErrors: Error[];
+  events: string[];
+}
+
+const importPipelineModulesWithPointerRollbackSyncProbe = async (
+  probe: PointerRollbackSyncProbe,
+) => {
+  vi.resetModules();
+  vi.doMock('node:fs/promises', async () => {
+    const actual = await vi.importActual<typeof import('node:fs/promises')>(
+      'node:fs/promises',
+    );
+    return {
+      ...actual,
+      open: async (...args: Parameters<typeof actual.open>) => {
+        const openedPath = String(args[0]);
+        const handle = await Reflect.apply(actual.open, undefined, args);
+        if (!probe.armed || !openedPath.endsWith(probe.pointerRootSuffix)) {
+          return handle;
+        }
+        const status = await handle.stat({bigint: true});
+        if (!status.isDirectory()) return handle;
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === 'sync') {
+              return async () => {
+                probe.events.push('sync:pointer-root');
+                const syncError = probe.syncErrors.shift();
+                if (syncError !== undefined) throw syncError;
+                await target.sync();
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
+      rename: async (...args: Parameters<typeof actual.rename>) => {
+        await Reflect.apply(actual.rename, undefined, args);
+        if (probe.armed) {
+          probe.events.push(
+            `rename:${path.basename(String(args[0]))}->${path.basename(String(args[1]))}`,
+          );
+        }
+      },
+    };
+  });
+  const scopes = await import('../../../src/fs/app-directory-scopes');
+  const artifacts = await import('../../../src/pipeline/artifacts');
+  const reports = await import('../../../src/pipeline/stage-report');
+  const executionPlan = await import('../../../src/pipeline/execution-plan');
+  const runner = await import('../../../src/pipeline/runner');
+  return {artifacts, executionPlan, reports, runner, scopes};
+};
+
 const writeFaultInjectedRunArtifact = async (
   modules: FaultInjectedPipelineModules,
   run: RunDirectoryScope,
@@ -1959,7 +2017,7 @@ describe('Pipeline Runner', () => {
     expect(runtime.events).not.toContain('delete-report:compile');
   });
 
-  it('keeps report and artifacts when real Work publication rejects after commit', async () => {
+  it('preserves Work evidence when rollback fails with the new pointer visible', async () => {
     const tempProject = await createTempProject();
     tempProjects.push(tempProject);
     const project = await loadProject(tempProject.workspaceRoot, 'demo');
@@ -2056,14 +2114,14 @@ describe('Pipeline Runner', () => {
       targetRunId: runId,
     });
 
-    const result = await runExecutionPlan(executionInput(plan, project), dependencies);
+    await expect(runExecutionPlan(executionInput(plan, project), dependencies))
+      .rejects.toMatchObject({
+        name: 'PipelinePointerOutcomeError',
+        code: 'PIPELINE_POINTER_OUTCOME_UNKNOWN',
+        cause: expect.objectContaining({code: 'RUN_POINTER_ROLLBACK_FAILED'}),
+      });
 
     expect(underlyingError).toMatchObject({code: 'RUN_POINTER_ROLLBACK_FAILED'});
-    expect(result).toMatchObject({
-      runId,
-      state: 'passed',
-      completedStage: 'compile',
-    });
     await expect(reportStore.readStage(runDirectory, 'compile')).resolves.toMatchObject({
       state: 'passed',
       artifacts: [expect.objectContaining({path: artifactPath})],
@@ -2079,6 +2137,203 @@ describe('Pipeline Runner', () => {
     });
     expect(release).toHaveBeenCalledOnce();
   });
+
+  it.each(['old', 'new'] as const)(
+    'preserves Work evidence when rollback durability is unknown and %s pointer survives restart',
+    async (persistedPointer) => {
+      const tempProject = await createTempProject();
+      tempProjects.push(tempProject);
+      const project = await loadProject(tempProject.workspaceRoot, 'demo');
+      const publishSyncError = Object.assign(new Error('Work publish sync failed'), {
+        code: 'EIO',
+      });
+      const rollbackSyncError = Object.assign(new Error('Work rollback sync failed'), {
+        code: 'EIO',
+      });
+      const probe: PointerRollbackSyncProbe = {
+        armed: false,
+        pointerRootSuffix: path.join('.work', 'demo'),
+        syncErrors: [publishSyncError, rollbackSyncError],
+        events: [],
+      };
+      const modules = await importPipelineModulesWithPointerRollbackSyncProbe(probe);
+      try {
+        const normalRunStore = modules.scopes.createRunStore(tempProject.workspaceRoot);
+        const failingRunStore = modules.scopes.createRunStore(tempProject.workspaceRoot);
+        const outputStore = modules.scopes.createOutputStore(tempProject.workspaceRoot);
+        const reportStore = modules.reports.createStageReportStore();
+        const runId = 'run-resume';
+        const runDirectory = await normalRunStore.createRun('demo', runId);
+        for (const stageId of ['preflight', 'ingest', 'narration'] as const) {
+          await reportStore.writeStage(runDirectory, makeReport({
+            runId,
+            preset: 'draft',
+            stageId,
+          }));
+        }
+        const oldPointer = currentPointer(runId, 'narration', {
+          preset: 'draft',
+          stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft'],
+        });
+        await normalRunStore.publishCurrent('demo', oldPointer);
+        let intendedPointer: CurrentPointer | undefined;
+        let underlyingError: unknown;
+        const runStore = {
+          createWork: failingRunStore.createWork.bind(failingRunStore),
+          createRun: failingRunStore.createRun.bind(failingRunStore),
+          openExistingRun: failingRunStore.openExistingRun.bind(failingRunStore),
+          readCurrentReadonly: failingRunStore.readCurrentReadonly.bind(failingRunStore),
+          publishCurrent: async (projectId: string, pointer: CurrentPointer) => {
+            intendedPointer = pointer;
+            probe.armed = true;
+            try {
+              await failingRunStore.publishCurrent(projectId, pointer);
+            } catch (error) {
+              underlyingError = error;
+              throw error;
+            } finally {
+              probe.armed = false;
+            }
+          },
+        } as RunStore;
+        const events: string[] = [];
+        const stageCalls: StageId[] = [];
+        const artifactPath = 'compiled/rollback-unknown.json';
+        const registry = createStages(events, stageCalls).map((stage) => (
+          stage.id !== 'compile'
+            ? stage
+            : {
+              ...stage,
+              verify: async (context: StagePlanningContext, report: StageReport) => {
+                if (
+                  context.sourceRun === undefined
+                  || report.fingerprint !== stageFingerprint('compile')
+                ) {
+                  return false;
+                }
+                return report.artifacts.every((artifact) => (
+                  artifact.scope === 'run'
+                )) && await Promise.all(report.artifacts.map(async (artifact) => (
+                  await modules.artifacts.verifyRunArtifact(
+                    context.sourceRun!.runDirectory,
+                    artifact,
+                  )
+                ))).then((results) => results.every(Boolean));
+              },
+              execute: async (context: StageExecutionContext, signal: AbortSignal) => {
+                const result = await stage.execute(context, signal);
+                if (context.runDirectory === undefined) throw new Error('missing Run');
+                const artifact = await writeFaultInjectedRunArtifact(
+                  modules,
+                  context.runDirectory,
+                  artifactPath,
+                  'rollback unknown compiled bytes',
+                );
+                return {...result, artifacts: [artifact]};
+              },
+            }
+        ));
+        const release = vi.fn(async () => undefined);
+        const dependencies: RunnerDependencies = {
+          registry,
+          runStore,
+          outputStore,
+          reportStore,
+          acquireProjectLock: vi.fn(async () => ({
+            record: {
+              pid: 1,
+              hostname: 'test',
+              processStart: 'test',
+              createdAt: NOW,
+              runId,
+            },
+            release,
+          })) as unknown as RunnerDependencies['acquireProjectLock'],
+          createRunId: vi.fn(() => runId),
+          now: vi.fn(() => NOW),
+        };
+        const plan = makePlan({
+          preset: 'draft',
+          stageIds: ['preflight', 'ingest', 'narration', 'compile'],
+          actions: ['run', 'cached', 'cached', 'resume'],
+          runMode: 'resume',
+          sourceRunId: runId,
+          targetRunId: runId,
+        });
+
+        await expect(modules.runner.runExecutionPlan(
+          executionInput(plan, project),
+          dependencies,
+        )).rejects.toMatchObject({
+          name: 'PipelinePointerOutcomeError',
+          code: 'PIPELINE_POINTER_OUTCOME_UNKNOWN',
+          cause: expect.objectContaining({code: 'RUN_POINTER_ROLLBACK_FAILED'}),
+        });
+
+        expect(underlyingError).toMatchObject({code: 'RUN_POINTER_ROLLBACK_FAILED'});
+        expect(probe.events).toEqual([
+          'rename:current.json.tmp->current.json',
+          'sync:pointer-root',
+          'rename:current.json.rollback->current.json',
+          'sync:pointer-root',
+        ]);
+        await expect(normalRunStore.readCurrentReadonly('demo')).resolves.toEqual(oldPointer);
+        await expect(reportStore.readStage(runDirectory, 'compile')).resolves.toMatchObject({
+          state: 'passed',
+          artifacts: [expect.objectContaining({path: artifactPath})],
+        });
+        await expect(readFile(path.join(
+          tempProject.workspaceRoot,
+          '.work/demo/runs/run-resume',
+          artifactPath,
+        ), 'utf8')).resolves.toBe('rollback unknown compiled bytes');
+
+        expect(intendedPointer).toBeDefined();
+        if (persistedPointer === 'new') {
+          await normalRunStore.publishCurrent('demo', intendedPointer!);
+        }
+        const restartDependencies: RunnerDependencies = {
+          ...dependencies,
+          runStore: normalRunStore,
+        };
+        const restartPlan = await modules.executionPlan.buildExecutionPlan({
+          project,
+          sourceCatalog,
+          registry,
+          runStore: normalRunStore,
+          outputStore,
+          reportStore,
+          createRunId: dependencies.createRunId,
+        }, {
+          preset: 'draft',
+          to: 'compile',
+          resume: true,
+        });
+
+        const restarted = await modules.runner.runExecutionPlan(
+          executionInput(restartPlan, project),
+          restartDependencies,
+        );
+
+        expect(restarted).toMatchObject({
+          runId,
+          state: 'passed',
+          completedStage: 'compile',
+        });
+        expect(stageCalls.filter((stageId) => stageId === 'compile')).toHaveLength(1);
+        await expect(normalRunStore.readCurrentReadonly('demo')).resolves.toEqual(
+          intendedPointer,
+        );
+        await expect(reportStore.readStage(runDirectory, 'compile')).resolves.toMatchObject({
+          state: 'passed',
+          artifacts: [expect.objectContaining({path: artifactPath})],
+        });
+      } finally {
+        vi.doUnmock('node:fs/promises');
+        vi.resetModules();
+      }
+    },
+  );
 
   it('materializes only listed cached Run artifacts into a new Run', async () => {
     const tempProject = await createTempProject();
@@ -2530,7 +2785,7 @@ describe('Pipeline Runner', () => {
     expect(runtime.events).not.toContain('delete-report:release');
   });
 
-  it('keeps Release published when real Output publication rejects after commit', async () => {
+  it('preserves Output evidence when rollback fails with the new pointer visible', async () => {
     const tempProject = await createTempProject();
     tempProjects.push(tempProject);
     const project = await loadProject(tempProject.workspaceRoot, 'demo');
@@ -2621,14 +2876,14 @@ describe('Pipeline Runner', () => {
       targetRunId: 'run-release',
     });
 
-    const result = await runExecutionPlan(executionInput(plan, project), dependencies);
+    await expect(runExecutionPlan(executionInput(plan, project), dependencies))
+      .rejects.toMatchObject({
+        name: 'PipelinePointerOutcomeError',
+        code: 'PIPELINE_POINTER_OUTCOME_UNKNOWN',
+        cause: expect.objectContaining({code: 'RUN_POINTER_ROLLBACK_FAILED'}),
+      });
 
     expect(underlyingError).toMatchObject({code: 'RUN_POINTER_ROLLBACK_FAILED'});
-    expect(result).toMatchObject({
-      runId: 'run-release',
-      state: 'passed',
-      completedStage: 'release',
-    });
     const runDirectory = await runStore.openExistingRun('demo', 'run-release');
     await expect(reportStore.readStage(runDirectory, 'release')).resolves.toMatchObject({
       state: 'passed',
@@ -2642,6 +2897,198 @@ describe('Pipeline Runner', () => {
     });
     expect(release).toHaveBeenCalledOnce();
   });
+
+  it.each(['old', 'new'] as const)(
+    'preserves Output evidence when rollback durability is unknown and %s pointer survives restart',
+    async (persistedPointer) => {
+      const tempProject = await createTempProject();
+      tempProjects.push(tempProject);
+      const project = await loadProject(tempProject.workspaceRoot, 'demo');
+      const publishSyncError = Object.assign(new Error('Output publish sync failed'), {
+        code: 'EIO',
+      });
+      const rollbackSyncError = Object.assign(new Error('Output rollback sync failed'), {
+        code: 'EIO',
+      });
+      const probe: PointerRollbackSyncProbe = {
+        armed: false,
+        pointerRootSuffix: path.join('output', 'demo'),
+        syncErrors: [publishSyncError, rollbackSyncError],
+        events: [],
+      };
+      const modules = await importPipelineModulesWithPointerRollbackSyncProbe(probe);
+      try {
+        const runStore = modules.scopes.createRunStore(tempProject.workspaceRoot);
+        const normalOutputStore = modules.scopes.createOutputStore(
+          tempProject.workspaceRoot,
+        );
+        const failingOutputStore = modules.scopes.createOutputStore(
+          tempProject.workspaceRoot,
+        );
+        const reportStore = modules.reports.createStageReportStore();
+        await normalOutputStore.createRelease('demo', 'run-old');
+        const oldPointer = currentPointer('run-old', 'release', {
+          relativePath: 'releases/run-old',
+          publishedAt: '2026-08-10T12:00:00.000Z',
+        });
+        await normalOutputStore.publishCurrent('demo', oldPointer);
+        let intendedPointer: CurrentPointer | undefined;
+        let underlyingError: unknown;
+        const outputStore = {
+          createRelease: failingOutputStore.createRelease.bind(failingOutputStore),
+          readCurrentReadonly: failingOutputStore.readCurrentReadonly.bind(
+            failingOutputStore,
+          ),
+          publishCurrent: async (projectId: string, pointer: CurrentPointer) => {
+            intendedPointer = pointer;
+            probe.armed = true;
+            try {
+              await failingOutputStore.publishCurrent(projectId, pointer);
+            } catch (error) {
+              underlyingError = error;
+              throw error;
+            } finally {
+              probe.armed = false;
+            }
+          },
+        } as OutputStore;
+        const events: string[] = [];
+        const stageCalls: StageId[] = [];
+        const releaseArtifactPath = path.join(
+          tempProject.workspaceRoot,
+          'output/demo/releases/run-release/final.mp4',
+        );
+        const registry = createStages(events, stageCalls).map((stage) => (
+          stage.id !== 'release'
+            ? stage
+            : {
+              ...stage,
+              execute: async (context: StageExecutionContext, signal: AbortSignal) => {
+                await stage.execute(context, signal);
+                if (context.runId === undefined) throw new Error('missing Run');
+                await outputStore.createRelease('demo', context.runId);
+                await writeFile(releaseArtifactPath, 'rollback unknown release bytes');
+                return {
+                  state: 'passed' as const,
+                  fingerprint: stageFingerprint('release'),
+                  outputs: {release: context.runId},
+                  artifacts: [{
+                    scope: 'output' as const,
+                    path: `releases/${context.runId}/final.mp4`,
+                    sha256: HASH_B,
+                  }],
+                  checks: [],
+                  outputCurrent: currentPointer(context.runId, 'release', {
+                    relativePath: `releases/${context.runId}`,
+                  }),
+                };
+              },
+            }
+        ));
+        const release = vi.fn(async () => undefined);
+        const dependencies: RunnerDependencies = {
+          registry,
+          runStore,
+          outputStore,
+          reportStore,
+          acquireProjectLock: vi.fn(async (_work, runId) => ({
+            record: {
+              pid: 1,
+              hostname: 'test',
+              processStart: 'test',
+              createdAt: NOW,
+              runId,
+            },
+            release,
+          })) as unknown as RunnerDependencies['acquireProjectLock'],
+          createRunId: vi.fn(() => 'run-release'),
+          now: vi.fn(() => NOW),
+        };
+        const plan = makePlan({
+          stageIds: [...STAGE_IDS],
+          actions: ['run', 'run', 'run', 'run', 'run', 'run', 'run'],
+          runMode: 'new',
+          targetRunId: 'run-release',
+        });
+
+        await expect(modules.runner.runExecutionPlan(
+          executionInput(plan, project),
+          dependencies,
+        )).rejects.toMatchObject({
+          name: 'PipelinePointerOutcomeError',
+          code: 'PIPELINE_POINTER_OUTCOME_UNKNOWN',
+          cause: expect.objectContaining({code: 'RUN_POINTER_ROLLBACK_FAILED'}),
+        });
+
+        expect(underlyingError).toMatchObject({code: 'RUN_POINTER_ROLLBACK_FAILED'});
+        expect(probe.events).toEqual([
+          'rename:current.json.tmp->current.json',
+          'sync:pointer-root',
+          'rename:current.json.rollback->current.json',
+          'sync:pointer-root',
+        ]);
+        await expect(normalOutputStore.readCurrentReadonly('demo')).resolves.toEqual(
+          oldPointer,
+        );
+        const runDirectory = await runStore.openExistingRun('demo', 'run-release');
+        await expect(reportStore.readStage(runDirectory, 'release')).resolves.toMatchObject({
+          state: 'passed',
+          artifacts: [expect.objectContaining({path: 'releases/run-release/final.mp4'})],
+        });
+        await expect(readFile(releaseArtifactPath, 'utf8'))
+          .resolves.toBe('rollback unknown release bytes');
+
+        expect(intendedPointer).toBeDefined();
+        if (persistedPointer === 'new') {
+          await normalOutputStore.publishCurrent('demo', intendedPointer!);
+        }
+        const restartDependencies: RunnerDependencies = {
+          ...dependencies,
+          outputStore: normalOutputStore,
+        };
+        const restartPlan = await modules.executionPlan.buildExecutionPlan({
+          project,
+          sourceCatalog,
+          registry,
+          runStore,
+          outputStore: normalOutputStore,
+          reportStore,
+          createRunId: dependencies.createRunId,
+        }, {
+          preset: 'release',
+          resume: true,
+          from: 'release',
+          to: 'release',
+        });
+
+        const restarted = await modules.runner.runExecutionPlan(
+          executionInput(restartPlan, project),
+          restartDependencies,
+        );
+
+        expect(restarted).toMatchObject({
+          runId: 'run-release',
+          state: 'passed',
+          completedStage: 'release',
+        });
+        expect(stageCalls.filter((stageId) => stageId === 'release')).toHaveLength(1);
+        await expect(normalOutputStore.readCurrentReadonly('demo')).resolves.toEqual(
+          intendedPointer,
+        );
+        await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
+          runId: 'run-release',
+          completedStage: 'release',
+        });
+        await expect(reportStore.readStage(runDirectory, 'release')).resolves.toMatchObject({
+          state: 'passed',
+          artifacts: [expect.objectContaining({path: 'releases/run-release/final.mp4'})],
+        });
+      } finally {
+        vi.doUnmock('node:fs/promises');
+        vi.resetModules();
+      }
+    },
+  );
 
   it('keeps the Release report when Output cleanup fails after pointer commit', async () => {
     const tempProject = await createTempProject();

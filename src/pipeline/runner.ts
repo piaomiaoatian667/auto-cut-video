@@ -93,10 +93,12 @@ export class PipelinePointerOutcomeError extends AggregateError {
   constructor(
     owner: PointerOwner,
     primaryError: unknown,
-    readError: unknown,
+    readError?: unknown,
   ) {
     super(
-      [primaryError, readError],
+      readError === undefined
+        ? [primaryError]
+        : [primaryError, readError],
       `${owner} pointer publication outcome could not be determined`,
       {cause: primaryError},
     );
@@ -106,6 +108,12 @@ export class PipelinePointerOutcomeError extends AggregateError {
 
 const isMissingPath = (error: unknown): boolean =>
   error instanceof Error && 'code' in error && error.code === 'ENOENT';
+
+const isPointerRollbackOutcomeUnknown = (error: unknown): boolean => (
+  error instanceof Error
+  && 'code' in error
+  && error.code === 'RUN_POINTER_ROLLBACK_FAILED'
+);
 
 const isOrdinaryReportMiss = (error: unknown): boolean => (
   isMissingPath(error)
@@ -184,6 +192,9 @@ const publishCurrentConfirmed = async (input: {
   try {
     await input.store.publishCurrent(input.projectId, input.pointer);
   } catch (primaryError) {
+    if (isPointerRollbackOutcomeUnknown(primaryError)) {
+      throw new PipelinePointerOutcomeError(input.owner, primaryError);
+    }
     let current: CurrentPointer | null;
     try {
       current = await input.store.readCurrentReadonly(input.projectId);
