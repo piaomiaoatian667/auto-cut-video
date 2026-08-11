@@ -96,6 +96,7 @@ const STAGE_POSITIONS = new Map(STAGE_IDS.map((stageId, index) => [
   stageId,
   index,
 ]));
+const NEW_RUN_REUSE_LIMIT = STAGE_POSITIONS.get('draft')!;
 
 const isPreset = (value: unknown): value is PipelinePreset =>
   typeof value === 'string' && PRESET_IDS.includes(value as PipelinePreset);
@@ -158,7 +159,9 @@ const reconcileCurrentPointer = (
   if (work === null) return output;
   if (output === null) return work;
   if (output.runId === work.runId) {
-    return pointerProgress(output) > pointerProgress(work) ? output : work;
+    const progressOrder = pointerProgress(output) - pointerProgress(work);
+    if (progressOrder !== 0) return progressOrder > 0 ? output : work;
+    return output.completedStage === 'release' ? output : work;
   }
   const publicationOrder = output.publishedAt.localeCompare(work.publishedAt);
   if (publicationOrder !== 0) return publicationOrder > 0 ? output : work;
@@ -204,6 +207,7 @@ const persistedPreflight = (
 const readSourceRun = async (
   context: ExecutionPlanContext,
   projectId: string,
+  reportStageIds: readonly StageId[],
 ): Promise<SourceRun | null> => {
   const [workCurrent, outputCurrent] = await Promise.all([
     context.runStore.readCurrentReadonly(projectId),
@@ -224,8 +228,14 @@ const readSourceRun = async (
   }
 
   const reports = new Map<StageId, StageReport>();
-  for (const stageId of STAGE_IDS) {
-    const report = await context.reportStore.readStage(runDirectory, stageId);
+  for (const stageId of reportStageIds) {
+    let report: StageReport | null;
+    try {
+      report = await context.reportStore.readStage(runDirectory, stageId);
+    } catch (error) {
+      if (isOrdinaryPlanningMiss(error)) continue;
+      throw error;
+    }
     if (report !== null) reports.set(stageId, report);
   }
   return {pointer, runDirectory, reports};
@@ -404,11 +414,12 @@ export async function buildExecutionPlan(
   }
 
   const projectId = context.project.project.id;
-  const source = await readSourceRun(context, projectId);
+  const relevantStageIds = presetStageIds.slice(0, toIndex + 1);
+  const source = await readSourceRun(context, projectId, relevantStageIds);
   const assessments = await assessStages(
     context,
     source,
-    presetStageIds,
+    relevantStageIds,
   );
   const omittedPrerequisites = presetStageIds.slice(0, fromIndex);
   const requiresRuntimePreflight = fromIndex > 0;
@@ -547,6 +558,7 @@ export async function buildExecutionPlan(
     const action: StageAction = assessment.stage.id !== 'preflight'
       && index < rerunFrom
       && assessment.matching
+      && STAGE_POSITIONS.get(assessment.stage.id)! <= NEW_RUN_REUSE_LIMIT
       ? 'cached'
       : 'run';
     return item(

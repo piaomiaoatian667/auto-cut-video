@@ -15,7 +15,11 @@ import type {
   StageId,
 } from '../../../src/pipeline/run-store';
 import type {ProjectSourceCatalog} from '../../../src/pipeline/source-assets';
-import type {StageReport, StageReportStore} from '../../../src/pipeline/stage-report';
+import {
+  StageReportValidationError,
+  type StageReport,
+  type StageReportStore,
+} from '../../../src/pipeline/stage-report';
 import {fakeStage, passedStageReport} from '../../helpers/pipeline-fixtures';
 
 const STAGE_IDS = [...STAGE_PRESETS.release];
@@ -68,6 +72,7 @@ interface PlanScenario {
   current?: CurrentPointer | null;
   outputCurrent?: CurrentPointer | null;
   reports?: ReadonlyMap<StageId, StageReport>;
+  malformedReports?: readonly StageId[];
   fingerprints?: Partial<Record<StageId, string | null>>;
   verified?: Partial<Record<StageId, boolean>>;
 }
@@ -91,7 +96,12 @@ const createContext = (scenario: PlanScenario = {}): {
     readCurrentReadonly: vi.fn(async () => scenario.outputCurrent ?? null),
   } as unknown as OutputStore;
   const reportStore: StageReportStore = {
-    readStage: vi.fn(async (_run, stageId) => reports.get(stageId) ?? null),
+    readStage: vi.fn(async (_run, stageId) => {
+      if (scenario.malformedReports?.includes(stageId) === true) {
+        throw new StageReportValidationError(`malformed ${stageId} report`);
+      }
+      return reports.get(stageId) ?? null;
+    }),
     writeStage: vi.fn(async () => undefined),
     writeAttempt: vi.fn(async () => 'unused-attempt'),
   };
@@ -343,6 +353,92 @@ describe('buildExecutionPlan', () => {
     ]);
   });
 
+  it('caps fresh Run reuse at Draft for a completed Release source', async () => {
+    const plan = await build({
+      current: pointer('release'),
+      reports: reportsThrough('release'),
+    }, {
+      preset: 'release',
+    });
+
+    expect(plan.runMode).toBe('new');
+    expect(plan.items.map((item) => [
+      item.stageId,
+      item.action,
+      item.materialize,
+    ])).toEqual([
+      ['preflight', 'run', false],
+      ['ingest', 'cached', true],
+      ['narration', 'cached', true],
+      ['compile', 'cached', true],
+      ['draft', 'cached', true],
+      ['review', 'run', false],
+      ['release', 'run', false],
+    ]);
+  });
+
+  it.each(['assets', 'draft'] as const)(
+    'does not read a malformed Release report for the %s Preset',
+    async (preset) => {
+      const {context} = createContext({
+        current: pointer('release'),
+        reports: reportsThrough('release'),
+        malformedReports: ['release'],
+      });
+
+      const plan = await buildExecutionPlan(context, {preset});
+
+      expect(plan.stageIds).toEqual([...STAGE_PRESETS[preset]]);
+      expect(vi.mocked(context.reportStore.readStage).mock.calls.map(
+        ([, stageId]) => stageId,
+      )).toEqual([...STAGE_PRESETS[preset]]);
+    },
+  );
+
+  it('treats a malformed relevant report as a cache miss in a full plan', async () => {
+    const plan = await build({
+      current: pointer('draft', {
+        preset: 'draft',
+        stageIds: [...STAGE_PRESETS.draft],
+      }),
+      reports: reportsThrough('draft'),
+      malformedReports: ['draft'],
+    }, {
+      preset: 'draft',
+    });
+
+    expect(plan.runMode).toBe('new');
+    expect(plan.items.map((item) => [
+      item.stageId,
+      item.action,
+      item.materialize,
+    ])).toEqual([
+      ['preflight', 'run', false],
+      ['ingest', 'cached', true],
+      ['narration', 'cached', true],
+      ['compile', 'cached', true],
+      ['draft', 'run', false],
+    ]);
+  });
+
+  it('treats a malformed completed range report as stale', async () => {
+    await expect(build({
+      current: pointer('draft', {
+        preset: 'draft',
+        stageIds: [...STAGE_PRESETS.draft],
+      }),
+      reports: reportsThrough('draft'),
+      malformedReports: ['draft'],
+    }, {
+      preset: 'draft',
+      from: 'draft',
+      to: 'draft',
+    })).rejects.toMatchObject({
+      code: 'PLAN_RANGE_STALE',
+      stageId: 'draft',
+    });
+  });
+
   it('keeps the current Run when force targets the first incomplete Stage', async () => {
     const plan = await build({
       current: pointer('narration'),
@@ -554,5 +650,38 @@ describe('buildExecutionPlan', () => {
 
     expect(plan.sourceRunId).toBe('same-run');
     expect(plan.runMode).toBe('noop');
+  });
+
+  it('uses same-Run Output authority for equal Release progress', async () => {
+    const publishedAt = '2026-08-11T00:01:00.000Z';
+    const workCurrent = pointer('release', {
+      runId: 'same-run',
+      relativePath: 'runs/same-run',
+      stageIds: ['release'],
+      publishedAt,
+    });
+    const outputCurrent = pointer('release', {
+      runId: 'same-run',
+      relativePath: 'releases/same-run',
+      stageIds: [...STAGE_PRESETS.release],
+      publishedAt,
+    });
+    const {context, createRunId} = createContext({
+      current: workCurrent,
+      outputCurrent,
+      reports: reportsThrough('release', {}, 'same-run'),
+    });
+
+    const plan = await buildExecutionPlan(context, {
+      preset: 'release',
+      resume: true,
+    });
+
+    expect(plan).toMatchObject({
+      runMode: 'resume',
+      sourceRunId: 'same-run',
+      targetRunId: 'same-run',
+    });
+    expect(createRunId).not.toHaveBeenCalled();
   });
 });
