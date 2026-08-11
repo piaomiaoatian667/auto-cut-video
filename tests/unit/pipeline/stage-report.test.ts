@@ -1,6 +1,14 @@
-import {readFile, symlink, writeFile} from 'node:fs/promises';
+import {constants} from 'node:fs';
+import {
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
 import path from 'node:path';
-import {describe, expect, it} from 'vitest';
+import {describe, expect, it, vi} from 'vitest';
 import {
   ensureRunDirectory,
   openNewRunFile,
@@ -86,6 +94,98 @@ describe('StageReportStore', () => {
         .rejects.toMatchObject({code: 'EEXIST'});
     } finally {
       await fixture.cleanup();
+    }
+  });
+
+  it('removes a canonical report when directory-authority close fails', async () => {
+    const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'stage-report-close-'));
+    const closeError = Object.assign(new Error('directory authority close failed'), {
+      code: 'EIO',
+    });
+    let armed = false;
+    let directoryProxied = false;
+    let directoryCloseFailed = false;
+    let reportFileOpened = false;
+    let reportFileClosed = false;
+    vi.resetModules();
+    vi.doMock('node:fs/promises', async () => {
+      const actual = await vi.importActual<typeof import('node:fs/promises')>(
+        'node:fs/promises',
+      );
+      return {
+        ...actual,
+        open: async (...args: Parameters<typeof actual.open>) => {
+          const handle = await Reflect.apply(actual.open, undefined, args);
+          if (!armed) return handle;
+          const flags = Number(args[1]);
+          if ((flags & constants.O_CREAT) !== 0) {
+            reportFileOpened = true;
+            return new Proxy(handle, {
+              get(target, property) {
+                if (property === 'close') {
+                  return async () => {
+                    await target.close();
+                    reportFileClosed = true;
+                  };
+                }
+                const value = Reflect.get(target, property, target);
+                return typeof value === 'function' ? value.bind(target) : value;
+              },
+            });
+          }
+          const status = await handle.stat({bigint: true});
+          if (!status.isDirectory()) return handle;
+          directoryProxied = true;
+          return new Proxy(handle, {
+            get(target, property) {
+              if (property === 'close') {
+                return async () => {
+                  await target.close();
+                  if (reportFileOpened && !directoryCloseFailed) {
+                    directoryCloseFailed = true;
+                    throw closeError;
+                  }
+                };
+              }
+              const value = Reflect.get(target, property, target);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+        },
+      };
+    });
+
+    try {
+      const scopes = await import('../../../src/fs/app-directory-scopes');
+      const reports = await import('../../../src/pipeline/stage-report');
+      const runDirectory = await scopes.createRunStore(workspaceRoot)
+        .createRun('demo', 'run-one');
+      const store = reports.createStageReportStore();
+      const report = passedStageReport({stageId: 'ingest'});
+      armed = true;
+
+      let writeError: unknown;
+      try {
+        await store.writeStage(runDirectory, report);
+      } catch (error) {
+        writeError = error;
+      }
+
+      expect(writeError).toBe(closeError);
+      expect(directoryProxied).toBe(true);
+      expect(directoryCloseFailed).toBe(true);
+      expect(reportFileClosed).toBe(true);
+      await expect(scopes.openExistingRunFile(
+        runDirectory,
+        'reports/ingest.json',
+      )).rejects.toMatchObject({code: 'ENOENT'});
+
+      await expect(store.writeStage(runDirectory, report)).resolves.toBeUndefined();
+      await expect(store.readStage(runDirectory, 'ingest')).resolves.toEqual(report);
+    } finally {
+      vi.doUnmock('node:fs/promises');
+      vi.resetModules();
+      await rm(workspaceRoot, {recursive: true, force: true});
     }
   });
 

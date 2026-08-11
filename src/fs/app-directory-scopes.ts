@@ -1163,38 +1163,50 @@ const openNewScopedWriteFileAuthority = async (
         return mapSymlinkError(error, relativePath);
       }
     };
-    let closed = false;
+    let fileClosed = false;
+    let directoriesClosed = false;
+    let unlinked = false;
     const result: AppDirectoryWriteFileAuthority = {
       handle: openedHandle,
       syncAndSeal,
       openForRead,
       revalidate,
-      unlink: async () => await unlinkHeldCreatedFile(
-        openedIdentity,
-        openedHandle,
-        relativePath,
-      ),
+      unlink: async () => {
+        await unlinkHeldCreatedFile(
+          openedIdentity,
+          openedHandle,
+          relativePath,
+        );
+        unlinked = true;
+      },
       close: async () => {
-        if (closed) return;
-        closed = true;
+        if (fileClosed && directoriesClosed) return;
         let fileCloseError: unknown;
-        try {
-          await openedHandle.close();
-        } catch (error) {
-          fileCloseError = error;
-        }
-        try {
-          await closeDirectoryAnchors(pathAuthority.directories);
-        } catch (directoryCloseError) {
-          if (fileCloseError !== undefined) {
-            throw new AggregateError(
-              [fileCloseError, directoryCloseError],
-              'failed to close scoped artifact write authority',
-            );
+        let directoryCloseError: unknown;
+        if (!directoriesClosed) {
+          try {
+            await closeDirectoryAnchors(pathAuthority.directories);
+            directoriesClosed = true;
+          } catch (error) {
+            directoryCloseError = error;
           }
-          throw directoryCloseError;
+        }
+        if (!fileClosed && (directoriesClosed || unlinked)) {
+          try {
+            await openedHandle.close();
+            fileClosed = true;
+          } catch (error) {
+            fileCloseError = error;
+          }
+        }
+        if (fileCloseError !== undefined && directoryCloseError !== undefined) {
+          throw new AggregateError(
+            [fileCloseError, directoryCloseError],
+            'failed to close scoped artifact write authority',
+          );
         }
         if (fileCloseError !== undefined) throw fileCloseError;
+        if (directoryCloseError !== undefined) throw directoryCloseError;
       },
     };
     handle = undefined;
