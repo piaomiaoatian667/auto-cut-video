@@ -48,6 +48,15 @@ interface ScopeState {
   ancestors: DirectoryIdentity[];
 }
 
+export interface RunDirectoryIdentity {
+  readonly projectId: string;
+  readonly runId: string;
+}
+
+interface RunScopeState extends ScopeState {
+  identity: RunDirectoryIdentity;
+}
+
 interface DirectoryAnchor {
   identity: DirectoryIdentity;
   handle: FileHandle;
@@ -70,6 +79,7 @@ export interface AppDirectoryReadFileAuthority {
 export interface AppDirectoryWriteFileAuthority {
   readonly handle: FileHandle;
   syncAndSeal(): Promise<void>;
+  syncParent(): Promise<void>;
   openForRead(): Promise<AppDirectoryReadFileAuthority>;
   revalidate(): Promise<void>;
   unlink(): Promise<void>;
@@ -77,7 +87,7 @@ export interface AppDirectoryWriteFileAuthority {
 }
 
 const workStates = new WeakMap<WorkDirectoryScope, ScopeState>();
-const runStates = new WeakMap<RunDirectoryScope, ScopeState>();
+const runStates = new WeakMap<RunDirectoryScope, RunScopeState>();
 const outputStates = new WeakMap<OutputDirectoryScope, ScopeState>();
 
 let mintWorkDirectoryScope!: () => WorkDirectoryScope;
@@ -395,11 +405,11 @@ const createWorkspaceState = (workspaceRoot: string): DirectoryIdentity => {
   return inspectPlainDirectory(canonicalWorkspace, 'workspace root');
 };
 
-const stateFor = <T extends object>(
-  states: WeakMap<T, ScopeState>,
-  scope: T,
+const stateFor = <Scope extends object, State extends ScopeState>(
+  states: WeakMap<Scope, State>,
+  scope: Scope,
   name: string,
-): ScopeState => {
+): State => {
   const state = states.get(scope);
   if (!state) throw new TypeError(`invalid ${name}`);
   return state;
@@ -465,8 +475,9 @@ const mintRunScope = async (
   runId: string,
   mode: 'create' | 'existing',
 ): Promise<RunDirectoryScope> => {
+  const validatedProjectId = StableIdSchema.parse(projectId);
   const validatedRunId = StableIdSchema.parse(runId);
-  const work = await createWorkScope(workspace, projectId);
+  const work = await createWorkScope(workspace, validatedProjectId);
   const workState = stateFor(workStates, work, 'WorkDirectoryScope');
   await assertScopeStable(workState, `runs/${validatedRunId}`);
   const workRoot = workState.ancestors.at(-1)!;
@@ -482,9 +493,21 @@ const mintRunScope = async (
   runStates.set(scope, {
     root: runRoot.path,
     ancestors: [...workState.ancestors, runsRoot, runRoot],
+    identity: Object.freeze({
+      projectId: validatedProjectId,
+      runId: validatedRunId,
+    }),
   });
   return scope;
 };
+
+export const getRunDirectoryIdentity = (
+  scope: RunDirectoryScope,
+): RunDirectoryIdentity => stateFor(
+  runStates,
+  scope,
+  'RunDirectoryScope',
+).identity;
 
 const mintOutputScope = async (
   workspace: DirectoryIdentity,
@@ -1121,6 +1144,13 @@ const openNewScopedWriteFileAuthority = async (
       }
       sealedIdentity = identity;
     };
+    const syncParent = async (): Promise<void> => {
+      const parentPath = path.posix.dirname(relativePath);
+      await syncScopedDirectory(
+        state,
+        parentPath === '.' ? undefined : parentPath,
+      );
+    };
     const openForRead = async (): Promise<AppDirectoryReadFileAuthority> => {
       const expected = sealedIdentity;
       if (expected === undefined) {
@@ -1169,6 +1199,7 @@ const openNewScopedWriteFileAuthority = async (
     const result: AppDirectoryWriteFileAuthority = {
       handle: openedHandle,
       syncAndSeal,
+      syncParent,
       openForRead,
       revalidate,
       unlink: async () => {
@@ -1377,11 +1408,27 @@ const syncScopedDirectory = async (
     throw securityError(`directory sync target is not plain: ${relativePath}`);
   }
   const handle = await open(target, constants.O_RDONLY | O_NOFOLLOW_ANY);
+  let syncError: unknown;
   try {
     await handle.sync();
-  } finally {
-    await handle.close();
+  } catch (error) {
+    syncError = error;
   }
+  let closeError: unknown;
+  try {
+    await handle.close();
+  } catch (error) {
+    closeError = error;
+  }
+  if (syncError !== undefined && closeError !== undefined) {
+    throw new AggregateError(
+      [syncError, closeError],
+      `failed to sync scoped directory: ${relativePath}`,
+      {cause: syncError},
+    );
+  }
+  if (syncError !== undefined) throw syncError;
+  if (closeError !== undefined) throw closeError;
 };
 
 const inspectWorkEntry = async (
@@ -1469,6 +1516,14 @@ const syncWorkDirectory = async (
   relativePath = '.',
 ): Promise<void> => await syncScopedDirectory(
   stateFor(workStates, scope, 'WorkDirectoryScope'),
+  relativePath,
+);
+
+export const syncRunDirectory = async (
+  scope: RunDirectoryScope,
+  relativePath = '.',
+): Promise<void> => await syncScopedDirectory(
+  stateFor(runStates, scope, 'RunDirectoryScope'),
   relativePath,
 );
 

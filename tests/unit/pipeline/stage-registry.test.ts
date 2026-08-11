@@ -6,6 +6,7 @@ import {
 } from '../../../src/pipeline/stage';
 import {createStageRegistry} from '../../../src/pipeline/stage-registry';
 import {STAGE_PRESETS} from '../../../src/pipeline/presets';
+import type {StageId} from '../../../src/pipeline/run-store';
 import {
   createPipelineRunFixture,
   fakePreflightResult,
@@ -21,6 +22,13 @@ const orderedStages = () => [
   fakeStage('review'),
   fakeStage('release'),
 ];
+
+const withPrerequisites = (
+  stageId: StageId,
+  prerequisites: readonly StageId[],
+) => orderedStages().map((stage) => stage.id === stageId
+  ? fakeStage(stageId, {prerequisites})
+  : stage);
 
 describe('STAGE_PRESETS', () => {
   it('keeps all Presets contiguous in registry order', () => {
@@ -70,6 +78,30 @@ describe('createStageRegistry', () => {
     expect(() => createStageRegistry(orderedStages().slice(0, -1)))
       .toThrow(/STAGE_REGISTRY_INVALID/u);
   });
+
+  it.each([
+    ['duplicate prerequisites', withPrerequisites('ingest', [
+      'preflight',
+      'preflight',
+    ])],
+    ['unregistered prerequisites', withPrerequisites('ingest', [
+      'missing' as StageId,
+    ])],
+    ['self prerequisites', withPrerequisites('ingest', ['ingest'])],
+    ['forward prerequisites', withPrerequisites('ingest', ['narration'])],
+  ])('rejects %s', (_label, stages) => {
+    expect(() => createStageRegistry(stages))
+      .toThrow(/STAGE_REGISTRY_INVALID/u);
+  });
+
+  it('accepts unique earlier prerequisites', () => {
+    const stages = orderedStages().map((stage, index, allStages) => fakeStage(
+      stage.id,
+      {prerequisites: allStages.slice(0, index).map((earlier) => earlier.id)},
+    ));
+
+    expect(createStageRegistry(stages)).toHaveLength(STAGE_PRESETS.release.length);
+  });
 });
 
 describe('Stage context requirements', () => {
@@ -89,6 +121,18 @@ describe('Stage context requirements', () => {
         .toThrow(/PIPELINE_CONTEXT_INVALID/u);
       expect(() => requireRunContext({runId: 'run-one'} as StageExecutionContext))
         .toThrow(/PIPELINE_CONTEXT_INVALID/u);
+      for (const context of [
+        {runId: null, runDirectory: fixture.runDirectory},
+        {runId: 'run-one', runDirectory: null},
+      ]) {
+        let caughtError: unknown;
+        try {
+          requireRunContext(context as unknown as StageExecutionContext);
+        } catch (error) {
+          caughtError = error;
+        }
+        expect(caughtError).toMatchObject({code: 'PIPELINE_CONTEXT_INVALID'});
+      }
     } finally {
       await fixture.cleanup();
     }
@@ -101,5 +145,12 @@ describe('Stage context requirements', () => {
       .toBe(preflight);
     expect(() => requirePreflight({} as StageExecutionContext))
       .toThrow(/PIPELINE_CONTEXT_INVALID/u);
+    let caughtError: unknown;
+    try {
+      requirePreflight({preflight: null} as unknown as StageExecutionContext);
+    } catch (error) {
+      caughtError = error;
+    }
+    expect(caughtError).toMatchObject({code: 'PIPELINE_CONTEXT_INVALID'});
   });
 });

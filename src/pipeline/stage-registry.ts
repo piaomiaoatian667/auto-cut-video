@@ -35,6 +35,26 @@ export function createStageRegistry(
     invalidRegistry('Stage registrations must use the exact stable order');
   }
 
+  const stagePositions = new Map(registeredIds.map((stageId, index) => [
+    stageId,
+    index,
+  ]));
+  for (const [stageIndex, stage] of registry.entries()) {
+    const prerequisites = new Set<string>();
+    for (const prerequisite of stage.prerequisites) {
+      if (prerequisites.has(prerequisite)) {
+        invalidRegistry(`duplicate prerequisite for ${stage.id}: ${prerequisite}`);
+      }
+      prerequisites.add(prerequisite);
+      const prerequisiteIndex = stagePositions.get(prerequisite);
+      if (prerequisiteIndex === undefined) {
+        invalidRegistry(`unregistered prerequisite for ${stage.id}: ${prerequisite}`);
+      } else if (prerequisiteIndex >= stageIndex) {
+        invalidRegistry(`prerequisite must precede ${stage.id}: ${prerequisite}`);
+      }
+    }
+  }
+
   for (const [preset, stageIds] of Object.entries(STAGE_PRESETS)) {
     if (
       stageIds.length > registeredIds.length

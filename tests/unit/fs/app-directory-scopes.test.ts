@@ -669,6 +669,60 @@ describe('app-owned directory scopes', () => {
     await retry.close();
   });
 
+  it('preserves Run directory sync and authority-close failures', async () => {
+    const workspaceRoot = await makeTempDirectory('app-scopes-directory-sync-');
+    const syncError = Object.assign(new Error('directory sync failed'), {code: 'EIO'});
+    const closeError = Object.assign(new Error('directory close failed'), {code: 'EIO'});
+    let armed = false;
+    let proxied = false;
+    vi.resetModules();
+    vi.doMock('node:fs/promises', async () => {
+      const actual = await vi.importActual<typeof import('node:fs/promises')>(
+        'node:fs/promises',
+      );
+      return {
+        ...actual,
+        open: async (...args: Parameters<typeof actual.open>) => {
+          const handle = await Reflect.apply(actual.open, undefined, args);
+          if (!armed || proxied) return handle;
+          const status = await handle.stat({bigint: true});
+          if (!status.isDirectory()) return handle;
+          proxied = true;
+          return new Proxy(handle, {
+            get(target, property) {
+              if (property === 'sync') return async () => { throw syncError; };
+              if (property === 'close') {
+                return async () => {
+                  await target.close();
+                  throw closeError;
+                };
+              }
+              const value = Reflect.get(target, property, target);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+        },
+      };
+    });
+    const scopes = await import('../../../src/fs/app-directory-scopes');
+    const run = await scopes.createRunStore(workspaceRoot)
+      .createRun('demo', 'run-one');
+    armed = true;
+
+    let caughtError: unknown;
+    try {
+      await scopes.syncRunDirectory(run);
+    } catch (error) {
+      caughtError = error;
+    }
+
+    expect(caughtError).toBeInstanceOf(AggregateError);
+    expect((caughtError as AggregateError).errors).toEqual([
+      syncError,
+      closeError,
+    ]);
+  });
+
   it.each(['work', 'run', 'output'] as const)(
     'fails closed after lexical %s root replacement',
     async (kind) => {

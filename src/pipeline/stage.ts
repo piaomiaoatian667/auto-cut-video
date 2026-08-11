@@ -71,7 +71,12 @@ export interface RequiredRunContext {
 export const requireRunContext = (
   context: Pick<StageExecutionContext, 'runId' | 'runDirectory'>,
 ): RequiredRunContext => {
-  if (context.runId === undefined || context.runDirectory === undefined) {
+  if (
+    context.runId === undefined
+    || context.runId === null
+    || context.runDirectory === undefined
+    || context.runDirectory === null
+  ) {
     throw new PipelineContextError('Stage execution requires a Run context');
   }
   return {
@@ -83,7 +88,7 @@ export const requireRunContext = (
 export const requirePreflight = (
   context: Pick<StagePlanningContext, 'preflight'>,
 ): PreflightResult => {
-  if (context.preflight === undefined) {
+  if (context.preflight === undefined || context.preflight === null) {
     throw new PipelineContextError('Stage execution requires Preflight results');
   }
   return context.preflight;
