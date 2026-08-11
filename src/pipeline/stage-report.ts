@@ -6,6 +6,7 @@ import {
   getRunDirectoryIdentity,
   openExistingRunFileForRead,
   openNewRunFileForWrite,
+  unlinkRunFile,
   type AppDirectoryReadFileAuthority,
   type AppDirectoryWriteFileAuthority,
   type RunDirectoryScope,
@@ -278,6 +279,7 @@ export interface StageReportStore {
   ): Promise<StageReport | null>;
   writeStage(run: RunDirectoryScope, report: StageReport): Promise<void>;
   writeAttempt(run: RunDirectoryScope, report: StageReport): Promise<string>;
+  deleteStage?(run: RunDirectoryScope, stageId: StageId): Promise<void>;
 }
 
 export class StageReportValidationError extends TypeError {
@@ -478,5 +480,8 @@ export const createStageReportStore = (): StageReportStore => ({
       validated,
     );
     return attemptId;
+  },
+  deleteStage: async (run, stageId) => {
+    await unlinkRunFile(run, `reports/${stageId}.json`);
   },
 });
