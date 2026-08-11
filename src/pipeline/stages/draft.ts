@@ -49,6 +49,8 @@ export type DraftReport = z.infer<typeof DraftReportSchema>;
 
 export interface DraftStageInput extends ProjectInputs {
   runDirectory: RunDirectoryScope;
+  ffmpegExecutable?: string;
+  ffprobeExecutable?: string;
   signal?: AbortSignal;
 }
 
@@ -180,6 +182,7 @@ const muxDraft = async (
   input: DraftStageInput,
   mutedVideoPath: string,
   mixedAudioPath: string,
+  ffmpegExecutable: string,
   runner: typeof runProcess,
 ): Promise<ArtifactReference> => {
   await ensureRunDirectory(input.runDirectory, 'draft');
@@ -187,7 +190,7 @@ const muxDraft = async (
   const audioHandle = await openExistingRunFile(input.runDirectory, mixedAudioPath);
   const outputHandle = await openNewRunReadWriteFile(input.runDirectory, 'draft/draft.mp4');
   try {
-    await runner(FFMPEG_EXECUTABLE, [
+    await runner(ffmpegExecutable, [
       '-v', 'error',
       '-y',
       '-i', '/dev/fd/3',
@@ -213,27 +216,35 @@ const muxDraft = async (
 };
 
 const verifyDraft = async (
-  runDirectory: RunDirectoryScope,
+  input: DraftStageInput,
   draftPath: string,
+  ffmpegExecutable: string,
+  ffprobeExecutable: string,
   runner: typeof runProcess,
 ): Promise<void> => {
-  await withRunFile(runDirectory, draftPath, async (handle) => {
-    await runner(FFMPEG_EXECUTABLE, [
+  await withRunFile(input.runDirectory, draftPath, async (handle) => {
+    await runner(ffmpegExecutable, [
       '-v', 'error',
       '-xerror',
       '-i', '/dev/fd/3',
       '-f', 'null',
       '-',
-    ], {extraStdioFds: [handle.fd]});
+    ], {
+      ...(input.signal === undefined ? {} : {signal: input.signal}),
+      extraStdioFds: [handle.fd],
+    });
   });
-  const metadata = await withRunFile(runDirectory, draftPath, async (handle) => {
-    const result = await runner(FFPROBE_EXECUTABLE, [
+  const metadata = await withRunFile(input.runDirectory, draftPath, async (handle) => {
+    const result = await runner(ffprobeExecutable, [
       '-v', 'error',
       '-print_format', 'json',
       '-show_format',
       '-show_streams',
       '/dev/fd/3',
-    ], {extraStdioFds: [handle.fd]});
+    ], {
+      ...(input.signal === undefined ? {} : {signal: input.signal}),
+      extraStdioFds: [handle.fd],
+    });
     return parseFfprobeJson(result.stdout);
   });
   if (metadata.videoStreams.length !== 1 || metadata.audioStreams.length !== 1) {
@@ -242,6 +253,8 @@ const verifyDraft = async (
 }
 
 export const runDraft = async (input: DraftStageInput): Promise<DraftStageResult> => {
+  const ffmpegExecutable = input.ffmpegExecutable ?? FFMPEG_EXECUTABLE;
+  const ffprobeExecutable = input.ffprobeExecutable ?? FFPROBE_EXECUTABLE;
   const timeline = await readRunJson(
     input.runDirectory,
     'compiled-timeline.json',
@@ -286,14 +299,28 @@ export const runDraft = async (input: DraftStageInput): Promise<DraftStageResult
       projectDirectory: input.projectDirectory,
       runDirectory: input.runDirectory,
       input: mixInput,
+      ffmpegExecutable,
       ...(input.signal === undefined ? {} : {signal: input.signal}),
     });
-    const draftVideo = await muxDraft(input, mutedVideo.path, audio.mixedAudio.path, runProcess);
-    await verifyDraft(input.runDirectory, draftVideo.path, runProcess);
+    const draftVideo = await muxDraft(
+      input,
+      mutedVideo.path,
+      audio.mixedAudio.path,
+      ffmpegExecutable,
+      runProcess,
+    );
+    await verifyDraft(
+      input,
+      draftVideo.path,
+      ffmpegExecutable,
+      ffprobeExecutable,
+      runProcess,
+    );
     const contactSheet = await generateContactSheet({
       runDirectory: input.runDirectory,
       videoPath: draftVideo.path,
       timeline,
+      ffmpegExecutable,
       ...(input.signal === undefined ? {} : {signal: input.signal}),
     });
 

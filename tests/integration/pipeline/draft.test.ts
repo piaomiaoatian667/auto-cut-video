@@ -1,4 +1,4 @@
-import {mkdir, rm} from 'node:fs/promises';
+import {chmod, mkdir, readFile, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {afterEach, describe, expect, it} from 'vitest';
 import {loadProject} from '../../../src/domain/load-project';
@@ -17,6 +17,25 @@ import {
 import {createTestMusic, createTestVideo} from '../../helpers/media-fixtures';
 
 const tempProjects: TempProject[] = [];
+
+const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\"'\"'")}'`;
+
+const createRecordingExecutable = async (
+  workspaceRoot: string,
+  name: string,
+  target: string,
+): Promise<{executablePath: string; logPath: string}> => {
+  const executablePath = path.join(workspaceRoot, `${name}-wrapper.sh`);
+  const logPath = path.join(workspaceRoot, `${name}-calls.log`);
+  await writeFile(executablePath, [
+    '#!/bin/sh',
+    `printf '%s\\n' "$*" >> ${shellQuote(logPath)}`,
+    `exec ${shellQuote(target)} "$@"`,
+    '',
+  ].join('\n'), 'utf8');
+  await chmod(executablePath, 0o755);
+  return {executablePath, logPath};
+};
 
 afterEach(async () => {
   await Promise.all(tempProjects.splice(0).map(async (project) => await project.cleanup()));
@@ -106,10 +125,25 @@ describe('runDraft', () => {
     await createTestMusic(path.join(tempProject.projectRoot, 'assets/source/music.wav'), 2);
     const project = await loadProject(tempProject.workspaceRoot, 'demo');
     const runDirectory = await createRunStore(tempProject.workspaceRoot).createRun('demo', 'run-draft');
+    const ffmpeg = await createRecordingExecutable(
+      tempProject.workspaceRoot,
+      'ffmpeg',
+      process.env.FFMPEG_PATH ?? '/opt/homebrew/bin/ffmpeg',
+    );
+    const ffprobe = await createRecordingExecutable(
+      tempProject.workspaceRoot,
+      'ffprobe',
+      process.env.FFPROBE_PATH ?? '/opt/homebrew/bin/ffprobe',
+    );
     await writeRunTone(runDirectory, 'audio/narration.wav', 1);
     await writeRunJson(runDirectory, 'compiled-timeline.json', compiledTimeline());
 
-    const result = await runDraft({...project, runDirectory});
+    const result = await runDraft({
+      ...project,
+      runDirectory,
+      ffmpegExecutable: ffmpeg.executablePath,
+      ffprobeExecutable: ffprobe.executablePath,
+    });
 
     expect(result.outputs.audio.filterGraph).toMatchObject({
       path: 'audio/filter-graph.txt',
@@ -125,5 +159,12 @@ describe('runDraft', () => {
     expect(metadata.audioStreams).toHaveLength(1);
     expect(metadata.videoStreams[0]).toMatchObject({width: 960, height: 540});
     await expect(probeRunMedia(runDirectory, result.outputs.contactSheet.path)).resolves.toMatchObject({videoStreams: expect.any(Array)});
+    const ffmpegCalls = await readFile(ffmpeg.logPath, 'utf8');
+    expect(ffmpegCalls).toContain('-filter_complex_script');
+    expect(ffmpegCalls).toContain('-map 0:v:0');
+    expect(ffmpegCalls).toContain('-xerror');
+    expect(ffmpegCalls).toContain('select=eq(n\\,');
+    expect(ffmpegCalls).toContain('tile=');
+    await expect(readFile(ffprobe.logPath, 'utf8')).resolves.toContain('-show_streams');
   }, 90_000);
 });

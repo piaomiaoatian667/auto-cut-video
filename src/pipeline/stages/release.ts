@@ -44,9 +44,7 @@ import {
   type RenderTimelineVideoInput,
 } from '../../remotion/render';
 
-const FFPROBE_EXECUTABLE = process.env.FFPROBE_PATH ?? '/opt/homebrew/bin/ffprobe';
-
-const RELEASE_STAGE_IDS: CurrentPointer['stageIds'] = [
+export const RELEASE_STAGE_IDS = [
   'preflight',
   'ingest',
   'narration',
@@ -54,7 +52,7 @@ const RELEASE_STAGE_IDS: CurrentPointer['stageIds'] = [
   'draft',
   'review',
   'release',
-];
+] as const;
 
 export const RELEASE_FIXED_PROFILE = {
   width: 1920,
@@ -156,7 +154,6 @@ type ReleaseRunner = (
 export interface ReleaseStageDependencies {
   renderTimelineVideo?: (input: RenderTimelineVideoInput) => Promise<void>;
   runProcess?: ReleaseRunner;
-  ffprobeExecutable?: string;
   outputStore?: ReturnType<typeof createOutputStore>;
   publishCurrent?: boolean;
   profile?: Record<string, unknown>;
@@ -324,16 +321,21 @@ const preparePublicDir = async (
 
 const assertReleaseTools = (
   preflight: ReleasePreflightSnapshot,
-): {ffmpeg: ReleaseToolIdentity; qtFaststart: ReleaseToolIdentity} => {
+): {
+  ffmpeg: ReleaseToolIdentity;
+  ffprobe: ReleaseToolIdentity;
+  qtFaststart: ReleaseToolIdentity;
+} => {
   const ffmpeg = preflight.toolIdentities.ffmpeg;
+  const ffprobe = preflight.toolIdentities.ffprobe;
   const qtFaststart = preflight.toolIdentities.qtFaststart;
-  if (ffmpeg === null || qtFaststart === null) {
+  if (ffmpeg === null || ffprobe === null || qtFaststart === null) {
     throw new ReleaseStageError(
       'RELEASE_TOOL_MISSING',
-      'release requires preflight-verified ffmpeg and qt-faststart tools',
+      'release requires preflight-verified ffmpeg, ffprobe, and qt-faststart tools',
     );
   }
-  return {ffmpeg, qtFaststart};
+  return {ffmpeg, ffprobe, qtFaststart};
 };
 
 const assertArtifactUnchanged = async (
@@ -524,15 +526,27 @@ const writeChecksums = async (
   );
 };
 
-const releasePointer = (runId: string, publishedAt: string): CurrentPointer => ({
-  runId,
-  relativePath: `releases/${runId}`,
-  preset: 'release',
-  stageIds: RELEASE_STAGE_IDS,
-  completedStage: 'release',
-  state: 'passed',
-  publishedAt,
-});
+export const releaseCurrentPointer = (
+  runId: string,
+  publishedAt: string,
+): CurrentPointer => {
+  const timestamp = new Date(publishedAt);
+  if (
+    Number.isNaN(timestamp.valueOf())
+    || timestamp.toISOString() !== publishedAt
+  ) {
+    throw new TypeError('publishedAt must be a canonical ISO timestamp');
+  }
+  return {
+    runId,
+    relativePath: `releases/${runId}`,
+    preset: 'release',
+    stageIds: [...RELEASE_STAGE_IDS],
+    completedStage: 'release',
+    state: 'passed',
+    publishedAt,
+  };
+};
 
 const releaseSrtFromTimeline = (timeline: CompiledTimeline): string => formatSrt({
   version: 1,
@@ -552,9 +566,6 @@ export const runRelease = async (
 ): Promise<ReleaseStageResult> => {
   const tools = assertReleaseTools(input.preflight);
   const runner = dependencies.runProcess ?? runSystemProcess;
-  const ffprobeExecutable = dependencies.ffprobeExecutable
-    ?? input.preflight.toolIdentities.ffprobe?.realPath
-    ?? FFPROBE_EXECUTABLE;
   const outputStore = dependencies.outputStore ?? createOutputStore(input.workspaceRoot);
   const timeline = await readRunJson(
     input.runDirectory,
@@ -609,7 +620,7 @@ export const runRelease = async (
     outputDirectory,
     relativePath: finalVideo.path,
     ffmpegExecutable: tools.ffmpeg.realPath,
-    ffprobeExecutable,
+    ffprobeExecutable: tools.ffprobe.realPath,
     runProcess: runner,
     ...(input.signal === undefined ? {} : {signal: input.signal}),
   });
@@ -625,7 +636,7 @@ export const runRelease = async (
     outputDirectory,
     draftReport.outputs.reviewFrames[0]!.path,
     tools.ffmpeg.realPath,
-    ffprobeExecutable,
+    tools.ffprobe.realPath,
     runner,
   );
   const releaseReview = await writeOutputJson(
@@ -677,7 +688,10 @@ export const runRelease = async (
     releaseReview,
     validationReport,
   ]);
-  const current = releasePointer(input.runId, (input.now ?? (() => new Date().toISOString()))());
+  const current = releaseCurrentPointer(
+    input.runId,
+    (input.now ?? (() => new Date().toISOString()))(),
+  );
   if (dependencies.publishCurrent ?? true) {
     await outputStore.publishCurrent(input.project.id, current);
   }

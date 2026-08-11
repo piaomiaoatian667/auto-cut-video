@@ -48,7 +48,6 @@ const DraftAdapterOutputSchema = z.object({
 
 export interface DraftStageAdapterDependencies {
   algorithmVersion?: string;
-  audioMixAlgorithmVersion?: string;
   readStageReport?: (
     runDirectory: RunDirectoryScope,
     stageId: 'compile',
@@ -113,8 +112,6 @@ export const createDraftStage = (
 ): PipelineStage => {
   const algorithmVersion = dependencies.algorithmVersion
     ?? STAGE_ALGORITHM_VERSIONS.draft;
-  const audioMixAlgorithmVersion = dependencies.audioMixAlgorithmVersion
-    ?? AUDIO_MIX_ALGORITHM_VERSION;
   const readStageReport = dependencies.readStageReport ?? readRunStageReport;
   const readTimeline = dependencies.readCompiledTimeline
     ?? (async (runDirectory: RunDirectoryScope) => await readRunJson(
@@ -131,15 +128,26 @@ export const createDraftStage = (
   const calculateFingerprint = (
     context: StagePlanningContext,
     compileFingerprint: string | null,
-  ): string | null => compileFingerprint === null
-    ? null
-    : fingerprintValue({
+  ): string | null => {
+    const ffmpegIdentity = context.preflight?.toolIdentities.ffmpeg;
+    const ffprobeIdentity = context.preflight?.toolIdentities.ffprobe;
+    if (
+      compileFingerprint === null
+      || ffmpegIdentity === undefined
+      || ffmpegIdentity === null
+      || ffprobeIdentity === undefined
+      || ffprobeIdentity === null
+    ) return null;
+    return fingerprintValue({
       algorithmVersion,
       compileFingerprint,
       audio: context.project.project.audio,
       render: context.project.project.render,
-      audioMixAlgorithmVersion,
+      audioMixAlgorithmVersion: AUDIO_MIX_ALGORITHM_VERSION,
+      ffmpegIdentity,
+      ffprobeIdentity,
     });
+  };
 
   return {
     id: 'draft',
@@ -166,7 +174,14 @@ export const createDraftStage = (
       : partialArtifactsByRun.get(context.runDirectory) ?? baselinePartialArtifacts(),
     execute: async (context, signal) => {
       const {runDirectory} = requireRunContext(context);
-      requirePreflight(context);
+      const preflight = requirePreflight(context);
+      const ffmpegIdentity = preflight.toolIdentities.ffmpeg;
+      const ffprobeIdentity = preflight.toolIdentities.ffprobe;
+      if (ffmpegIdentity === null || ffprobeIdentity === null) {
+        throw new PipelineContextError(
+          'Draft requires Preflight FFmpeg and FFprobe identities',
+        );
+      }
       const compileReport = await readStageReport(runDirectory, 'compile');
       const stageFingerprint = calculateFingerprint(context, compileReport.fingerprint);
       if (stageFingerprint === null) {
@@ -186,7 +201,13 @@ export const createDraftStage = (
           throw error;
         }
       }
-      const result = await executeDraft({...context.project, runDirectory, signal});
+      const result = await executeDraft({
+        ...context.project,
+        runDirectory,
+        ffmpegExecutable: ffmpegIdentity.realPath,
+        ffprobeExecutable: ffprobeIdentity.realPath,
+        signal,
+      });
       const expected = draftExpectedArtifacts(result.outputs);
       if (expected === null) {
         throw new PipelineContextError('Draft returned invalid owned artifact paths');

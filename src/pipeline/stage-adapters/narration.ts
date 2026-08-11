@@ -10,7 +10,10 @@ import {
   openExistingProjectFile,
   type ProjectDirectoryScope,
 } from '../../fs/project-paths';
-import {narrationSegmentInputHash} from '../../narration/build-narration';
+import {
+  narrationMasterPath,
+  narrationSegmentInputHash,
+} from '../../narration/build-narration';
 import {
   createTtsProvider,
   fingerprintTtsProvider,
@@ -246,9 +249,6 @@ const narrationExpectedArtifacts = (
     output.narrationPath !== 'narration-manifest.json'
     || output.captionsPath !== 'captions.json'
     || output.srtPath !== 'captions.srt'
-    || !/^audio\/narration-[0-9a-f]{16}\.wav$/u.test(
-      output.narration.master.audioPath,
-    )
   ) return null;
   const expected: Array<{
     scope: 'run';
@@ -270,6 +270,13 @@ const narrationExpectedArtifacts = (
       {scope: 'run' as const, path: segment.audioPath, sha256: segment.audioHash},
     );
   }
+  if (
+    output.narration.master.audioPath
+    !== narrationMasterPath({
+      provider: output.narration.provider,
+      segments: output.narration.segments,
+    })
+  ) return null;
   expected.push(
     {
       scope: 'run' as const,

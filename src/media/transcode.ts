@@ -11,6 +11,20 @@ export interface MediaProcessRunner {
   ): Promise<ProcessResult>;
 }
 
+export const INGEST_MVP_PROFILE = {
+  frameRate: 30,
+  pixelFormat: 'yuv420p',
+  frameRateMode: 'cfr',
+  videoEncoder: 'libx264',
+  crf: 18,
+  encoderPreset: 'medium',
+  colorPrimaries: 'bt709',
+  colorTransfer: 'bt709',
+  colorSpace: 'bt709',
+  colorRange: 'tv',
+  container: 'mp4',
+} as const;
+
 export interface TranscodeVideoInput {
   ffmpegExecutable: string;
   sourceFd: number;
@@ -44,7 +58,12 @@ const transcodeVideoArgs = (input: TranscodeVideoInput): readonly string[] => {
   const space = colorToken(input.sourceColor.space, 'sourceColor.space');
   const range = input.sourceColor.range;
   const colorFilter = [
-    'colorspace=space=bt709:trc=bt709:primaries=bt709:range=tv',
+    [
+      `colorspace=space=${INGEST_MVP_PROFILE.colorSpace}`,
+      `trc=${INGEST_MVP_PROFILE.colorTransfer}`,
+      `primaries=${INGEST_MVP_PROFILE.colorPrimaries}`,
+      `range=${INGEST_MVP_PROFILE.colorRange}`,
+    ].join(':'),
     `ispace=${space}:itrc=${transfer}:iprimaries=${primaries}:irange=${range}:fast=0`,
   ].join(':');
   return [
@@ -53,16 +72,16 @@ const transcodeVideoArgs = (input: TranscodeVideoInput): readonly string[] => {
     '-i', '/dev/fd/3',
     '-map', `0:${input.sourceStreamIndex}`,
     '-an',
-    '-vf', `${colorFilter},fps=30,format=yuv420p`,
-    '-fps_mode', 'cfr',
-    '-c:v', 'libx264',
-    '-crf', '18',
-    '-preset', 'medium',
-    '-color_primaries', 'bt709',
-    '-color_trc', 'bt709',
-    '-colorspace', 'bt709',
-    '-color_range', 'tv',
-    '-f', 'mp4',
+    '-vf', `${colorFilter},fps=${INGEST_MVP_PROFILE.frameRate},format=${INGEST_MVP_PROFILE.pixelFormat}`,
+    '-fps_mode', INGEST_MVP_PROFILE.frameRateMode,
+    '-c:v', INGEST_MVP_PROFILE.videoEncoder,
+    '-crf', String(INGEST_MVP_PROFILE.crf),
+    '-preset', INGEST_MVP_PROFILE.encoderPreset,
+    '-color_primaries', INGEST_MVP_PROFILE.colorPrimaries,
+    '-color_trc', INGEST_MVP_PROFILE.colorTransfer,
+    '-colorspace', INGEST_MVP_PROFILE.colorSpace,
+    '-color_range', INGEST_MVP_PROFILE.colorRange,
+    '-f', INGEST_MVP_PROFILE.container,
     '/dev/fd/4',
   ];
 };

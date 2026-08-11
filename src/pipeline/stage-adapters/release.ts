@@ -28,6 +28,7 @@ import {
 } from '../stages/draft';
 import {
   RELEASE_FIXED_PROFILE,
+  releaseCurrentPointer,
   releaseStageFingerprint,
   runRelease,
   type ReleasePreflightSnapshot,
@@ -51,6 +52,8 @@ const OutputArtifactReferenceSchema = ArtifactReferenceSchema.extend({
   path: z.string().regex(/^releases\/[^/]+\/[^/]+$/u),
 }).strict();
 
+const HashSchema = z.string().regex(/^sha256:[0-9a-f]{64}$/u);
+
 const ReleaseAdapterOutputSchema = z.object({
   mutedVideo: ArtifactReferenceSchema,
   intermediate: ArtifactReferenceSchema,
@@ -60,9 +63,9 @@ const ReleaseAdapterOutputSchema = z.object({
   review: OutputArtifactReferenceSchema,
   validationReport: OutputArtifactReferenceSchema,
   checksums: OutputArtifactReferenceSchema,
-  releaseFingerprint: z.string().min(1),
+  releaseFingerprint: HashSchema,
   verification: z.object({
-    sha256: z.string().min(1),
+    sha256: HashSchema,
     probe: z.object({
       durationMs: z.number().nonnegative(),
       videoStreams: z.array(z.unknown()),
@@ -71,7 +74,15 @@ const ReleaseAdapterOutputSchema = z.object({
     atoms: z.array(z.unknown()),
     moovBeforeMdat: z.literal(true),
   }).passthrough(),
-}).strict();
+}).strict().superRefine((outputs, context) => {
+  if (outputs.verification.sha256 !== outputs.finalVideo.sha256) {
+    context.addIssue({
+      code: 'custom',
+      path: ['verification', 'sha256'],
+      message: 'must match finalVideo.sha256',
+    });
+  }
+});
 
 export interface ReleaseStageAdapterDependencies {
   algorithmVersion?: string;
@@ -101,6 +112,22 @@ const parseReleasePreflightSnapshot = (
     toolIdentities: parsed.toolIdentities,
     environmentFingerprint: parsed.environmentFingerprint,
   };
+};
+
+const releaseToolsAvailable = (
+  preflight: ReleasePreflightSnapshot,
+): boolean => (
+  preflight.toolIdentities.ffmpeg !== null
+  && preflight.toolIdentities.ffprobe !== null
+  && preflight.toolIdentities.qtFaststart !== null
+);
+
+const requireReleaseTools = (preflight: ReleasePreflightSnapshot): void => {
+  if (!releaseToolsAvailable(preflight)) {
+    throw new PipelineContextError(
+      'Release requires persisted FFmpeg, FFprobe, and qt-faststart identities',
+    );
+  }
 };
 
 const requireBoundStageReport = (
@@ -204,6 +231,7 @@ export const createReleaseStage = (
     preflight: ReleasePreflightSnapshot,
     compileStageFingerprint: string,
   ): Promise<string | null> => {
+    if (!releaseToolsAvailable(preflight)) return null;
     const [draft, timeline, review] = await Promise.all([
       readDraftReport(runDirectory),
       readCompiledTimeline(runDirectory),
@@ -348,6 +376,7 @@ export const createReleaseStage = (
         );
       }
       const preflight = parseReleasePreflightSnapshot(preflightReport.outputs);
+      requireReleaseTools(preflight);
       const stageFingerprint = await calculateFingerprint(
         runDirectory,
         runId,
@@ -358,6 +387,8 @@ export const createReleaseStage = (
       if (stageFingerprint === null) {
         throw new ReviewGateError('Release requires approved Review evidence');
       }
+      const publishedAt = context.now();
+      const outputCurrent = releaseCurrentPointer(runId, publishedAt);
       const result = await executeRelease({
         ...context.project,
         runDirectory,
@@ -365,7 +396,7 @@ export const createReleaseStage = (
         preflight,
         compileStageFingerprint: compileReport.fingerprint!,
         signal,
-        now: context.now,
+        now: () => publishedAt,
       }, {
         publishCurrent: false,
         profile,
@@ -376,19 +407,26 @@ export const createReleaseStage = (
           'Release output fingerprint does not match adapter inputs',
         );
       }
-      const expected = releaseExpectedArtifacts(result.outputs, runId);
+      const parsedOutputs = ReleaseAdapterOutputSchema.safeParse(result.outputs);
+      if (!parsedOutputs.success) {
+        throw new PipelineContextError('Release returned internally inconsistent outputs');
+      }
+      if (fingerprintValue(result.current) !== fingerprintValue(outputCurrent)) {
+        throw new PipelineContextError('Release returned an invalid current pointer candidate');
+      }
+      const expected = releaseExpectedArtifacts(parsedOutputs.data, runId);
       if (expected === null) {
         throw new PipelineContextError('Release returned invalid artifact paths');
       }
       return {
         state: 'passed',
         fingerprint: stageFingerprint,
-        outputs: result.outputs,
+        outputs: parsedOutputs.data,
         artifacts: expected.map((artifact) => artifact.scope === 'run'
           ? runArtifact(artifact)
           : outputArtifact(artifact)),
         checks: [],
-        outputCurrent: result.current,
+        outputCurrent,
       };
     },
   };

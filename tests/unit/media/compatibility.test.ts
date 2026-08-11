@@ -5,7 +5,10 @@ import {
   parseFfprobeJson,
   type MediaProbe,
 } from '../../../src/media/ffprobe';
-import {transcodeVideo} from '../../../src/media/transcode';
+import {
+  INGEST_MVP_PROFILE,
+  transcodeVideo,
+} from '../../../src/media/transcode';
 import type {ProcessResult} from '../../../src/process/run-process';
 
 const createProbe = (
@@ -289,6 +292,19 @@ describe('video compatibility', () => {
 
 describe('transcodeVideo', () => {
   it('uses only borrowed descriptors and the normalized MP4 command contract', async () => {
+    expect(INGEST_MVP_PROFILE).toEqual({
+      frameRate: 30,
+      pixelFormat: 'yuv420p',
+      frameRateMode: 'cfr',
+      videoEncoder: 'libx264',
+      crf: 18,
+      encoderPreset: 'medium',
+      colorPrimaries: 'bt709',
+      colorTransfer: 'bt709',
+      colorSpace: 'bt709',
+      colorRange: 'tv',
+      container: 'mp4',
+    });
     const calls: Array<{
       command: string;
       args: readonly string[];
@@ -337,18 +353,18 @@ describe('transcodeVideo', () => {
         '-an',
         '-vf', [
           'colorspace=space=bt709:trc=bt709:primaries=bt709:range=tv:ispace=bt470bg:itrc=bt470bg:iprimaries=bt470bg:irange=tv:fast=0',
-          'fps=30',
-          'format=yuv420p',
+          `fps=${INGEST_MVP_PROFILE.frameRate}`,
+          `format=${INGEST_MVP_PROFILE.pixelFormat}`,
         ].join(','),
-        '-fps_mode', 'cfr',
-        '-c:v', 'libx264',
-        '-crf', '18',
-        '-preset', 'medium',
-        '-color_primaries', 'bt709',
-        '-color_trc', 'bt709',
-        '-colorspace', 'bt709',
-        '-color_range', 'tv',
-        '-f', 'mp4',
+        '-fps_mode', INGEST_MVP_PROFILE.frameRateMode,
+        '-c:v', INGEST_MVP_PROFILE.videoEncoder,
+        '-crf', String(INGEST_MVP_PROFILE.crf),
+        '-preset', INGEST_MVP_PROFILE.encoderPreset,
+        '-color_primaries', INGEST_MVP_PROFILE.colorPrimaries,
+        '-color_trc', INGEST_MVP_PROFILE.colorTransfer,
+        '-colorspace', INGEST_MVP_PROFILE.colorSpace,
+        '-color_range', INGEST_MVP_PROFILE.colorRange,
+        '-f', INGEST_MVP_PROFILE.container,
         '/dev/fd/4',
       ],
       extraStdioFds: [41, 42],

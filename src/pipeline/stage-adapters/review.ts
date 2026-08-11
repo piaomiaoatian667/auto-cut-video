@@ -19,7 +19,7 @@ import {
 } from '../stages/review';
 import {
   STAGE_ALGORITHM_VERSIONS,
-  isOrdinaryVerificationMiss,
+  isOrdinaryPersistedInputMiss,
   readOptionalRunJson,
   readPlanningInput,
   readRunJson,
@@ -126,7 +126,7 @@ export const createReviewStage = (
         }
         return true;
       } catch (error) {
-        if (error instanceof ReviewGateError || isOrdinaryVerificationMiss(error)) {
+        if (error instanceof ReviewGateError || isOrdinaryPersistedInputMiss(error)) {
           return false;
         }
         throw error;

@@ -44,6 +44,32 @@ export interface BuildNarrationInput extends ProjectInputs {
 const hexFromFingerprint = (fingerprint: string): string =>
   fingerprint.startsWith('sha256:') ? fingerprint.slice('sha256:'.length) : fingerprint;
 
+export interface NarrationMasterPathInput {
+  provider: NarrationManifest['provider'];
+  segments: readonly Pick<
+    NarrationManifest['segments'][number],
+    'id' | 'inputHash' | 'audioHash' | 'startMs' | 'endMs' | 'pauseAfterMs'
+  >[];
+}
+
+export const narrationMasterPath = ({
+  provider,
+  segments,
+}: NarrationMasterPathInput): string => {
+  const manifestFingerprint = fingerprintValue({
+    provider,
+    segments: segments.map((segment) => ({
+      id: segment.id,
+      inputHash: segment.inputHash,
+      audioHash: segment.audioHash,
+      startMs: segment.startMs,
+      endMs: segment.endMs,
+      pauseAfterMs: segment.pauseAfterMs,
+    })),
+  });
+  return `audio/narration-${hexFromFingerprint(manifestFingerprint).slice(0, 16)}.wav`;
+};
+
 const safeSegmentId = (segmentId: string): string => segmentId.replace(/[^a-zA-Z0-9-]/g, '-');
 
 const ensureParentDirectory = async (
@@ -233,18 +259,10 @@ export const buildNarration = async (input: BuildNarrationInput): Promise<Narrat
     cursorMs += durationMs + segment.pauseAfterMs;
   }
 
-  const manifestFingerprint = fingerprintValue({
+  const masterPath = narrationMasterPath({
     provider: input.provider.id,
-    segments: segments.map((segment) => ({
-      id: segment.id,
-      inputHash: segment.inputHash,
-      audioHash: segment.audioHash,
-      startMs: segment.startMs,
-      endMs: segment.endMs,
-      pauseAfterMs: segment.pauseAfterMs,
-    })),
+    segments,
   });
-  const masterPath = `audio/narration-${hexFromFingerprint(manifestFingerprint).slice(0, 16)}.wav`;
   input.onPartialArtifact?.(masterPath);
   await createSyntheticMaster({
     runDirectory: input.runDirectory,

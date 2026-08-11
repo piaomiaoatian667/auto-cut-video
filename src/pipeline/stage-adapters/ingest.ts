@@ -1,4 +1,5 @@
 import {z} from 'zod';
+import {INGEST_MVP_PROFILE} from '../../media/transcode';
 import {hashRunArtifact, type PipelineArtifact} from '../artifacts';
 import {fingerprintValue} from '../fingerprint';
 import {
@@ -19,17 +20,6 @@ import {
   verifyReportedArtifacts,
 } from './shared';
 
-const MVP_INGEST_PROFILE = {
-  videoCodec: 'h264',
-  pixelFormat: 'yuv420p',
-  frameRate: 30,
-  frameRateMode: 'cfr',
-  colorPrimaries: 'bt709',
-  colorTransfer: 'bt709',
-  colorSpace: 'bt709',
-  audioSampleRate: 48_000,
-} as const;
-
 const INGEST_MANIFEST_TEMP_PATH = '.asset-manifest.pipeline.tmp';
 
 const IngestAdapterOutputSchema = z.object({
@@ -41,8 +31,6 @@ type IngestAdapterOutput = z.infer<typeof IngestAdapterOutputSchema>;
 
 export interface IngestStageAdapterDependencies {
   algorithmVersion?: string;
-  profile?: Record<string, unknown>;
-  ffprobeExecutable?: string;
   runIngest?: (input: IngestInput) => Promise<IngestAdapterOutput>;
   hashRunArtifact?: typeof hashRunArtifact;
 }
@@ -67,10 +55,6 @@ export const createIngestStage = (
 ): PipelineStage => {
   const algorithmVersion = dependencies.algorithmVersion
     ?? STAGE_ALGORITHM_VERSIONS.ingest;
-  const profile = dependencies.profile ?? MVP_INGEST_PROFILE;
-  const ffprobeExecutable = dependencies.ffprobeExecutable
-    ?? process.env.FFPROBE_PATH
-    ?? '/opt/homebrew/bin/ffprobe';
   const executeIngest = dependencies.runIngest
     ?? (async (input: IngestInput) => await runIngest(
       input,
@@ -80,7 +64,13 @@ export const createIngestStage = (
 
   const fingerprint = async (context: Parameters<PipelineStage['fingerprint']>[0]) => {
     const ffmpeg = context.preflight?.toolIdentities.ffmpeg;
-    if (ffmpeg === undefined || ffmpeg === null) return null;
+    const ffprobe = context.preflight?.toolIdentities.ffprobe;
+    if (
+      ffmpeg === undefined
+      || ffmpeg === null
+      || ffprobe === undefined
+      || ffprobe === null
+    ) return null;
     return fingerprintValue({
       algorithmVersion,
       sourceCatalog: {
@@ -94,7 +84,8 @@ export const createIngestStage = (
         })),
       },
       ffmpeg,
-      profile,
+      ffprobe,
+      profile: INGEST_MVP_PROFILE,
     });
   };
 
@@ -134,8 +125,11 @@ export const createIngestStage = (
       const {runDirectory} = requireRunContext(context);
       const preflight = requirePreflight(context);
       const ffmpeg = preflight.toolIdentities.ffmpeg;
-      if (ffmpeg === null) {
-        throw new PipelineContextError('Ingest requires a Preflight FFmpeg identity');
+      const ffprobe = preflight.toolIdentities.ffprobe;
+      if (ffmpeg === null || ffprobe === null) {
+        throw new PipelineContextError(
+          'Ingest requires Preflight FFmpeg and FFprobe identities',
+        );
       }
       const result = await executeIngest({
         projectDirectory: context.project.projectDirectory,
@@ -146,7 +140,7 @@ export const createIngestStage = (
           sourcePath: asset.sourcePath,
         })),
         ffmpegExecutable: ffmpeg.realPath,
-        ffprobeExecutable,
+        ffprobeExecutable: ffprobe.realPath,
         manifestTempPath: INGEST_MANIFEST_TEMP_PATH,
         signal,
       });

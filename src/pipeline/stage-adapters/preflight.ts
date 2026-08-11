@@ -18,6 +18,29 @@ const ToolIdentitySchema = z.object({
   sha256: z.string().min(1),
 }).strict();
 
+const PreflightVersionsSchema = z.object({
+  node: z.string().min(1).nullable(),
+  pnpm: z.string().min(1).nullable(),
+  macos: z.string().min(1).nullable(),
+  ffmpeg: z.string().min(1).nullable(),
+  ffprobe: z.string().min(1).nullable(),
+}).strict();
+
+const PreflightVoiceSchema = z.object({
+  configured: z.string().min(1),
+  available: z.boolean(),
+  segmentedWavFallback: z.boolean(),
+}).strict();
+
+const PreflightSystemSchema = z.object({
+  platform: z.string().min(1),
+  arch: z.string().min(1),
+  sourceBytes: z.number().int().nonnegative(),
+  requiredBytes: z.number().int().nonnegative(),
+  availableBytes: z.number().int().nonnegative().nullable(),
+  workDirectory: z.string().min(1),
+}).strict();
+
 export const PreflightAdapterOutputSchema = z.object({
   environmentFingerprint: z.string().min(1),
   toolIdentities: z.object({
@@ -29,6 +52,9 @@ export const PreflightAdapterOutputSchema = z.object({
     path: z.string().min(1),
     sha256: z.string().min(1),
   }).strict()),
+  voice: PreflightVoiceSchema,
+  versions: PreflightVersionsSchema,
+  system: PreflightSystemSchema,
 }).passthrough();
 
 export type PreflightAdapterOutput = z.infer<typeof PreflightAdapterOutputSchema>;
@@ -37,6 +63,12 @@ export interface CanonicalPreflightAdapterOutput {
   environmentFingerprint: string;
   toolIdentities: PreflightAdapterOutput['toolIdentities'];
   fonts: PreflightAdapterOutput['fonts'];
+  voice: PreflightAdapterOutput['voice'];
+  versions: PreflightAdapterOutput['versions'];
+  system: Pick<
+    PreflightAdapterOutput['system'],
+    'platform' | 'arch' | 'sourceBytes' | 'requiredBytes'
+  >;
 }
 
 export const normalizePreflightAdapterOutput = (
@@ -49,6 +81,14 @@ export const normalizePreflightAdapterOutput = (
     fonts: [...parsed.fonts].sort((left, right) => (
       left.path.localeCompare(right.path) || left.sha256.localeCompare(right.sha256)
     )),
+    voice: parsed.voice,
+    versions: parsed.versions,
+    system: {
+      platform: parsed.system.platform,
+      arch: parsed.system.arch,
+      sourceBytes: parsed.system.sourceBytes,
+      requiredBytes: parsed.system.requiredBytes,
+    },
   };
 };
 

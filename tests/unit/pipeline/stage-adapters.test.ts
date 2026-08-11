@@ -18,7 +18,10 @@ import {
 } from '../../../src/fs/app-directory-scopes';
 import {hashRunArtifact} from '../../../src/pipeline/artifacts';
 import {fingerprintValue} from '../../../src/pipeline/fingerprint';
-import {narrationSegmentInputHash} from '../../../src/narration/build-narration';
+import {
+  narrationMasterPath,
+  narrationSegmentInputHash,
+} from '../../../src/narration/build-narration';
 import {
   createCompileStage,
   createDraftStage,
@@ -42,9 +45,14 @@ import {
 } from '../../../src/pipeline/stage-report';
 import type {PreflightResult} from '../../../src/pipeline/stages/preflight';
 import type {NarrationStageInput} from '../../../src/pipeline/stages/narration';
-import type {DraftReport, DraftStageResult} from '../../../src/pipeline/stages/draft';
+import type {
+  DraftReport,
+  DraftStageInput,
+  DraftStageResult,
+} from '../../../src/pipeline/stages/draft';
 import {
   releaseStageFingerprint,
+  type ReleaseStageInput,
   type ReleaseStageResult,
 } from '../../../src/pipeline/stages/release';
 import type {ProjectSourceCatalog} from '../../../src/pipeline/source-assets';
@@ -379,6 +387,16 @@ describe('adapter fingerprints', () => {
         },
       }),
     })],
+    ['FFprobe identity', (context: StagePlanningContext) => ({
+      ...context,
+      preflight: preflightResult({
+        toolIdentities: {
+          ffmpeg: {realPath: '/tools/ffmpeg', sha256: hash('ffmpeg')},
+          ffprobe: {realPath: '/tools/ffprobe', sha256: hash('ffprobe-2')},
+          qtFaststart: {realPath: '/tools/qt-faststart', sha256: hash('qt-faststart')},
+        },
+      }),
+    })],
   ] as const)('changes Ingest for %s', async (_label, mutate) => {
     const stage = createIngestStage();
     const beforeContext = planningContext();
@@ -387,13 +405,21 @@ describe('adapter fingerprints', () => {
     );
   });
 
-  it('changes Ingest for profile and algorithm versions', async () => {
+  it('changes Ingest for its algorithm version', async () => {
     const context = planningContext();
-    expect(await createIngestStage({profile: {fps: 60}}).fingerprint(context))
-      .not.toBe(await createIngestStage().fingerprint(context));
     expect(await createIngestStage({algorithmVersion: 'ingest-stage-v2'}).fingerprint(context))
       .not.toBe(await createIngestStage().fingerprint(context));
   });
+
+  it.each(['ffmpeg', 'ffprobe'] as const)(
+    'returns null for Ingest without a persisted %s identity',
+    async (tool) => {
+      const preflight = preflightResult();
+      preflight.toolIdentities[tool] = null;
+      await expect(createIngestStage().fingerprint(planningContext({preflight})))
+        .resolves.toBeNull();
+    },
+  );
 
   it.each([
     ['script', (context: StagePlanningContext) => ({
@@ -510,14 +536,36 @@ describe('adapter fingerprints', () => {
     }));
   });
 
-  it('changes Draft for Compile, audio-mix, and Stage algorithm versions', async () => {
+  it.each(['ffmpeg', 'ffprobe'] as const)(
+    'changes Draft for the persisted %s identity',
+    async (tool) => {
+      const context = planningContext();
+      const changed = preflightResult();
+      changed.toolIdentities[tool] = {
+        realPath: `/tools/${tool}`,
+        sha256: hash(`${tool}-2`),
+      };
+      expect(await createDraftStage().fingerprint({...context, preflight: changed}))
+        .not.toBe(await createDraftStage().fingerprint(context));
+    },
+  );
+
+  it.each(['ffmpeg', 'ffprobe'] as const)(
+    'returns null for Draft without a persisted %s identity',
+    async (tool) => {
+      const preflight = preflightResult();
+      preflight.toolIdentities[tool] = null;
+      await expect(createDraftStage().fingerprint(planningContext({preflight})))
+        .resolves.toBeNull();
+    },
+  );
+
+  it('changes Draft for Compile and Stage algorithm versions', async () => {
     const reports = new Map(planningContext().sourceRun!.reports);
     const context = planningContext({}, reports);
     const before = await createDraftStage().fingerprint(context);
     reports.set('compile', passedStageReport({stageId: 'compile', fingerprint: hash('compile-2')}));
     expect(await createDraftStage().fingerprint(context)).not.toBe(before);
-    expect(await createDraftStage({audioMixAlgorithmVersion: 'audio-mix-v2'}).fingerprint(context))
-      .not.toBe(await createDraftStage().fingerprint(context));
     expect(await createDraftStage({algorithmVersion: 'draft-stage-v2'}).fingerprint(context))
       .not.toBe(await createDraftStage().fingerprint(context));
   });
@@ -758,8 +806,24 @@ describe('adapter artifact inventories', () => {
       project.project.tts.rate,
       hash('provider'),
     );
-    const narrationPath = `audio/narration-${hash('manifest').slice(7, 23)}.wav`;
     const narrationSegmentPath = `audio/segments/0001-intro-${narrationInputHash.slice('sha256:'.length, 'sha256:'.length + 12)}.wav`;
+    const narrationSegments = [{
+      id: 'intro',
+      inputHash: narrationInputHash,
+      audioPath: narrationSegmentPath,
+      audioHash: hash('segment'),
+      startMs: 0,
+      endMs: 1000,
+      durationMs: 1000,
+      pauseAfterMs: 300,
+      sampleRate: 48_000 as const,
+      channels: 1 as const,
+      providerFingerprint: hash('provider'),
+    }];
+    const narrationPath = narrationMasterPath({
+      provider: 'mock',
+      segments: narrationSegments,
+    });
     const draftResult: DraftStageResult = {
       reportPath: 'draft/draft-report.json',
       outputs: {
@@ -879,19 +943,7 @@ describe('adapter artifact inventories', () => {
           narration: {
             version: 1,
             provider: 'mock',
-            segments: [{
-              id: 'intro',
-              inputHash: narrationInputHash,
-              audioPath: narrationSegmentPath,
-              audioHash: hash('segment'),
-              startMs: 0,
-              endMs: 1000,
-              durationMs: 1000,
-              pauseAfterMs: 300,
-              sampleRate: 48_000,
-              channels: 1,
-              providerFingerprint: hash('provider'),
-            }],
+            segments: narrationSegments,
             master: {
               audioPath: narrationPath,
               audioHash: hash('master'),
@@ -1016,6 +1068,121 @@ describe('adapter artifact inventories', () => {
       path: '.asset-manifest.pipeline.tmp',
     });
   });
+
+  it('passes persisted FFmpeg and FFprobe paths into Ingest execution', async () => {
+    const runIngest = vi.fn(async () => ({
+      manifestPath: 'asset-manifest.json' as const,
+      manifest: {
+        version: 1 as const,
+        assets: {
+          cover: {
+            kind: 'image' as const,
+            sourcePath: 'assets/source/cover.png',
+            sourceHash: hash('cover'),
+            renderPath: 'assets/source/cover.png',
+            renderScope: 'project' as const,
+            compatibility: 'direct' as const,
+            width: 1920,
+            height: 1080,
+          },
+        },
+      },
+    }));
+    const preflight = preflightResult({
+      toolIdentities: {
+        ffmpeg: {realPath: '/persisted/ffmpeg', sha256: hash('ffmpeg')},
+        ffprobe: {realPath: '/persisted/ffprobe', sha256: hash('ffprobe')},
+        qtFaststart: {realPath: '/persisted/qt-faststart', sha256: hash('qt-faststart')},
+      },
+    });
+    const stage = createIngestStage({runIngest, hashRunArtifact: fakeArtifact});
+
+    await stage.execute(executionContext({preflight}), new AbortController().signal);
+
+    expect(runIngest).toHaveBeenCalledWith(expect.objectContaining({
+      ffmpegExecutable: '/persisted/ffmpeg',
+      ffprobeExecutable: '/persisted/ffprobe',
+    }));
+  });
+
+  it.each(['ffmpeg', 'ffprobe'] as const)(
+    'does not execute Ingest without a persisted %s identity',
+    async (tool) => {
+      const preflight = preflightResult();
+      preflight.toolIdentities[tool] = null;
+      const runIngest = vi.fn();
+      const stage = createIngestStage({runIngest});
+
+      await expect(stage.execute(
+        executionContext({preflight}),
+        new AbortController().signal,
+      )).rejects.toBeDefined();
+      expect(runIngest).not.toHaveBeenCalled();
+    },
+  );
+
+  it('passes persisted FFmpeg and FFprobe paths into Draft execution', async () => {
+    const result: DraftStageResult = {
+      reportPath: 'draft/draft-report.json',
+      outputs: {
+        mutedVideo: {path: 'draft/muted-video.mp4', sha256: hash('muted')},
+        draftVideo: {path: 'draft/draft.mp4', sha256: hash('draft')},
+        contactSheet: {path: 'draft/contact-sheet.jpg', sha256: hash('contact')},
+        reviewFrames: [{path: 'draft/frames/frame-000000.jpg', sha256: hash('frame')}],
+        audio: {
+          filterGraph: {path: 'audio/filter-graph.txt', sha256: hash('graph')},
+          mixedAudio: {path: 'audio/mixed-normalized.wav', sha256: hash('mixed')},
+        },
+        report: {path: 'draft/draft-report.json', sha256: hash('report')},
+        audioMixFingerprint: hash('audio-mix'),
+      },
+    };
+    const runDraft = vi.fn(async (_input: DraftStageInput) => result);
+    const preflight = preflightResult({
+      toolIdentities: {
+        ffmpeg: {realPath: '/persisted/ffmpeg', sha256: hash('ffmpeg')},
+        ffprobe: {realPath: '/persisted/ffprobe', sha256: hash('ffprobe')},
+        qtFaststart: {realPath: '/persisted/qt-faststart', sha256: hash('qt-faststart')},
+      },
+    });
+    const stage = createDraftStage({
+      readStageReport: async () => passedStageReport({
+        stageId: 'compile',
+        fingerprint: hash('compile-report'),
+      }),
+      readCompiledTimeline: async () => compiledTimeline(),
+      runDraft,
+    });
+
+    await stage.execute(executionContext({preflight}), new AbortController().signal);
+
+    expect(runDraft).toHaveBeenCalledWith(expect.objectContaining({
+      ffmpegExecutable: '/persisted/ffmpeg',
+      ffprobeExecutable: '/persisted/ffprobe',
+    }));
+  });
+
+  it.each(['ffmpeg', 'ffprobe'] as const)(
+    'does not execute Draft without a persisted %s identity',
+    async (tool) => {
+      const preflight = preflightResult();
+      preflight.toolIdentities[tool] = null;
+      const runDraft = vi.fn();
+      const stage = createDraftStage({
+        readStageReport: async () => passedStageReport({
+          stageId: 'compile',
+          fingerprint: hash('compile-report'),
+        }),
+        runDraft,
+      });
+
+      await expect(stage.execute(
+        executionContext({preflight}),
+        new AbortController().signal,
+      )).rejects.toBeDefined();
+      expect(runDraft).not.toHaveBeenCalled();
+    },
+  );
 
   it('retains predictable and dynamic Narration partials through failure', async () => {
     const context = executionContext();
@@ -1382,6 +1549,69 @@ describe('adapter verification', () => {
       },
     })).resolves.toBe(false);
   });
+
+  it.each([
+    ['Draft JSON', 'draft/draft-report.json', '{not-json\n'],
+    ['Review schema', 'review.json', '{}\n'],
+  ] as const)('returns false for malformed persisted %s', async (_label, relativePath, contents) => {
+    const draft = draftReport();
+    if (relativePath !== 'draft/draft-report.json') {
+      await writeRunText(
+        sourceRun,
+        'draft/draft-report.json',
+        `${JSON.stringify(draft)}\n`,
+      );
+    }
+    await writeRunText(sourceRun, relativePath, contents);
+    const review = approvedReview();
+    const report = passedStageReport({
+      stageId: 'review',
+      fingerprint: hash('review'),
+      artifacts: [],
+      outputs: {
+        evidence: [draft.outputs.contactSheet, ...draft.outputs.reviewFrames],
+        review,
+      },
+    });
+
+    await expect(createReviewStage().verify(planningContext(), report))
+      .resolves.toBe(false);
+  });
+
+  it.each(['Draft', 'Review'] as const)(
+    'propagates persisted %s EIO failures during Review verification',
+    async (input) => {
+      const failure = Object.assign(new Error(`${input} I/O failed`), {code: 'EIO'});
+      const draft = draftReport();
+      const review = approvedReview();
+      const stage = createReviewStage({
+        readDraftReport: async () => {
+          if (input === 'Draft') throw failure;
+          return draft;
+        },
+        readReview: async () => {
+          if (input === 'Review') throw failure;
+          return review;
+        },
+      });
+      const reportFingerprint = input === 'Review'
+        ? await createReviewStage({
+          readDraftReport: async () => draft,
+        }).fingerprint(planningContext())
+        : hash('review');
+      const report = passedStageReport({
+        stageId: 'review',
+        fingerprint: reportFingerprint,
+        artifacts: [],
+        outputs: {
+          evidence: [draft.outputs.contactSheet, ...draft.outputs.reviewFrames],
+          review,
+        },
+      });
+
+      await expect(stage.verify(planningContext(), report)).rejects.toBe(failure);
+    },
+  );
 });
 
 describe('Narration compatibility-gated cache seeding', () => {
@@ -1429,6 +1659,19 @@ describe('Narration compatibility-gated cache seeding', () => {
         currentProject.project.tts.rate,
         currentProviderFingerprint,
       );
+      const segments = [{
+        id: segment.id,
+        inputHash,
+        audioPath: `audio/segments/0001-${segment.id}-${inputHash.slice('sha256:'.length, 'sha256:'.length + 12)}.wav`,
+        audioHash: hash('current-segment'),
+        startMs: 0,
+        endMs: 1000,
+        durationMs: 1000,
+        pauseAfterMs: segment.pauseAfterMs,
+        sampleRate: 48_000 as const,
+        channels: 1 as const,
+        providerFingerprint: currentProviderFingerprint,
+      }];
       return {
         narrationPath: 'narration-manifest.json' as const,
         captionsPath: 'captions.json' as const,
@@ -1436,21 +1679,12 @@ describe('Narration compatibility-gated cache seeding', () => {
         narration: {
           version: 1 as const,
           provider: currentProject.project.tts.provider,
-          segments: [{
-            id: segment.id,
-            inputHash,
-            audioPath: `audio/segments/0001-${segment.id}-${inputHash.slice('sha256:'.length, 'sha256:'.length + 12)}.wav`,
-            audioHash: hash('current-segment'),
-            startMs: 0,
-            endMs: 1000,
-            durationMs: 1000,
-            pauseAfterMs: segment.pauseAfterMs,
-            sampleRate: 48_000 as const,
-            channels: 1 as const,
-            providerFingerprint: currentProviderFingerprint,
-          }],
+          segments,
           master: {
-            audioPath: 'audio/narration-0123456789abcdef.wav',
+            audioPath: narrationMasterPath({
+              provider: currentProject.project.tts.provider,
+              segments,
+            }),
             audioHash: hash('master'),
             durationMs: 1000,
           },
@@ -1503,26 +1737,30 @@ describe('Narration compatibility-gated cache seeding', () => {
     );
     const sourceCachePath = `audio/cache/${sourceInputHash.slice('sha256:'.length)}.wav`;
     const sourceSegmentPath = `audio/segments/0001-${sourceSegment.id}-${sourceInputHash.slice('sha256:'.length, 'sha256:'.length + 12)}.wav`;
-    const sourceMasterPath = 'audio/narration-fedcba9876543210.wav';
+    const sourceSegments = [{
+      id: sourceSegment.id,
+      inputHash: sourceInputHash,
+      audioPath: sourceSegmentPath,
+      audioHash: contentHash('source-segment'),
+      startMs: 0,
+      endMs: 1000,
+      durationMs: 1000,
+      pauseAfterMs: sourceSegment.pauseAfterMs,
+      sampleRate: 48_000 as const,
+      channels: 1 as const,
+      providerFingerprint: sourceProviderFingerprint,
+    }];
+    const sourceMasterPath = narrationMasterPath({
+      provider: sourceProject.project.tts.provider,
+      segments: sourceSegments,
+    });
     await writeRunText(sourceRun, sourceCachePath, 'source-cache');
     await writeRunText(sourceRun, sourceSegmentPath, 'source-segment');
     await writeRunText(sourceRun, sourceMasterPath, 'source-master');
     const sourceNarration = {
       version: 1 as const,
       provider: sourceProject.project.tts.provider,
-      segments: [{
-        id: sourceSegment.id,
-        inputHash: sourceInputHash,
-        audioPath: sourceSegmentPath,
-        audioHash: contentHash('source-segment'),
-        startMs: 0,
-        endMs: 1000,
-        durationMs: 1000,
-        pauseAfterMs: sourceSegment.pauseAfterMs,
-        sampleRate: 48_000 as const,
-        channels: 1 as const,
-        providerFingerprint: sourceProviderFingerprint,
-      }],
+      segments: sourceSegments,
       master: {
         audioPath: sourceMasterPath,
         audioHash: contentHash('source-master'),
@@ -1794,6 +2032,43 @@ describe('provenance hardening regressions', () => {
     },
   });
 
+  const writeTargetReleaseReports = async (
+    preflight: PreflightResult,
+    compileFingerprint = hash('compile-report'),
+  ): Promise<void> => {
+    const store = createStageReportStore();
+    await store.writeStage(targetRun, {
+      ...preflightStageReport(preflight),
+      runId: 'target-run',
+      artifacts: [],
+    });
+    await store.writeStage(targetRun, passedStageReport({
+      stageId: 'compile',
+      runId: 'target-run',
+      fingerprint: compileFingerprint,
+      artifacts: [],
+    }));
+  };
+
+  const targetReleaseInputs = (
+    preflight: PreflightResult,
+    compileFingerprint = hash('compile-report'),
+  ) => {
+    const draft = draftReport();
+    const timeline = compiledTimeline();
+    const review = approvedReview({runId: 'target-run'});
+    const stageFingerprint = releaseStageFingerprint({
+      draft: draft.outputs,
+      compileInputHashes: timeline.inputHashes,
+      compileStageFingerprint: compileFingerprint,
+      compiledTimeline: timeline,
+      review,
+      preflightEnvironmentFingerprint: preflight.environmentFingerprint,
+      algorithmVersion: STAGE_ALGORITHM_VERSIONS.release,
+    });
+    return {draft, timeline, review, stageFingerprint};
+  };
+
   it.each([
     ['FFmpeg real path', (value: Record<string, any>) => {
       value.toolIdentities.ffmpeg.realPath = '/tampered/ffmpeg';
@@ -1806,6 +2081,30 @@ describe('provenance hardening regressions', () => {
     }],
     ['font hash', (value: Record<string, any>) => {
       value.fonts[0].sha256 = hash('tampered-font');
+    }],
+    ['Node version', (value: Record<string, any>) => {
+      value.versions.node = 'v99.0.0';
+    }],
+    ['FFprobe version', (value: Record<string, any>) => {
+      value.versions.ffprobe = '99.0';
+    }],
+    ['voice availability', (value: Record<string, any>) => {
+      value.voice.available = false;
+    }],
+    ['voice fallback mode', (value: Record<string, any>) => {
+      value.voice.segmentedWavFallback = true;
+    }],
+    ['system platform', (value: Record<string, any>) => {
+      value.system.platform = 'linux';
+    }],
+    ['system architecture', (value: Record<string, any>) => {
+      value.system.arch = 'x64';
+    }],
+    ['system source bytes', (value: Record<string, any>) => {
+      value.system.sourceBytes += 1;
+    }],
+    ['system required bytes', (value: Record<string, any>) => {
+      value.system.requiredBytes += 1;
     }],
   ])('rejects a persisted Preflight snapshot with a tampered %s', async (_label, mutate) => {
     const live = preflightResult();
@@ -1822,6 +2121,29 @@ describe('provenance hardening regressions', () => {
     });
 
     await expect(stage.verify(context, report)).resolves.toBe(false);
+  });
+
+  it('ignores Preflight runtime noise and human-readable checks during verification', async () => {
+    const live = preflightResult();
+    const context = planningContext({preflight: live});
+    const stage = createPreflightStage();
+    const outputs = structuredClone(live);
+    outputs.system.availableBytes = 1;
+    outputs.system.workDirectory = '/absolute/runtime/work/demo';
+    outputs.checks = [{
+      id: 'changed-message',
+      severity: 'warning',
+      code: 'ENV_TOOL_CHANGED',
+      message: 'runtime-only message changed',
+    }];
+    const report = passedStageReport({
+      stageId: 'preflight',
+      fingerprint: await stage.fingerprint(context),
+      artifacts: [],
+      outputs: JSON.parse(JSON.stringify(outputs)),
+    });
+
+    await expect(stage.verify(context, report)).resolves.toBe(true);
   });
 
   it('rejects a persisted Preflight snapshot with a tampered ffprobe identity', async () => {
@@ -2025,6 +2347,114 @@ describe('provenance hardening regressions', () => {
     )).rejects.toBeDefined();
     expect(executeRelease).not.toHaveBeenCalled();
   });
+
+  it.each(['ffmpeg', 'ffprobe', 'qtFaststart'] as const)(
+    'does not execute Release without a persisted %s identity',
+    async (tool) => {
+      const persisted = preflightResult();
+      persisted.toolIdentities[tool] = null;
+      await writeTargetReleaseReports(persisted);
+      const inputs = targetReleaseInputs(persisted);
+      const executeRelease = vi.fn(async () => releaseResult(
+        'target-run',
+        inputs.stageFingerprint,
+      ));
+      const stage = createReleaseStage({
+        readDraftReport: async () => inputs.draft,
+        readCompiledTimeline: async () => inputs.timeline,
+        readReview: async () => inputs.review,
+        runRelease: executeRelease,
+      });
+
+      await expect(stage.execute(
+        executionContext({preflight: persisted}),
+        new AbortController().signal,
+      )).rejects.toBeDefined();
+      expect(executeRelease).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ['mismatched verification hash', hash('other-final')],
+    ['malformed verification hash', 'not-a-sha256'],
+  ])('rejects Release outputs with a %s', async (_label, verificationSha256) => {
+    const preflight = preflightResult();
+    await writeTargetReleaseReports(preflight);
+    const inputs = targetReleaseInputs(preflight);
+    const concreteResult = releaseResult('target-run', inputs.stageFingerprint);
+    concreteResult.outputs.verification.sha256 = verificationSha256;
+    const stage = createReleaseStage({
+      readDraftReport: async () => inputs.draft,
+      readCompiledTimeline: async () => inputs.timeline,
+      readReview: async () => inputs.review,
+      runRelease: async () => concreteResult,
+    });
+
+    await expect(stage.execute(
+      executionContext({preflight}),
+      new AbortController().signal,
+    )).rejects.toBeDefined();
+  });
+
+  it.each([
+    ['wrong Run', (current: ReleaseStageResult['current']) => {
+      current.runId = 'other-run';
+      current.relativePath = 'releases/other-run';
+    }],
+    ['incomplete Stage list', (current: ReleaseStageResult['current']) => {
+      current.stageIds = current.stageIds.filter((stageId) => stageId !== 'release');
+    }],
+    ['different timestamp', (current: ReleaseStageResult['current']) => {
+      current.publishedAt = '2026-08-11T01:02:04.000Z';
+    }],
+  ] as const)('rejects a Release %s pointer candidate', async (_label, mutate) => {
+    const preflight = preflightResult();
+    await writeTargetReleaseReports(preflight);
+    const inputs = targetReleaseInputs(preflight);
+    const concreteResult = releaseResult('target-run', inputs.stageFingerprint);
+    mutate(concreteResult.current);
+    const stage = createReleaseStage({
+      readDraftReport: async () => inputs.draft,
+      readCompiledTimeline: async () => inputs.timeline,
+      readReview: async () => inputs.review,
+      runRelease: async () => concreteResult,
+    });
+
+    await expect(stage.execute(
+      executionContext({preflight}),
+      new AbortController().signal,
+    )).rejects.toBeDefined();
+  });
+
+  it('freezes one canonical Release timestamp and derives the pointer candidate', async () => {
+    const preflight = preflightResult();
+    await writeTargetReleaseReports(preflight);
+    const inputs = targetReleaseInputs(preflight);
+    const concreteResult = releaseResult('target-run', inputs.stageFingerprint);
+    const now = vi.fn()
+      .mockReturnValueOnce('2026-08-11T01:02:03.000Z')
+      .mockReturnValue('2026-08-11T01:02:04.000Z');
+    const executeRelease = vi.fn(async (input: ReleaseStageInput) => {
+      expect(input.now?.()).toBe('2026-08-11T01:02:03.000Z');
+      expect(input.now?.()).toBe('2026-08-11T01:02:03.000Z');
+      return concreteResult;
+    });
+    const stage = createReleaseStage({
+      readDraftReport: async () => inputs.draft,
+      readCompiledTimeline: async () => inputs.timeline,
+      readReview: async () => inputs.review,
+      runRelease: executeRelease,
+    });
+
+    const result = await stage.execute(
+      executionContext({preflight, now}),
+      new AbortController().signal,
+    );
+
+    expect(now).toHaveBeenCalledOnce();
+    expect(result.outputCurrent).toEqual(concreteResult.current);
+    expect(result.outputCurrent).not.toBe(concreteResult.current);
+  });
 });
 
 describe('Narration fingerprint and media tool provenance', () => {
@@ -2107,6 +2537,19 @@ describe('Narration fingerprint and media tool provenance', () => {
         project.project.tts.rate,
         providerFingerprint,
       );
+      const segments = [{
+        id: segment.id,
+        inputHash,
+        audioPath: `audio/segments/0001-intro-${inputHash.slice('sha256:'.length, 'sha256:'.length + 12)}.wav`,
+        audioHash: hash('segment'),
+        startMs: 0,
+        endMs: 1000,
+        durationMs: 1000,
+        pauseAfterMs: segment.pauseAfterMs,
+        sampleRate: 48_000 as const,
+        channels: 1 as const,
+        providerFingerprint,
+      }];
       return {
         narrationPath: 'narration-manifest.json' as const,
         captionsPath: 'captions.json' as const,
@@ -2114,21 +2557,9 @@ describe('Narration fingerprint and media tool provenance', () => {
         narration: {
           version: 1 as const,
           provider: 'mock' as const,
-          segments: [{
-            id: segment.id,
-            inputHash,
-            audioPath: `audio/segments/0001-intro-${inputHash.slice('sha256:'.length, 'sha256:'.length + 12)}.wav`,
-            audioHash: hash('segment'),
-            startMs: 0,
-            endMs: 1000,
-            durationMs: 1000,
-            pauseAfterMs: segment.pauseAfterMs,
-            sampleRate: 48_000 as const,
-            channels: 1 as const,
-            providerFingerprint,
-          }],
+          segments,
           master: {
-            audioPath: 'audio/narration-0123456789abcdef.wav',
+            audioPath: narrationMasterPath({provider: 'mock', segments}),
             audioHash: hash('master'),
             durationMs: 1000,
           },
@@ -2351,6 +2782,88 @@ describe('exact stage-owned artifact validators', () => {
       master: {audioPath: masterPath, audioHash: contentHash('master'), durationMs: 1000},
     };
     const captions = {version: 1 as const, sourceNarrationHash: narration.master.audioHash, cues: []};
+    const reuseCompatibility = {
+      tts: project.project.tts,
+      providerFingerprint,
+      ffmpegIdentity: preflightResult().toolIdentities.ffmpeg!,
+      ffprobeIdentity: preflightResult().toolIdentities.ffprobe!,
+      algorithmVersion: STAGE_ALGORITHM_VERSIONS.narration,
+    };
+    await Promise.all([
+      writeRunText(sourceRun, cachePath, 'cache'),
+      writeRunText(sourceRun, segmentPath, 'segment'),
+      writeRunText(sourceRun, masterPath, 'master'),
+      writeRunText(sourceRun, 'narration-manifest.json', `${JSON.stringify(narration)}\n`),
+      writeRunText(sourceRun, 'captions.json', `${JSON.stringify(captions)}\n`),
+      writeRunText(sourceRun, 'captions.srt', ''),
+    ]);
+    const artifacts = await Promise.all([
+      cachePath,
+      segmentPath,
+      masterPath,
+      'narration-manifest.json',
+      'captions.json',
+      'captions.srt',
+    ].map(async (relativePath) => await hashRunArtifact(sourceRun, relativePath)));
+    const report = passedStageReport({
+      stageId: 'narration',
+      artifacts,
+      outputs: JSON.parse(JSON.stringify({
+        narrationPath: 'narration-manifest.json',
+        captionsPath: 'captions.json',
+        srtPath: 'captions.srt',
+        narration,
+        captions,
+        reuseCompatibility,
+        reuseCompatibilityFingerprint: narrationReuseCompatibilityFingerprint(
+          reuseCompatibility,
+        ),
+      })),
+    });
+
+    await expect(createNarrationStage({
+      fingerprintTtsProvider: async () => providerFingerprint,
+    }).verify(planningContext(), report)).resolves.toBe(false);
+  });
+
+  it('rejects a pattern-valid Narration master path with different provenance', async () => {
+    const providerFingerprint = hash('provider');
+    const inputHash = narrationSegmentInputHash(
+      project.script.segments[0]!,
+      project.project.tts.voice,
+      project.project.tts.rate,
+      providerFingerprint,
+    );
+    const cachePath = `audio/cache/${inputHash.slice('sha256:'.length)}.wav`;
+    const segmentPath = `audio/segments/0001-intro-${inputHash.slice('sha256:'.length, 'sha256:'.length + 12)}.wav`;
+    const segments = [{
+      id: 'intro',
+      inputHash,
+      audioPath: segmentPath,
+      audioHash: contentHash('segment'),
+      startMs: 0,
+      endMs: 1000,
+      durationMs: 1000,
+      pauseAfterMs: 300,
+      sampleRate: 48_000 as const,
+      channels: 1 as const,
+      providerFingerprint,
+    }];
+    const exactMasterPath = narrationMasterPath({provider: 'mock', segments});
+    const masterPath = exactMasterPath === 'audio/narration-0123456789abcdef.wav'
+      ? 'audio/narration-fedcba9876543210.wav'
+      : 'audio/narration-0123456789abcdef.wav';
+    const narration = {
+      version: 1 as const,
+      provider: 'mock' as const,
+      segments,
+      master: {audioPath: masterPath, audioHash: contentHash('master'), durationMs: 1300},
+    };
+    const captions = {
+      version: 1 as const,
+      sourceNarrationHash: narration.master.audioHash,
+      cues: [],
+    };
     const reuseCompatibility = {
       tts: project.project.tts,
       providerFingerprint,

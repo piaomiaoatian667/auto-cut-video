@@ -6,7 +6,10 @@ import {
   openExistingRunFile,
   type RunDirectoryScope,
 } from '../../../src/fs/app-directory-scopes';
-import {buildNarration} from '../../../src/narration/build-narration';
+import {
+  buildNarration,
+  narrationMasterPath,
+} from '../../../src/narration/build-narration';
 import {fingerprintValue} from '../../../src/pipeline/fingerprint';
 import {MockTtsProvider, type TtsInput, type TtsProvider, type TtsResult} from '../../../src/providers/tts';
 import {
@@ -94,9 +97,31 @@ describe('buildNarration', () => {
     expect(manifest.segments.map((segment) => segment.id)).toEqual(['intro', 'segment-2']);
     expect(manifest.segments[0]).toMatchObject({startMs: 0, endMs: 1000, durationMs: 1000, pauseAfterMs: 250});
     expect(manifest.segments[1]).toMatchObject({startMs: 1250, endMs: 2250, durationMs: 1000, pauseAfterMs: 0});
-    expect(manifest.master.audioPath).toMatch(/^audio\/narration-[0-9a-f]{16}\.wav$/);
+    expect(manifest.master.audioPath).toBe(narrationMasterPath(manifest));
     expect(manifest.master.durationMs).toBe(2250);
     expect(provider.calls.map((call) => call.segmentId)).toEqual(['intro', 'segment-2']);
+  });
+
+  it('derives the exact master path from provider and segment provenance', () => {
+    const segments = [{
+      id: 'intro',
+      inputHash: fingerprintValue('input'),
+      audioHash: fingerprintValue('audio'),
+      startMs: 0,
+      endMs: 1000,
+      pauseAfterMs: 250,
+    }];
+
+    expect(narrationMasterPath({provider: 'mock', segments})).toBe(
+      narrationMasterPath({provider: 'mock', segments: structuredClone(segments)}),
+    );
+    expect(narrationMasterPath({provider: 'file', segments})).not.toBe(
+      narrationMasterPath({provider: 'mock', segments}),
+    );
+    expect(narrationMasterPath({
+      provider: 'mock',
+      segments: [{...segments[0]!, audioHash: fingerprintValue('changed-audio')}],
+    })).not.toBe(narrationMasterPath({provider: 'mock', segments}));
   });
 
   it('reuses unchanged cached segment audio on subsequent builds', async () => {

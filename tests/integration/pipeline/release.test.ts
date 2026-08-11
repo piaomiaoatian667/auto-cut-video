@@ -302,7 +302,6 @@ describe('runRelease', () => {
     }, {
       renderTimelineVideo: renderFinalVideo,
       runProcess: recordingRunner,
-      ffprobeExecutable: FFPROBE,
       outputStore,
       profile,
       algorithmVersion,
@@ -343,6 +342,7 @@ describe('runRelease', () => {
       },
       {command: QT_FASTSTART, args: ['/dev/fd/3', '/dev/fd/4'], fdCount: 2},
     ]));
+    expect(calls.some((call) => call.command === FFPROBE)).toBe(true);
     expect(calls.find((call) => call.command === FFMPEG)?.args).not.toContain('+faststart');
     expect(await readOutputFile(tempProject.workspaceRoot, 'releases/run-release/final.mp4')).not.toHaveLength(0);
     expect(assertMoovBeforeMdat(parseTopLevelMp4Atoms(
@@ -373,10 +373,33 @@ describe('runRelease', () => {
       runId: 'run-release',
       preflight: missingQt,
       now: () => '2026-08-10T00:01:00.000Z',
-    }, {renderTimelineVideo: renderFinalVideo, outputStore, ffprobeExecutable: FFPROBE}))
+    }, {renderTimelineVideo: renderFinalVideo, outputStore}))
       .rejects.toMatchObject({code: 'RELEASE_TOOL_MISSING'});
 
     await expect(readFile(path.join(tempProject.workspaceRoot, 'output/demo/current.json'))).resolves.toEqual(oldCurrent);
+    await expect(outputStore.readCurrent('demo')).resolves.toEqual(pointer('run-old'));
+  }, 90_000);
+
+  it('preserves the previous output pointer when ffprobe is missing', async () => {
+    const {tempProject, project, runDirectory} = await prepareReleaseRun();
+    const outputStore = createOutputStore(tempProject.workspaceRoot);
+    await outputStore.createRelease('demo', 'run-old');
+    await outputStore.publishCurrent('demo', pointer('run-old'));
+    const oldCurrent = await readFile(path.join(tempProject.workspaceRoot, 'output/demo/current.json'));
+    const missingFfprobe = preflight();
+    missingFfprobe.toolIdentities.ffprobe = null;
+
+    await expect(runRelease({
+      ...project,
+      runDirectory,
+      runId: 'run-release',
+      preflight: missingFfprobe,
+      now: () => '2026-08-10T00:01:00.000Z',
+    }, {renderTimelineVideo: renderFinalVideo, outputStore}))
+      .rejects.toMatchObject({code: 'RELEASE_TOOL_MISSING'});
+
+    await expect(readFile(path.join(tempProject.workspaceRoot, 'output/demo/current.json')))
+      .resolves.toEqual(oldCurrent);
     await expect(outputStore.readCurrent('demo')).resolves.toEqual(pointer('run-old'));
   }, 90_000);
 
@@ -405,7 +428,6 @@ describe('runRelease', () => {
       renderTimelineVideo: renderFinalVideo,
       runProcess: failingRunner,
       outputStore,
-      ffprobeExecutable: FFPROBE,
     })).rejects.toThrow('injected qt-faststart failure');
 
     await expect(readFile(path.join(tempProject.workspaceRoot, 'output/demo/current.json'))).resolves.toEqual(oldCurrent);
