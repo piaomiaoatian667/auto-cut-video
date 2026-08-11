@@ -1,7 +1,9 @@
 import {constants, type BigIntStats} from 'node:fs';
 import {
   mkdir,
+  lstat,
   mkdtemp,
+  open,
   readFile,
   realpath,
   rename,
@@ -35,6 +37,7 @@ import {
   openNewOutputFile,
   openNewOutputReadWriteFile,
   openNewRunFile,
+  openNewRunFileForWrite,
   openNewRunReadWriteFile,
   unlinkRunFile,
 } from '../../../src/fs/app-directory-scopes';
@@ -610,6 +613,85 @@ describe('app-owned directory scopes', () => {
     await expect(readFile(targetPath, 'utf8')).resolves.toBe(replacement);
     await expect(readFile(movedPath, 'utf8')).rejects.toMatchObject({code: 'ENOENT'});
     expect(unlinkError).toBeUndefined();
+  });
+
+  it('syncs the held parent and rejects a restored lexical replacement', async () => {
+    const workspaceRoot = await makeTempDirectory('app-scopes-parent-sync-');
+    const run = await createRunStore(workspaceRoot).createRun('demo', 'run-one');
+    await ensureRunDirectory(run, 'reports');
+    const reportsPath = path.join(
+      workspaceRoot,
+      '.work',
+      'demo',
+      'runs',
+      'run-one',
+      'reports',
+    );
+    const movedReportsPath = `${reportsPath}-original`;
+    const reportPath = path.join(reportsPath, 'ingest.json');
+    const authority = await openNewRunFileForWrite(run, 'reports/ingest.json');
+    await authority.handle.writeFile('report');
+    await authority.syncAndSeal();
+    await authority.revalidate();
+    const originalIdentity = await lstat(reportsPath, {bigint: true});
+    const probe = await open(reportsPath, constants.O_RDONLY);
+    const prototype = Object.getPrototypeOf(probe) as {
+      sync: (this: FileHandle) => Promise<void>;
+    };
+    const originalSync = prototype.sync;
+    await probe.close();
+    await rename(reportsPath, movedReportsPath);
+    await mkdir(reportsPath);
+    const replacementIdentity = await lstat(reportsPath, {bigint: true});
+    let originalSyncs = 0;
+    let replacementSyncs = 0;
+    let restored = false;
+    prototype.sync = async function () {
+      const stats = await this.stat({bigint: true});
+      const isOriginal = stats.isDirectory()
+        && stats.dev === originalIdentity.dev
+        && stats.ino === originalIdentity.ino;
+      const isReplacement = stats.isDirectory()
+        && stats.dev === replacementIdentity.dev
+        && stats.ino === replacementIdentity.ino;
+      if (isOriginal) originalSyncs += 1;
+      if (isReplacement) replacementSyncs += 1;
+      await originalSync.call(this);
+      if (!restored && (isOriginal || isReplacement)) {
+        await rm(reportsPath, {recursive: true, force: true});
+        await rename(movedReportsPath, reportsPath);
+        restored = true;
+      }
+    };
+
+    let successSyncError: unknown;
+    let rollbackSyncError: unknown;
+    try {
+      try {
+        await authority.syncParent();
+      } catch (error) {
+        successSyncError = error;
+      }
+      await authority.unlink();
+      try {
+        await authority.syncParent();
+      } catch (error) {
+        rollbackSyncError = error;
+      }
+    } finally {
+      prototype.sync = originalSync;
+      if (!restored) {
+        await rm(reportsPath, {recursive: true, force: true});
+        await rename(movedReportsPath, reportsPath);
+      }
+      await authority.close();
+    }
+
+    expect(successSyncError).toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
+    expect(rollbackSyncError).toBeUndefined();
+    expect(originalSyncs).toBe(2);
+    expect(replacementSyncs).toBe(0);
+    await expect(readFile(reportPath, 'utf8')).rejects.toMatchObject({code: 'ENOENT'});
   });
 
   it('retries identity acquisition to clean up after the first created-file stat fails', async () => {

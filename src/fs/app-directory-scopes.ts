@@ -1145,11 +1145,30 @@ const openNewScopedWriteFileAuthority = async (
       sealedIdentity = identity;
     };
     const syncParent = async (): Promise<void> => {
-      const parentPath = path.posix.dirname(relativePath);
-      await syncScopedDirectory(
-        state,
-        parentPath === '.' ? undefined : parentPath,
-      );
+      const errors: unknown[] = [];
+      try {
+        await assertScopedReadPathStable(state, pathAuthority, relativePath);
+      } catch (error) {
+        errors.push(error);
+      }
+      try {
+        await anchor.parent.handle.sync();
+      } catch (error) {
+        errors.push(error);
+      }
+      try {
+        await assertScopedReadPathStable(state, pathAuthority, relativePath);
+      } catch (error) {
+        errors.push(error);
+      }
+      if (errors.length === 1) throw errors[0];
+      if (errors.length > 1) {
+        throw new AggregateError(
+          errors,
+          `failed to sync held parent directory: ${relativePath}`,
+          {cause: errors[0]},
+        );
+      }
     };
     const openForRead = async (): Promise<AppDirectoryReadFileAuthority> => {
       const expected = sealedIdentity;

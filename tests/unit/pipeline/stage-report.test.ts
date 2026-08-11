@@ -1,7 +1,11 @@
-import {constants} from 'node:fs';
+import {constants, type BigIntStats} from 'node:fs';
 import {
+  lstat,
+  mkdir,
   mkdtemp,
+  open,
   readFile,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -29,6 +33,12 @@ interface DirectorySyncProbe {
   syncPaths: string[];
   postCreateSyncPaths: string[];
 }
+
+interface DirectorySyncHandle {
+  stat(options: {bigint: true}): Promise<BigIntStats>;
+}
+
+type DirectorySync = (this: DirectorySyncHandle) => Promise<void>;
 
 const importReportModulesWithDirectorySyncProbe = async (
   probe: DirectorySyncProbe,
@@ -536,6 +546,85 @@ describe('StageReportStore', () => {
     },
   );
 
+  it('syncs the held report parent again after rollback unlink', async () => {
+    const fixture = await createPipelineRunFixture();
+    const reportsPath = path.join(
+      fixture.workspaceRoot,
+      '.work',
+      'demo',
+      'runs',
+      'run-one',
+      'reports',
+    );
+    const movedReportsPath = `${reportsPath}-original`;
+    const report = passedStageReport({stageId: 'ingest'});
+    await ensureRunDirectory(fixture.runDirectory, 'reports');
+    const originalIdentity = await lstat(reportsPath, {bigint: true});
+    const probe = await open(reportsPath, constants.O_RDONLY);
+    const prototype = Object.getPrototypeOf(probe) as {sync: DirectorySync};
+    const originalSync = prototype.sync;
+    await probe.close();
+    let replacementIdentity: BigIntStats | undefined;
+    let originalSyncs = 0;
+    let replacementSyncs = 0;
+    let swapped = false;
+    prototype.sync = async function () {
+      const stats = await this.stat({bigint: true});
+      const isOriginal = stats.isDirectory()
+        && stats.dev === originalIdentity.dev
+        && stats.ino === originalIdentity.ino;
+      const isReplacement = replacementIdentity !== undefined
+        && stats.isDirectory()
+        && stats.dev === replacementIdentity.dev
+        && stats.ino === replacementIdentity.ino;
+      if (isOriginal) originalSyncs += 1;
+      if (isReplacement) replacementSyncs += 1;
+      if (isOriginal && !swapped) {
+        await rename(reportsPath, movedReportsPath);
+        await mkdir(reportsPath);
+        replacementIdentity = await lstat(reportsPath, {bigint: true});
+        swapped = true;
+      }
+      await originalSync.call(this);
+    };
+
+    let writeError: unknown;
+    try {
+      await createStageReportStore().writeStage(fixture.runDirectory, report);
+    } catch (error) {
+      writeError = error;
+    } finally {
+      prototype.sync = originalSync;
+    }
+
+    try {
+      expect(writeError).toBeInstanceOf(AggregateError);
+      const errors = writeError instanceof AggregateError
+        ? writeError.errors
+        : [];
+      expect(errors).toHaveLength(2);
+      expect(errors[0]).toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
+      expect(errors[1]).toBeInstanceOf(AggregateError);
+      expect((errors[1] as AggregateError).errors).toEqual([
+        expect.objectContaining({code: 'APP_PATH_OUTSIDE_SCOPE'}),
+        expect.objectContaining({code: 'APP_PATH_OUTSIDE_SCOPE'}),
+      ]);
+      expect(originalSyncs).toBe(2);
+      expect(replacementSyncs).toBe(0);
+      await expect(readFile(path.join(movedReportsPath, 'ingest.json'), 'utf8'))
+        .rejects.toMatchObject({code: 'ENOENT'});
+      await expect(readFile(path.join(reportsPath, 'ingest.json'), 'utf8'))
+        .rejects.toMatchObject({code: 'ENOENT'});
+
+      await expect(createStageReportStore().writeStage(
+        fixture.runDirectory,
+        report,
+      )).resolves.toBeUndefined();
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   it('removes a canonical report when directory-authority close fails', async () => {
     const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'stage-report-close-'));
     const closeError = Object.assign(new Error('directory authority close failed'), {
@@ -610,7 +699,13 @@ describe('StageReportStore', () => {
         writeError = error;
       }
 
-      expect(writeError).toBe(closeError);
+      expect(writeError).toBeInstanceOf(AggregateError);
+      const errors = writeError instanceof AggregateError
+        ? writeError.errors
+        : [];
+      expect(errors).toHaveLength(2);
+      expect(errors[0]).toBe(closeError);
+      expect(errors[1]).toBeInstanceOf(AggregateError);
       expect(directoryProxied).toBe(true);
       expect(directoryCloseFailed).toBe(true);
       expect(reportFileClosed).toBe(true);
