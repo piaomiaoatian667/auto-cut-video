@@ -1,5 +1,7 @@
 # Agent Video MVP P06 Workflow and Productization Implementation Plan
 
+> **Superseded:** Use [Agent Video MVP P06 Complete Closeout Implementation Plan](2026-08-10-agent-video-mvp-p06-complete-closeout.md). This file is retained only for historical context.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Productize the independently working Stages through a typed registry, built-in Presets, side-effect-free Execution Plan, resumable Runner, complete CLI, demo project, and end-to-end acceptance suite.

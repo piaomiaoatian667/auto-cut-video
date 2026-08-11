@@ -42,7 +42,7 @@ flowchart LR
 | P03 | Media and Visual Pipeline | 7, 10, 11 | P01, P02 | Ingest, EDL compile, fixed components, muted Remotion render | [P03 Plan](2026-08-09-agent-video-mvp-03-media-visual-pipeline.md) |
 | P04 | Narration and Audio | 8, 9, 12 | P01, P02 | TTS cache, narration master, captions, BGM mix and loudness | [P04 Plan](2026-08-09-agent-video-mvp-04-narration-audio.md) |
 | P05 | Review and Release | 13–14 | P03, P04 | Draft evidence, explicit Review Gate, two-step scoped-FD faststart publication, verified release package | [P05 Plan](2026-08-09-agent-video-mvp-05-review-release.md) |
-| P06 | Workflow and Productization | 15–16 | P02, P05 | Stage registry, Presets, Execution Plan, Runner, CLI and E2E | [P06 Plan](2026-08-09-agent-video-mvp-06-workflow-productization.md) |
+| P06 | Workflow and Productization | 15–16 | P02, P05 | Stage registry, Presets, Execution Plan, Runner, CLI and E2E | [P06 Complete Closeout Plan](2026-08-10-agent-video-mvp-p06-complete-closeout.md) |
 
 ## Execution Waves
 
