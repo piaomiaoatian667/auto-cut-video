@@ -101,7 +101,7 @@ export interface ReleaseStageAdapterDependencies {
   openOutputDirectory?: (
     workspaceRoot: string,
     projectId: string,
-  ) => Promise<OutputDirectoryScope>;
+  ) => Promise<OutputDirectoryScope | null>;
 }
 
 const parseReleasePreflightSnapshot = (
@@ -282,7 +282,7 @@ export const createReleaseStage = (
   const openOutputDirectory = dependencies.openOutputDirectory
     ?? (async (workspaceRoot: string, projectId: string) => await createOutputStore(
       workspaceRoot,
-    ).openProject(projectId));
+    ).openExistingProject(projectId));
 
   const calculatePlan = async (
     runDirectory: RunDirectoryScope,
@@ -406,7 +406,7 @@ export const createReleaseStage = (
         || report.fingerprint !== planning.plan.fingerprint
         || parsed.data.releaseFingerprint !== planning.plan.fingerprint
       ) return false;
-      let outputDirectory: OutputDirectoryScope;
+      let outputDirectory: OutputDirectoryScope | null;
       try {
         outputDirectory = await openOutputDirectory(
           context.project.workspaceRoot,
@@ -416,6 +416,7 @@ export const createReleaseStage = (
         if (isOrdinaryVerificationMiss(error)) return false;
         throw error;
       }
+      if (outputDirectory === null) return false;
       if (!await verifyReleaseAuditMetadata({
         outputDirectory,
         projectId: context.project.project.id,

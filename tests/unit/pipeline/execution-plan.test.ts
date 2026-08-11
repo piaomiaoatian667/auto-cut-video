@@ -50,12 +50,14 @@ const pointer = (
 const reportsThrough = (
   completedStage: StageId,
   overrides: Partial<Record<StageId, Partial<StageReport>>> = {},
+  runId = 'run-one',
 ): Map<StageId, StageReport> => {
   const completedIndex = STAGE_IDS.indexOf(completedStage);
   return new Map(STAGE_IDS.slice(0, completedIndex + 1).map((stageId) => [
     stageId,
     passedStageReport({
       stageId,
+      runId,
       fingerprint: stageFingerprint(stageId),
       ...overrides[stageId],
     }),
@@ -413,5 +415,144 @@ describe('buildExecutionPlan', () => {
         materialize: false,
       }),
     ]);
+  });
+
+  it('uses a newer published Output Release when Work points to an older Run', async () => {
+    const workCurrent = pointer('draft', {
+      runId: 'work-old',
+      relativePath: 'runs/work-old',
+      preset: 'draft',
+      stageIds: [...STAGE_PRESETS.draft],
+      publishedAt: '2026-08-11T00:00:00.000Z',
+    });
+    const outputCurrent = pointer('release', {
+      runId: 'release-new',
+      relativePath: 'releases/release-new',
+      publishedAt: '2026-08-11T00:01:00.000Z',
+    });
+
+    const plan = await build({
+      current: workCurrent,
+      outputCurrent,
+      reports: reportsThrough('release', {}, 'release-new'),
+    }, {
+      preset: 'release',
+      from: 'release',
+      to: 'release',
+    });
+
+    expect(plan).toMatchObject({
+      runMode: 'noop',
+      sourceRunId: 'release-new',
+      targetRunId: 'release-new',
+    });
+  });
+
+  it('keeps newer Work progress on a later Run over an older Output Release', async () => {
+    const workCurrent = pointer('narration', {
+      runId: 'work-new',
+      relativePath: 'runs/work-new',
+      publishedAt: '2026-08-11T00:02:00.000Z',
+    });
+    const outputCurrent = pointer('release', {
+      runId: 'release-old',
+      relativePath: 'releases/release-old',
+      publishedAt: '2026-08-11T00:01:00.000Z',
+    });
+
+    const plan = await build({
+      current: workCurrent,
+      outputCurrent,
+      reports: reportsThrough('narration', {}, 'work-new'),
+    }, {
+      preset: 'release',
+      resume: true,
+    });
+
+    expect(plan).toMatchObject({
+      runMode: 'resume',
+      sourceRunId: 'work-new',
+      targetRunId: 'work-new',
+    });
+    expect(plan.items.find((item) => item.stageId === 'compile'))
+      .toMatchObject({action: 'resume'});
+  });
+
+  it('uses Stage progress when cross-Run pointers share a publication time', async () => {
+    const publishedAt = '2026-08-11T00:01:00.000Z';
+    const workCurrent = pointer('draft', {
+      runId: 'work-tied',
+      relativePath: 'runs/work-tied',
+      publishedAt,
+    });
+    const outputCurrent = pointer('release', {
+      runId: 'release-tied',
+      relativePath: 'releases/release-tied',
+      publishedAt,
+    });
+
+    const plan = await build({
+      current: workCurrent,
+      outputCurrent,
+      reports: reportsThrough('release', {}, 'release-tied'),
+    }, {
+      preset: 'release',
+      from: 'release',
+      to: 'release',
+    });
+
+    expect(plan.sourceRunId).toBe('release-tied');
+  });
+
+  it('uses Output Release authority when cross-Run pointers are otherwise tied', async () => {
+    const publishedAt = '2026-08-11T00:01:00.000Z';
+    const workCurrent = pointer('release', {
+      runId: 'work-tied',
+      relativePath: 'runs/work-tied',
+      publishedAt,
+    });
+    const outputCurrent = pointer('release', {
+      runId: 'release-tied',
+      relativePath: 'releases/release-tied',
+      publishedAt,
+    });
+
+    const plan = await build({
+      current: workCurrent,
+      outputCurrent,
+      reports: reportsThrough('release', {}, 'release-tied'),
+    }, {
+      preset: 'release',
+      from: 'release',
+      to: 'release',
+    });
+
+    expect(plan.sourceRunId).toBe('release-tied');
+  });
+
+  it('preserves same-Run Release progress over a later stale Work timestamp', async () => {
+    const workCurrent = pointer('draft', {
+      runId: 'same-run',
+      relativePath: 'runs/same-run',
+      publishedAt: '2026-08-11T00:02:00.000Z',
+    });
+    const outputCurrent = pointer('release', {
+      runId: 'same-run',
+      relativePath: 'releases/same-run',
+      publishedAt: '2026-08-11T00:01:00.000Z',
+    });
+
+    const plan = await build({
+      current: workCurrent,
+      outputCurrent,
+      reports: reportsThrough('release', {}, 'same-run'),
+    }, {
+      preset: 'release',
+      from: 'release',
+      to: 'release',
+    });
+
+    expect(plan.sourceRunId).toBe('same-run');
+    expect(plan.runMode).toBe('noop');
   });
 });

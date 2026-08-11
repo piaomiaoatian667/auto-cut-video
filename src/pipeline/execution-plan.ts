@@ -156,8 +156,15 @@ const reconcileCurrentPointer = (
   output: CurrentPointer | null,
 ): CurrentPointer | null => {
   if (work === null) return output;
-  if (output === null || output.runId !== work.runId) return work;
-  return pointerProgress(output) > pointerProgress(work) ? output : work;
+  if (output === null) return work;
+  if (output.runId === work.runId) {
+    return pointerProgress(output) > pointerProgress(work) ? output : work;
+  }
+  const publicationOrder = output.publishedAt.localeCompare(work.publishedAt);
+  if (publicationOrder !== 0) return publicationOrder > 0 ? output : work;
+  const progressOrder = pointerProgress(output) - pointerProgress(work);
+  if (progressOrder !== 0) return progressOrder > 0 ? output : work;
+  return output;
 };
 
 const reportMatchesIdentity = (
