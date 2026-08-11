@@ -14,6 +14,17 @@ import {runReviewCommand} from '../../../src/cli/commands/review';
 import {runVideoctl, type VideoctlDependencies} from '../../../src/cli/videoctl';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
 import {PipelineArtifactError} from '../../../src/pipeline/artifacts';
+import {fingerprintValue} from '../../../src/pipeline/fingerprint';
+import {STAGE_PRESETS} from '../../../src/pipeline/presets';
+import {
+  createStageReportStore,
+  StageReportSchema,
+} from '../../../src/pipeline/stage-report';
+import {STAGE_ALGORITHM_VERSIONS} from '../../../src/pipeline/stage-adapters/shared';
+import {
+  DraftReportSchema,
+  draftReviewEvidenceArtifacts,
+} from '../../../src/pipeline/stages/draft';
 import {createEditFixture, createProjectFixture, createScriptFixture} from '../../helpers/temp-project';
 import type {ProjectInputs} from '../../../src/domain/load-project';
 
@@ -29,7 +40,8 @@ afterEach(async () => {
 
 const writeRunJson = async (workspaceRoot: string, runId: string, relativePath: string, value: unknown) => {
   const run = await createRunStore(workspaceRoot).openExistingRun('demo', runId);
-  await ensureRunDirectory(run, path.posix.dirname(relativePath));
+  const parent = path.posix.dirname(relativePath);
+  if (parent !== '.') await ensureRunDirectory(run, parent);
   const handle = await openNewRunFile(run, relativePath);
   try {
     await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
@@ -72,7 +84,7 @@ const makeFixture = async () => {
   tempDirectories.push(workspaceRoot);
   const store = createRunStore(workspaceRoot);
   const runId = 'run-review';
-  await store.createRun('demo', runId);
+  const runDirectory = await store.createRun('demo', runId);
   const draftVideoSha = await writeRunText(
     workspaceRoot,
     runId,
@@ -91,7 +103,7 @@ const makeFixture = async () => {
     'draft/frames/frame-000000.jpg',
     'review-frame',
   );
-  await writeRunJson(workspaceRoot, runId, 'draft/draft-report.json', {
+  const draftReport = DraftReportSchema.parse({
     version: 1,
     projectId: 'demo',
     outputs: {
@@ -104,14 +116,44 @@ const makeFixture = async () => {
       },
     },
   });
+  await writeRunJson(workspaceRoot, runId, 'draft/draft-report.json', draftReport);
+  const evidence = draftReviewEvidenceArtifacts(draftReport);
+  const reviewFingerprint = fingerprintValue({
+    algorithmVersion: STAGE_ALGORITHM_VERSIONS.review,
+    evidence,
+  });
+  const reviewAttempt = StageReportSchema.parse({
+    version: 1,
+    projectId: 'demo',
+    runId,
+    preset: 'release',
+    stageId: 'review',
+    position: 6,
+    total: 7,
+    state: 'needs_review',
+    fingerprint: reviewFingerprint,
+    startedAt: '2026-08-11T00:00:00.000Z',
+    finishedAt: '2026-08-11T00:00:01.000Z',
+    artifacts: [],
+    outputs: {evidence, review: null},
+    checks: [{
+      id: 'draft-review-required',
+      severity: 'warning',
+      message: 'Draft review approval is required before Release.',
+      requiresReview: true,
+      affectedPaths: evidence.map((artifact) => artifact.path),
+    }],
+  });
+  const reviewAttemptId = await createStageReportStore()
+    .writeAttempt(runDirectory, reviewAttempt);
   await store.publishCurrent('demo', {
     runId,
     relativePath: `runs/${runId}`,
-    preset: 'draft',
-    stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft', 'review'],
+    preset: 'release',
+    stageIds: [...STAGE_PRESETS.release],
     completedStage: 'review',
     state: 'needs_review',
-    publishedAt: '2026-08-10T00:00:00.000Z',
+    publishedAt: '2026-08-11T00:00:01.000Z',
   });
 
   let stdout = '';
@@ -141,12 +183,17 @@ const makeFixture = async () => {
     stdout: () => stdout,
     stderr: () => stderr,
     runRoot: path.join(workspaceRoot, '.work', 'demo', 'runs', runId),
+    evidence,
+    reviewAttempt,
+    reviewAttemptPath: `reports/attempts/${reviewAttemptId}.json`,
+    reviewFingerprint,
   };
 };
 
 describe('videoctl review', () => {
-  it('approves the current draft run and writes review.json', async () => {
+  it('approves the current run, writes a canonical Review report, and preserves the attempt', async () => {
     const fixture = await makeFixture();
+    const beforePointer = await createRunStore(fixture.workspaceRoot).readCurrent('demo');
 
     const exitCode = await runVideoctl([
       'review', 'demo', '--approve', '--reason', 'looks good', '--reviewer', 'tester',
@@ -164,6 +211,148 @@ describe('videoctl review', () => {
       reason: 'looks good',
       evidencePaths: ['draft/draft.mp4', 'draft/contact-sheet.jpg', 'draft/frames/frame-000000.jpg'],
     });
+    const runDirectory = await createRunStore(fixture.workspaceRoot)
+      .openExistingRun('demo', fixture.runId);
+    const canonical = await createStageReportStore().readStage(runDirectory, 'review');
+    expect(canonical).toMatchObject({
+      projectId: 'demo',
+      runId: fixture.runId,
+      preset: 'release',
+      stageId: 'review',
+      position: 6,
+      total: 7,
+      state: 'passed',
+      fingerprint: fixture.reviewFingerprint,
+      artifacts: [],
+      outputs: {
+        evidence: fixture.evidence,
+        review: {
+          projectId: 'demo',
+          runId: fixture.runId,
+          status: 'approved',
+          reviewer: 'tester',
+          reason: 'looks good',
+        },
+      },
+      checks: [{
+        id: 'draft-review-approved',
+        severity: 'info',
+        message: 'Draft review is approved.',
+      }],
+    });
+    expect(await readRunJson(
+      fixture.workspaceRoot,
+      fixture.runId,
+      fixture.reviewAttemptPath,
+    )).toEqual(fixture.reviewAttempt);
+    const afterPointer = await createRunStore(fixture.workspaceRoot).readCurrent('demo');
+    expect(afterPointer).toMatchObject({
+      runId: beforePointer!.runId,
+      preset: beforePointer!.preset,
+      stageIds: beforePointer!.stageIds,
+      completedStage: beforePointer!.completedStage,
+      state: 'passed',
+    });
+  });
+
+  it('rejects simultaneous approval and rejection', async () => {
+    const fixture = await makeFixture();
+
+    const exitCode = await runReviewCommand(
+      'demo',
+      {approve: true, reject: true, reason: 'conflicting choice'},
+      fixture.dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(fixture.stderr()).toBe('Choose exactly one of --approve or --reject.\n');
+  });
+
+  it('returns a stable validation failure for rejection', async () => {
+    const fixture = await makeFixture();
+
+    const exitCode = await runReviewCommand(
+      'demo',
+      {reject: true, reason: 'needs changes'},
+      fixture.dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(fixture.stderr()).toBe('Review rejection is not supported in MVP.\n');
+  });
+
+  it('refuses approval unless the current pointer is needs_review', async () => {
+    const fixture = await makeFixture();
+    const store = createRunStore(fixture.workspaceRoot);
+    const current = await store.readCurrent('demo');
+    await store.publishCurrent('demo', {...current!, state: 'passed'});
+
+    const exitCode = await runReviewCommand(
+      'demo',
+      {approve: true, reason: 'looks good', reviewer: 'tester'},
+      {...fixture.dependencies, now: () => '2026-08-11T01:00:00.000Z'},
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(fixture.stderr()).toBe('Current run is not awaiting review.\n');
+    const runDirectory = await store.openExistingRun('demo', fixture.runId);
+    await expect(createStageReportStore().readStage(runDirectory, 'review'))
+      .resolves.toBeNull();
+  });
+
+  it('recovers a lagging pointer from a matching canonical Review report', async () => {
+    const fixture = await makeFixture();
+    const review = {
+      version: 1 as const,
+      projectId: 'demo',
+      runId: fixture.runId,
+      status: 'approved' as const,
+      reviewer: 'tester',
+      reviewedAt: '2026-08-11T00:05:00.000Z',
+      reason: 'looks good',
+      evidencePaths: fixture.evidence.map((artifact) => artifact.path),
+    };
+    await writeRunJson(fixture.workspaceRoot, fixture.runId, 'review.json', review);
+    const canonical = StageReportSchema.parse({
+      version: 1,
+      projectId: 'demo',
+      runId: fixture.runId,
+      preset: 'release',
+      stageId: 'review',
+      position: 6,
+      total: 7,
+      state: 'passed',
+      fingerprint: fixture.reviewFingerprint,
+      startedAt: '2026-08-11T00:05:01.000Z',
+      finishedAt: '2026-08-11T00:05:02.000Z',
+      artifacts: [],
+      outputs: {evidence: fixture.evidence, review},
+      checks: [{
+        id: 'draft-review-approved',
+        severity: 'info',
+        message: 'Draft review is approved.',
+      }],
+    });
+    const runDirectory = await createRunStore(fixture.workspaceRoot)
+      .openExistingRun('demo', fixture.runId);
+    const reportStore = createStageReportStore();
+    await reportStore.writeStage(runDirectory, canonical);
+
+    const exitCode = await runReviewCommand(
+      'demo',
+      {approve: true, reason: 'looks good', reviewer: 'tester'},
+      {...fixture.dependencies, now: () => '2026-08-11T01:00:00.000Z'},
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.success);
+    await expect(reportStore.readStage(runDirectory, 'review')).resolves.toEqual(canonical);
+    await expect(createRunStore(fixture.workspaceRoot).readCurrent('demo'))
+      .resolves.toMatchObject({
+        runId: fixture.runId,
+        completedStage: 'review',
+        state: 'passed',
+        publishedAt: review.reviewedAt,
+      });
   });
 
   it.each([

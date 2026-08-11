@@ -168,7 +168,11 @@ const needsRecoveredWorkProgress = (
   report: StageReport,
 ): boolean => current === null
   || current.runId !== runId
-  || (STAGE_POSITIONS.get(report.stageId) ?? -1) > pointerProgress(current);
+  || (STAGE_POSITIONS.get(report.stageId) ?? -1) > pointerProgress(current)
+  || (
+    current.completedStage === report.stageId
+    && current.state !== 'passed'
+  );
 
 const isCanonicalReleasePointer = (
   pointer: CurrentPointer | null,
