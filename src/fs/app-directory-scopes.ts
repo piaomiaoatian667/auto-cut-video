@@ -898,6 +898,14 @@ const unlinkWorkFile = async (
   relativePath,
 );
 
+export const unlinkRunFile = async (
+  scope: RunDirectoryScope,
+  relativePath: string,
+): Promise<void> => await unlinkScopedFile(
+  stateFor(runStates, scope, 'RunDirectoryScope'),
+  relativePath,
+);
+
 const unlinkOutputFile = async (
   scope: OutputDirectoryScope,
   relativePath: string,

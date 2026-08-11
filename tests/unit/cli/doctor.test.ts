@@ -1,10 +1,8 @@
 import {describe, expect, it, vi} from 'vitest';
 import {createEditFixture, createProjectFixture, createScriptFixture} from '../../helpers/temp-project';
 import type {ProjectInputs} from '../../../src/domain/load-project';
-import {
-  ProjectPathError,
-  type ProjectDirectoryScope,
-} from '../../../src/fs/project-paths';
+import type {ProjectDirectoryScope} from '../../../src/fs/project-paths';
+import {ProjectSourceError} from '../../../src/pipeline/source-assets';
 import type {PreflightResult} from '../../../src/pipeline/stages/preflight';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
 import {runVideoctl, type VideoctlDependencies} from '../../../src/cli/videoctl';
@@ -142,10 +140,11 @@ describe('videoctl doctor', () => {
     expect(stderr()).toBe('');
   });
 
-  it('maps scoped source measurement failures to project validation JSON', async () => {
+  it('maps source catalog failures to sanitized project validation JSON', async () => {
     const {dependencies, stdout, stderr} = fixture();
     dependencies.measureSourceBytes = vi.fn(async () => {
-      throw new ProjectPathError(
+      throw new ProjectSourceError(
+        'PROJECT_SOURCE_INVALID',
         'project directory changed after scope creation: assets/source',
       );
     });

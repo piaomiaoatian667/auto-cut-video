@@ -36,6 +36,7 @@ import {
   openNewOutputReadWriteFile,
   openNewRunFile,
   openNewRunReadWriteFile,
+  unlinkRunFile,
 } from '../../../src/fs/app-directory-scopes';
 import * as appDirectoryScopes from '../../../src/fs/app-directory-scopes';
 import {runProcess} from '../../../src/process/run-process';
@@ -555,6 +556,17 @@ describe('app-owned directory scopes', () => {
         .rejects.toMatchObject({code: 'APP_PATH_OUTSIDE_SCOPE'});
     },
   );
+
+  it('unlinks a regular file through a Run-scoped helper', async () => {
+    const workspaceRoot = await makeTempDirectory('app-scopes-unlink-run-');
+    const run = await createRunStore(workspaceRoot).createRun('demo', 'run-one');
+    await writeAndClose(await openNewRunFile(run, 'artifact.bin'), 'artifact');
+
+    await unlinkRunFile(run, 'artifact.bin');
+
+    await expect(openExistingRunFile(run, 'artifact.bin'))
+      .rejects.toMatchObject({code: 'ENOENT'});
+  });
 
   it.each(['work', 'run', 'output'] as const)(
     'fails closed after lexical %s root replacement',
