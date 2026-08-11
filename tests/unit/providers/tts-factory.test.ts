@@ -1,3 +1,4 @@
+import {stat as statFile} from 'node:fs/promises';
 import {describe, expect, it, vi} from 'vitest';
 import type {RunDirectoryScope} from '../../../src/fs/app-directory-scopes';
 import type {ProjectDirectoryScope} from '../../../src/fs/project-paths';
@@ -28,6 +29,20 @@ describe('createTtsProvider', () => {
 });
 
 describe('fingerprintTtsProvider', () => {
+  it('normalizes an actual Node Stats result before fingerprinting macos-say', async () => {
+    const sayStats = await statFile(new URL(import.meta.url));
+    const stat = vi.fn(async () => sayStats);
+
+    await expect(fingerprintTtsProvider('macos-say', {stat})).resolves.toBe(
+      fingerprintValue({
+        provider: 'macos-say',
+        algorithm: 'macos-say-v1',
+        say: {mtimeMs: sayStats.mtimeMs, size: sayStats.size},
+      }),
+    );
+    expect(stat).toHaveBeenCalledWith('/usr/bin/say');
+  });
+
   it.each(['mock', 'file', 'macos-say'] as const)(
     'returns a sha256 identity for %s',
     async (provider: TtsProviderId) => {

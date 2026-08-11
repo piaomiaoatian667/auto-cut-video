@@ -54,7 +54,8 @@ export async function fingerprintTtsProvider(
   dependencies: TtsProviderIdentityDependencies = {stat},
 ): Promise<string> {
   if (provider === 'macos-say') {
-    const say = await dependencies.stat('/usr/bin/say');
+    const sayStats = await dependencies.stat('/usr/bin/say');
+    const say = {mtimeMs: sayStats.mtimeMs, size: sayStats.size};
     return fingerprintValue({provider, algorithm: 'macos-say-v1', say});
   }
   return fingerprintValue({provider, algorithm: `${provider}-tts-v1`});
