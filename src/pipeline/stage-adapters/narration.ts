@@ -121,6 +121,27 @@ const preliminaryPartialArtifacts = (
   return paths;
 };
 
+const uniquePartialArtifacts = (
+  artifacts: readonly PipelinePartialArtifact[],
+): PipelinePartialArtifact[] => {
+  const byPath = new Map<string, PipelinePartialArtifact>();
+  for (const artifact of artifacts) {
+    byPath.set(`${artifact.scope}:${artifact.path}`, artifact);
+  }
+  return [...byPath.values()];
+};
+
+const withCanonicalFingerprint = (
+  provider: TtsProvider,
+  providerId: TtsProviderId,
+  providerFingerprint: string,
+): TtsProvider => ({
+  id: providerId,
+  capabilities: async () => await provider.capabilities(),
+  fingerprint: async () => providerFingerprint,
+  synthesize: async (input, signal) => await provider.synthesize(input, signal),
+});
+
 export interface NarrationStageAdapterDependencies {
   algorithmVersion?: string;
   fingerprintTtsProvider?: typeof fingerprintTtsProvider;
@@ -206,13 +227,18 @@ export const createNarrationStage = (
       if (ffmpegIdentity === null) {
         throw new PipelineContextError('Narration requires a Preflight FFmpeg identity');
       }
-      const provider = makeProvider({
+      const providerId = context.project.project.tts.provider;
+      const providerFingerprint = await providerIdentity(providerId);
+      partialArtifactsByRun.set(
+        runDirectory,
+        preliminaryPartialArtifacts(context, providerFingerprint, providerId),
+      );
+      const provider = withCanonicalFingerprint(makeProvider({
         provider: context.project.project.tts.provider,
         projectDirectory: context.project.projectDirectory,
         runDirectory,
         ffmpegExecutable: ffmpegIdentity.realPath,
-      });
-      const providerFingerprint = await provider.fingerprint();
+      }), providerId, providerFingerprint);
       const compatibilityFingerprint = narrationReuseCompatibilityFingerprint({
         tts: context.project.project.tts,
         providerFingerprint,
@@ -227,17 +253,12 @@ export const createNarrationStage = (
       if (stageFingerprint === null) {
         throw new PipelineContextError('Narration fingerprint requires Preflight');
       }
-      partialArtifactsByRun.set(
-        runDirectory,
-        preliminaryPartialArtifacts(context, providerFingerprint, provider.id),
-      );
-
       const sourceReport = context.sourceRun?.reports.get('narration');
       const sourceCompatibility = z.object({
         reuseCompatibilityFingerprint: z.string().min(1),
       }).passthrough().safeParse(sourceReport?.outputs);
       if (
-        provider.id !== 'file'
+        providerId !== 'file'
         && context.sourceRun !== undefined
         && context.sourceRun.runId !== runId
         && sourceReport?.fingerprint !== null
@@ -262,11 +283,17 @@ export const createNarrationStage = (
         runDirectory,
         provider,
         signal,
+        onPartialArtifact: (relativePath) => {
+          partialArtifactsByRun.set(runDirectory, uniquePartialArtifacts([
+            ...(partialArtifactsByRun.get(runDirectory) ?? []),
+            {scope: 'run', path: relativePath},
+          ]));
+        },
       });
-      partialArtifactsByRun.set(runDirectory, [
-        ...preliminaryPartialArtifacts(context, providerFingerprint, provider.id),
+      partialArtifactsByRun.set(runDirectory, uniquePartialArtifacts([
+        ...(partialArtifactsByRun.get(runDirectory) ?? []),
         {scope: 'run', path: result.narration.master.audioPath},
-      ]);
+      ]));
       const artifacts: PipelineArtifact[] = [];
       for (const segment of result.narration.segments) {
         artifacts.push(await hashArtifact(runDirectory, cachePath(segment.inputHash)));
@@ -287,7 +314,13 @@ export const createNarrationStage = (
       const ownedArtifacts = uniqueArtifacts(artifacts);
       partialArtifactsByRun.set(
         runDirectory,
-        ownedArtifacts.map((artifact) => ({scope: artifact.scope, path: artifact.path})),
+        uniquePartialArtifacts([
+          ...(partialArtifactsByRun.get(runDirectory) ?? []),
+          ...ownedArtifacts.map((artifact) => ({
+            scope: artifact.scope,
+            path: artifact.path,
+          })),
+        ]),
       );
       return {
         state: 'passed',

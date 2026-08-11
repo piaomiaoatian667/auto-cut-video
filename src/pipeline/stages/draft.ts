@@ -41,7 +41,7 @@ export const DraftReportSchema = z.object({
       filterGraph: ArtifactReferenceSchema,
       mixedAudio: ArtifactReferenceSchema,
     }).strict(),
-    audioMixFingerprint: z.string().min(1),
+    audioMixFingerprint: z.string().min(1).optional(),
   }).passthrough(),
 }).passthrough();
 

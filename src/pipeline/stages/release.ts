@@ -95,7 +95,7 @@ export const releaseStageFingerprint = ({
     contactSheet: draft.contactSheet,
     reviewFrames: draft.reviewFrames,
     audio: draft.audio,
-    audioMixFingerprint: draft.audioMixFingerprint,
+    audioMixFingerprint: draft.audioMixFingerprint ?? null,
   },
   compileInputHashes,
   approvedReview: review,

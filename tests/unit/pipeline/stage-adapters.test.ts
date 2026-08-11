@@ -34,8 +34,12 @@ import type {
 import type {PipelineArtifact} from '../../../src/pipeline/artifacts';
 import type {StageReport} from '../../../src/pipeline/stage-report';
 import type {PreflightResult} from '../../../src/pipeline/stages/preflight';
+import type {NarrationStageInput} from '../../../src/pipeline/stages/narration';
 import type {DraftReport, DraftStageResult} from '../../../src/pipeline/stages/draft';
-import type {ReleaseStageResult} from '../../../src/pipeline/stages/release';
+import {
+  releaseStageFingerprint,
+  type ReleaseStageResult,
+} from '../../../src/pipeline/stages/release';
 import type {ProjectSourceCatalog} from '../../../src/pipeline/source-assets';
 import type {TtsProvider} from '../../../src/providers/tts';
 import {
@@ -139,6 +143,13 @@ const preflightResult = (overrides: Partial<PreflightResult> = {}): PreflightRes
   ...overrides,
 });
 
+const preflightStageReport = (result = preflightResult()): StageReport => passedStageReport({
+  stageId: 'preflight',
+  fingerprint: hash(result.environmentFingerprint),
+  artifacts: [],
+  outputs: JSON.parse(JSON.stringify(result)),
+});
+
 const sourceCatalog = (sourceHash = hash('source')): ProjectSourceCatalog => ({
   assets: [{
     assetId: 'cover',
@@ -197,6 +208,7 @@ afterEach(async () => {
 const planningContext = (
   overrides: Partial<StagePlanningContext> = {},
   reports: ReadonlyMap<StageReport['stageId'], StageReport> = new Map([
+    ['preflight', preflightStageReport()],
     ['ingest', passedStageReport({stageId: 'ingest', fingerprint: hash('ingest-report')})],
     ['narration', passedStageReport({stageId: 'narration', fingerprint: hash('narration-report')})],
     ['compile', passedStageReport({stageId: 'compile', fingerprint: hash('compile-report')})],
@@ -510,9 +522,19 @@ describe('adapter fingerprints', () => {
     timeline = compiledTimeline();
     review = approvedReview({reviewer: 'other'});
     expect(await stage.fingerprint(context)).not.toBe(before);
+    review = approvedReview();
+    const livePreflightChanged = {
+      ...context,
+      preflight: preflightResult({environmentFingerprint: hash('live-environment-2')}),
+    };
+    expect(await stage.fingerprint(livePreflightChanged)).toBe(before);
+    const reports = new Map(context.sourceRun!.reports);
+    reports.set('preflight', preflightStageReport(preflightResult({
+      environmentFingerprint: hash('persisted-environment-2'),
+    })));
     expect(await stage.fingerprint({
       ...context,
-      preflight: preflightResult({environmentFingerprint: hash('environment-2')}),
+      sourceRun: {...context.sourceRun!, reports},
     })).not.toBe(before);
     expect(await createReleaseStage({...dependencies, profile: {fps: 60}}).fingerprint(context))
       .not.toBe(before);
@@ -534,9 +556,110 @@ describe('adapter fingerprints', () => {
         qtFaststart: {realPath: '/tools/qt-faststart', sha256: hash('qt-faststart-2')},
       },
     });
-    expect(await stage.fingerprint({...context, preflight: changed})).not.toBe(
-      await stage.fingerprint(context),
-    );
+    const reports = new Map(context.sourceRun!.reports);
+    reports.set('preflight', preflightStageReport(changed));
+    expect(await stage.fingerprint({
+      ...context,
+      sourceRun: {...context.sourceRun!, reports},
+    })).not.toBe(await stage.fingerprint(context));
+  });
+
+  it('uses persisted Preflight outputs for Release planning and execution', async () => {
+    const sourcePersisted = preflightResult({
+      environmentFingerprint: hash('source-persisted-environment'),
+      toolIdentities: {
+        ffmpeg: {realPath: '/persisted/source/ffmpeg', sha256: hash('source-ffmpeg')},
+        qtFaststart: {realPath: '/persisted/source/qt-faststart', sha256: hash('source-qt')},
+      },
+    });
+    const currentPersisted = preflightResult({
+      environmentFingerprint: hash('current-persisted-environment'),
+      toolIdentities: {
+        ffmpeg: {realPath: '/persisted/current/ffmpeg', sha256: hash('current-ffmpeg')},
+        qtFaststart: {realPath: '/persisted/current/qt-faststart', sha256: hash('current-qt')},
+      },
+    });
+    const live = preflightResult({
+      environmentFingerprint: hash('live-environment'),
+      toolIdentities: {
+        ffmpeg: {realPath: '/live/ffmpeg', sha256: hash('live-ffmpeg')},
+        qtFaststart: {realPath: '/live/qt-faststart', sha256: hash('live-qt')},
+      },
+    });
+    const draft = draftReport();
+    const timeline = compiledTimeline();
+    const review = approvedReview({runId: 'target-run'});
+    const releaseResult: ReleaseStageResult = {
+      outputs: {
+        mutedVideo: {path: 'release/muted-video.mp4', sha256: hash('release-muted')},
+        intermediate: {path: 'release/final-intermediate.mp4', sha256: hash('intermediate')},
+        finalVideo: {path: 'releases/target-run/final.mp4', sha256: hash('final')},
+        subtitles: {path: 'releases/target-run/subtitles.srt', sha256: hash('subtitles')},
+        thumbnail: {path: 'releases/target-run/thumbnail.jpg', sha256: hash('thumbnail')},
+        review: {path: 'releases/target-run/review.json', sha256: hash('review-output')},
+        validationReport: {path: 'releases/target-run/validation-report.json', sha256: hash('validation')},
+        checksums: {path: 'releases/target-run/checksums.sha256', sha256: hash('checksums')},
+        releaseFingerprint: hash('release'),
+        verification: {
+          sha256: hash('final'),
+          probe: {durationMs: 1000, videoStreams: [], audioStreams: []},
+          moovBeforeMdat: true,
+          atoms: [],
+        },
+      },
+      current: {
+        runId: 'target-run',
+        relativePath: 'releases/target-run',
+        preset: 'release',
+        stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft', 'review', 'release'],
+        completedStage: 'release',
+        state: 'passed',
+        publishedAt: '2026-08-11T01:02:03.000Z',
+      },
+    };
+    const executeRelease = vi.fn(async () => releaseResult);
+    const stage = createReleaseStage({
+      readDraftReport: async () => draft,
+      readCompiledTimeline: async () => timeline,
+      readReview: async () => review,
+      runRelease: executeRelease,
+    });
+    const sourceReports = new Map(planningContext().sourceRun!.reports);
+    sourceReports.set('preflight', preflightStageReport(sourcePersisted));
+    const planning = planningContext({
+      preflight: live,
+      sourceRun: {
+        runId: 'source-run',
+        runDirectory: sourceRun,
+        reports: sourceReports,
+      },
+    });
+    expect(await stage.fingerprint(planning)).toBe(releaseStageFingerprint({
+      draft: draft.outputs,
+      compileInputHashes: timeline.inputHashes,
+      review,
+      preflightEnvironmentFingerprint: sourcePersisted.environmentFingerprint,
+      algorithmVersion: STAGE_ALGORITHM_VERSIONS.release,
+    }));
+
+    await writeRunText(targetRun, 'reports/preflight.json', `${JSON.stringify({
+      ...preflightStageReport(currentPersisted),
+      runId: 'target-run',
+    })}\n`);
+    const result = await stage.execute(executionContext({preflight: live}), new AbortController().signal);
+    expect(executeRelease).toHaveBeenCalledWith(expect.objectContaining({
+      preflight: {
+        toolIdentities: currentPersisted.toolIdentities,
+        environmentFingerprint: currentPersisted.environmentFingerprint,
+      },
+    }), {publishCurrent: false});
+    expect(result.fingerprint).toBe(releaseStageFingerprint({
+      draft: draft.outputs,
+      compileInputHashes: timeline.inputHashes,
+      review,
+      preflightEnvironmentFingerprint: currentPersisted.environmentFingerprint,
+      algorithmVersion: STAGE_ALGORITHM_VERSIONS.release,
+    }));
   });
 });
 
@@ -593,6 +716,15 @@ describe('adapter artifact inventories', () => {
       },
     };
     const runReleaseAdapter = vi.fn(async () => releaseResult);
+    await writeRunText(
+      targetRun,
+      'reports/preflight.json',
+      `${JSON.stringify({
+        ...preflightStageReport(),
+        runId: 'target-run',
+        outputs: preflightResult(),
+      })}\n`,
+    );
 
     const stages = [
       createPreflightStage({runPreflight: async () => preflightResult()}),
@@ -731,7 +863,7 @@ describe('adapter artifact inventories', () => {
         'audio/mixed-normalized.wav',
         'draft/draft-report.json',
       ]],
-      ['review', ['draft/contact-sheet.jpg', 'draft/frames/frame-000000.jpg']],
+      ['review', []],
       ['release', [
         'release/muted-video.mp4',
         'release/final-intermediate.mp4',
@@ -760,6 +892,114 @@ describe('adapter artifact inventories', () => {
       expect.objectContaining({runId: 'target-run'}),
       {publishCurrent: false},
     );
+  });
+
+  it('pre-registers the deterministic Ingest manifest temp path through failure', async () => {
+    const ingestFailure = new Error('ingest manifest write failed');
+    const ingestRun = vi.fn(async (input) => {
+      expect(input.manifestTempPath).toBe('.asset-manifest.pipeline.tmp');
+      throw ingestFailure;
+    });
+    const ingest = createIngestStage({runIngest: ingestRun});
+    const context = executionContext();
+    expect(ingest.partialArtifacts(context)).toContainEqual({
+      scope: 'run',
+      path: '.asset-manifest.pipeline.tmp',
+    });
+    await expect(ingest.execute(context, new AbortController().signal))
+      .rejects.toBe(ingestFailure);
+    expect(ingest.partialArtifacts(context)).toContainEqual({
+      scope: 'run',
+      path: '.asset-manifest.pipeline.tmp',
+    });
+  });
+
+  it('retains predictable and dynamic Narration partials through failure', async () => {
+    const context = executionContext();
+    const providerFingerprint = hash('partial-provider');
+    const narrationFailure = new Error('narration report write failed');
+    const narration = createNarrationStage({
+      fingerprintTtsProvider: async () => providerFingerprint,
+      createTtsProvider: () => ({
+        id: 'mock',
+        capabilities: async () => ({languages: ['zh-CN'], voices: ['fixture']}),
+        fingerprint: async () => hash('untrusted-provider'),
+        synthesize: async () => ({
+          outputPath: 'unused',
+          providerFingerprint: hash('untrusted-provider'),
+        }),
+      }),
+      runNarration: async (input) => {
+        input.onPartialArtifact?.('audio/narration-dynamic-master.wav');
+        throw narrationFailure;
+      },
+    });
+    await expect(narration.execute(context, new AbortController().signal))
+      .rejects.toBe(narrationFailure);
+    const narrationInputHash = narrationSegmentInputHash(
+      project.script.segments[0]!,
+      project.project.tts.voice,
+      project.project.tts.rate,
+      providerFingerprint,
+    );
+    expect(narration.partialArtifacts(context)).toEqual(expect.arrayContaining([
+      {
+        scope: 'run',
+        path: `audio/cache/${narrationInputHash.slice('sha256:'.length)}.wav`,
+      },
+      {
+        scope: 'run',
+        path: `audio/segments/0001-intro-${narrationInputHash.slice('sha256:'.length, 'sha256:'.length + 12)}.wav`,
+      },
+      {scope: 'run', path: 'audio/narration-dynamic-master.wav'},
+      {scope: 'run', path: 'narration-manifest.json'},
+      {scope: 'run', path: 'captions.json'},
+      {scope: 'run', path: 'captions.srt'},
+    ]));
+  });
+
+  it('retains Draft baseline, dynamic, and final partials after success', async () => {
+    const context = executionContext();
+    const draftFailure = new Error('draft report write failed');
+    let failDraft = true;
+    const successfulDraft: DraftStageResult = {
+      reportPath: 'draft/draft-report.json',
+      outputs: {
+        mutedVideo: {path: 'draft/muted-video.mp4', sha256: hash('muted')},
+        draftVideo: {path: 'draft/draft.mp4', sha256: hash('draft')},
+        contactSheet: {path: 'draft/contact-sheet.jpg', sha256: hash('contact')},
+        reviewFrames: [{path: 'draft/frames/frame-000007.jpg', sha256: hash('frame-7')}],
+        audio: {
+          filterGraph: {path: 'audio/filter-graph.txt', sha256: hash('graph')},
+          mixedAudio: {path: 'audio/mixed-normalized.wav', sha256: hash('mixed')},
+        },
+        report: {path: 'draft/draft-report.json', sha256: hash('draft-report')},
+        audioMixFingerprint: hash('audio-mix'),
+      },
+    };
+    const draft = createDraftStage({
+      readStageReport: async () => passedStageReport({
+        stageId: 'compile',
+        fingerprint: hash('compile-report'),
+      }),
+      readCompiledTimeline: async () => compiledTimeline(),
+      runDraft: async () => {
+        if (failDraft) throw draftFailure;
+        return successfulDraft;
+      },
+    });
+    await expect(draft.execute(context, new AbortController().signal))
+      .rejects.toBe(draftFailure);
+    const partialsAfterFailure = draft.partialArtifacts(context);
+    expect(partialsAfterFailure).toContainEqual({scope: 'run', path: 'audio/mixed-raw.wav'});
+    expect(partialsAfterFailure.some((artifact) => artifact.path.startsWith('draft/frames/')))
+      .toBe(true);
+    failDraft = false;
+    await draft.execute(context, new AbortController().signal);
+    expect(draft.partialArtifacts(context)).toEqual(expect.arrayContaining([
+      ...partialsAfterFailure,
+      {scope: 'run', path: 'draft/frames/frame-000007.jpg'},
+    ]));
   });
 });
 
@@ -837,6 +1077,45 @@ describe('adapter verification', () => {
     });
     await expect(stage.verify(planningContext(), report)).resolves.toBe(false);
   });
+
+  it('requires an empty Review inventory and verifies current Draft evidence as provenance', async () => {
+    await writeRunText(sourceRun, 'draft/contact-sheet.jpg', 'contact-sheet');
+    await writeRunText(sourceRun, 'draft/frames/frame-000000.jpg', 'review-frame');
+    const contactSheet = await hashRunArtifact(sourceRun, 'draft/contact-sheet.jpg');
+    const reviewFrame = await hashRunArtifact(sourceRun, 'draft/frames/frame-000000.jpg');
+    const draft = draftReport({
+      contactSheet: {path: contactSheet.path, sha256: contactSheet.sha256},
+      reviewFrames: [{path: reviewFrame.path, sha256: reviewFrame.sha256}],
+    });
+    const review = approvedReview();
+    const stage = createReviewStage({
+      readDraftReport: async () => draft,
+      readReview: async () => review,
+    });
+    const context = planningContext();
+    const report = passedStageReport({
+      stageId: 'review',
+      fingerprint: await stage.fingerprint(context),
+      artifacts: [],
+      outputs: {
+        evidence: [draft.outputs.contactSheet, ...draft.outputs.reviewFrames],
+        review,
+      },
+    });
+
+    await expect(stage.verify(context, report)).resolves.toBe(true);
+    await expect(stage.verify(context, {
+      ...report,
+      artifacts: [contactSheet],
+    })).resolves.toBe(false);
+    await expect(stage.verify(context, {
+      ...report,
+      outputs: {
+        evidence: [{...draft.outputs.contactSheet, sha256: hash('changed')}],
+        review,
+      },
+    })).resolves.toBe(false);
+  });
 });
 
 describe('Narration compatibility-gated cache seeding', () => {
@@ -847,6 +1126,7 @@ describe('Narration compatibility-gated cache seeding', () => {
     currentPreflight,
     sourceProviderFingerprint,
     currentProviderFingerprint,
+    injectedProviderFingerprint = currentProviderFingerprint,
   }: {
     sourceProject: ProjectInputs;
     currentProject: ProjectInputs;
@@ -854,9 +1134,10 @@ describe('Narration compatibility-gated cache seeding', () => {
     currentPreflight: PreflightResult;
     sourceProviderFingerprint: string;
     currentProviderFingerprint: string;
+    injectedProviderFingerprint?: string;
   }) => {
     const seedNarrationCache = vi.fn(async () => [] as string[]);
-    const runNarration = vi.fn(async () => ({
+    const runNarration = vi.fn(async (_input: NarrationStageInput) => ({
       narrationPath: 'narration-manifest.json' as const,
       captionsPath: 'captions.json' as const,
       srtPath: 'captions.srt' as const,
@@ -869,13 +1150,14 @@ describe('Narration compatibility-gated cache seeding', () => {
       captions: {version: 1 as const, sourceNarrationHash: hash('master'), cues: []},
     }));
     let providerFingerprint = sourceProviderFingerprint;
+    const injectedFingerprint = vi.fn(async () => injectedProviderFingerprint);
     const stage = createNarrationStage({
       fingerprintTtsProvider: async () => providerFingerprint,
       createTtsProvider: () => ({
         id: currentProject.project.tts.provider,
         capabilities: async () => ({languages: ['zh-CN'], voices: ['fixture']}),
-        fingerprint: async () => currentProviderFingerprint,
-        synthesize: async () => ({outputPath: 'unused', providerFingerprint: currentProviderFingerprint}),
+        fingerprint: injectedFingerprint,
+        synthesize: async () => ({outputPath: 'unused', providerFingerprint: injectedProviderFingerprint}),
       } satisfies TtsProvider),
       seedNarrationCache,
       runNarration,
@@ -908,7 +1190,7 @@ describe('Narration compatibility-gated cache seeding', () => {
       },
     });
     await stage.execute(context, new AbortController().signal);
-    return {seedNarrationCache, runNarration};
+    return {seedNarrationCache, runNarration, injectedFingerprint};
   };
 
   it('seeds for script-only changes', async () => {
@@ -988,5 +1270,27 @@ describe('Narration compatibility-gated cache seeding', () => {
       currentProviderFingerprint: providerFingerprint,
     });
     expect(result.seedNarrationCache).not.toHaveBeenCalled();
+  });
+
+  it('uses the canonical provider fingerprint when an injected provider disagrees', async () => {
+    const canonicalFingerprint = hash('canonical-provider');
+    const injectedFingerprint = hash('injected-provider');
+    const result = await executeCase({
+      sourceProject: project,
+      currentProject: {...project, script: createScriptFixture('changed script')},
+      sourcePreflight: preflightResult(),
+      currentPreflight: preflightResult(),
+      sourceProviderFingerprint: canonicalFingerprint,
+      currentProviderFingerprint: canonicalFingerprint,
+      injectedProviderFingerprint: injectedFingerprint,
+    });
+
+    expect(result.injectedFingerprint).not.toHaveBeenCalled();
+    expect(result.seedNarrationCache).toHaveBeenCalledWith(expect.objectContaining({
+      providerFingerprint: canonicalFingerprint,
+    }));
+    const executionInput = result.runNarration.mock.calls[0]?.[0];
+    expect(executionInput).toBeDefined();
+    await expect(executionInput!.provider.fingerprint()).resolves.toBe(canonicalFingerprint);
   });
 });

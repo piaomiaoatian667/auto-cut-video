@@ -38,6 +38,7 @@ export interface BuildNarrationInput extends ProjectInputs {
   ffprobeExecutable?: string;
   runProcess?: NarrationProcessRunner;
   probeDurationMs?: (path: string) => Promise<number>;
+  onPartialArtifact?: (relativePath: string) => void;
 }
 
 const hexFromFingerprint = (fingerprint: string): string =>
@@ -244,6 +245,7 @@ export const buildNarration = async (input: BuildNarrationInput): Promise<Narrat
     })),
   });
   const masterPath = `audio/narration-${hexFromFingerprint(manifestFingerprint).slice(0, 16)}.wav`;
+  input.onPartialArtifact?.(masterPath);
   await createSyntheticMaster({
     runDirectory: input.runDirectory,
     outputPath: masterPath,

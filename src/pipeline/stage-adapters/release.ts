@@ -13,8 +13,8 @@ import {
   requirePreflight,
   requireRunContext,
   type PipelineStage,
-  type StagePlanningContext,
 } from '../stage';
+import type {StageReport} from '../stage-report';
 import {
   ArtifactReferenceSchema,
   DraftReportSchema,
@@ -24,6 +24,7 @@ import {
   RELEASE_FIXED_PROFILE,
   releaseStageFingerprint,
   runRelease,
+  type ReleasePreflightSnapshot,
   type ReleaseStageDependencies,
   type ReleaseStageInput,
   type ReleaseStageResult,
@@ -33,9 +34,11 @@ import {
   STAGE_ALGORITHM_VERSIONS,
   outputArtifact,
   readRunJson,
+  readRunStageReport,
   runArtifact,
   verifyReportedArtifacts,
 } from './shared';
+import {parsePreflightAdapterOutput} from './preflight';
 
 const OutputArtifactReferenceSchema = ArtifactReferenceSchema.extend({
   path: z.string().regex(/^releases\/[^/]+\/[^/]+$/u),
@@ -69,6 +72,7 @@ export interface ReleaseStageAdapterDependencies {
   readDraftReport?: (runDirectory: RunDirectoryScope) => Promise<DraftReport>;
   readCompiledTimeline?: (runDirectory: RunDirectoryScope) => Promise<CompiledTimeline>;
   readReview?: (runDirectory: RunDirectoryScope) => Promise<Review>;
+  readPreflightReport?: (runDirectory: RunDirectoryScope) => Promise<StageReport>;
   runRelease?: (
     input: ReleaseStageInput,
     dependencies?: ReleaseStageDependencies,
@@ -78,6 +82,16 @@ export interface ReleaseStageAdapterDependencies {
     projectId: string,
   ) => Promise<OutputDirectoryScope>;
 }
+
+const parseReleasePreflightSnapshot = (
+  value: unknown,
+): ReleasePreflightSnapshot => {
+  const parsed = parsePreflightAdapterOutput(value);
+  return {
+    toolIdentities: parsed.toolIdentities,
+    environmentFingerprint: parsed.environmentFingerprint,
+  };
+};
 
 export const createReleaseStage = (
   dependencies: ReleaseStageAdapterDependencies = {},
@@ -103,6 +117,11 @@ export const createReleaseStage = (
       'review.json',
       (value) => ReviewSchema.parse(value),
     ));
+  const readPreflightReport = dependencies.readPreflightReport
+    ?? (async (runDirectory: RunDirectoryScope) => await readRunStageReport(
+      runDirectory,
+      'preflight',
+    ));
   const executeRelease = dependencies.runRelease ?? runRelease;
   const openOutputDirectory = dependencies.openOutputDirectory
     ?? (async (workspaceRoot: string, projectId: string) => await createOutputStore(
@@ -110,11 +129,9 @@ export const createReleaseStage = (
     ).openProject(projectId));
 
   const calculateFingerprint = async (
-    context: StagePlanningContext,
     runDirectory: RunDirectoryScope,
+    preflight: ReleasePreflightSnapshot,
   ): Promise<string | null> => {
-    const preflight = context.preflight;
-    if (preflight === undefined) return null;
     const [draft, timeline, review] = await Promise.all([
       readDraftReport(runDirectory),
       readCompiledTimeline(runDirectory),
@@ -135,9 +152,19 @@ export const createReleaseStage = (
     id: 'release',
     displayName: 'Release',
     prerequisites: ['review'],
-    fingerprint: async (context) => context.sourceRun === undefined
-      ? null
-      : await calculateFingerprint(context, context.sourceRun.runDirectory),
+    fingerprint: async (context) => {
+      if (context.sourceRun === undefined) return null;
+      const preflightReport = context.sourceRun.reports.get('preflight');
+      if (preflightReport?.outputs === undefined) return null;
+      let preflight: ReleasePreflightSnapshot;
+      try {
+        preflight = parseReleasePreflightSnapshot(preflightReport.outputs);
+      } catch (error) {
+        if (error instanceof z.ZodError) return null;
+        throw error;
+      }
+      return await calculateFingerprint(context.sourceRun.runDirectory, preflight);
+    },
     verify: async (context, report) => {
       const parsed = ReleaseAdapterOutputSchema.safeParse(report.outputs);
       if (!parsed.success) return false;
@@ -188,11 +215,10 @@ export const createReleaseStage = (
     },
     execute: async (context, signal) => {
       const {runId, runDirectory} = requireRunContext(context);
-      const preflight = requirePreflight(context);
-      const stageFingerprint = await calculateFingerprint(
-        {...context, preflight},
-        runDirectory,
-      );
+      requirePreflight(context);
+      const preflightReport = await readPreflightReport(runDirectory);
+      const preflight = parseReleasePreflightSnapshot(preflightReport.outputs);
+      const stageFingerprint = await calculateFingerprint(runDirectory, preflight);
       if (stageFingerprint === null) {
         throw new ReviewGateError('Release requires approved Review evidence');
       }
@@ -200,10 +226,7 @@ export const createReleaseStage = (
         ...context.project,
         runDirectory,
         runId,
-        preflight: {
-          toolIdentities: preflight.toolIdentities,
-          environmentFingerprint: preflight.environmentFingerprint,
-        },
+        preflight,
         signal,
         now: context.now,
       }, {publishCurrent: false});

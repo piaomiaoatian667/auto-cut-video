@@ -30,6 +30,8 @@ const MVP_INGEST_PROFILE = {
   audioSampleRate: 48_000,
 } as const;
 
+const INGEST_MANIFEST_TEMP_PATH = '.asset-manifest.pipeline.tmp';
+
 const IngestAdapterOutputSchema = z.object({
   manifestPath: z.literal('asset-manifest.json'),
   manifest: IngestManifestSchema,
@@ -109,6 +111,7 @@ export const createIngestStage = (
       });
     },
     partialArtifacts: (context) => [
+      {scope: 'run', path: INGEST_MANIFEST_TEMP_PATH},
       {scope: 'run', path: 'asset-manifest.json'},
       ...context.sourceCatalog.assets
         .filter((asset) => asset.kind === 'video')
@@ -134,6 +137,7 @@ export const createIngestStage = (
         })),
         ffmpegExecutable: ffmpeg.realPath,
         ffprobeExecutable,
+        manifestTempPath: INGEST_MANIFEST_TEMP_PATH,
         signal,
       });
       const artifacts: PipelineArtifact[] = [

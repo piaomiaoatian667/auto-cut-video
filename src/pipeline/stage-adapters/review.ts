@@ -1,6 +1,10 @@
 import {z} from 'zod';
 import {ReviewSchema, type Review} from '../../domain/review-schema';
 import type {RunDirectoryScope} from '../../fs/app-directory-scopes';
+import {
+  PipelineArtifactError,
+  verifyRunArtifact,
+} from '../artifacts';
 import {fingerprintValue} from '../fingerprint';
 import {
   requirePreflight,
@@ -19,7 +23,6 @@ import {
   STAGE_ALGORITHM_VERSIONS,
   readOptionalRunJson,
   readRunJson,
-  runArtifact,
   verifyReportedArtifacts,
 } from './shared';
 
@@ -44,6 +47,16 @@ const evidenceFromDraft = (report: DraftReport) => [
   report.outputs.contactSheet,
   ...report.outputs.reviewFrames,
 ];
+
+const isOrdinaryVerificationMiss = (error: unknown): boolean => (
+  error instanceof z.ZodError
+  || error instanceof PipelineArtifactError
+  || (
+    error instanceof Error
+    && 'code' in error
+    && (error.code === 'ENOENT' || error.code === 'APP_PATH_OUTSIDE_SCOPE')
+  )
+);
 
 export const createReviewStage = (
   dependencies: ReviewStageAdapterDependencies = {},
@@ -81,29 +94,39 @@ export const createReviewStage = (
       const parsed = ReviewAdapterOutputSchema.safeParse(report.outputs);
       if (!parsed.success || parsed.data.review?.status !== 'approved') return false;
       if (context.sourceRun === undefined) return false;
-      let currentReview: Review | undefined;
       try {
-        currentReview = await readReview(context.sourceRun.runDirectory);
-      } catch (error) {
-        if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
+        const currentDraft = await readDraftReport(context.sourceRun.runDirectory);
+        const currentEvidence = evidenceFromDraft(currentDraft);
+        if (
+          fingerprintValue(currentEvidence)
+          !== fingerprintValue(parsed.data.evidence)
+          || report.fingerprint !== fingerprintFromDraft(currentDraft)
+        ) {
           return false;
         }
+        const currentReview = await readReview(context.sourceRun.runDirectory);
+        if (
+          currentReview === undefined
+          || fingerprintValue(currentReview) !== fingerprintValue(parsed.data.review)
+        ) {
+          return false;
+        }
+        if (!await verifyReportedArtifacts({context, report, expected: []})) {
+          return false;
+        }
+        for (const artifact of currentEvidence) {
+          if (!await verifyRunArtifact(context.sourceRun.runDirectory, {
+            scope: 'run',
+            ...artifact,
+          })) {
+            return false;
+          }
+        }
+        return true;
+      } catch (error) {
+        if (isOrdinaryVerificationMiss(error)) return false;
         throw error;
       }
-      if (
-        currentReview === undefined
-        || fingerprintValue(currentReview) !== fingerprintValue(parsed.data.review)
-      ) {
-        return false;
-      }
-      return await verifyReportedArtifacts({
-        context,
-        report,
-        expected: parsed.data.evidence.map((artifact) => ({
-          scope: 'run' as const,
-          ...artifact,
-        })),
-      });
     },
     partialArtifacts: () => [],
     execute: async (context) => {
@@ -126,7 +149,7 @@ export const createReviewStage = (
           evidence,
           review: result.review ?? null,
         },
-        artifacts: evidence.map(runArtifact),
+        artifacts: [],
         checks: result.state === 'passed'
           ? [{
             id: 'draft-review-approved',

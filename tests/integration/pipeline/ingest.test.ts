@@ -992,6 +992,36 @@ describe('runIngest', () => {
     await expectMissingManifest(project.runDirectory);
   });
 
+  it('uses the caller-provided manifest temp path through a write failure', async () => {
+    const project = await makeProject('manifest-explicit-temp');
+    await createTestImage(path.join(project.projectRoot, 'assets/source/poster.png'));
+    const failure = new Error('injected manifest write failure');
+    const manifestTempPath = '.asset-manifest.pipeline.tmp';
+    const system = createSystemIngestDependencies();
+    const openNewRunFileSpy = vi.fn(system.fileSystem.openNewRunFile);
+    const dependencies = dependenciesWithManifestFault(system, 'write', failure);
+    dependencies.fileSystem = {
+      ...dependencies.fileSystem,
+      openNewRunFile: openNewRunFileSpy,
+    };
+
+    await expect(runIngest({
+      ...inputFor(project, [{
+        assetId: 'poster',
+        kind: 'image',
+        sourcePath: 'assets/source/poster.png',
+      }]),
+      manifestTempPath,
+    }, dependencies)).rejects.toBe(failure);
+
+    expect(openNewRunFileSpy).toHaveBeenCalledWith(project.runDirectory, manifestTempPath);
+    await expect(readHandle(await openExistingRunFile(
+      project.runDirectory,
+      manifestTempPath,
+    ))).resolves.toEqual(Buffer.alloc(0));
+    await expectMissingManifest(project.runDirectory);
+  });
+
   it('never overwrites an existing final manifest', async () => {
     const project = await makeProject('manifest-existing');
     await createTestImage(path.join(project.projectRoot, 'assets/source/poster.png'));

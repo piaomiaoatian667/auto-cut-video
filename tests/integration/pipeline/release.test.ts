@@ -16,6 +16,7 @@ import {
   type RunDirectoryScope,
 } from '../../../src/fs/app-directory-scopes';
 import {parseTopLevelMp4Atoms, assertMoovBeforeMdat} from '../../../src/media/release-verify';
+import {DraftReportSchema} from '../../../src/pipeline/stages/draft';
 import {runRelease, type ReleasePreflightSnapshot} from '../../../src/pipeline/stages/release';
 import {runProcess, type RunProcessOptions, type ProcessResult} from '../../../src/process/run-process';
 import {
@@ -187,7 +188,11 @@ const pointer = (runId: string, publishedAt = '2026-08-10T00:00:00.000Z'): Curre
   publishedAt,
 });
 
-const prepareReleaseRun = async () => {
+const prepareReleaseRun = async ({
+  includeAudioMixFingerprint = true,
+}: {
+  includeAudioMixFingerprint?: boolean;
+} = {}) => {
   const tempProject = await createTempProject({
     project: createProjectFixture('demo'),
     script: createScriptFixture('介绍'),
@@ -212,7 +217,9 @@ const prepareReleaseRun = async () => {
         filterGraph: {path: 'audio/filter-graph.txt', sha256: filterGraphSha},
         mixedAudio: {path: 'audio/mixed-normalized.wav', sha256: mixedAudioSha},
       },
-      audioMixFingerprint: 'sha256:audio-mix',
+      ...(includeAudioMixFingerprint
+        ? {audioMixFingerprint: 'sha256:audio-mix'}
+        : {}),
     },
   }, null, 2)}\n`);
   await writeRunText(runDirectory, 'review.json', `${JSON.stringify({
@@ -243,8 +250,25 @@ const renderFinalVideo = async ({outputLocation}: {outputLocation: string}): Pro
 };
 
 describe('runRelease', () => {
-  it('packages a verified faststart release without rewriting Draft audio artifacts', async () => {
-    const {tempProject, project, runDirectory} = await prepareReleaseRun();
+  it('parses the legacy Draft report shape without an audio-mix fingerprint', () => {
+    expect(DraftReportSchema.parse({
+      version: 1,
+      projectId: 'demo',
+      outputs: {
+        contactSheet: {path: 'draft/contact-sheet.jpg', sha256: sha256('contact')},
+        reviewFrames: [{path: 'draft/frame.jpg', sha256: sha256('frame')}],
+        audio: {
+          filterGraph: {path: 'audio/filter-graph.txt', sha256: sha256('graph')},
+          mixedAudio: {path: 'audio/mixed-normalized.wav', sha256: sha256('mixed')},
+        },
+      },
+    }).outputs.audioMixFingerprint).toBeUndefined();
+  });
+
+  it('packages a legacy Draft report without rewriting Draft audio artifacts', async () => {
+    const {tempProject, project, runDirectory} = await prepareReleaseRun({
+      includeAudioMixFingerprint: false,
+    });
     const outputStore = createOutputStore(tempProject.workspaceRoot);
     await outputStore.createRelease('demo', 'run-old');
     await outputStore.publishCurrent('demo', pointer('run-old'));

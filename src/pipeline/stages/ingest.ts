@@ -141,6 +141,7 @@ export interface IngestInput {
   assets: readonly IngestAsset[];
   ffmpegExecutable: string;
   ffprobeExecutable: string;
+  manifestTempPath?: string;
   timeoutMs?: number;
   signal?: AbortSignal;
 }
@@ -1295,7 +1296,8 @@ const writeManifest = async (
   manifest: IngestManifest,
 ): Promise<void> => {
   const finalPath = 'asset-manifest.json';
-  const tempPath = `.asset-manifest.${process.pid}.${randomUUID()}.tmp`;
+  const tempPath = input.manifestTempPath
+    ?? `.asset-manifest.${process.pid}.${randomUUID()}.tmp`;
   await withFreshHandle(
     async () => await dependencies.fileSystem.openNewRunFile(
       input.runDirectory,

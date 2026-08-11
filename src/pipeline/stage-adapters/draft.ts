@@ -67,6 +67,16 @@ const baselinePartialArtifacts = (): PipelinePartialArtifact[] => [
   {scope: 'run', path: 'draft/draft-report.json'},
 ];
 
+const uniquePartialArtifacts = (
+  artifacts: readonly PipelinePartialArtifact[],
+): PipelinePartialArtifact[] => {
+  const byPath = new Map<string, PipelinePartialArtifact>();
+  for (const artifact of artifacts) {
+    byPath.set(`${artifact.scope}:${artifact.path}`, artifact);
+  }
+  return [...byPath.values()];
+};
+
 export const createDraftStage = (
   dependencies: DraftStageAdapterDependencies = {},
 ): PipelineStage => {
@@ -163,7 +173,13 @@ export const createDraftStage = (
       ];
       partialArtifactsByRun.set(
         runDirectory,
-        artifacts.map((artifact) => ({scope: artifact.scope, path: artifact.path})),
+        uniquePartialArtifacts([
+          ...(partialArtifactsByRun.get(runDirectory) ?? baselinePartialArtifacts()),
+          ...artifacts.map((artifact) => ({
+            scope: artifact.scope,
+            path: artifact.path,
+          })),
+        ]),
       );
       return {
         state: 'passed',

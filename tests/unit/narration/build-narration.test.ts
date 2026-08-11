@@ -1,7 +1,11 @@
 import {afterEach, describe, expect, it} from 'vitest';
 import {createHash} from 'node:crypto';
 import {loadProject, type ProjectInputs} from '../../../src/domain/load-project';
-import {createRunStore, type RunDirectoryScope} from '../../../src/fs/app-directory-scopes';
+import {
+  createRunStore,
+  openExistingRunFile,
+  type RunDirectoryScope,
+} from '../../../src/fs/app-directory-scopes';
 import {buildNarration} from '../../../src/narration/build-narration';
 import {fingerprintValue} from '../../../src/pipeline/fingerprint';
 import {MockTtsProvider, type TtsInput, type TtsProvider, type TtsResult} from '../../../src/providers/tts';
@@ -130,5 +134,27 @@ describe('buildNarration', () => {
       provider,
       probeDurationMs: async () => 7001,
     })).rejects.toThrowError(/NARRATION_SEGMENT_TOO_LONG/);
+  });
+
+  it('reports the dynamic master path immediately before opening it', async () => {
+    const project = await makeProject(['第一句']);
+    const provider = new RecordingProvider(project.runDirectory);
+    const partialPaths: string[] = [];
+    const failure = new Error('stop before opening master');
+
+    await expect(buildNarration({
+      ...project,
+      provider,
+      onPartialArtifact: (relativePath) => {
+        partialPaths.push(relativePath);
+        throw failure;
+      },
+    })).rejects.toBe(failure);
+
+    expect(partialPaths).toEqual([
+      expect.stringMatching(/^audio\/narration-[0-9a-f]{16}\.wav$/),
+    ]);
+    await expect(openExistingRunFile(project.runDirectory, partialPaths[0]!))
+      .rejects.toMatchObject({code: 'ENOENT'});
   });
 });

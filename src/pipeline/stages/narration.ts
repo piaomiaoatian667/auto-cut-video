@@ -14,6 +14,7 @@ export interface NarrationStageInput extends ProjectInputs {
   runDirectory: RunDirectoryScope;
   provider: TtsProvider;
   signal?: AbortSignal;
+  onPartialArtifact?: (relativePath: string) => void;
 }
 
 export interface NarrationStageFileSystem {

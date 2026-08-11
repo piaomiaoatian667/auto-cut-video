@@ -18,7 +18,7 @@ const ToolIdentitySchema = z.object({
   sha256: z.string().min(1),
 }).strict();
 
-const PreflightAdapterOutputSchema = z.object({
+export const PreflightAdapterOutputSchema = z.object({
   environmentFingerprint: z.string().min(1),
   toolIdentities: z.object({
     ffmpeg: ToolIdentitySchema.nullable(),
@@ -29,6 +29,12 @@ const PreflightAdapterOutputSchema = z.object({
     sha256: z.string().min(1),
   }).strict()),
 }).passthrough();
+
+export type PreflightAdapterOutput = z.infer<typeof PreflightAdapterOutputSchema>;
+
+export const parsePreflightAdapterOutput = (
+  value: unknown,
+): PreflightAdapterOutput => PreflightAdapterOutputSchema.parse(value);
 
 export interface PreflightStageAdapterDependencies {
   algorithmVersion?: string;
