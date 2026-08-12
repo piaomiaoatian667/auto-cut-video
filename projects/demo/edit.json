@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "visualClips": [
+    {
+      "id": "camera-a-clip",
+      "kind": "video",
+      "assetId": "camera-a",
+      "startFrame": 0,
+      "durationInFrames": 30,
+      "sourceInMs": 0,
+      "sourceOutMs": 1000,
+      "fit": "cover",
+      "position": {
+        "x": 0,
+        "y": 0
+      },
+      "scale": 1,
+      "opacity": 1,
+      "fadeInFrames": 0,
+      "fadeOutFrames": 0,
+      "zIndex": 0
+    },
+    {
+      "id": "cover-clip",
+      "kind": "image",
+      "assetId": "cover",
+      "startFrame": 30,
+      "durationInFrames": 30,
+      "fit": "contain",
+      "position": {
+        "x": 0,
+        "y": 0
+      },
+      "scale": 1,
+      "opacity": 1,
+      "fadeInFrames": 0,
+      "fadeOutFrames": 0,
+      "zIndex": 0
+    },
+    {
+      "id": "camera-b-clip",
+      "kind": "video",
+      "assetId": "camera-b",
+      "startFrame": 60,
+      "durationInFrames": 30,
+      "sourceInMs": 0,
+      "sourceOutMs": 1000,
+      "fit": "cover",
+      "position": {
+        "x": 0,
+        "y": 0
+      },
+      "scale": 1,
+      "opacity": 1,
+      "fadeInFrames": 0,
+      "fadeOutFrames": 0,
+      "zIndex": 0
+    }
+  ],
+  "overlays": [
+    {
+      "id": "opening-title",
+      "component": "basic-title",
+      "startFrame": 5,
+      "durationInFrames": 20,
+      "props": {
+        "text": "Agent Video MVP"
+      },
+      "zIndex": 10
+    }
+  ],
+  "backgroundMusic": {
+    "assetId": "music-main",
+    "startMs": 0
+  }
+}

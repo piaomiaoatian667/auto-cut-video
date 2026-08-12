@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "language": "zh-CN",
+  "segments": [
+    {
+      "id": "intro",
+      "text": "本地流程开始。",
+      "normalizedText": "本地流程开始。",
+      "pauseAfterMs": 200,
+      "requiredTerms": [
+        "本地"
+      ],
+      "notes": {
+        "visualHint": "展示本地素材"
+      }
+    },
+    {
+      "id": "publish",
+      "text": "审核通过后发布。",
+      "normalizedText": "审核通过后发布。",
+      "pauseAfterMs": 200,
+      "requiredTerms": [
+        "审核"
+      ],
+      "notes": {
+        "visualHint": "展示发布结果"
+      }
+    }
+  ]
+}

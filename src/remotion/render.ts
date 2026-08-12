@@ -1,5 +1,10 @@
 import {bundle, type WebpackConfiguration} from '@remotion/bundler';
-import {renderMedia, selectComposition} from '@remotion/renderer';
+import {
+  renderMedia,
+  selectComposition,
+  type ChromeMode,
+  type ChromiumOptions,
+} from '@remotion/renderer';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {CompiledTimelineSchema, type CompiledTimeline} from '../domain/timeline-schema';
@@ -16,6 +21,53 @@ const defaultEntryPoint = (): string => path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   'index.ts',
 );
+
+const CHROME_MODES = ['headless-shell', 'chrome-for-testing'] as const;
+const OPENGL_RENDERERS = [
+  'swangle',
+  'angle',
+  'egl',
+  'swiftshader',
+  'vulkan',
+  'angle-egl',
+] as const;
+
+const remotionBrowserOptions = (): {
+  browserExecutable?: string;
+  chromeMode?: ChromeMode;
+  chromiumOptions?: ChromiumOptions;
+} => {
+  const browserExecutable = process.env.REMOTION_BROWSER_EXECUTABLE?.trim();
+  const chromeMode = process.env.REMOTION_CHROME_MODE?.trim();
+  const openGlRenderer = process.env.REMOTION_OPENGL_RENDERER?.trim();
+  if (
+    chromeMode !== undefined
+    && !CHROME_MODES.includes(chromeMode as ChromeMode)
+  ) {
+    throw new TypeError(`Invalid REMOTION_CHROME_MODE: ${chromeMode}`);
+  }
+  if (
+    openGlRenderer !== undefined
+    && !OPENGL_RENDERERS.includes(
+      openGlRenderer as NonNullable<ChromiumOptions['gl']>,
+    )
+  ) {
+    throw new TypeError(`Invalid REMOTION_OPENGL_RENDERER: ${openGlRenderer}`);
+  }
+  return {
+    ...(browserExecutable === undefined || browserExecutable.length === 0
+      ? {}
+      : {browserExecutable}),
+    ...(chromeMode === undefined ? {} : {chromeMode: chromeMode as ChromeMode}),
+    ...(openGlRenderer === undefined
+      ? {}
+      : {
+        chromiumOptions: {
+          gl: openGlRenderer as NonNullable<ChromiumOptions['gl']>,
+        },
+      }),
+  };
+};
 
 interface LoaderUseEntry {
   options?: Record<string, unknown>;
@@ -64,10 +116,12 @@ export const renderTimelineVideo = async ({
     ignoreRegisterRootWarning: true,
     webpackOverride: injectTsconfigRaw,
   });
+  const browserOptions = remotionBrowserOptions();
   const composition = await selectComposition({
     serveUrl: bundleLocation,
     id: 'Project',
     inputProps,
+    ...browserOptions,
   });
   await renderMedia({
     serveUrl: bundleLocation,
@@ -75,11 +129,13 @@ export const renderTimelineVideo = async ({
     codec: 'h264',
     muted: true,
     pixelFormat: 'yuv420p',
+    colorSpace: 'bt709',
     outputLocation,
     inputProps,
     overwrite: true,
     concurrency: 1,
     logLevel: 'warn',
+    ...browserOptions,
     ...(scale === undefined ? {} : {scale}),
   });
 };

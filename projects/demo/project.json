@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "id": "demo",
+  "composition": {
+    "width": 1920,
+    "height": 1080,
+    "fps": 30,
+    "backgroundColor": "#101828",
+    "allowBackgroundGaps": false
+  },
+  "tts": {
+    "provider": "mock",
+    "voice": "fixture",
+    "rate": 180
+  },
+  "captions": {
+    "font": "assets/fonts/NotoSansSC-Bold.otf",
+    "fontSize": 54,
+    "color": "#FFFFFF",
+    "bottomMargin": 90,
+    "maximumChineseCharacters": 28
+  },
+  "audio": {
+    "sampleRate": 48000,
+    "targetLufs": -16,
+    "truePeakDb": -1.5,
+    "backgroundMusicGainDb": -20,
+    "duckDuringNarrationDb": -12,
+    "duckAttackMs": 120,
+    "duckReleaseMs": 250
+  },
+  "render": {
+    "draftWidth": 960,
+    "draftHeight": 540,
+    "videoCodec": "h264",
+    "pixelFormat": "yuv420p"
+  }
+}

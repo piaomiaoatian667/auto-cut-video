@@ -87,5 +87,10 @@ describe('renderTimelineVideo', () => {
     expect(video?.width).toBe(1920);
     expect(video?.height).toBe(1080);
     expect(video?.averageFrameRate.value).toBe(30);
+    expect(video).toMatchObject({
+      pixelFormat: 'yuv420p',
+      colorRange: 'tv',
+      colorSpace: 'bt709',
+    });
   }, 120_000);
 });
