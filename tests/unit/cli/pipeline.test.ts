@@ -1,5 +1,7 @@
 import {describe, expect, it, vi} from 'vitest';
+import {z} from 'zod';
 import type {ProjectInputs} from '../../../src/domain/load-project';
+import {JsonFileError} from '../../../src/fs/json-files';
 import type {ProjectDirectoryScope} from '../../../src/fs/project-paths';
 import {
   ExecutionPlanError,
@@ -12,7 +14,10 @@ import type {
   RunExecutionInput,
 } from '../../../src/pipeline/runner';
 import type {PipelineSignalHandle} from '../../../src/pipeline/signals';
-import type {ProjectSourceCatalog} from '../../../src/pipeline/source-assets';
+import {
+  discoverProjectSourceCatalog,
+  type ProjectSourceCatalog,
+} from '../../../src/pipeline/source-assets';
 import type {PreflightResult} from '../../../src/pipeline/stages/preflight';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
 import {
@@ -122,6 +127,17 @@ const pipelineResult = (
   warnings: [],
   ...request,
 });
+
+const systemFailure = (
+  code: string,
+  message: string,
+): NodeJS.ErrnoException => Object.assign(new Error(message), {code});
+
+const zodFailure = (): Error => {
+  const result = z.literal('expected').safeParse('secret-cause');
+  if (result.success) throw new Error('Expected Zod validation to fail.');
+  return result.error;
+};
 
 const makeDependencies = () => {
   let stdout = '';
@@ -337,6 +353,193 @@ describe('pipeline CLI commands', () => {
     });
     expect(fixture.stdout()).not.toContain('secret-text');
   });
+
+  it.each([
+    ['invalid JSON', () => new SyntaxError('secret-cause invalid JSON')],
+    ['invalid schema', () => zodFailure()],
+    ['missing authoring file', () => systemFailure(
+      'ENOENT',
+      'secret-cause missing /private/project/script.json',
+    )],
+  ] as const)(
+    'maps JsonFileError wrapping %s to a sanitized project load failure',
+    async (_case, makeCause) => {
+      const fixture = makeDependencies();
+      fixture.dependencies.loadProject.mockRejectedValueOnce(new JsonFileError(
+        '/private/project/project.json',
+        makeCause(),
+      ));
+
+      const exitCode = await runPipelineCommand(
+        'demo',
+        {json: true},
+        fixture.dependencies,
+      );
+
+      expect(exitCode).toBe(EXIT_CODES.validationFailed);
+      expect(JSON.parse(fixture.stdout())).toEqual({
+        projectId: 'demo',
+        code: 'PROJECT_LOAD_FAILED',
+        message: 'Unable to load or validate project.',
+      });
+      expect(fixture.stdout()).not.toContain('/private/project');
+      expect(fixture.stdout()).not.toContain('secret-cause');
+    },
+  );
+
+  it('maps JsonFileError wrapping EACCES to a sanitized environment failure', async () => {
+    const fixture = makeDependencies();
+    fixture.dependencies.loadProject.mockRejectedValueOnce(new JsonFileError(
+      '/private/project/project.json',
+      systemFailure(
+        'EACCES',
+        'secret-cause permission denied at /private/project/project.json',
+      ),
+    ));
+
+    const exitCode = await runPipelineCommand(
+      'demo',
+      {json: true},
+      fixture.dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.environmentFailed);
+    expect(JSON.parse(fixture.stdout())).toEqual({
+      projectId: 'demo',
+      code: 'EACCES',
+      message: 'Pipeline environment access was denied.',
+    });
+    expect(fixture.stdout()).not.toContain('/private/project');
+    expect(fixture.stdout()).not.toContain('secret-cause');
+  });
+
+  it('maps source discovery I/O wrappers to a sanitized environment failure', async () => {
+    const fixture = makeDependencies();
+    const sourceFailure = await discoverProjectSourceCatalog(project(), {
+      listSourceFiles: vi.fn(async () => {
+        throw systemFailure(
+          'EIO',
+          'secret-cause read failed at /private/project/assets/source',
+        );
+      }),
+      hashProjectFile: vi.fn(async () => 'sha256:unused'),
+    }).then(
+      () => { throw new Error('Expected source discovery to fail.'); },
+      (error: unknown) => error,
+    );
+    expect(sourceFailure).toMatchObject({
+      code: 'PROJECT_SOURCE_INVALID',
+      cause: {code: 'EIO'},
+    });
+    fixture.dependencies.discoverProjectSourceCatalog
+      .mockRejectedValueOnce(sourceFailure);
+
+    const exitCode = await runPipelineCommand(
+      'demo',
+      {json: true},
+      fixture.dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.environmentFailed);
+    expect(JSON.parse(fixture.stdout())).toEqual({
+      projectId: 'demo',
+      code: 'EIO',
+      message: 'Pipeline environment I/O failed.',
+    });
+    expect(fixture.stdout()).not.toContain('/private/project');
+    expect(fixture.stdout()).not.toContain('secret-cause');
+  });
+
+  it('keeps genuine source path validation at exit 3', async () => {
+    const fixture = makeDependencies();
+    const sourceFailure = await discoverProjectSourceCatalog(project(), {
+      listSourceFiles: vi.fn(async () => [{
+        sourcePath: '../private/secret-source.mp4',
+        sizeBytes: 1,
+      }]),
+      hashProjectFile: vi.fn(async () => 'sha256:unused'),
+    }).then(
+      () => { throw new Error('Expected source discovery to fail.'); },
+      (error: unknown) => error,
+    );
+    expect(sourceFailure).toMatchObject({code: 'PROJECT_SOURCE_INVALID'});
+    fixture.dependencies.discoverProjectSourceCatalog
+      .mockRejectedValueOnce(sourceFailure);
+
+    const exitCode = await runPipelineCommand(
+      'demo',
+      {json: true},
+      fixture.dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(JSON.parse(fixture.stdout())).toEqual({
+      projectId: 'demo',
+      code: 'PROJECT_SOURCE_INVALID',
+      message: 'Project source assets could not be discovered safely.',
+    });
+    expect(fixture.stdout()).not.toContain('secret-source');
+  });
+
+  it('prioritizes AggregateError environment causes over plan validation', async () => {
+    const fixture = makeDependencies();
+    fixture.dependencies.buildExecutionPlan.mockRejectedValueOnce(new AggregateError([
+      new ExecutionPlanError(
+        'PLAN_RANGE_INVALID',
+        'secret-cause invalid range',
+        'draft',
+      ),
+      systemFailure(
+        'ENOSPC',
+        'secret-cause disk full at /private/project/.work',
+      ),
+    ], 'secret aggregate'));
+
+    const exitCode = await runPipelineCommand(
+      'demo',
+      {json: true},
+      fixture.dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.environmentFailed);
+    expect(JSON.parse(fixture.stdout())).toEqual({
+      projectId: 'demo',
+      code: 'ENOSPC',
+      message: 'Pipeline storage is exhausted.',
+    });
+    expect(fixture.stdout()).not.toContain('/private/project');
+    expect(fixture.stdout()).not.toContain('secret-cause');
+  });
+
+  it.each(['cycle', 'no cause'] as const)(
+    'falls back safely for a JsonFileError with %s',
+    async (causeKind) => {
+      const fixture = makeDependencies();
+      const cyclicCause = new Error('secret-cause cycle') as Error & {
+        cause?: unknown;
+      };
+      cyclicCause.cause = cyclicCause;
+      fixture.dependencies.loadProject.mockRejectedValueOnce(new JsonFileError(
+        '/private/project/project.json',
+        causeKind === 'cycle' ? cyclicCause : undefined,
+      ));
+
+      const exitCode = await runPipelineCommand(
+        'demo',
+        {json: true},
+        fixture.dependencies,
+      );
+
+      expect(exitCode).toBe(EXIT_CODES.environmentFailed);
+      expect(JSON.parse(fixture.stdout())).toEqual({
+        projectId: 'demo',
+        code: 'PIPELINE_EXECUTION_FAILED',
+        message: 'Pipeline execution failed unexpectedly.',
+      });
+      expect(fixture.stdout()).not.toContain('/private/project');
+      expect(fixture.stdout()).not.toContain('secret-cause');
+    },
+  );
 
   it('rebuilds and retries exactly once after a pre-write PLAN_STALE', async () => {
     const fixture = makeDependencies();

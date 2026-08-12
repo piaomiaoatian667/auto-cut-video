@@ -144,6 +144,64 @@ const errorName = (error: unknown): string | undefined => {
   }
 };
 
+const ERROR_GRAPH_MAX_DEPTH = 8;
+const ERROR_GRAPH_MAX_NODES = 64;
+
+interface ErrorGraphEntry {
+  error: object;
+  depth: number;
+}
+
+const readCause = (error: object): unknown => {
+  try {
+    return (error as {cause?: unknown}).cause;
+  } catch {
+    return undefined;
+  }
+};
+
+const readAggregateErrors = (error: object): readonly unknown[] => {
+  if (!(error instanceof AggregateError) && errorName(error) !== 'AggregateError') {
+    return [];
+  }
+  try {
+    const errors = (error as {errors?: unknown}).errors;
+    return Array.isArray(errors)
+      ? errors.slice(0, ERROR_GRAPH_MAX_NODES)
+      : [];
+  } catch {
+    return [];
+  }
+};
+
+const inspectErrorGraph = (root: unknown): readonly ErrorGraphEntry[] => {
+  const queue: Array<{error: unknown; depth: number}> = [{error: root, depth: 0}];
+  const entries: ErrorGraphEntry[] = [];
+  const seen = new Set<object>();
+  let queueIndex = 0;
+
+  while (
+    queueIndex < queue.length
+    && entries.length < ERROR_GRAPH_MAX_NODES
+  ) {
+    const current = queue[queueIndex++]!;
+    if (current.error === null || typeof current.error !== 'object') continue;
+    if (seen.has(current.error)) continue;
+    seen.add(current.error);
+    entries.push({error: current.error, depth: current.depth});
+    if (current.depth >= ERROR_GRAPH_MAX_DEPTH) continue;
+
+    const nextDepth = current.depth + 1;
+    const cause = readCause(current.error);
+    if (cause !== undefined) queue.push({error: cause, depth: nextDepth});
+    for (const aggregateError of readAggregateErrors(current.error)) {
+      queue.push({error: aggregateError, depth: nextDepth});
+    }
+  }
+
+  return entries;
+};
+
 const isSchemaValidationError = (error: unknown): boolean => (
   errorName(error) === 'ZodError'
   || error instanceof SyntaxError
@@ -176,16 +234,53 @@ const environmentMessage = (code: string | undefined): string | undefined => {
     case 'EACCES':
     case 'EPERM':
       return 'Pipeline environment access was denied.';
+    case 'EIO':
+      return 'Pipeline environment I/O failed.';
     case 'ENV_TOOL_MISSING':
       return 'Required pipeline tooling is unavailable.';
     case 'ENOSPC':
+    case 'EDQUOT':
     case 'DISK_SPACE_EXHAUSTED':
       return 'Pipeline storage is exhausted.';
+    case 'EROFS':
+      return 'Pipeline storage is read-only.';
+    case 'EMFILE':
+    case 'ENFILE':
+      return 'Pipeline environment file capacity was exhausted.';
+    case 'ENOMEM':
+      return 'Pipeline environment memory was exhausted.';
     default:
       return code?.startsWith('ENV_') === true
         ? 'Pipeline environment validation failed.'
         : undefined;
   }
+};
+
+interface EnvironmentIssue {
+  code: string;
+  message: string;
+  stageId?: StageId;
+}
+
+const findEnvironmentIssue = (
+  entries: readonly ErrorGraphEntry[],
+): EnvironmentIssue | undefined => {
+  const rootStageId = entries[0] === undefined
+    ? undefined
+    : readStageId(entries[0].error);
+  for (const entry of entries) {
+    const code = readCode(entry.error);
+    const message = environmentMessage(code);
+    if (code !== undefined && message !== undefined) {
+      const stageId = readStageId(entry.error) ?? rootStageId;
+      return {
+        code,
+        message,
+        ...(stageId === undefined ? {} : {stageId}),
+      };
+    }
+  }
+  return undefined;
 };
 
 const validationFailure = (
@@ -205,13 +300,13 @@ const validationFailure = (
 const environmentFailure = (
   projectId: string,
   error: unknown,
+  entries: readonly ErrorGraphEntry[] = inspectErrorGraph(error),
 ): PipelineCommandOutcome => {
-  const code = readCode(error);
-  const message = environmentMessage(code);
+  const issue = findEnvironmentIssue(entries);
   return {
     kind: 'failure',
     exitCode: EXIT_CODES.environmentFailed,
-    failure: message === undefined
+    failure: issue === undefined
       ? publicFailure(
         projectId,
         error,
@@ -220,9 +315,9 @@ const environmentFailure = (
       )
       : {
         projectId,
-        code: code!,
-        message,
-        ...(readStageId(error) === undefined ? {} : {stageId: readStageId(error)!}),
+        code: issue.code,
+        message: issue.message,
+        ...(issue.stageId === undefined ? {} : {stageId: issue.stageId}),
       },
   };
 };
@@ -243,32 +338,60 @@ const signalFailure = (
 const projectLoadFailure = (
   projectId: string,
   error: unknown,
-): PipelineCommandOutcome => isProjectLoadValidationError(error)
-  ? {
-    kind: 'failure',
-    exitCode: EXIT_CODES.validationFailed,
-    failure: {
-      projectId,
-      code: 'PROJECT_LOAD_FAILED',
-      message: 'Unable to load or validate project.',
-    },
+): PipelineCommandOutcome => {
+  const entries = inspectErrorGraph(error);
+  if (findEnvironmentIssue(entries) !== undefined) {
+    return environmentFailure(projectId, error, entries);
   }
-  : environmentFailure(projectId, error);
+  return entries.some(({error: entry}) => isProjectLoadValidationError(entry))
+    ? {
+      kind: 'failure',
+      exitCode: EXIT_CODES.validationFailed,
+      failure: {
+        projectId,
+        code: 'PROJECT_LOAD_FAILED',
+        message: 'Unable to load or validate project.',
+      },
+    }
+    : environmentFailure(projectId, error, entries);
+};
 
 const sourceCatalogFailure = (
   projectId: string,
   error: unknown,
-): PipelineCommandOutcome => isSourceCatalogValidationError(error)
-  ? {
-    kind: 'failure',
-    exitCode: EXIT_CODES.validationFailed,
-    failure: {
-      projectId,
-      code: 'PROJECT_SOURCE_INVALID',
-      message: 'Project source assets could not be discovered safely.',
-    },
+): PipelineCommandOutcome => {
+  const entries = inspectErrorGraph(error);
+  if (findEnvironmentIssue(entries) !== undefined) {
+    return environmentFailure(projectId, error, entries);
   }
-  : environmentFailure(projectId, error);
+  return entries.some(({error: entry}) => isSourceCatalogValidationError(entry))
+    ? {
+      kind: 'failure',
+      exitCode: EXIT_CODES.validationFailed,
+      failure: {
+        projectId,
+        code: 'PROJECT_SOURCE_INVALID',
+        message: 'Project source assets could not be discovered safely.',
+      },
+    }
+    : environmentFailure(projectId, error, entries);
+};
+
+const planFailure = (
+  projectId: string,
+  error: unknown,
+): PipelineCommandOutcome => {
+  const entries = inspectErrorGraph(error);
+  if (findEnvironmentIssue(entries) !== undefined) {
+    return environmentFailure(projectId, error, entries);
+  }
+  const validationError = entries.find(
+    ({error: entry}) => isPlanValidationError(entry),
+  )?.error;
+  return validationError === undefined
+    ? environmentFailure(projectId, error, entries)
+    : validationFailure(projectId, validationError);
+};
 
 const resultExitCode = (result: PipelineRunResult): number => {
   switch (result.state) {
@@ -310,9 +433,7 @@ export async function executePipelineCommand(
   try {
     plan = await dependencies.buildExecutionPlan(project, sourceCatalog, request);
   } catch (error) {
-    return isPlanValidationError(error)
-      ? validationFailure(projectId, error)
-      : environmentFailure(projectId, error);
+    return planFailure(projectId, error);
   }
 
   if (options.plan === true) {
@@ -350,15 +471,11 @@ export async function executePipelineCommand(
               request,
             );
           } catch (rebuildError) {
-            return isPlanValidationError(rebuildError)
-              ? validationFailure(projectId, rebuildError)
-              : environmentFailure(projectId, rebuildError);
+            return planFailure(projectId, rebuildError);
           }
           continue;
         }
-        return isPlanValidationError(error)
-          ? validationFailure(projectId, error)
-          : environmentFailure(projectId, error);
+        return planFailure(projectId, error);
       }
     }
     return validationFailure(
