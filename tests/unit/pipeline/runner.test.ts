@@ -280,6 +280,7 @@ interface MemoryRuntimeOptions extends StageOptions {
   failOutputReadAfterPublish?: Error;
   failOutputPublish?: boolean;
   failWorkReadAfterPublish?: Error;
+  failWorkPublishError?: Error;
   failWorkPublishAt?: StageId;
   failWorkPublishOnceAt?: StageId;
   releaseError?: Error;
@@ -350,7 +351,7 @@ const createMemoryRuntime = (options: MemoryRuntimeOptions = {}) => {
       ) {
         workPublishFailed = true;
         workPublishRejected = true;
-        throw new Error('work pointer failed');
+        throw options.failWorkPublishError ?? new Error('work pointer failed');
       }
       workCurrent = pointer;
       await options.afterWorkPublish?.(pointer);
@@ -1607,6 +1608,62 @@ describe('Pipeline Runner', () => {
     expect(runtime.release).toHaveBeenCalledOnce();
   });
 
+  it('rolls back selected Preflight when Work publication deterministically exhausts disk', async () => {
+    const previousWork = currentPointer('run-previous', 'release');
+    const previousOutput = currentPointer('run-previous', 'release', {
+      relativePath: 'releases/run-previous',
+    });
+    const preflightPartial: PipelinePartialArtifact = {
+      scope: 'run',
+      path: 'partials/preflight.tmp',
+    };
+    const cleanupFailedStage = vi.fn(async () => undefined);
+    const runtime = createMemoryRuntime({
+      current: previousWork,
+      outputCurrent: previousOutput,
+      failWorkPublishAt: 'preflight',
+      failWorkPublishError: Object.assign(new Error('private Work temp path'), {
+        code: 'ENOSPC',
+      }),
+      partialArtifacts: {preflight: [preflightPartial]},
+    });
+    runtime.dependencies.cleanupFailedStage = cleanupFailedStage;
+    const plan = makePlan({
+      preset: 'assets',
+      stageIds: ['preflight', 'ingest'],
+      actions: ['run', 'run'],
+      runMode: 'new',
+      targetRunId: 'run-preflight-work-enospc',
+    });
+
+    await expect(runExecutionPlan(executionInput(plan), runtime.dependencies))
+      .rejects.toMatchObject({
+        code: 'DISK_SPACE_EXHAUSTED',
+        stageId: 'preflight',
+      });
+
+    expect(runtime.stageCalls).toEqual(['preflight']);
+    expect(runtime.report('run-preflight-work-enospc', 'preflight')).toBeUndefined();
+    expect(runtime.workCurrent).toEqual(previousWork);
+    expect(runtime.outputCurrent).toEqual(previousOutput);
+    expect(runtime.attempts).toEqual([
+      expect.objectContaining({
+        runId: 'run-preflight-work-enospc',
+        stageId: 'preflight',
+        state: 'failed',
+        error: expect.objectContaining({code: 'DISK_SPACE_EXHAUSTED'}),
+      }),
+    ]);
+    expect(cleanupFailedStage).toHaveBeenCalledOnce();
+    expect(cleanupFailedStage).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: 'demo',
+      runId: 'run-preflight-work-enospc',
+      stageId: 'preflight',
+      partialArtifacts: [preflightPartial],
+    }));
+    expect(runtime.release).toHaveBeenCalledOnce();
+  });
+
   it('keeps a needs_review attempt diagnostic without publishing cancelled progress', async () => {
     const controller = new AbortController();
     const previousOutput = currentPointer('run-previous', 'release', {
@@ -2685,6 +2742,68 @@ describe('Pipeline Runner', () => {
     expect(cleanupFailedStage).not.toHaveBeenCalled();
     expect(runtime.release).toHaveBeenCalledOnce();
   });
+
+  it.each(['EACCES', 'EIO'] as const)(
+    'sanitizes recovered Release verify %s without cleaning durable evidence',
+    async (code) => {
+      const runId = 'run-release';
+      const project = memoryProject();
+      const releasePartial: PipelinePartialArtifact = {
+        scope: 'output',
+        path: `releases/${runId}/partial.tmp`,
+      };
+      const cleanupFailedStage = vi.fn(async () => undefined);
+      const runtime = createMemoryRuntime({
+        current: currentPointer(runId, 'review'),
+        partialArtifacts: {release: [releasePartial]},
+      });
+      runtime.dependencies.cleanupFailedStage = cleanupFailedStage;
+      runtime.seedRun(runId, reportsThrough(runId, 'release', 'release'));
+      const plan = await buildExecutionPlan(planningContext(runtime, project), {
+        preset: 'release',
+        from: 'release',
+        to: 'release',
+        resume: true,
+      });
+      const releaseStage = runtime.registry.find((stage) => stage.id === 'release')!;
+      const verifyRelease = releaseStage.verify.bind(releaseStage);
+      let releaseVerifyCalls = 0;
+      releaseStage.verify = async (context, report) => {
+        releaseVerifyCalls += 1;
+        if (releaseVerifyCalls === 3) {
+          throw Object.assign(
+            new Error(`${code} at /private/releases/${runId}/audit.json`),
+            {code},
+          );
+        }
+        return await verifyRelease(context, report);
+      };
+
+      let runError: unknown;
+      try {
+        await runExecutionPlan(executionInput(plan, project), runtime.dependencies);
+      } catch (error) {
+        runError = error;
+      }
+
+      expect(runError).toMatchObject({
+        name: 'PipelineRuntimeError',
+        code,
+        stageId: 'release',
+        message: `${code}: Pipeline operation failed.`,
+      });
+      expect((runError as Error).message).not.toContain('/private/releases');
+      expect(runtime.workCurrent).toMatchObject({
+        runId,
+        completedStage: 'review',
+      });
+      expect(runtime.outputCurrent).toBeNull();
+      expect(runtime.report(runId, 'release')).toMatchObject({state: 'passed'});
+      expect(runtime.attempts).toEqual([]);
+      expect(cleanupFailedStage).not.toHaveBeenCalled();
+      expect(runtime.release).toHaveBeenCalledOnce();
+    },
+  );
 
   it('returns recovered Release success when Work read-back is unreadable', async () => {
     const runId = 'run-release';
@@ -4552,6 +4671,66 @@ describe('Pipeline Runner', () => {
       .toBeLessThan(runtime.events.indexOf('output:release'));
     expect(runtime.events.indexOf('output:release'))
       .toBeLessThan(runtime.events.indexOf('work:release:passed'));
+    expect(runtime.release).toHaveBeenCalledOnce();
+  });
+
+  it('keeps ordinary Release Output when cancellation arrives during Output commit', async () => {
+    const controller = new AbortController();
+    const outputCurrent = currentPointer('run-release', 'release', {
+      relativePath: 'releases/run-release',
+    });
+    const releasePartial: PipelinePartialArtifact = {
+      scope: 'output',
+      path: 'releases/run-release/partial.tmp',
+    };
+    const cleanupFailedStage = vi.fn(async () => undefined);
+    const runtime = createMemoryRuntime({
+      afterOutputPublish: (pointer) => {
+        if (pointer.runId === 'run-release') controller.abort('SIGTERM');
+      },
+      partialArtifacts: {release: [releasePartial]},
+      results: {
+        release: {
+          state: 'passed',
+          fingerprint: stageFingerprint('release'),
+          outputs: {finalVideo: 'releases/run-release/final.mp4'},
+          artifacts: [{
+            scope: 'output',
+            path: 'releases/run-release/final.mp4',
+            sha256: HASH_B,
+          }],
+          checks: [],
+          outputCurrent,
+        },
+      },
+    });
+    runtime.dependencies.cleanupFailedStage = cleanupFailedStage;
+    const plan = makePlan({
+      stageIds: ['preflight', 'draft', 'release'],
+      actions: ['run', 'run', 'run'],
+      runMode: 'new',
+      targetRunId: 'run-release',
+    });
+
+    const result = await runExecutionPlan({
+      ...executionInput(plan),
+      signal: controller.signal,
+    }, runtime.dependencies);
+
+    expect(result).toMatchObject({
+      runId: 'run-release',
+      state: 'passed',
+      completedStage: 'release',
+      warnings: [{code: 'WORK_POINTER_LAGGING'}],
+    });
+    expect(runtime.outputCurrent).toEqual(outputCurrent);
+    expect(runtime.workCurrent).toMatchObject({
+      runId: 'run-release',
+      completedStage: 'draft',
+    });
+    expect(runtime.report('run-release', 'release')).toMatchObject({state: 'passed'});
+    expect(runtime.attempts).toEqual([]);
+    expect(cleanupFailedStage).not.toHaveBeenCalled();
     expect(runtime.release).toHaveBeenCalledOnce();
   });
 

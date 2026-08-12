@@ -1118,6 +1118,14 @@ export async function runExecutionPlan(
         await dependencies.reportStore.writeStage(runDirectory, preflightReport);
         preflightReportWritten = true;
         throwIfPipelineCancelled(input.signal, preflightStage.id);
+        activeStageFailure.boundary = 'work-pointer';
+        workCurrent = await publishWorkProgress(
+          revalidated,
+          lockRunId,
+          preflightReport,
+          'passed',
+          dependencies,
+        );
       } catch (error) {
         if (
           error instanceof PipelinePointerOutcomeError
@@ -1125,29 +1133,15 @@ export async function runExecutionPlan(
         ) {
           throw error;
         }
-        if (
-          error instanceof PipelineRuntimeError
-          && error.code === 'PIPELINE_CANCELLED'
-        ) {
-          return await rollbackStageProgress({
-            primaryError: error,
-            reportStore: dependencies.reportStore,
-            runDirectory,
-            stageId: preflightStage.id,
-            reportWritten: preflightReportWritten,
-            artifacts: [],
-          });
-        }
-        throw error;
+        return await rollbackStageProgress({
+          primaryError: error,
+          reportStore: dependencies.reportStore,
+          runDirectory,
+          stageId: preflightStage.id,
+          reportWritten: preflightReportWritten,
+          artifacts: [],
+        });
       }
-      activeStageFailure.boundary = 'work-pointer';
-      workCurrent = await publishWorkProgress(
-        revalidated,
-        lockRunId,
-        preflightReport,
-        'passed',
-        dependencies,
-      );
       reports.push(preflightReport);
       activeStageFailure = undefined;
     } else if (revalidated.runMode === 'new') {
@@ -1263,7 +1257,9 @@ export async function runExecutionPlan(
                 cached,
               );
             } catch (error) {
-              if (!isOrdinaryReportMiss(error)) throw error;
+              if (!isOrdinaryReportMiss(error)) {
+                throw normalizePipelineError(error, 'release');
+              }
             }
             activeStageFailure = {
               plan: revalidated,
@@ -1487,6 +1483,7 @@ export async function runExecutionPlan(
       const warnings: PipelineRunResult['warnings'] = [];
       try {
         activeStageFailure.boundary = 'work-pointer';
+        throwIfPipelineCancelled(input.signal, item.stageId);
         workCurrent = await publishWorkProgress(
           revalidated,
           lockRunId,
