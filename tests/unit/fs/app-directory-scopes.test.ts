@@ -267,6 +267,20 @@ const importScopesWithQuarantineRestoreRace = async (
         }
         await actual.link(source, target);
       },
+      copyFile: async (
+        source: string,
+        target: string,
+        mode?: number,
+      ) => {
+        if (
+          probe.timing === 'during'
+          && source.startsWith('/.vol/')
+          && path.basename(target) === path.basename(probe.targetPath)
+        ) {
+          await installReplacement();
+        }
+        await actual.copyFile(source, target, mode);
+      },
       unlink: async (target: string) => {
         if (
           !probe.restoreFaultInjected
@@ -292,6 +306,59 @@ interface PostValidationHardlinkProbe {
   quarantinePath?: string;
   hardlinkAdded: boolean;
 }
+
+interface ExternalPrimaryHardlinkRestoreProbe {
+  targetPath: string;
+  outsidePath: string;
+  quarantinePath?: string;
+  displacedPath?: string;
+  replacementIdentity?: {dev: bigint; ino: bigint; nlink: bigint};
+  raced: boolean;
+}
+
+const importScopesWithExternalPrimaryHardlinkRestore = async (
+  probe: ExternalPrimaryHardlinkRestoreProbe,
+): Promise<typeof import('../../../src/fs/app-directory-scopes')> => {
+  vi.resetModules();
+  vi.doMock('node:fs/promises', async () => {
+    const actual = await vi.importActual<typeof import('node:fs/promises')>(
+      'node:fs/promises',
+    );
+    return {
+      ...actual,
+      rename: async (source: string, target: string) => {
+        if (
+          path.basename(source) === path.basename(probe.targetPath)
+          && path.basename(target).startsWith('.cleanup-')
+        ) {
+          probe.quarantinePath = target;
+        }
+        await actual.rename(source, target);
+      },
+      unlink: async (target: string) => {
+        if (
+          !probe.raced
+          && probe.quarantinePath !== undefined
+          && target.startsWith('/.vol/')
+        ) {
+          probe.raced = true;
+          probe.displacedPath = `${probe.quarantinePath}.original`;
+          await actual.rename(probe.quarantinePath, probe.displacedPath);
+          await actual.link(probe.outsidePath, probe.quarantinePath);
+          await actual.writeFile(probe.targetPath, 'scoped replacement');
+          const replacement = await actual.lstat(probe.outsidePath, {bigint: true});
+          probe.replacementIdentity = {
+            dev: replacement.dev,
+            ino: replacement.ino,
+            nlink: replacement.nlink,
+          };
+        }
+        await actual.unlink(target);
+      },
+    };
+  });
+  return await import('../../../src/fs/app-directory-scopes');
+};
 
 const importScopesWithPostValidationHardlink = async (
   probe: PostValidationHardlinkProbe,
@@ -1723,6 +1790,85 @@ describe('app-owned directory scopes', () => {
       });
       const parentEntries = await readdir(path.dirname(targetPath));
       expect(parentEntries.some((entry) => entry.startsWith('.cleanup-'))).toBe(false);
+    },
+  );
+
+  it.each(['unlinkRunFile', 'removeRunTree'] as const)(
+    'never unlinks an outside primary hardlink while restoring through %s',
+    async (operation) => {
+      const outsideRoot = await makeTempDirectory('000-app-scopes-external-hardlink-');
+      const outsidePath = path.join(outsideRoot, '000-outside.bin');
+      await writeFile(outsidePath, 'outside content');
+      const outsideBefore = await lstat(outsidePath, {bigint: true});
+      const workspaceRoot = await makeTempDirectory('app-scopes-external-primary-');
+      const runRoot = path.join(workspaceRoot, '.work', 'demo', 'runs', 'run-one');
+      const relativePath = operation === 'unlinkRunFile'
+        ? 'artifact.bin'
+        : 'draft/artifact.bin';
+      const targetPath = path.join(runRoot, relativePath);
+      const probe: ExternalPrimaryHardlinkRestoreProbe = {
+        targetPath,
+        outsidePath,
+        raced: false,
+      };
+      const scopes = await importScopesWithExternalPrimaryHardlinkRestore(probe);
+      const run = await scopes.createRunStore(workspaceRoot).createRun(
+        'demo',
+        'run-one',
+      );
+      if (operation === 'removeRunTree') {
+        await scopes.ensureRunDirectory(run, 'draft');
+      }
+      await writeAndClose(
+        await scopes.openNewRunFile(run, relativePath),
+        'scoped content',
+      );
+
+      let caught: unknown;
+      try {
+        if (operation === 'unlinkRunFile') {
+          await scopes.unlinkRunFile(run, relativePath);
+        } else {
+          await scopes.removeRunTree(run, 'draft');
+        }
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(probe.raced).toBe(true);
+      if (probe.quarantinePath === undefined || probe.replacementIdentity === undefined) {
+        throw new TypeError('external hardlink replacement race was not observed');
+      }
+      const outsideAfter = await lstat(outsidePath, {bigint: true});
+      expect(await readFile(outsidePath, 'utf8')).toBe('outside content');
+      expect({
+        dev: outsideAfter.dev,
+        ino: outsideAfter.ino,
+        nlink: outsideAfter.nlink,
+      }).toEqual(probe.replacementIdentity);
+      expect({dev: outsideAfter.dev, ino: outsideAfter.ino}).toEqual({
+        dev: outsideBefore.dev,
+        ino: outsideBefore.ino,
+      });
+      const evidence = await lstat(probe.quarantinePath, {bigint: true});
+      expect({dev: evidence.dev, ino: evidence.ino, nlink: evidence.nlink}).toEqual(
+        probe.replacementIdentity,
+      );
+      expect(await readFile(probe.quarantinePath, 'utf8')).toBe('outside content');
+      await expect(readFile(targetPath, 'utf8')).resolves.toBe('scoped replacement');
+      const cleanupEntries = (await readdir(path.dirname(targetPath)))
+        .filter((entry) => entry.startsWith('.cleanup-'));
+      expect(cleanupEntries).toEqual([path.basename(probe.quarantinePath)]);
+      expect(caught).toBeInstanceOf(AggregateError);
+      if (!(caught instanceof AggregateError)) {
+        throw new TypeError('expected incomplete recovery aggregate error');
+      }
+      expect(caught.errors).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          code: 'APP_SCOPE_AUTHORITY_CHANGED',
+          message: expect.stringContaining('hard links'),
+        }),
+      ]));
     },
   );
 

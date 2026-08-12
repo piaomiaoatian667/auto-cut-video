@@ -6,6 +6,7 @@ import {
   type BigIntStats,
 } from 'node:fs';
 import {
+  copyFile,
   link,
   lstat,
   mkdir,
@@ -1465,6 +1466,40 @@ const unusedQuarantineBasename = async (
   throw authorityError(`could not reserve a cleanup quarantine name: ${relativePath}`);
 };
 
+const unlinkSingleLinkIdentity = async (
+  expected: ScopedDirectoryEntryIdentity,
+  relativePath: string,
+): Promise<void> => {
+  const identityPath = volumePath(expected.dev, expected.ino);
+  let current: BigIntStats;
+  try {
+    current = await lstat(identityPath, {bigint: true});
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ENOENT') return;
+    throw error;
+  }
+  const kind: AppDirectoryEntryKind = current.isSymbolicLink()
+    ? 'symlink'
+    : current.isFile()
+      ? 'file'
+      : current.isDirectory()
+        ? 'directory'
+        : 'other';
+  if (
+    kind !== expected.kind
+    || current.dev !== expected.dev
+    || current.ino !== expected.ino
+  ) {
+    throw authorityError(`cleanup recovery identity changed: ${relativePath}`);
+  }
+  if (current.nlink !== 1n) {
+    throw authorityError(
+      `cleanup recovery incomplete because identity has unexpected hard links: ${relativePath}`,
+    );
+  }
+  await unlink(identityPath);
+};
+
 const restoreQuarantinedEntry = async (
   state: ScopeState,
   anchor: ScopedPathAnchor,
@@ -1482,12 +1517,17 @@ const restoreQuarantinedEntry = async (
   if (!anchoredEntryMatchesIdentity(quarantined.kind, quarantined.stats, expected)) {
     throw authorityError(`cleanup quarantine changed before restore: ${relativePath}`);
   }
+  if (quarantined.stats === undefined || quarantined.stats.nlink !== 1n) {
+    throw authorityError(
+      `cleanup recovery incomplete because quarantine has unexpected hard links: ${relativePath}`,
+    );
+  }
   const identityPath = volumePath(expected.dev, expected.ino);
   const originalPath = path.join(anchor.parent.volumePath, anchor.basename);
   let occupied = false;
   try {
     if (expected.kind === 'file') {
-      await link(identityPath, originalPath);
+      await copyFile(identityPath, originalPath, constants.COPYFILE_EXCL);
     } else if (expected.kind === 'symlink') {
       await symlink(await readlink(identityPath), originalPath);
     } else {
@@ -1500,11 +1540,7 @@ const restoreQuarantinedEntry = async (
     else throw error;
   }
 
-  try {
-    await unlink(identityPath);
-  } catch (error) {
-    if (!isNodeError(error) || error.code !== 'ENOENT') throw error;
-  }
+  await unlinkSingleLinkIdentity(expected, relativePath);
   await assertScopedPathAnchorStable(state, anchor, relativePath);
   const remaining = await inspectAnchoredEntry(quarantineAnchor, relativePath);
   if (remaining.kind !== 'missing') {
@@ -1513,8 +1549,12 @@ const restoreQuarantinedEntry = async (
   if (!occupied) {
     const restored = await inspectAnchoredEntry(anchor, relativePath);
     if (expected.kind === 'file') {
-      if (!anchoredEntryMatchesIdentity(restored.kind, restored.stats, expected)) {
-        throw authorityError(`cleanup quarantine restore changed identity: ${relativePath}`);
+      if (
+        restored.kind !== 'file'
+        || restored.stats === undefined
+        || restored.stats.size !== quarantined.stats.size
+      ) {
+        throw authorityError(`cleanup quarantine restore changed content: ${relativePath}`);
       }
     } else if (restored.kind !== 'symlink') {
       throw authorityError(`cleanup quarantine restore changed type: ${relativePath}`);
