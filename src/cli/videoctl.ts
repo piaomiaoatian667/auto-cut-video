@@ -44,7 +44,11 @@ import {
   type PipelineCommandOptions,
 } from './commands/pipeline';
 import {runReportCommand, type ReportCommandOptions} from './commands/report';
-import {runReviewCommand, type ReviewCommandOptions} from './commands/review';
+import {
+  ReviewApprovalOutcomeError,
+  runReviewCommand,
+  type ReviewCommandOptions,
+} from './commands/review';
 import {EXIT_CODES} from './exit-codes';
 import {
   formatDoctorFailure,
@@ -196,6 +200,15 @@ const writeCommandFailure = (
   if (context.json) writers.stdout.write(formatted);
   else writers.stderr.write(formatted);
 };
+
+const isReviewApprovalOutcomeUnknown = (error: unknown): boolean => (
+  error instanceof ReviewApprovalOutcomeError
+  || (
+    error instanceof Error
+    && 'code' in error
+    && error.code === 'REVIEW_APPROVAL_OUTCOME_UNKNOWN'
+  )
+);
 
 type VideoctlDependenciesLoader = () => (
   VideoctlDependencies | Promise<VideoctlDependencies>
@@ -369,6 +382,15 @@ const runVideoctlWithLoader = async (
         'Invalid command-line arguments.',
       );
       return EXIT_CODES.validationFailed;
+    }
+    if (isReviewApprovalOutcomeUnknown(error)) {
+      writeCommandFailure(
+        commandFailureContext(activeCommand),
+        writers,
+        'REVIEW_APPROVAL_OUTCOME_UNKNOWN',
+        'Review approval outcome is unknown; inspect the current report before retrying.',
+      );
+      return EXIT_CODES.environmentFailed;
     }
     writeCommandFailure(
       commandFailureContext(activeCommand),

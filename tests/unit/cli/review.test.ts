@@ -16,7 +16,10 @@ import {
   type RunDirectoryScope,
   type WorkDirectoryScope,
 } from '../../../src/fs/app-directory-scopes';
-import {runReviewCommand} from '../../../src/cli/commands/review';
+import {
+  ReviewApprovalOutcomeError,
+  runReviewCommand,
+} from '../../../src/cli/commands/review';
 import {runVideoctl, type VideoctlDependencies} from '../../../src/cli/videoctl';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
 import {PipelineArtifactError} from '../../../src/pipeline/artifacts';
@@ -724,6 +727,38 @@ describe('videoctl review', () => {
       path.join(fixture.workspaceRoot, '.work', 'demo', 'pipeline.lock'),
       'utf8',
     )).rejects.toMatchObject({code: 'ENOENT'});
+  });
+
+  it('reports an unknown approval outcome with a stable sanitized CLI failure', async () => {
+    const fixture = await makeFixture();
+    const secretPath = '/private/project/.work/demo/runs/run-review/review.json';
+    const primaryFailure = new Error(`link outcome unknown at ${secretPath}`);
+    const recoveryFailure = new Error(`recovery failed at ${secretPath}`);
+
+    const dependencies = {
+      ...fixture.dependencies,
+      acquireProjectLock: async () => {
+        throw new ReviewApprovalOutcomeError(
+          'review.json',
+          primaryFailure,
+          [recoveryFailure],
+        );
+      },
+    };
+    const exitCode = await runVideoctl([
+      'review', 'demo', '--approve', '--reason', 'looks good',
+    ], dependencies);
+
+    expect(exitCode).toBe(EXIT_CODES.environmentFailed);
+    expect(fixture.stdout()).toBe('');
+    expect(fixture.stderr()).toBe(
+      'Pipeline failure: REVIEW_APPROVAL_OUTCOME_UNKNOWN: '
+      + 'Review approval outcome is unknown; inspect the current report before retrying.\n',
+    );
+    expect(fixture.stderr()).not.toContain(secretPath);
+    expect(fixture.stderr()).not.toContain(primaryFailure.message);
+    expect(fixture.stderr()).not.toContain(recoveryFailure.message);
+    await expectNoCanonicalApproval(fixture);
   });
 
   it('refuses approval unless the current pointer is needs_review', async () => {

@@ -274,6 +274,7 @@ Source-video audio is always muted in the MVP: each Remotion `OffthreadVideo` is
 | `PROJECT_LOCK_*` | Let the active process finish or recover only a demonstrably stale lock; never delete a live lock blindly. |
 | `PIPELINE_CANCELLED` | Inspect `report`, then rerun the same Preset with `--resume`; immutable completed Stages are verified before reuse. |
 | `PIPELINE_REPORT_FAILED`, `PIPELINE_CLEANUP_FAILED` | Preserve current pointers, inspect filesystem permissions/authority, and retry after the underlying environment issue is fixed. |
+| `REVIEW_APPROVAL_OUTCOME_UNKNOWN` | Do not approve again blindly. Read `videoctl report <project> --json`, inspect the current pointer and `review.json`, then retry only after confirming whether approval committed. |
 | Review validation messages | Return to the current `needs_review` Run, restore unchanged draft evidence, and approve with a non-empty reason. Do not fabricate or edit `review.json`. |
 
 ## Verification and Acceptance Smoke
