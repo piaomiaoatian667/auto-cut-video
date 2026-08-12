@@ -121,6 +121,7 @@ describe('videoctl doctor', () => {
       validationFailed: 3,
       environmentFailed: 4,
       cancelled: 130,
+      terminated: 143,
     });
   });
 

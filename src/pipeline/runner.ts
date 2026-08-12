@@ -1,6 +1,9 @@
 import {randomUUID} from 'node:crypto';
 import {StableIdSchema} from '../domain/schema-primitives';
-import type {RunDirectoryScope} from '../fs/app-directory-scopes';
+import type {
+  OutputDirectoryScope,
+  RunDirectoryScope,
+} from '../fs/app-directory-scopes';
 import {
   copyRunArtifact,
   deleteRunArtifact,
@@ -29,6 +32,7 @@ import type {
 import type {ProjectSourceCatalog} from './source-assets';
 import {
   PipelineContextError,
+  type PipelinePartialArtifact,
   type PipelineStage,
   type StageExecutionContext,
   type StageExecutionResult,
@@ -43,6 +47,10 @@ import {
 import type {PreflightResult} from './stages/preflight';
 import {releaseCurrentPointer} from './stages/release';
 import type {ProjectInputs} from '../domain/load-project';
+import {
+  PipelineRuntimeError,
+  normalizePipelineError,
+} from './runtime-errors';
 
 export interface PipelineRunResult {
   projectId: string;
@@ -68,8 +76,19 @@ export interface RunnerDependencies {
   outputStore: OutputStore;
   reportStore: StageReportStore;
   acquireProjectLock: typeof acquireProjectLock;
+  copyRunArtifact?: typeof copyRunArtifact;
+  cleanupFailedStage?: (input: FailedStageCleanupInput) => Promise<void>;
   createRunId(): string;
   now(): string;
+}
+
+export interface FailedStageCleanupInput {
+  projectId: string;
+  runId?: string;
+  stageId: StageId;
+  runDirectory?: RunDirectoryScope;
+  outputDirectory?: OutputDirectoryScope;
+  partialArtifacts: readonly PipelinePartialArtifact[];
 }
 
 interface RunnerSourceRun {
@@ -83,6 +102,29 @@ interface PreflightExecution {
   result: StageExecutionResult;
   startedAt: string;
   finishedAt: string;
+}
+
+interface PreflightExecutionStart {
+  stage: PipelineStage;
+  context: StageExecutionContext;
+  startedAt: string;
+}
+
+type ActiveStageBoundary =
+  | 'execute'
+  | 'materialize'
+  | 'canonical-report'
+  | 'attempt-report'
+  | 'work-pointer'
+  | 'output-pointer';
+
+interface ActiveStageFailure {
+  plan: ExecutionPlan;
+  item?: ExecutionPlanItem;
+  stage: PipelineStage;
+  context: StageExecutionContext;
+  startedAt: string;
+  boundary: ActiveStageBoundary;
 }
 
 type PointerOwner = 'Work' | 'Output';
@@ -157,6 +199,172 @@ const pointersEqual = (
 const STAGE_POSITIONS = new Map(
   STAGE_PRESETS.release.map((stageId, index) => [stageId, index]),
 );
+
+const preservesCommittedEvidence = (error: unknown): boolean =>
+  error instanceof PipelinePointerOutcomeError || isStageReportOutcomeError(error);
+
+const NOOP_FAILED_STAGE_CLEANUP = async (
+  _input: FailedStageCleanupInput,
+): Promise<void> => undefined;
+
+const safeBoundaryMessage = (
+  error: PipelineRuntimeError,
+  active: ActiveStageFailure,
+): string => {
+  if (
+    error.code === 'PIPELINE_STAGE_FAILED'
+    && active.boundary === 'output-pointer'
+  ) {
+    return `${error.code}: Pipeline stage ${active.stage.id} output pointer failed.`;
+  }
+  return error.message;
+};
+
+const normalizeActiveStageFailure = (
+  error: unknown,
+  active: ActiveStageFailure,
+): PipelineRuntimeError => {
+  const normalized = normalizePipelineError(error, active.stage.id);
+  if (
+    error instanceof PipelineRuntimeError
+    || !(error instanceof Error)
+    || error instanceof AggregateError
+  ) {
+    return normalized;
+  }
+  try {
+    Object.setPrototypeOf(error, PipelineRuntimeError.prototype);
+    Object.defineProperty(error, 'code', {
+      configurable: true,
+      enumerable: true,
+      value: normalized.code,
+      writable: true,
+    });
+    Object.defineProperty(error, 'stageId', {
+      configurable: true,
+      enumerable: true,
+      value: active.stage.id,
+      writable: true,
+    });
+    error.name = 'PipelineRuntimeError';
+    error.message = safeBoundaryMessage(normalized, active);
+    return error as PipelineRuntimeError;
+  } catch {
+    return normalized;
+  }
+};
+
+const failureAttempt = (
+  active: ActiveStageFailure,
+  error: PipelineRuntimeError,
+  finishedAt: string,
+): StageReport | undefined => {
+  const {item} = active;
+  const runId = active.context.runId;
+  if (item === undefined || runId === undefined) return undefined;
+  return StageReportSchema.parse({
+    version: 1,
+    projectId: active.plan.projectId,
+    runId,
+    preset: active.plan.preset,
+    stageId: item.stageId,
+    position: item.position,
+    total: item.total,
+    state: error.code === 'PIPELINE_CANCELLED' ? 'cancelled' : 'failed',
+    fingerprint: item.fingerprint,
+    startedAt: active.startedAt,
+    finishedAt,
+    artifacts: [],
+    checks: [],
+    error: {
+      code: error.code,
+      message: error.message,
+    },
+  });
+};
+
+const attachRecoveryErrors = (
+  primary: PipelineRuntimeError,
+  recoveryErrors: readonly unknown[],
+): void => {
+  if (recoveryErrors.length === 0) return;
+  const priorCause = primary.cause;
+  const recoveryCause = new AggregateError(
+    recoveryErrors,
+    'Pipeline failure recovery did not complete',
+    priorCause === undefined ? undefined : {cause: priorCause},
+  );
+  try {
+    Object.defineProperty(primary, 'cause', {
+      configurable: true,
+      enumerable: false,
+      value: recoveryCause,
+      writable: true,
+    });
+  } catch {
+    try {
+      Object.defineProperty(primary, 'recoveryErrors', {
+        configurable: true,
+        enumerable: false,
+        value: Object.freeze([...recoveryErrors]),
+      });
+    } catch {
+      return;
+    }
+  }
+};
+
+const recoverActiveStageFailure = async (
+  error: unknown,
+  active: ActiveStageFailure,
+  dependencies: RunnerDependencies,
+): Promise<PipelineRuntimeError> => {
+  const primary = normalizeActiveStageFailure(error, active);
+  const recoveryErrors: unknown[] = [];
+  const runDirectory = active.context.runDirectory;
+  try {
+    const attempt = failureAttempt(active, primary, dependencies.now());
+    if (attempt !== undefined && runDirectory !== undefined) {
+      await dependencies.reportStore.writeAttempt(runDirectory, attempt);
+    }
+  } catch (attemptError) {
+    recoveryErrors.push(attemptError);
+  }
+
+  let partialArtifacts: readonly PipelinePartialArtifact[] = [];
+  try {
+    partialArtifacts = [...active.stage.partialArtifacts(active.context)];
+  } catch (partialError) {
+    recoveryErrors.push(partialError);
+  }
+
+  let outputDirectory: OutputDirectoryScope | undefined;
+  if (partialArtifacts.some((artifact) => artifact.scope === 'output')) {
+    try {
+      outputDirectory = await dependencies.outputStore.openExistingProject(
+        active.plan.projectId,
+      ) ?? undefined;
+    } catch (outputError) {
+      recoveryErrors.push(outputError);
+    }
+  }
+
+  try {
+    await (dependencies.cleanupFailedStage ?? NOOP_FAILED_STAGE_CLEANUP)({
+      projectId: active.plan.projectId,
+      ...(active.context.runId === undefined ? {} : {runId: active.context.runId}),
+      stageId: active.stage.id,
+      ...(runDirectory === undefined ? {} : {runDirectory}),
+      ...(outputDirectory === undefined ? {} : {outputDirectory}),
+      partialArtifacts,
+    });
+  } catch (cleanupError) {
+    recoveryErrors.push(cleanupError);
+  }
+
+  attachRecoveryErrors(primary, recoveryErrors);
+  return primary;
+};
 
 const pointerProgress = (pointer: CurrentPointer | null): number => pointer === null
   ? -1
@@ -280,13 +488,16 @@ const runPreflight = async (
   plan: ExecutionPlan,
   dependencies: RunnerDependencies,
   sourceRun?: RunnerSourceRun,
+  onStart?: (start: PreflightExecutionStart) => void,
 ): Promise<PreflightExecution> => {
   const stage = stageById(dependencies.registry, 'preflight');
   const startedAt = dependencies.now();
+  const context = executionContext(input, plan, dependencies, {
+    ...(sourceRun === undefined ? {} : {sourceRun}),
+  });
+  onStart?.({stage, context, startedAt});
   const result = await stage.execute(
-    executionContext(input, plan, dependencies, {
-      ...(sourceRun === undefined ? {} : {sourceRun}),
-    }),
+    context,
     input.signal,
   );
   const finishedAt = dependencies.now();
@@ -523,8 +734,9 @@ const materializeCachedStage = async (
   const artifacts: PipelineArtifact[] = [];
   let reportWritten = false;
   try {
+    const copyArtifact = dependencies.copyRunArtifact ?? copyRunArtifact;
     for (const artifact of source.artifacts) {
-      artifacts.push(await copyRunArtifact({
+      artifacts.push(await copyArtifact({
         sourceRun: sourceRun!.runDirectory,
         targetRun: runDirectory,
         artifact,
@@ -744,6 +956,7 @@ export async function runExecutionPlan(
   const work = await dependencies.runStore.createWork(plan.projectId);
   let lease: ProjectLockLease | undefined;
   let releaseOutputCommitted = false;
+  let activeStageFailure: ActiveStageFailure | undefined;
   let outcome:
     | {ok: true; value: PipelineRunResult}
     | {ok: false; error: unknown}
@@ -776,7 +989,18 @@ export async function runExecutionPlan(
       revalidated,
       dependencies,
       sourceRun,
+      ({stage, context: stageContext, startedAt}) => {
+        activeStageFailure = {
+          plan: revalidated,
+          ...(preflightItem === undefined ? {} : {item: preflightItem}),
+          stage,
+          context: stageContext,
+          startedAt,
+          boundary: 'execute',
+        };
+      },
     );
+    activeStageFailure = undefined;
     if (aggregateChecks(preflightExecution.preflight.checks) === 'failed') {
       return preflightFailed(
         revalidated,
@@ -816,6 +1040,21 @@ export async function runExecutionPlan(
     const reports: StageReport[] = [];
 
     if (revalidated.runMode === 'new' && preflightItem !== undefined) {
+      const preflightStage = stageById(dependencies.registry, 'preflight');
+      const preflightContext = executionContext(input, revalidated, dependencies, {
+        ...(sourceRun === undefined ? {} : {sourceRun}),
+        preflight: preflightExecution.preflight,
+        runId: lockRunId,
+        runDirectory,
+      });
+      activeStageFailure = {
+        plan: revalidated,
+        item: preflightItem,
+        stage: preflightStage,
+        context: preflightContext,
+        startedAt: preflightExecution.startedAt,
+        boundary: 'canonical-report',
+      };
       const preflightReport = reportFromExecution(
         revalidated,
         lockRunId,
@@ -825,6 +1064,7 @@ export async function runExecutionPlan(
         preflightExecution.finishedAt,
       );
       await dependencies.reportStore.writeStage(runDirectory, preflightReport);
+      activeStageFailure.boundary = 'work-pointer';
       workCurrent = await publishWorkProgress(
         revalidated,
         lockRunId,
@@ -833,6 +1073,7 @@ export async function runExecutionPlan(
         dependencies,
       );
       reports.push(preflightReport);
+      activeStageFailure = undefined;
     } else if (revalidated.runMode === 'new') {
       const sourcePreflight = persistedPreflight
         ?? requireSourceReport(sourceRun, 'preflight');
@@ -852,6 +1093,20 @@ export async function runExecutionPlan(
       if (item.stageId === 'preflight') continue;
       if (item.action === 'cached') {
         if (revalidated.runMode === 'new') {
+          const cachedStage = stageById(dependencies.registry, item.stageId);
+          activeStageFailure = {
+            plan: revalidated,
+            item,
+            stage: cachedStage,
+            context: executionContext(input, revalidated, dependencies, {
+              ...(sourceRun === undefined ? {} : {sourceRun}),
+              preflight: preflightExecution.preflight,
+              runId: lockRunId,
+              runDirectory,
+            }),
+            startedAt: dependencies.now(),
+            boundary: 'materialize',
+          };
           const cached = await materializeCachedStage(
             revalidated,
             item,
@@ -861,6 +1116,7 @@ export async function runExecutionPlan(
             dependencies,
           );
           reports.push(cached);
+          activeStageFailure = undefined;
         } else {
           const cached = requireSourceReport(sourceRun, item.stageId);
           if (item.stageId === 'release') {
@@ -894,18 +1150,45 @@ export async function runExecutionPlan(
                 lockRunId,
                 cached.finishedAt,
               );
+              activeStageFailure = {
+                plan: revalidated,
+                item,
+                stage: releaseStage,
+                context: executionContext(input, revalidated, dependencies, {
+                  ...(sourceRun === undefined ? {} : {sourceRun}),
+                  preflight: preflightExecution.preflight,
+                  runId: lockRunId,
+                  runDirectory,
+                }),
+                startedAt: dependencies.now(),
+                boundary: 'output-pointer',
+              };
               await publishOutputProgress(
                 revalidated.projectId,
                 recoveredOutput,
                 dependencies,
               );
               outputPointerSnapshot = recoveredOutput;
+              activeStageFailure = undefined;
             }
             releaseOutputCommitted = true;
             reports.push(cached);
             const warnings: PipelineRunResult['warnings'] = [];
             if (needsRecoveredWorkProgress(workCurrent, lockRunId, cached)) {
               try {
+                activeStageFailure = {
+                  plan: revalidated,
+                  item,
+                  stage: releaseStage,
+                  context: executionContext(input, revalidated, dependencies, {
+                    ...(sourceRun === undefined ? {} : {sourceRun}),
+                    preflight: preflightExecution.preflight,
+                    runId: lockRunId,
+                    runDirectory,
+                  }),
+                  startedAt: dependencies.now(),
+                  boundary: 'work-pointer',
+                };
                 workCurrent = await publishWorkProgress(
                   revalidated,
                   lockRunId,
@@ -918,6 +1201,8 @@ export async function runExecutionPlan(
                   code: 'WORK_POINTER_LAGGING',
                   message: 'Output Release is published, but Work progress metadata is lagging.',
                 });
+              } finally {
+                activeStageFailure = undefined;
               }
             }
             return result(revalidated, {
@@ -930,6 +1215,20 @@ export async function runExecutionPlan(
             });
           }
           if (needsRecoveredWorkProgress(workCurrent, lockRunId, cached)) {
+            const cachedStage = stageById(dependencies.registry, item.stageId);
+            activeStageFailure = {
+              plan: revalidated,
+              item,
+              stage: cachedStage,
+              context: executionContext(input, revalidated, dependencies, {
+                ...(sourceRun === undefined ? {} : {sourceRun}),
+                preflight: preflightExecution.preflight,
+                runId: lockRunId,
+                runDirectory,
+              }),
+              startedAt: dependencies.now(),
+              boundary: 'work-pointer',
+            };
             workCurrent = await publishWorkProgress(
               revalidated,
               lockRunId,
@@ -937,6 +1236,7 @@ export async function runExecutionPlan(
               'passed',
               dependencies,
             );
+            activeStageFailure = undefined;
           }
           reports.push(cached);
         }
@@ -945,13 +1245,22 @@ export async function runExecutionPlan(
 
       const stage = stageById(dependencies.registry, item.stageId);
       const startedAt = dependencies.now();
+      const stageContext = executionContext(input, revalidated, dependencies, {
+        ...(sourceRun === undefined ? {} : {sourceRun}),
+        preflight: preflightExecution.preflight,
+        runId: lockRunId,
+        runDirectory,
+      });
+      activeStageFailure = {
+        plan: revalidated,
+        item,
+        stage,
+        context: stageContext,
+        startedAt,
+        boundary: 'execute',
+      };
       const stageResult = await stage.execute(
-        executionContext(input, revalidated, dependencies, {
-          ...(sourceRun === undefined ? {} : {sourceRun}),
-          preflight: preflightExecution.preflight,
-          runId: lockRunId,
-          runDirectory,
-        }),
+        stageContext,
         input.signal,
       );
       const finishedAt = dependencies.now();
@@ -965,7 +1274,9 @@ export async function runExecutionPlan(
       );
 
       if (stageResult.state === 'needs_review') {
+        activeStageFailure.boundary = 'attempt-report';
         await dependencies.reportStore.writeAttempt(runDirectory, report);
+        activeStageFailure.boundary = 'work-pointer';
         workCurrent = await publishWorkProgress(
           revalidated,
           lockRunId,
@@ -974,6 +1285,7 @@ export async function runExecutionPlan(
           dependencies,
         );
         reports.push(report);
+        activeStageFailure = undefined;
         return result(revalidated, {
           runId: lockRunId,
           state: 'needs_review',
@@ -991,8 +1303,10 @@ export async function runExecutionPlan(
               `${item.stageId} returned an unexpected Output pointer`,
             );
           }
+          activeStageFailure.boundary = 'canonical-report';
           await dependencies.reportStore.writeStage(runDirectory, report);
           reportWritten = true;
+          activeStageFailure.boundary = 'work-pointer';
           workCurrent = await publishWorkProgress(
             revalidated,
             lockRunId,
@@ -1020,12 +1334,15 @@ export async function runExecutionPlan(
         if (sourceRun?.runId === lockRunId) {
           sourceRun.reports.set(report.stageId, report);
         }
+        activeStageFailure = undefined;
         continue;
       }
 
       const outputCurrent = validateReleaseResult(lockRunId, stageResult);
+      activeStageFailure.boundary = 'canonical-report';
       await dependencies.reportStore.writeStage(runDirectory, report);
       try {
+        activeStageFailure.boundary = 'output-pointer';
         await publishOutputProgress(revalidated.projectId, outputCurrent, dependencies);
         releaseOutputCommitted = true;
       } catch (error) {
@@ -1048,6 +1365,7 @@ export async function runExecutionPlan(
       reports.push(report);
       const warnings: PipelineRunResult['warnings'] = [];
       try {
+        activeStageFailure.boundary = 'work-pointer';
         workCurrent = await publishWorkProgress(
           revalidated,
           lockRunId,
@@ -1061,6 +1379,7 @@ export async function runExecutionPlan(
           message: 'Output Release is published, but Work progress metadata is lagging.',
         });
       }
+      activeStageFailure = undefined;
       return result(revalidated, {
         runId: lockRunId,
         state: 'passed',
@@ -1071,6 +1390,7 @@ export async function runExecutionPlan(
       });
     }
 
+    activeStageFailure = undefined;
     return result(revalidated, {
       runId: lockRunId,
       state: 'passed',
@@ -1081,28 +1401,50 @@ export async function runExecutionPlan(
       preflight: preflightExecution.preflight,
     });
   };
-  try {
-    lease = await dependencies.acquireProjectLock(work, lockRunId);
-    outcome = {ok: true, value: await executeLocked()};
-  } catch (error) {
-    outcome = {ok: false, error};
-  }
-
   let releaseError: unknown;
   try {
-    await lease?.release();
-  } catch (error) {
-    releaseError = error;
+    try {
+      lease = await dependencies.acquireProjectLock(work, lockRunId);
+      outcome = {ok: true, value: await executeLocked()};
+    } catch (error) {
+      outcome = {
+        ok: false,
+        error: activeStageFailure === undefined || preservesCommittedEvidence(error)
+          ? error
+          : await recoverActiveStageFailure(
+            error,
+            activeStageFailure,
+            dependencies,
+          ),
+      };
+    }
+  } finally {
+    try {
+      await lease?.release();
+    } catch (error) {
+      releaseError = error;
+    }
   }
   if (outcome === undefined) {
     throw new TypeError('Pipeline Runner completed without an outcome');
   }
   if (!outcome.ok) {
     if (releaseError !== undefined) {
+      const aggregatePrimary = outcome.error instanceof PipelineRuntimeError
+        && outcome.error.code === 'PIPELINE_STAGE_FAILED'
+        && outcome.error.stageId !== undefined
+        ? Object.assign(
+          new Error(`${outcome.error.stageId} failed`, {cause: outcome.error}),
+          {
+            code: outcome.error.code,
+            stageId: outcome.error.stageId,
+          },
+        )
+        : outcome.error;
       throw new AggregateError(
-        [outcome.error, releaseError],
+        [aggregatePrimary, releaseError],
         'Pipeline execution and project lock release both failed',
-        {cause: outcome.error},
+        {cause: aggregatePrimary},
       );
     }
     throw outcome.error;

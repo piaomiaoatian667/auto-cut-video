@@ -4,4 +4,5 @@ export const EXIT_CODES = {
   validationFailed: 3,
   environmentFailed: 4,
   cancelled: 130,
+  terminated: 143,
 } as const;
