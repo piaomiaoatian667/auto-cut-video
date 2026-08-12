@@ -1009,6 +1009,7 @@ describe('pipeline CLI commands', () => {
       };
       let stdout = '';
       let stderr = '';
+      let runnerError: unknown;
       const dependencies = {
         workspaceRoot: fixture.tempProject.workspaceRoot,
         stdout: {write: (chunk: string) => { stdout += chunk; }},
@@ -1038,11 +1039,7 @@ describe('pipeline CLI commands', () => {
               now: () => '2026-08-12T00:00:00.000Z',
             });
           } catch (error) {
-            expect(error).toBeInstanceOf(AggregateError);
-            expect((error as AggregateError).errors).toMatchObject([
-              {code: 'PLAN_STALE', retrySafe: true},
-              {message: expect.stringContaining('secret lock release failure')},
-            ]);
+            runnerError = error;
             throw error;
           }
         }),
@@ -1059,6 +1056,11 @@ describe('pipeline CLI commands', () => {
         json: true,
       }, dependencies);
 
+      expect(runnerError).toBeInstanceOf(AggregateError);
+      expect((runnerError as AggregateError).errors).toMatchObject([
+        {code: 'PLAN_STALE', retrySafe: true},
+        {message: expect.stringContaining('secret lock release failure')},
+      ]);
       expect(exitCode).toBe(EXIT_CODES.environmentFailed);
       expect(lockAcquisitions).toBe(1);
       expect(dependencies.buildExecutionPlan).toHaveBeenCalledOnce();
