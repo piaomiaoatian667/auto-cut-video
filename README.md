@@ -168,12 +168,13 @@ All convenience commands map through the same Execution Plan builder and Runner:
 - `--force <stage>` must name a Stage inside the selected range. It invalidates that Stage and every selected downstream Stage while preserving matching reusable predecessors.
 - `--json` writes deterministic machine-readable output to stdout. Text-mode failures are sanitized before stderr output.
 
-`--resume --force` has two branches:
+`--resume --force` follows these rules:
 
-1. If the forced Stage is the first incomplete Stage in a compatible current Run, execution resumes that same Run and continues without overwriting any immutable artifact.
-2. If the forced Stage is already complete, execution creates a new Run, materializes and hash-verifies matching predecessors up to the force boundary, then runs the forced Stage and all selected downstream Stages. For example, `--resume --force compile` stays in the current Run only when `compile` has not materialized; otherwise it creates a new Run and reuses verified `preflight`/`ingest`/`narration` evidence.
+1. If the forced Stage has not completed and the selected range, current pointer, fingerprints, artifacts, and Review evidence remain compatible, execution reuses the current Run. It resumes at the earliest incomplete selected Stage, which may be before the forced Stage; the forced Stage does not need to be the first incomplete Stage.
+2. If the forced Stage is already complete and the selected range can establish a complete executable prerequisite chain, execution creates a new Run. Preflight always runs again; eligible matching Stages after Preflight and before the force boundary are materialized and hash-verified from the source Run, then the forced Stage and selected downstream Stages run.
+3. If a selected slice omits prerequisites and therefore cannot establish a legal new-Run chain for the forced rerun, planning fails with `PLAN_RANGE_STALE` instead of always creating a new Run. Widen `--from` to the reported stale Stage or remove the range bound.
 
-A range that omits prerequisites is bound to the current Run. If an omitted prerequisite is missing or stale, widen `--from` to the first invalid Stage or remove the range bound.
+A range that omits prerequisites is bound to the current Run. Missing prerequisites fail with `PLAN_PREREQUISITE_MISSING`; changed, invalid, or already-completed forced Stages that cannot be legally rerun inside that slice fail with `PLAN_RANGE_STALE`.
 
 ### Exit Codes
 
@@ -210,7 +211,7 @@ pnpm video clean demo
 
 `report` is read-only. It resolves `.work/<project>/current.json`, opens only that Run, and returns canonical Stage reports in stable registry order followed by attempt reports. Each report preserves the `position/total` values of the selected plan that produced it.
 
-`clean` acquires the project lock, inventories through scoped stores, and removes only non-current `.work/<project>/runs/<runId>` and unpublished `output/<project>/releases/<runId>` directories. The Work current Run and Output current Release are re-read and protected during deletion. Cleanup is idempotent and never deletes authoring inputs or source assets.
+`clean` removes every non-current `.work/<project>/runs/<runId>` and every non-current `output/<project>/releases/<runId>`, including an older previously published Release that is no longer selected by the Output current pointer. It reads both current pointers while building the scoped inventory, acquires the project lock, and re-opens the scoped directories and re-reads the relevant pointer before each candidate removal so a Run or Release that became current is protected. Cleanup is idempotent and never deletes authoring inputs or source assets.
 
 There are two atomic current pointers:
 
@@ -243,6 +244,7 @@ Source-video audio is always muted in the MVP: each Remotion `OffthreadVideo` is
 | `ENV_FONT_MISSING`, `ENV_FONT_INVALID`, `ENV_VOICE_MISSING` | Restore the configured local font or voice/file-TTS inputs; do not fetch them during render. |
 | `ENV_WORK_DIRECTORY_UNAVAILABLE`, `DISK_SPACE_EXHAUSTED` | Restore safe Work-directory authority, free at least the reported required bytes, run `clean` if appropriate, then resume. |
 | `PLAN_STAGE_INVALID`, `PLAN_RANGE_INVALID`, `PLAN_PREREQUISITE_MISSING` | Use stable Stage IDs, keep ranges inside the Preset and in order, or widen `--from` to include the first missing prerequisite. |
+| `PLAN_RANGE_STALE` | The current-bound slice cannot safely reuse or force-rerun its selected chain. Widen `--from` to the reported Stage or remove the range bound so a legal full plan can be built. |
 | `PLAN_STALE` | Rerun the command so the CLI can rebuild from the current pointer; if authoring changed, start from the first invalid Stage. |
 | `PROJECT_LOCK_*` | Let the active process finish or recover only a demonstrably stale lock; never delete a live lock blindly. |
 | `PIPELINE_CANCELLED` | Inspect `report`, then rerun the same Preset with `--resume`; immutable completed Stages are verified before reuse. |
