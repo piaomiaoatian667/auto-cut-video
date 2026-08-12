@@ -166,19 +166,19 @@ export class MockTtsProvider implements TtsProvider {
   }
 
   async synthesize(input: TtsInput, signal: AbortSignal): Promise<TtsResult> {
-    const invocation = {
+    const invocation: Readonly<MockTtsInvocation> = Object.freeze({
       segmentId: input.segmentId,
       text: input.text,
       voice: input.voice,
       rate: input.rate,
-    };
-    this.#onInvocation?.(invocation);
+    });
     const digest = createHash('sha256')
       .update(JSON.stringify(invocation))
       .digest();
     const primaryFrequency = 220 + (digest.readUInt16BE(0) % 661);
     const secondaryFrequency = 880 + (digest.readUInt16BE(2) % 881);
     const phase = ((digest.readUInt16BE(4) % 6284) / 1000).toFixed(3);
+    this.#onInvocation?.(Object.freeze({...invocation}));
     await normalizeToOutput({
       runDirectory: this.#runDirectory,
       outputPath: input.outputPath,

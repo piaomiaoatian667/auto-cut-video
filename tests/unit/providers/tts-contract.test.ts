@@ -1,7 +1,7 @@
 import {createHash} from 'node:crypto';
 import {mkdir, readFile} from 'node:fs/promises';
 import path from 'node:path';
-import {afterEach, describe, expect, it} from 'vitest';
+import {afterEach, describe, expect, it, vi} from 'vitest';
 import {loadProject} from '../../../src/domain/load-project';
 import {createRunStore, openExistingRunFile} from '../../../src/fs/app-directory-scopes';
 import {
@@ -155,6 +155,64 @@ describe('MockTtsProvider input waveform', () => {
       input,
       {...input, text: '第二句'},
     ]);
+  });
+
+  it('isolates waveform generation from malicious observer mutation', async () => {
+    const scopes = await makeScopes();
+    const baseline = new MockTtsProvider({runDirectory: scopes.runDirectory});
+    let observedFrozen = false;
+    const observedTexts: string[] = [];
+    const observed = new MockTtsProvider({
+      runDirectory: scopes.runDirectory,
+      onInvocation: (input) => {
+        observedFrozen = Object.isFrozen(input);
+        try {
+          (input as any).text = 'observer rewrite';
+        } catch {}
+        observedTexts.push(input.text);
+      },
+    });
+    const input = {
+      segmentId: 'intro',
+      text: '第一句',
+      voice: 'fixture',
+      rate: 180,
+    };
+
+    expect(await observed.fingerprint()).toBe(await baseline.fingerprint());
+    await baseline.synthesize({
+      ...input,
+      outputPath: 'audio/segments/baseline.wav',
+    }, new AbortController().signal);
+    await observed.synthesize({
+      ...input,
+      outputPath: 'audio/segments/observed.wav',
+    }, new AbortController().signal);
+
+    expect(hashBytes(await outputBytes(scopes.runDirectory, 'audio/segments/observed.wav')))
+      .toBe(hashBytes(await outputBytes(scopes.runDirectory, 'audio/segments/baseline.wav')));
+    expect(observedFrozen).toBe(true);
+    expect(observedTexts).toEqual(['第一句']);
+  });
+
+  it('propagates observer failures before spawning FFmpeg', async () => {
+    const scopes = await makeScopes();
+    const failure = new Error('observer failed');
+    const runner = vi.fn(async () => undefined);
+    const provider = new MockTtsProvider({
+      runDirectory: scopes.runDirectory,
+      runProcess: runner,
+      onInvocation: () => { throw failure; },
+    });
+
+    await expect(provider.synthesize({
+      segmentId: 'intro',
+      text: '第一句',
+      voice: 'fixture',
+      rate: 180,
+      outputPath: 'audio/segments/observer-failure.wav',
+    }, new AbortController().signal)).rejects.toBe(failure);
+    expect(runner).not.toHaveBeenCalled();
   });
 });
 
