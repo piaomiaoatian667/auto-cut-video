@@ -1100,7 +1100,7 @@ describe('StageReportStore', () => {
         .rejects.toBe(syncError);
 
       expect(probe.events).toEqual([
-        'unlink:ingest.json',
+        expect.stringMatching(/^unlink:\d+$/u),
         'sync:reports',
         'close:reports',
       ]);

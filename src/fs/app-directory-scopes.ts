@@ -1,3 +1,4 @@
+import {randomUUID} from 'node:crypto';
 import {
   constants,
   lstatSync,
@@ -1438,6 +1439,216 @@ const syncRemovedEntryParent = async (
   await syncHeldDirectoryAnchor(anchor.parent, relativePath);
 };
 
+const anchoredEntryMatchesIdentity = (
+  kind: AppDirectoryEntryKind,
+  stats: BigIntStats | undefined,
+  expected: ScopedDirectoryEntryIdentity,
+): boolean => stats !== undefined
+  && kind === expected.kind
+  && stats.dev === expected.dev
+  && stats.ino === expected.ino;
+
+const unusedQuarantineBasename = async (
+  anchor: ScopedPathAnchor,
+  relativePath: string,
+): Promise<string> => {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const basename = `.cleanup-${randomUUID()}`;
+    const entry = await inspectAnchoredEntry(
+      {parent: anchor.parent, basename},
+      relativePath,
+    );
+    if (entry.kind === 'missing') return basename;
+  }
+  throw authorityError(`could not reserve a cleanup quarantine name: ${relativePath}`);
+};
+
+const restoreQuarantinedEntry = async (
+  state: ScopeState,
+  anchor: ScopedPathAnchor,
+  quarantineBasename: string,
+  relativePath: string,
+  expected: ScopedDirectoryEntryIdentity,
+): Promise<void> => {
+  await assertScopedPathAnchorStable(state, anchor, relativePath);
+  const original = await inspectAnchoredEntry(anchor, relativePath);
+  if (original.kind !== 'missing') {
+    throw authorityError(`cleanup target was occupied before quarantine restore: ${relativePath}`);
+  }
+  const quarantineAnchor = {parent: anchor.parent, basename: quarantineBasename};
+  const quarantined = await inspectAnchoredEntry(quarantineAnchor, relativePath);
+  if (quarantined.kind === 'missing') {
+    await syncRemovedEntryParent(state, anchor, relativePath);
+    return;
+  }
+  if (!anchoredEntryMatchesIdentity(quarantined.kind, quarantined.stats, expected)) {
+    throw authorityError(`cleanup quarantine changed before restore: ${relativePath}`);
+  }
+  await rename(
+    path.join(anchor.parent.volumePath, quarantineBasename),
+    path.join(anchor.parent.volumePath, anchor.basename),
+  );
+  await assertScopedPathAnchorStable(state, anchor, relativePath);
+  const restored = await inspectAnchoredEntry(anchor, relativePath);
+  if (!anchoredEntryMatchesIdentity(restored.kind, restored.stats, expected)) {
+    throw authorityError(`cleanup quarantine restore changed identity: ${relativePath}`);
+  }
+  const remaining = await inspectAnchoredEntry(quarantineAnchor, relativePath);
+  if (remaining.kind !== 'missing') {
+    throw authorityError(`cleanup quarantine remained after restore: ${relativePath}`);
+  }
+  await syncRemovedEntryParent(state, anchor, relativePath);
+};
+
+const restoreQuarantineAfterFailure = async (
+  state: ScopeState,
+  anchor: ScopedPathAnchor,
+  quarantineBasename: string,
+  relativePath: string,
+  expected: ScopedDirectoryEntryIdentity,
+  primaryError: unknown,
+): Promise<never> => {
+  try {
+    await restoreQuarantinedEntry(
+      state,
+      anchor,
+      quarantineBasename,
+      relativePath,
+      expected,
+    );
+  } catch (restoreError) {
+    throw new AggregateError(
+      [primaryError, restoreError],
+      `cleanup quarantine and restore both failed for ${relativePath}`,
+      {cause: primaryError},
+    );
+  }
+  throw primaryError;
+};
+
+const removeAnchoredEntryThroughQuarantine = async (
+  state: ScopeState,
+  anchor: ScopedPathAnchor,
+  relativePath: string,
+  expected: AnchoredTreeEntryIdentity,
+): Promise<void> => {
+  if (await revalidateAnchoredTreeEntry(
+    state,
+    anchor,
+    relativePath,
+    expected,
+  ) === null) return;
+
+  const quarantineBasename = await unusedQuarantineBasename(anchor, relativePath);
+  const quarantineAnchor = {parent: anchor.parent, basename: quarantineBasename};
+  const sourcePath = path.join(anchor.parent.volumePath, anchor.basename);
+  const quarantinePath = path.join(anchor.parent.volumePath, quarantineBasename);
+  const expectedEntry: ScopedDirectoryEntryIdentity = expected;
+  try {
+    await rename(sourcePath, quarantinePath);
+  } catch (error) {
+    const quarantined = await inspectAnchoredEntry(quarantineAnchor, relativePath);
+    if (anchoredEntryMatchesIdentity(
+      quarantined.kind,
+      quarantined.stats,
+      expectedEntry,
+    )) {
+      return await restoreQuarantineAfterFailure(
+        state,
+        anchor,
+        quarantineBasename,
+        relativePath,
+        expectedEntry,
+        error,
+      );
+    }
+    if (isNodeError(error) && error.code === 'ENOENT') {
+      await assertScopedPathAnchorStable(state, anchor, relativePath);
+      if ((await inspectAnchoredEntry(anchor, relativePath)).kind === 'missing') {
+        await syncRemovedEntryParent(state, anchor, relativePath);
+        return;
+      }
+    }
+    throw error;
+  }
+
+  await assertScopedPathAnchorStable(state, anchor, relativePath);
+  const quarantined = await inspectAnchoredEntry(quarantineAnchor, relativePath);
+  if (quarantined.kind === 'missing' || quarantined.stats === undefined) {
+    throw authorityError(`cleanup quarantine disappeared after rename: ${relativePath}`);
+  }
+  const quarantinedIdentity: ScopedDirectoryEntryIdentity = {
+    kind: quarantined.kind,
+    dev: quarantined.stats.dev,
+    ino: quarantined.stats.ino,
+  };
+  if (
+    quarantined.kind === 'symlink'
+    || quarantined.kind === 'other'
+    || !anchoredEntryMatchesIdentity(
+      quarantined.kind,
+      quarantined.stats,
+      expectedEntry,
+    )
+  ) {
+    return await restoreQuarantineAfterFailure(
+      state,
+      anchor,
+      quarantineBasename,
+      relativePath,
+      quarantinedIdentity,
+      authorityError(`cleanup target changed while entering quarantine: ${relativePath}`),
+    );
+  }
+  const hardlinkedFile = expected.kind === 'file' && quarantined.stats.nlink !== 1n;
+
+  try {
+    if (hardlinkedFile) await unlink(quarantinePath);
+    else if (expected.kind === 'file') {
+      await unlink(volumePath(expected.dev, expected.ino));
+    }
+    else await rmdir(volumePath(expected.dev, expected.ino));
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== 'ENOENT') {
+      return await restoreQuarantineAfterFailure(
+        state,
+        anchor,
+        quarantineBasename,
+        relativePath,
+        expectedEntry,
+        error,
+      );
+    }
+  }
+
+  await assertScopedPathAnchorStable(state, anchor, relativePath);
+  const remaining = await inspectAnchoredEntry(quarantineAnchor, relativePath);
+  if (remaining.kind !== 'missing') {
+    if (remaining.stats === undefined) {
+      throw authorityError(`cleanup quarantine became unreadable: ${relativePath}`);
+    }
+    const remainingIdentity: ScopedDirectoryEntryIdentity = {
+      kind: remaining.kind,
+      dev: remaining.stats.dev,
+      ino: remaining.stats.ino,
+    };
+    return await restoreQuarantineAfterFailure(
+      state,
+      anchor,
+      quarantineBasename,
+      relativePath,
+      remainingIdentity,
+      authorityError(`cleanup quarantine changed during removal: ${relativePath}`),
+    );
+  }
+  const replacement = await inspectAnchoredEntry(anchor, relativePath);
+  if (replacement.kind !== 'missing') {
+    await syncRemovedEntryParent(state, anchor, relativePath);
+    throw authorityError(`cleanup target was replaced during removal: ${relativePath}`);
+  }
+  await syncRemovedEntryParent(state, anchor, relativePath);
+};
+
 const removeAnchoredTreeEntry = async (
   state: ScopeState,
   anchor: ScopedPathAnchor,
@@ -1468,18 +1679,12 @@ const removeAnchoredTreeEntry = async (
   }
   const expected = anchoredTreeEntryIdentity(initial.kind, initial.stats);
   if (initial.kind === 'file') {
-    if (await revalidateAnchoredTreeEntry(
+    await removeAnchoredEntryThroughQuarantine(
       state,
       anchor,
       relativePath,
       expected,
-    ) === null) return;
-    try {
-      await unlink(path.join(anchor.parent.volumePath, anchor.basename));
-    } catch (error) {
-      if (!isNodeError(error) || error.code !== 'ENOENT') throw error;
-    }
-    await syncRemovedEntryParent(state, anchor, relativePath);
+    );
     return;
   }
 
@@ -1509,18 +1714,12 @@ const removeAnchoredTreeEntry = async (
     if ((await readdir(directory.volumePath)).length !== 0) {
       throw authorityError(`app-owned directory changed while removing: ${relativePath}`);
     }
-    if (await revalidateAnchoredTreeEntry(
+    await removeAnchoredEntryThroughQuarantine(
       state,
       anchor,
       relativePath,
       expected,
-    ) === null) return;
-    try {
-      await rmdir(path.join(anchor.parent.volumePath, anchor.basename));
-    } catch (error) {
-      if (!isNodeError(error) || error.code !== 'ENOENT') throw error;
-    }
-    await syncRemovedEntryParent(state, anchor, relativePath);
+    );
   } finally {
     await closeDirectoryAnchor(directory);
   }
@@ -1873,7 +2072,8 @@ const unlinkScopedFile = async (
     throw error;
   }
   try {
-    const {kind} = await inspectAnchoredEntry(anchor, relativePath);
+    const initial = await inspectAnchoredEntry(anchor, relativePath);
+    const {kind} = initial;
     if (kind === 'missing') {
       await assertScopedPathAnchorStable(state, anchor, relativePath);
       await syncHeldDirectoryAnchor(anchor.parent, relativePath);
@@ -1882,15 +2082,15 @@ const unlinkScopedFile = async (
     if (kind !== 'file') {
       throw securityError(`refusing to unlink non-file app entry: ${relativePath}`);
     }
-    await assertScopedPathAnchorStable(state, anchor, relativePath);
-    try {
-      await unlink(path.join(anchor.parent.volumePath, anchor.basename));
-    } catch (error) {
-      if (!isNodeError(error) || error.code !== 'ENOENT') throw error;
+    if (initial.stats === undefined) {
+      throw authorityError(`app-owned unlink target identity is unavailable: ${relativePath}`);
     }
-    await assertScopeStable(state, relativePath);
-    await assertDirectoryIdentityStable(anchor.parent.identity, relativePath);
-    await syncHeldDirectoryAnchor(anchor.parent, relativePath);
+    await removeAnchoredEntryThroughQuarantine(
+      state,
+      anchor,
+      relativePath,
+      anchoredTreeEntryIdentity('file', initial.stats),
+    );
   } finally {
     await closeDirectoryAnchor(anchor.parent);
   }

@@ -144,6 +144,73 @@ describe('pipeline cleanup integration', () => {
     ))).rejects.toMatchObject({code: 'ENOENT'});
   });
 
+  it('does not reuse a consumed Run candidate against a recreated directory', async () => {
+    const workspaceRoot = await makeWorkspace();
+    const runStore = createRunStore(workspaceRoot);
+    await runStore.createRun('demo', 'run-current');
+    await runStore.createRun('demo', 'run-old');
+    await runStore.publishCurrent('demo', workPointer('run-current'));
+    const plan = await buildCleanupPlan({workspaceRoot, projectId: 'demo'});
+
+    await expect(executeCleanupPlan(plan)).resolves.toEqual({
+      removedRuns: ['run-old'],
+      removedReleases: [],
+    });
+
+    await runStore.createRun('demo', 'run-old');
+    const replacementSentinel = path.join(
+      workspaceRoot,
+      '.work',
+      'demo',
+      'runs',
+      'run-old',
+      'replacement.txt',
+    );
+    await writeFile(replacementSentinel, 'replacement run');
+
+    await expect(executeCleanupPlan(plan)).resolves.toEqual({
+      removedRuns: [],
+      removedReleases: [],
+    });
+    await expect(readFile(replacementSentinel, 'utf8')).resolves.toBe('replacement run');
+  });
+
+  it('does not reuse a consumed Release candidate against a recreated directory', async () => {
+    const workspaceRoot = await makeWorkspace();
+    const runStore = createRunStore(workspaceRoot);
+    await runStore.createRun('demo', 'run-current');
+    await runStore.publishCurrent('demo', workPointer('run-current'));
+    const outputStore = createOutputStore(workspaceRoot);
+    await outputStore.createRelease('demo', 'release-current');
+    await outputStore.createRelease('demo', 'release-old');
+    await outputStore.publishCurrent('demo', outputPointer('release-current'));
+    const plan = await buildCleanupPlan({workspaceRoot, projectId: 'demo'});
+
+    await expect(executeCleanupPlan(plan)).resolves.toEqual({
+      removedRuns: [],
+      removedReleases: ['release-old'],
+    });
+
+    await outputStore.createRelease('demo', 'release-old');
+    const replacementSentinel = path.join(
+      workspaceRoot,
+      'output',
+      'demo',
+      'releases',
+      'release-old',
+      'replacement.txt',
+    );
+    await writeFile(replacementSentinel, 'replacement release');
+
+    await expect(executeCleanupPlan(plan)).resolves.toEqual({
+      removedRuns: [],
+      removedReleases: [],
+    });
+    await expect(readFile(replacementSentinel, 'utf8')).resolves.toBe(
+      'replacement release',
+    );
+  });
+
   it('re-reads both pointers and skips candidates that became current', async () => {
     const workspaceRoot = await makeWorkspace();
     const runStore = createRunStore(workspaceRoot);

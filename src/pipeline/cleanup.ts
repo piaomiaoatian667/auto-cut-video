@@ -54,7 +54,29 @@ interface CleanupPlanAuthority {
   releaseEntries: Map<string, ScopedDirectoryEntry>;
 }
 
+interface CleanupPlanExecutionState {
+  consumedRunIds: Set<string>;
+  consumedReleaseIds: Set<string>;
+}
+
 const cleanupPlanAuthorities = new WeakMap<CleanupPlan, CleanupPlanAuthority>();
+const cleanupPlanExecutionStates = new WeakMap<
+  CleanupPlan,
+  CleanupPlanExecutionState
+>();
+
+const cleanupPlanExecutionState = (
+  plan: CleanupPlan,
+): CleanupPlanExecutionState => {
+  const existing = cleanupPlanExecutionStates.get(plan);
+  if (existing !== undefined) return existing;
+  const created: CleanupPlanExecutionState = {
+    consumedRunIds: new Set(),
+    consumedReleaseIds: new Set(),
+  };
+  cleanupPlanExecutionStates.set(plan, created);
+  return created;
+};
 
 const isNodeError = (error: unknown): error is NodeJS.ErrnoException =>
   error instanceof Error && 'code' in error;
@@ -153,6 +175,7 @@ const executeCleanupPlanLocked = async (
   plan: CleanupPlan,
   resolved: CleanupDependencies,
   authority: CleanupPlanAuthority | undefined,
+  executionState: CleanupPlanExecutionState,
 ): Promise<CleanupResult> => {
   const projectId = StableIdSchema.parse(plan.projectId);
   const removedRuns: string[] = [];
@@ -161,13 +184,14 @@ const executeCleanupPlanLocked = async (
   for (const rawRunId of plan.runDirectories) {
     const runId = StableIdSchema.parse(rawRunId);
     if (runId === plan.protectedRunId) continue;
+    if (executionState.consumedRunIds.has(runId)) continue;
     const work = await resolved.runStore.openExistingWork(projectId);
     const currentEntry = candidateEntry(
       await listIfPresent(work, 'runs', listWorkDirectory),
       runId,
     );
     if (currentEntry === undefined) {
-      authority?.runEntries.delete(runId);
+      executionState.consumedRunIds.add(runId);
       continue;
     }
     const current = await resolved.runStore.readCurrentReadonly(projectId);
@@ -182,20 +206,21 @@ const executeCleanupPlanLocked = async (
       );
     }
     await resolved.removeWorkTree(work, `runs/${runId}`);
-    authority?.runEntries.delete(runId);
+    executionState.consumedRunIds.add(runId);
     removedRuns.push(runId);
   }
 
   for (const rawReleaseId of plan.releaseDirectories) {
     const releaseId = StableIdSchema.parse(rawReleaseId);
     if (releaseId === plan.protectedReleaseId) continue;
+    if (executionState.consumedReleaseIds.has(releaseId)) continue;
     const output = await resolved.outputStore.openExistingProject(projectId);
     const currentEntry = candidateEntry(
       await listIfPresent(output, 'releases', listOutputDirectory),
       releaseId,
     );
     if (currentEntry === undefined) {
-      authority?.releaseEntries.delete(releaseId);
+      executionState.consumedReleaseIds.add(releaseId);
       continue;
     }
     const current = await resolved.outputStore.readCurrentReadonly(projectId);
@@ -210,7 +235,7 @@ const executeCleanupPlanLocked = async (
       );
     }
     await resolved.removeOutputTree(output, `releases/${releaseId}`);
-    authority?.releaseEntries.delete(releaseId);
+    executionState.consumedReleaseIds.add(releaseId);
     removedReleases.push(releaseId);
   }
 
@@ -235,6 +260,7 @@ export async function executeCleanupPlan(
         plan,
         resolved,
         cleanupPlanAuthorities.get(plan),
+        cleanupPlanExecutionState(plan),
       ),
     };
   } catch (error) {
