@@ -1,4 +1,7 @@
-import {describe, expect, it, vi} from 'vitest';
+import {mkdtemp, realpath, rm, writeFile} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import path from 'node:path';
+import {describe, expect, it, onTestFinished, vi} from 'vitest';
 import type {ProjectInputs} from '../../../src/domain/load-project';
 import type {ProjectDirectoryScope} from '../../../src/fs/project-paths';
 import type {ExecutionPlan} from '../../../src/pipeline/execution-plan';
@@ -6,7 +9,11 @@ import type {PipelineRunResult} from '../../../src/pipeline/runner';
 import type {ProjectSourceCatalog} from '../../../src/pipeline/source-assets';
 import type {PreflightResult} from '../../../src/pipeline/stages/preflight';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
-import {runVideoctl, type VideoctlDependencies} from '../../../src/cli/videoctl';
+import {
+  createSystemVideoctlDependencies,
+  runVideoctl,
+  type VideoctlDependencies,
+} from '../../../src/cli/videoctl';
 import {
   createEditFixture,
   createProjectFixture,
@@ -152,6 +159,45 @@ const fixture = (result: PreflightResult = successfulResult()) => {
 };
 
 describe('videoctl doctor', () => {
+  it.skipIf(process.platform !== 'darwin')(
+    'system dependencies pass FFMPEG_PATH and FFPROBE_PATH into real Preflight execution',
+    async () => {
+      const toolDirectory = await mkdtemp(path.join(tmpdir(), 'videoctl-tools-'));
+      onTestFinished(async () => rm(toolDirectory, {recursive: true, force: true}));
+      const ffmpeg = path.join(toolDirectory, 'ffmpeg-custom');
+      const ffprobe = path.join(toolDirectory, 'ffprobe-custom');
+      const qtFaststart = path.join(toolDirectory, 'qt-faststart');
+      const executable = '#!/bin/sh\nexit 0\n';
+      await Promise.all([
+        writeFile(ffmpeg, executable, {mode: 0o755}),
+        writeFile(ffprobe, executable, {mode: 0o755}),
+        writeFile(qtFaststart, executable, {mode: 0o755}),
+      ]);
+      const options = {
+        environment: {
+          ...process.env,
+          FFMPEG_PATH: ffmpeg,
+          FFPROBE_PATH: ffprobe,
+        },
+      } as Parameters<typeof createSystemVideoctlDependencies>[0] & {
+        environment: NodeJS.ProcessEnv;
+      };
+      const dependencies = createSystemVideoctlDependencies(options);
+
+      const result = await dependencies.runExecutionPlan({
+        plan: plan(),
+        project: loadedProject(),
+        sourceCatalog: sourceCatalog(),
+        signal: new AbortController().signal,
+      });
+
+      expect(result.preflight?.toolIdentities.ffmpeg?.realPath)
+        .toBe(await realpath(ffmpeg));
+      expect(result.preflight?.toolIdentities.ffprobe?.realPath)
+        .toBe(await realpath(ffprobe));
+    },
+  );
+
   it('exports the exact shared exit-code contract', () => {
     expect(EXIT_CODES).toEqual({
       success: 0,

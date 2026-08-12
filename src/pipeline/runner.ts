@@ -16,6 +16,7 @@ import {
 import {
   ExecutionPlanError,
   revalidateExecutionPlan,
+  RetrySafePlanStaleError,
   type ExecutionPlan,
   type ExecutionPlanContext,
   type ExecutionPlanItem,
@@ -179,6 +180,33 @@ const isStageReportOutcomeError = (
 
 const planStale = (message: string, stageId?: StageId): never => {
   throw new ExecutionPlanError('PLAN_STALE', message, stageId);
+};
+
+const retrySafePlanStale = (message: string, stageId?: StageId): never => {
+  throw new RetrySafePlanStaleError(message, stageId);
+};
+
+const retrySafeRevalidateExecutionPlan = async (
+  plan: ExecutionPlan,
+  context: ExecutionPlanContext,
+  livePreflight?: PreflightResult,
+): Promise<ExecutionPlan> => {
+  try {
+    return await revalidateExecutionPlan(plan, context, livePreflight);
+  } catch (error) {
+    if (error instanceof ExecutionPlanError && error.code === 'PLAN_STALE') {
+      const prefix = 'PLAN_STALE: ';
+      const message = error.message.startsWith(prefix)
+        ? error.message.slice(prefix.length)
+        : 'Pipeline plan is stale.';
+      throw new RetrySafePlanStaleError(
+        message,
+        error.stageId,
+        {cause: error},
+      );
+    }
+    throw error;
+  }
 };
 
 const pointersEqual = (
@@ -551,7 +579,7 @@ const loadSourceRun = async (
   } catch (error) {
     if (plan.runMode === 'new' && isMissingPath(error)) return undefined;
     if (isMissingPath(error)) {
-      return planStale('the planned source Run no longer exists');
+      return retrySafePlanStale('the planned source Run no longer exists');
     }
     throw error;
   }
@@ -583,7 +611,7 @@ const verifyLivePreflight = async (
     || persisted.runId !== sourceRun?.runId
     || persisted.fingerprint !== execution.result.fingerprint
   ) {
-    return planStale('the live Preflight fingerprint changed', 'preflight');
+    return retrySafePlanStale('the live Preflight fingerprint changed', 'preflight');
   }
   const stage = stageById(dependencies.registry, 'preflight');
   let verified = false;
@@ -599,7 +627,10 @@ const verifyLivePreflight = async (
     if (!isMissingPath(error)) throw error;
   }
   if (!verified) {
-    return planStale('the live Preflight result no longer matches its report', 'preflight');
+    return retrySafePlanStale(
+      'the live Preflight result no longer matches its report',
+      'preflight',
+    );
   }
   return persisted;
 };
@@ -919,7 +950,7 @@ export async function runExecutionPlan(
 ): Promise<PipelineRunResult> {
   const {plan} = input;
   if (plan.projectId !== input.project.project.id) {
-    return planStale('the Execution Plan belongs to another project');
+    return retrySafePlanStale('the Execution Plan belongs to another project');
   }
   throwIfPipelineCancelled(input.signal, 'preflight');
 
@@ -950,7 +981,7 @@ export async function runExecutionPlan(
         reportStore: dependencies.reportStore,
         createRunId: dependencies.createRunId,
       };
-      let revalidated = await revalidateExecutionPlan(plan, context);
+      let revalidated = await retrySafeRevalidateExecutionPlan(plan, context);
       throwIfPipelineCancelled(input.signal, 'preflight');
       const sourceRun = await loadSourceRun(revalidated, dependencies);
       let preflight: PreflightResult | undefined;
@@ -968,7 +999,7 @@ export async function runExecutionPlan(
           sourceRun,
           execution,
         );
-        revalidated = await revalidateExecutionPlan(
+        revalidated = await retrySafeRevalidateExecutionPlan(
           revalidated,
           context,
           execution.preflight,
@@ -1014,18 +1045,20 @@ export async function runExecutionPlan(
       reportStore: dependencies.reportStore,
       createRunId: dependencies.createRunId,
     };
-    let revalidated = await revalidateExecutionPlan(plan, context);
+    let revalidated = await retrySafeRevalidateExecutionPlan(plan, context);
     const sourceRun = await loadSourceRun(revalidated, dependencies);
     if (
       revalidated.runMode === 'new'
       && revalidated.items.some((item) => item.action === 'cached')
       && sourceRun === undefined
     ) {
-      return planStale('the planned cache source no longer exists');
+      return retrySafePlanStale('the planned cache source no longer exists');
     }
     const preflightItem = revalidated.items.find((item) => item.stageId === 'preflight');
     if (preflightItem === undefined && !revalidated.requiresRuntimePreflight) {
-      return planStale('executable plans require selected or prerequisite Preflight');
+      return retrySafePlanStale(
+        'executable plans require selected or prerequisite Preflight',
+      );
     }
     const preflightExecution = await runPreflight(
       input,
@@ -1063,7 +1096,7 @@ export async function runExecutionPlan(
         preflightExecution,
       );
     }
-    revalidated = await revalidateExecutionPlan(
+    revalidated = await retrySafeRevalidateExecutionPlan(
       revalidated,
       context,
       preflightExecution.preflight,
@@ -1081,7 +1114,7 @@ export async function runExecutionPlan(
       ? sourceRun?.runDirectory
       : await dependencies.runStore.createRun(revalidated.projectId, lockRunId);
     if (runDirectory === undefined) {
-      return planStale('the resumable Run no longer exists');
+      return retrySafePlanStale('the resumable Run no longer exists');
     }
     const reports: StageReport[] = [];
 

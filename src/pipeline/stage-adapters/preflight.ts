@@ -99,6 +99,8 @@ export const parsePreflightAdapterOutput = (
 
 export interface PreflightStageAdapterDependencies {
   algorithmVersion?: string;
+  ffmpegExecutable?: string;
+  ffprobeExecutable?: string;
   runPreflight?: (
     input: PreflightInput,
     options?: PreflightRunOptions,
@@ -178,6 +180,12 @@ export const createPreflightStage = (
         project: context.project.project,
         script: context.project.script,
         sourceBytes: context.sourceCatalog.totalBytes,
+        ...(dependencies.ffmpegExecutable === undefined
+          ? {}
+          : {ffmpegExecutable: dependencies.ffmpegExecutable}),
+        ...(dependencies.ffprobeExecutable === undefined
+          ? {}
+          : {ffprobeExecutable: dependencies.ffprobeExecutable}),
       }, {signal});
       return {
         state: 'passed',

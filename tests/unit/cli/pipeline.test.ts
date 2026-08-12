@@ -1,6 +1,11 @@
+import {spawnSync} from 'node:child_process';
+import {lstat, mkdtemp, rm, writeFile} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import path from 'node:path';
+import {pathToFileURL} from 'node:url';
 import {describe, expect, it, vi} from 'vitest';
 import {z} from 'zod';
-import type {ProjectInputs} from '../../../src/domain/load-project';
+import {loadProject, type ProjectInputs} from '../../../src/domain/load-project';
 import {JsonFileError} from '../../../src/fs/json-files';
 import type {ProjectDirectoryScope} from '../../../src/fs/project-paths';
 import {
@@ -8,16 +13,24 @@ import {
   type ExecutionPlan,
   type ExecutionPlanRequest,
 } from '../../../src/pipeline/execution-plan';
+import {acquireProjectLock} from '../../../src/pipeline/project-lock';
 import {PipelineRuntimeError} from '../../../src/pipeline/runtime-errors';
-import type {
-  PipelineRunResult,
-  RunExecutionInput,
+import {
+  createRunId,
+  runExecutionPlan,
+  type PipelineRunResult,
+  type RunExecutionInput,
 } from '../../../src/pipeline/runner';
+import {
+  createOutputStore,
+  createRunStore,
+} from '../../../src/pipeline/run-store';
 import type {PipelineSignalHandle} from '../../../src/pipeline/signals';
 import {
   discoverProjectSourceCatalog,
   type ProjectSourceCatalog,
 } from '../../../src/pipeline/source-assets';
+import {createStageReportStore} from '../../../src/pipeline/stage-report';
 import type {PreflightResult} from '../../../src/pipeline/stages/preflight';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
 import {
@@ -29,7 +42,12 @@ import {
   createEditFixture,
   createProjectFixture,
   createScriptFixture,
+  createTempProject,
 } from '../../helpers/temp-project';
+import {
+  fakePreflightResult,
+  fakeStage,
+} from '../../helpers/pipeline-fixtures';
 
 const project = (): ProjectInputs => ({
   workspaceRoot: '/workspace',
@@ -139,6 +157,47 @@ const zodFailure = (): Error => {
   return result.error;
 };
 
+const retrySafeStale = (
+  message: string,
+  stageId = 'ingest' as const,
+): ExecutionPlanError & {readonly retrySafe: true} => Object.assign(
+  new ExecutionPlanError('PLAN_STALE', message, stageId),
+  {retrySafe: true as const},
+);
+
+const runVideoctlOnPlatform = async (
+  platform: NodeJS.Platform,
+  argv: readonly string[],
+) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'videoctl-bootstrap-'));
+  try {
+    const preload = path.join(directory, 'platform.mjs');
+    await writeFile(
+      preload,
+      `Object.defineProperty(process, 'platform', {value: ${JSON.stringify(platform)}});\n`,
+      'utf8',
+    );
+    return spawnSync(
+      process.execPath,
+      ['--import', 'tsx', 'src/cli/videoctl.ts', ...argv],
+      {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          NODE_NO_WARNINGS: '1',
+          NODE_OPTIONS: [
+            process.env.NODE_OPTIONS,
+            `--import=${pathToFileURL(preload).href}`,
+          ].filter((value) => value !== undefined && value.length > 0).join(' '),
+        },
+      },
+    );
+  } finally {
+    await rm(directory, {recursive: true, force: true});
+  }
+};
+
 const makeDependencies = () => {
   let stdout = '';
   let stderr = '';
@@ -165,6 +224,28 @@ const makeDependencies = () => {
 };
 
 describe('pipeline CLI commands', () => {
+  it('shows help without initializing Darwin-only system stores', async () => {
+    const result = await runVideoctlOnPlatform('linux', ['--help']);
+
+    expect(result.status).toBe(EXIT_CODES.success);
+    expect(result.stdout).toContain('Usage: videoctl');
+    expect(result.stderr).toBe('');
+  });
+
+  it('formats synchronous system bootstrap failures without a raw stack', async () => {
+    const result = await runVideoctlOnPlatform('linux', [
+      'pipeline', 'demo', '--plan',
+    ]);
+
+    expect(result.status).toBe(EXIT_CODES.environmentFailed);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe(
+      'Pipeline failure: PIPELINE_EXECUTION_FAILED: Pipeline execution failed unexpectedly.\n',
+    );
+    expect(result.stderr).not.toContain('AppDirectoryPlatformError');
+    expect(result.stderr).not.toContain('src/fs/app-directory-scopes.ts');
+  });
+
   it.each([
     ['doctor', ['doctor', 'demo'], {preset: 'release', to: 'preflight'}],
     ['ingest', ['ingest', 'demo'], {preset: 'assets', to: 'ingest'}],
@@ -541,7 +622,34 @@ describe('pipeline CLI commands', () => {
     },
   );
 
-  it('rebuilds and retries exactly once after a pre-write PLAN_STALE', async () => {
+  it('keeps a root PipelineRuntimeError at exit 4 despite schema causes', async () => {
+    const fixture = makeDependencies();
+    fixture.dependencies.runExecutionPlan.mockRejectedValueOnce(
+      new PipelineRuntimeError(
+        'PIPELINE_STAGE_FAILED',
+        'Pipeline stage ingest failed.',
+        'ingest',
+        {cause: new SyntaxError('secret-cause malformed stage output')},
+      ),
+    );
+
+    const exitCode = await runPipelineCommand(
+      'demo',
+      {json: true},
+      fixture.dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.environmentFailed);
+    expect(JSON.parse(fixture.stdout())).toEqual({
+      projectId: 'demo',
+      code: 'PIPELINE_STAGE_FAILED',
+      message: 'Pipeline stage ingest failed.',
+      stageId: 'ingest',
+    });
+    expect(fixture.stdout()).not.toContain('secret-cause');
+  });
+
+  it('rebuilds and retries a cause-wrapped retry-safe PLAN_STALE exactly once', async () => {
     const fixture = makeDependencies();
     const firstPlan = executionPlan({targetRunId: 'run-first'});
     const secondPlan = executionPlan({targetRunId: 'run-second'});
@@ -549,11 +657,9 @@ describe('pipeline CLI commands', () => {
       .mockResolvedValueOnce(firstPlan)
       .mockResolvedValueOnce(secondPlan);
     fixture.dependencies.runExecutionPlan
-      .mockRejectedValueOnce(new ExecutionPlanError(
-        'PLAN_STALE',
-        'source Run changed before writes',
-        'ingest',
-      ))
+      .mockRejectedValueOnce(new Error('Runner stale wrapper', {
+        cause: retrySafeStale('source Run changed before writes'),
+      }))
       .mockResolvedValueOnce(pipelineResult({runId: 'run-second'}));
 
     const exitCode = await runPipelineCommand(
@@ -577,12 +683,10 @@ describe('pipeline CLI commands', () => {
     fixture.dependencies.buildExecutionPlan
       .mockResolvedValueOnce(executionPlan({targetRunId: 'run-first'}))
       .mockResolvedValueOnce(executionPlan({targetRunId: 'run-second'}));
-    fixture.dependencies.runExecutionPlan.mockRejectedValue(
-      Object.assign(new Error('PLAN_STALE: still stale'), {
-        code: 'PLAN_STALE',
-        stageId: 'ingest',
-      }),
-    );
+    fixture.dependencies.runExecutionPlan.mockImplementation(async () => {
+      const stale = retrySafeStale('still stale');
+      throw new AggregateError([stale], 'Runner stale aggregate', {cause: stale});
+    });
 
     const exitCode = await runPipelineCommand(
       'demo',
@@ -599,6 +703,135 @@ describe('pipeline CLI commands', () => {
       message: 'still stale',
       stageId: 'ingest',
     });
+  });
+
+  it('does not retry an unmarked PLAN_STALE', async () => {
+    const fixture = makeDependencies();
+    fixture.dependencies.runExecutionPlan.mockRejectedValueOnce(
+      new ExecutionPlanError(
+        'PLAN_STALE',
+        'stale after persistence began',
+        'ingest',
+      ),
+    );
+
+    const exitCode = await runPipelineCommand(
+      'demo',
+      {json: true},
+      fixture.dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(fixture.dependencies.buildExecutionPlan).toHaveBeenCalledOnce();
+    expect(fixture.dependencies.runExecutionPlan).toHaveBeenCalledOnce();
+    expect(JSON.parse(fixture.stdout())).toMatchObject({
+      code: 'PLAN_STALE',
+      message: 'stale after persistence began',
+      stageId: 'ingest',
+    });
+  });
+
+  it('retries a real Runner pre-write stale only after proving zero persistent writes', async () => {
+    const tempProject = await createTempProject();
+    try {
+      const loaded = await loadProject(tempProject.workspaceRoot, 'demo');
+      const runStore = createRunStore(tempProject.workspaceRoot);
+      const outputStore = createOutputStore(tempProject.workspaceRoot);
+      const reportStore = createStageReportStore();
+      const registry = [fakeStage('preflight', {
+        execute: async () => ({
+          state: 'passed',
+          fingerprint: 'sha256:preflight',
+          outputs: fakePreflightResult(),
+          artifacts: [],
+          checks: [],
+        }),
+      })];
+      const runnerDependencies = {
+        registry,
+        runStore,
+        outputStore,
+        reportStore,
+        acquireProjectLock,
+        createRunId,
+        now: () => '2026-08-12T00:00:00.000Z',
+      };
+      const validPlan = executionPlan({
+        projectId: 'demo',
+        preset: 'release',
+        stageIds: ['preflight'],
+        targetRunId: 'run-fresh',
+        items: [{
+          position: 1,
+          total: 1,
+          stageId: 'preflight',
+          displayName: 'Preflight',
+          action: 'run',
+          fingerprint: null,
+          materialize: false,
+        }],
+      });
+      const stalePlan = {...validPlan, projectId: 'other-project'};
+      let runAttempts = 0;
+      let verifiedNoWrites = false;
+      let stdout = '';
+      let stderr = '';
+      const dependencies = {
+        workspaceRoot: tempProject.workspaceRoot,
+        stdout: {write: (chunk: string) => { stdout += chunk; }},
+        stderr: {write: (chunk: string) => { stderr += chunk; }},
+        loadProject: vi.fn(async () => loaded),
+        discoverProjectSourceCatalog: vi.fn(async () => sourceCatalog()),
+        buildExecutionPlan: vi.fn()
+          .mockResolvedValueOnce(stalePlan)
+          .mockResolvedValueOnce(validPlan),
+        runExecutionPlan: vi.fn(async (input: RunExecutionInput) => {
+          runAttempts += 1;
+          try {
+            return await runExecutionPlan(input, runnerDependencies);
+          } catch (error) {
+            if (runAttempts === 1) {
+              expect(error).toMatchObject({
+                code: 'PLAN_STALE',
+                retrySafe: true,
+              });
+              await expect(runStore.readCurrentReadonly('demo')).resolves.toBeNull();
+              await expect(outputStore.readCurrentReadonly('demo')).resolves.toBeNull();
+              await expect(lstat(path.join(
+                tempProject.workspaceRoot,
+                '.work',
+                'demo',
+                'runs',
+              ))).rejects.toMatchObject({code: 'ENOENT'});
+              await expect(lstat(path.join(
+                tempProject.workspaceRoot,
+                '.work',
+                'demo',
+                'pipeline.lock',
+              ))).rejects.toMatchObject({code: 'ENOENT'});
+              verifiedNoWrites = true;
+              throw new AggregateError([error], 'wrapped Runner stale', {cause: error});
+            }
+            throw error;
+          }
+        }),
+        installPipelineSignalHandlers: vi.fn(() => ({
+          signal: new AbortController().signal,
+          dispose: vi.fn(),
+        })),
+      } satisfies PipelineCommandDependencies;
+
+      const exitCode = await runPipelineCommand('demo', {}, dependencies);
+
+      expect(exitCode).toBe(EXIT_CODES.success);
+      expect(verifiedNoWrites).toBe(true);
+      expect(dependencies.buildExecutionPlan).toHaveBeenCalledTimes(2);
+      expect(dependencies.runExecutionPlan).toHaveBeenCalledTimes(2);
+      expect(stdout).toContain('State: passed');
+      expect(stderr).toBe('');
+    } finally {
+      await tempProject.cleanup();
+    }
   });
 
   it.each([
@@ -706,10 +939,10 @@ describe('pipeline CLI commands', () => {
 
     const exitCode = await runVideoctl([
       'pipeline',
+      '--json',
       'demo',
       '--preset',
       'release\nSTATUS forged\u001b[31m',
-      '--json',
     ], fixture.dependencies as VideoctlDependencies);
 
     expect(exitCode).toBe(EXIT_CODES.validationFailed);
@@ -721,6 +954,26 @@ describe('pipeline CLI commands', () => {
     });
     expect(fixture.stdout()).not.toContain('STATUS forged');
     expect(fixture.stdout()).not.toContain('allowed choices');
+    expect(fixture.dependencies.loadProject).not.toHaveBeenCalled();
+  });
+
+  it('does not infer JSON output from an unsupported review --json option', async () => {
+    const fixture = makeDependencies();
+
+    const exitCode = await runVideoctl([
+      'review',
+      'demo',
+      '--approve',
+      '--reason',
+      'looks good',
+      '--json',
+    ], fixture.dependencies as VideoctlDependencies);
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(fixture.stdout()).toBe('');
+    expect(fixture.stderr()).toBe(
+      'Pipeline failure: CLI_ARGUMENT_INVALID: Invalid command-line arguments.\n',
+    );
     expect(fixture.dependencies.loadProject).not.toHaveBeenCalled();
   });
 });

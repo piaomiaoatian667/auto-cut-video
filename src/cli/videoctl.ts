@@ -26,7 +26,11 @@ import {
   discoverProjectSourceCatalog,
   type SourceCatalogDependencies,
 } from '../pipeline/source-assets';
-import {MVP_STAGES} from '../pipeline/stage-registry';
+import {PIPELINE_PRESET_IDS} from '../pipeline/presets';
+import {
+  createMvpStageRegistry,
+  MVP_STAGES,
+} from '../pipeline/stage-registry';
 import {createStageReportStore} from '../pipeline/stage-report';
 import {runCleanCommand} from './commands/clean';
 import {
@@ -110,63 +114,110 @@ const runDoctor = async (
     : EXIT_CODES.environmentFailed;
 };
 
-const pipelineOptions = (options: PipelineCommandOptions): PipelineCommandOptions => ({
-  ...(options.preset === undefined ? {} : {preset: options.preset}),
+interface RawPipelineCommandOptions {
+  preset?: string;
+  plan?: boolean;
+  from?: string;
+  to?: string;
+  resume?: boolean;
+  force?: string;
+  json?: boolean;
+}
+
+const PRESET_IDS: readonly PipelinePreset[] = PIPELINE_PRESET_IDS;
+const STAGE_IDS: readonly StageId[] = Object.freeze(
+  MVP_STAGES.map((stage) => stage.id),
+);
+
+const invalidCliArgument = (): never => {
+  throw new CommanderError(
+    EXIT_CODES.validationFailed,
+    'commander.invalidArgument',
+    'Invalid command-line arguments.',
+  );
+};
+
+const parsePreset = (value: string | undefined): PipelinePreset | undefined => {
+  if (value === undefined) return undefined;
+  if (!PRESET_IDS.includes(value as PipelinePreset)) return invalidCliArgument();
+  return value as PipelinePreset;
+};
+
+const parseStage = (value: string | undefined): StageId | undefined => {
+  if (value === undefined) return undefined;
+  if (!STAGE_IDS.includes(value as StageId)) return invalidCliArgument();
+  return value as StageId;
+};
+
+const pipelineOptions = (
+  options: RawPipelineCommandOptions,
+): PipelineCommandOptions => ({
+  ...(options.preset === undefined ? {} : {preset: parsePreset(options.preset)!}),
   ...(options.plan === undefined ? {} : {plan: options.plan}),
-  ...(options.from === undefined ? {} : {from: options.from}),
-  ...(options.to === undefined ? {} : {to: options.to}),
+  ...(options.from === undefined ? {} : {from: parseStage(options.from)!}),
+  ...(options.to === undefined ? {} : {to: parseStage(options.to)!}),
   ...(options.resume === undefined ? {} : {resume: options.resume}),
-  ...(options.force === undefined ? {} : {force: options.force}),
+  ...(options.force === undefined ? {} : {force: parseStage(options.force)!}),
   ...(options.json === undefined ? {} : {json: options.json}),
 });
 
-const PRESET_IDS = [
-  'assets',
-  'draft',
-  'release',
-] as const satisfies readonly PipelinePreset[];
+interface CommandFailureContext {
+  projectId: string;
+  json: boolean;
+}
 
-const STAGE_IDS = [
-  'preflight',
-  'ingest',
-  'narration',
-  'compile',
-  'draft',
-  'review',
-  'release',
-] as const satisfies readonly StageId[];
-
-const commandProjectId = (argv: readonly string[]): string => (
-  argv[1] !== undefined && !argv[1].startsWith('-') ? argv[1] : 'unknown'
-);
+const commandFailureContext = (command: Command): CommandFailureContext => {
+  const processedProject = command.processedArgs[0];
+  const rawProject = command.args.find((argument) => !argument.startsWith('-'));
+  const projectId = typeof processedProject === 'string'
+    ? processedProject
+    : (rawProject ?? 'unknown');
+  return {
+    projectId,
+    json: command.opts<{json?: unknown}>().json === true,
+  };
+};
 
 const writeCommandFailure = (
-  argv: readonly string[],
-  dependencies: VideoctlDependencies,
+  context: CommandFailureContext,
+  writers: Pick<VideoctlDependencies, 'stdout' | 'stderr'>,
   code: string,
   message: string,
 ): void => {
-  const json = argv.includes('--json');
-  const output = formatPipelineFailure({
-    projectId: commandProjectId(argv),
+  const formatted = formatPipelineFailure({
+    projectId: context.projectId,
     code,
     message,
-  }, json);
-  if (json) dependencies.stdout.write(output);
-  else dependencies.stderr.write(output);
+  }, context.json);
+  if (context.json) writers.stdout.write(formatted);
+  else writers.stderr.write(formatted);
 };
 
-export async function runVideoctl(
+type VideoctlDependenciesLoader = () => (
+  VideoctlDependencies | Promise<VideoctlDependencies>
+);
+
+const runVideoctlWithLoader = async (
   argv: readonly string[],
-  dependencies: VideoctlDependencies,
-): Promise<number> {
+  loadDependencies: VideoctlDependenciesLoader,
+  writers: Pick<VideoctlDependencies, 'stdout' | 'stderr'>,
+): Promise<number> => {
   let exitCode: number = EXIT_CODES.success;
+  let dependenciesPromise: Promise<VideoctlDependencies> | undefined;
+  const resolveDependencies = (): Promise<VideoctlDependencies> => {
+    dependenciesPromise ??= Promise.resolve().then(loadDependencies);
+    return dependenciesPromise;
+  };
   const command = new Command();
+  let activeCommand = command;
   command
     .name('videoctl')
     .exitOverride()
+    .hook('preSubcommand', (_root, subcommand) => {
+      activeCommand = subcommand;
+    })
     .configureOutput({
-      writeOut: (value) => { dependencies.stdout.write(value); },
+      writeOut: (value) => { writers.stdout.write(value); },
       writeErr: () => undefined,
     });
 
@@ -176,6 +227,7 @@ export async function runVideoctl(
     .argument('<project>')
     .option('--json', 'print machine-readable JSON')
     .action(async (project: string, options: DoctorOptions) => {
+      const dependencies = await resolveDependencies();
       exitCode = await runDoctor(project, options, dependencies);
     });
   command
@@ -184,6 +236,7 @@ export async function runVideoctl(
     .argument('<project>')
     .option('--json', 'print machine-readable JSON')
     .action(async (project: string, options: {json?: boolean}) => {
+      const dependencies = await resolveDependencies();
       exitCode = await runPipelineCommand(project, {
         preset: 'assets',
         to: 'ingest',
@@ -194,12 +247,14 @@ export async function runVideoctl(
     .command('run')
     .description('Run the one-path draft pipeline')
     .argument('<project>')
-    .addOption(new Option('--to <stage>').choices(['narration']).makeOptionMandatory())
+    .addOption(new Option('--to <stage>').makeOptionMandatory())
     .option('--json', 'print machine-readable JSON')
-    .action(async (project: string, options: {to: 'narration'; json?: boolean}) => {
+    .action(async (project: string, options: {to: string; json?: boolean}) => {
+      if (options.to !== 'narration') invalidCliArgument();
+      const dependencies = await resolveDependencies();
       exitCode = await runPipelineCommand(project, {
         preset: 'draft',
-        to: options.to,
+        to: 'narration',
         ...(options.json === undefined ? {} : {json: options.json}),
       }, dependencies);
     });
@@ -209,6 +264,7 @@ export async function runVideoctl(
     .argument('<project>')
     .option('--json', 'print machine-readable JSON')
     .action(async (project: string, options: {json?: boolean}) => {
+      const dependencies = await resolveDependencies();
       exitCode = await runPipelineCommand(project, {
         preset: 'draft',
         to: 'compile',
@@ -219,26 +275,28 @@ export async function runVideoctl(
     .command('pipeline')
     .description('Plan or execute a pipeline range')
     .argument('<project>')
-    .addOption(new Option('--preset <preset>').choices([...PRESET_IDS]))
+    .addOption(new Option('--preset <preset>'))
     .option('--plan', 'print the execution plan without running')
     .addOption(new Option(
       '--from <stage>',
       'start at a stable Stage ID',
-    ).choices([...STAGE_IDS]))
+    ))
     .addOption(new Option(
       '--to <stage>',
       'stop at a stable Stage ID',
-    ).choices([...STAGE_IDS]))
+    ))
     .option('--resume', 'resume the current Run')
     .addOption(new Option(
       '--force <stage>',
       'force a Stage inside the selected range',
-    ).choices([...STAGE_IDS]))
+    ))
     .option('--json', 'print machine-readable JSON')
-    .action(async (project: string, options: PipelineCommandOptions) => {
+    .action(async (project: string, options: RawPipelineCommandOptions) => {
+      const parsedOptions = pipelineOptions(options);
+      const dependencies = await resolveDependencies();
       exitCode = await runPipelineCommand(
         project,
-        pipelineOptions(options),
+        parsedOptions,
         dependencies,
       );
     });
@@ -250,6 +308,7 @@ export async function runVideoctl(
     .option('--reject', 'reject the current draft')
     .requiredOption('--reason <text>', 'review reason')
     .action(async (project: string, options: ReviewCommandOptions) => {
+      const dependencies = await resolveDependencies();
       exitCode = await runReviewCommand(project, options, dependencies);
     });
   command
@@ -258,6 +317,7 @@ export async function runVideoctl(
     .argument('<project>')
     .option('--json', 'print machine-readable JSON')
     .action(async (project: string, options: {json?: boolean}) => {
+      const dependencies = await resolveDependencies();
       exitCode = await runPipelineCommand(project, {
         preset: 'release',
         ...(options.json === undefined ? {} : {json: options.json}),
@@ -269,6 +329,7 @@ export async function runVideoctl(
     .argument('<project>')
     .option('--json', 'print machine-readable JSON')
     .action(async (project: string, options: ReportCommandOptions) => {
+      const dependencies = await resolveDependencies();
       exitCode = await runReportCommand(project, options, dependencies);
     });
   command
@@ -276,6 +337,7 @@ export async function runVideoctl(
     .description('Remove non-current pipeline Runs and Releases')
     .argument('<project>')
     .action(async (project: string) => {
+      const dependencies = await resolveDependencies();
       exitCode = await runCleanCommand(project, {
         workspaceRoot: dependencies.workspaceRoot,
         stdout: dependencies.stdout,
@@ -297,33 +359,53 @@ export async function runVideoctl(
     }
     if (error instanceof CommanderError) {
       writeCommandFailure(
-        argv,
-        dependencies,
+        commandFailureContext(activeCommand),
+        writers,
         'CLI_ARGUMENT_INVALID',
         'Invalid command-line arguments.',
       );
       return EXIT_CODES.validationFailed;
     }
     writeCommandFailure(
-      argv,
-      dependencies,
+      commandFailureContext(activeCommand),
+      writers,
       'PIPELINE_EXECUTION_FAILED',
       'Pipeline execution failed unexpectedly.',
     );
     return EXIT_CODES.environmentFailed;
   }
+};
+
+export async function runVideoctl(
+  argv: readonly string[],
+  dependencies: VideoctlDependencies,
+): Promise<number> {
+  return await runVideoctlWithLoader(argv, () => dependencies, dependencies);
 }
 
 export interface SystemVideoctlOptions {
   sourceCatalog?: SourceCatalogDependencies;
+  workspaceRoot?: string;
+  environment?: NodeJS.ProcessEnv;
+  stdout?: OutputWriter;
+  stderr?: OutputWriter;
 }
 
 export const createSystemVideoctlDependencies = (
   options: SystemVideoctlOptions = {},
 ): VideoctlDependencies => {
-  const workspaceRoot = process.cwd();
+  const workspaceRoot = options.workspaceRoot ?? process.cwd();
+  const environment = options.environment ?? process.env;
   const sourceCatalogDependencies = options.sourceCatalog
     ?? createSystemSourceCatalogDependencies();
+  const registry = createMvpStageRegistry({
+    ...(environment.FFMPEG_PATH === undefined
+      ? {}
+      : {ffmpegExecutable: environment.FFMPEG_PATH}),
+    ...(environment.FFPROBE_PATH === undefined
+      ? {}
+      : {ffprobeExecutable: environment.FFPROBE_PATH}),
+  });
   const runStore = createRunStore(workspaceRoot);
   const outputStore = createOutputStore(workspaceRoot);
   const reportStore = createStageReportStore();
@@ -334,7 +416,7 @@ export const createSystemVideoctlDependencies = (
   ) => await buildExecutionPlan({
     project,
     sourceCatalog,
-    registry: MVP_STAGES,
+    registry,
     runStore,
     outputStore,
     reportStore,
@@ -342,15 +424,15 @@ export const createSystemVideoctlDependencies = (
   }, request);
   return {
     workspaceRoot,
-    stdout: process.stdout,
-    stderr: process.stderr,
+    stdout: options.stdout ?? process.stdout,
+    stderr: options.stderr ?? process.stderr,
     loadProject,
     discoverProjectSourceCatalog: async (project) => (
       await discoverProjectSourceCatalog(project, sourceCatalogDependencies)
     ),
     buildExecutionPlan: buildPlan,
     runExecutionPlan: async (input) => await runExecutionPlan(input, {
-      registry: MVP_STAGES,
+      registry,
       runStore,
       outputStore,
       reportStore,
@@ -364,17 +446,41 @@ export const createSystemVideoctlDependencies = (
   };
 };
 
+export interface VideoctlMainOptions {
+  createDependencies?: VideoctlDependenciesLoader;
+  stdout?: OutputWriter;
+  stderr?: OutputWriter;
+}
+
+export const runVideoctlMain = async (
+  argv: readonly string[],
+  options: VideoctlMainOptions = {},
+): Promise<number> => {
+  const writers = {
+    stdout: options.stdout ?? process.stdout,
+    stderr: options.stderr ?? process.stderr,
+  };
+  const loadDependencies = options.createDependencies ?? (() => (
+    createSystemVideoctlDependencies({
+      stdout: writers.stdout,
+      stderr: writers.stderr,
+    })
+  ));
+  return await runVideoctlWithLoader(argv, loadDependencies, writers);
+};
+
 const directlyExecuted = process.argv[1] !== undefined
   && pathToFileURL(process.argv[1]).href === import.meta.url;
 
 if (directlyExecuted) {
-  void runVideoctl(
-    process.argv.slice(2),
-    createSystemVideoctlDependencies(),
-  ).then(
+  void runVideoctlMain(process.argv.slice(2)).then(
     (code) => { process.exitCode = code; },
     () => {
-      process.stderr.write('videoctl failed unexpectedly.\n');
+      process.stderr.write(formatPipelineFailure({
+        projectId: 'unknown',
+        code: 'PIPELINE_EXECUTION_FAILED',
+        message: 'Pipeline execution failed unexpectedly.',
+      }, false));
       process.exitCode = EXIT_CODES.environmentFailed;
     },
   );

@@ -1,12 +1,13 @@
 import {STAGE_PRESETS} from './presets';
 import {
   compileStage,
+  createPreflightStage,
   draftStage,
   ingestStage,
   narrationStage,
-  preflightStage,
   releaseStage,
   reviewStage,
+  type PreflightStageAdapterDependencies,
 } from './stage-adapters';
 import type {PipelineStage} from './stage';
 
@@ -76,8 +77,10 @@ export function createStageRegistry(
   return Object.freeze(registry);
 }
 
-export const MVP_STAGES = createStageRegistry([
-  preflightStage,
+export const createMvpStageRegistry = (
+  preflightDependencies: PreflightStageAdapterDependencies = {},
+): readonly PipelineStage[] => createStageRegistry([
+  createPreflightStage(preflightDependencies),
   ingestStage,
   narrationStage,
   compileStage,
@@ -85,3 +88,5 @@ export const MVP_STAGES = createStageRegistry([
   reviewStage,
   releaseStage,
 ]);
+
+export const MVP_STAGES = createMvpStageRegistry();

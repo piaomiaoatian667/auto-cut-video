@@ -13,3 +13,7 @@ export const STAGE_PRESETS = {
     'release',
   ],
 } as const satisfies Record<PipelinePreset, readonly StageId[]>;
+
+export const PIPELINE_PRESET_IDS = Object.freeze(
+  Object.keys(STAGE_PRESETS) as PipelinePreset[],
+);

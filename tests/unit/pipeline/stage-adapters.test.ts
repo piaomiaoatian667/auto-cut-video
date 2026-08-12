@@ -644,6 +644,26 @@ describe('adapter fingerprints', () => {
     );
   });
 
+  it('passes configured FFmpeg overrides into Preflight execution', async () => {
+    const runPreflight = vi.fn(async () => preflightResult());
+    const dependencies = {
+      runPreflight,
+      ffmpegExecutable: '/custom/tools/ffmpeg',
+      ffprobeExecutable: '/custom/tools/ffprobe',
+    } as Parameters<typeof createPreflightStage>[0] & {
+      ffmpegExecutable: string;
+      ffprobeExecutable: string;
+    };
+    const stage = createPreflightStage(dependencies);
+
+    await stage.execute(executionContext(), new AbortController().signal);
+
+    expect(runPreflight).toHaveBeenCalledWith(expect.objectContaining({
+      ffmpegExecutable: '/custom/tools/ffmpeg',
+      ffprobeExecutable: '/custom/tools/ffprobe',
+    }), expect.any(Object));
+  });
+
   it.each([
     ['source hash', (context: StagePlanningContext) => ({
       ...context,

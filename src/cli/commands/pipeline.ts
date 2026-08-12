@@ -4,6 +4,7 @@ import {
   type ExecutionPlan,
   type ExecutionPlanRequest,
 } from '../../pipeline/execution-plan';
+import {STAGE_PRESETS} from '../../pipeline/presets';
 import {PipelineRuntimeError} from '../../pipeline/runtime-errors';
 import type {
   PipelineRunResult,
@@ -78,15 +79,7 @@ const readCode = (error: unknown): string | undefined => {
   }
 };
 
-const STAGE_IDS = new Set<StageId>([
-  'preflight',
-  'ingest',
-  'narration',
-  'compile',
-  'draft',
-  'review',
-  'release',
-]);
+const STAGE_IDS = new Set<StageId>(STAGE_PRESETS.release);
 
 const readStageId = (error: unknown): StageId | undefined => {
   if (error === null || typeof error !== 'object') return undefined;
@@ -202,6 +195,79 @@ const inspectErrorGraph = (root: unknown): readonly ErrorGraphEntry[] => {
   return entries;
 };
 
+const readRetrySafe = (error: object): boolean => {
+  try {
+    return (error as {retrySafe?: unknown}).retrySafe === true;
+  } catch {
+    return false;
+  }
+};
+
+interface RetrySafeStaleInspection {
+  found: boolean;
+  unsafe: boolean;
+}
+
+interface RetrySafeStaleTraversal {
+  seen: Set<object>;
+  visited: number;
+}
+
+const inspectRetrySafeStale = (
+  error: unknown,
+  depth: number,
+  traversal: RetrySafeStaleTraversal,
+): RetrySafeStaleInspection => {
+  if (
+    depth > ERROR_GRAPH_MAX_DEPTH
+    || traversal.visited >= ERROR_GRAPH_MAX_NODES
+  ) {
+    return {found: false, unsafe: true};
+  }
+  if (error === null || typeof error !== 'object') {
+    return {found: false, unsafe: true};
+  }
+  if (traversal.seen.has(error)) return {found: false, unsafe: false};
+  traversal.seen.add(error);
+  traversal.visited += 1;
+
+  const code = readCode(error);
+  if (code === 'PLAN_STALE' && readRetrySafe(error)) {
+    return {found: true, unsafe: false};
+  }
+  if (error instanceof PipelineRuntimeError || code === 'PLAN_STALE') {
+    return {found: false, unsafe: true};
+  }
+
+  const aggregateErrors = readAggregateErrors(error);
+  const cause = readCause(error);
+  const nested = aggregateErrors.length === 0
+    ? (cause === undefined ? [] : [cause])
+    : (cause === undefined ? aggregateErrors : [cause, ...aggregateErrors]);
+  if (nested.length === 0) return {found: false, unsafe: true};
+
+  let found = false;
+  let unsafe = false;
+  for (const nestedError of nested) {
+    const inspected = inspectRetrySafeStale(
+      nestedError,
+      depth + 1,
+      traversal,
+    );
+    found ||= inspected.found;
+    unsafe ||= inspected.unsafe;
+  }
+  return {found, unsafe};
+};
+
+const isRetrySafePlanStale = (error: unknown): boolean => {
+  const inspected = inspectRetrySafeStale(error, 0, {
+    seen: new Set<object>(),
+    visited: 0,
+  });
+  return inspected.found && !inspected.unsafe;
+};
+
 const isSchemaValidationError = (error: unknown): boolean => (
   errorName(error) === 'ZodError'
   || error instanceof SyntaxError
@@ -223,10 +289,13 @@ const isSourceCatalogValidationError = (error: unknown): boolean => {
     || code?.startsWith('PROJECT_SOURCE_') === true;
 };
 
-const isPlanValidationError = (error: unknown): boolean => (
-  isSchemaValidationError(error)
-  || error instanceof ExecutionPlanError
+const isTrustedPlanError = (error: unknown): boolean => (
+  error instanceof ExecutionPlanError
   || readCode(error)?.startsWith('PLAN_') === true
+);
+
+const isPlanValidationError = (error: unknown): boolean => (
+  isSchemaValidationError(error) || isTrustedPlanError(error)
 );
 
 const environmentMessage = (code: string | undefined): string | undefined => {
@@ -393,6 +462,34 @@ const planFailure = (
     : validationFailure(projectId, validationError);
 };
 
+const executionFailure = (
+  projectId: string,
+  error: unknown,
+): PipelineCommandOutcome => {
+  if (error instanceof PipelineRuntimeError) {
+    return environmentFailure(projectId, error, [{error, depth: 0}]);
+  }
+  const entries = inspectErrorGraph(error);
+  if (findEnvironmentIssue(entries) !== undefined) {
+    return environmentFailure(projectId, error, entries);
+  }
+  const runtimeError = entries.find(
+    ({error: entry}) => entry instanceof PipelineRuntimeError,
+  )?.error;
+  if (runtimeError instanceof PipelineRuntimeError) {
+    return environmentFailure(projectId, runtimeError, [{
+      error: runtimeError,
+      depth: 0,
+    }]);
+  }
+  const planError = entries.find(
+    ({error: entry}) => isTrustedPlanError(entry),
+  )?.error;
+  return planError === undefined
+    ? environmentFailure(projectId, error, entries)
+    : validationFailure(projectId, planError);
+};
+
 const resultExitCode = (result: PipelineRunResult): number => {
   switch (result.state) {
     case 'passed':
@@ -463,7 +560,7 @@ export async function executePipelineCommand(
         return {kind: 'result', exitCode, result};
       } catch (error) {
         if (handle.received !== undefined) return signalFailure(projectId, handle);
-        if (readCode(error) === 'PLAN_STALE' && attempt === 0) {
+        if (isRetrySafePlanStale(error) && attempt === 0) {
           try {
             activePlan = await dependencies.buildExecutionPlan(
               project,
@@ -475,7 +572,7 @@ export async function executePipelineCommand(
           }
           continue;
         }
-        return planFailure(projectId, error);
+        return executionFailure(projectId, error);
       }
     }
     return validationFailure(

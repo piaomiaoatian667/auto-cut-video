@@ -78,6 +78,19 @@ export class ExecutionPlanError extends Error {
   }
 }
 
+export class RetrySafePlanStaleError extends ExecutionPlanError {
+  readonly retrySafe = true;
+
+  constructor(
+    message: string,
+    stageId?: StageId,
+    options?: ErrorOptions,
+  ) {
+    super('PLAN_STALE', message, stageId, options);
+    this.name = 'RetrySafePlanStaleError';
+  }
+}
+
 interface LoadedRun {
   runId: string;
   runDirectory: RunDirectoryScope;
