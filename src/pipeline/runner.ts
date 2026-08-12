@@ -731,6 +731,7 @@ const materializeCachedStage = async (
   runId: string,
   runDirectory: RunDirectoryScope,
   sourceRun: RunnerSourceRun | undefined,
+  signal: AbortSignal,
   dependencies: RunnerDependencies,
 ): Promise<StageReport> => {
   if (item.stageId === 'review' || item.stageId === 'release') {
@@ -751,12 +752,15 @@ const materializeCachedStage = async (
   try {
     const copyArtifact = dependencies.copyRunArtifact ?? copyRunArtifact;
     for (const artifact of source.artifacts) {
-      artifacts.push(await copyArtifact({
+      const copied = await copyArtifact({
         sourceRun: sourceRun!.runDirectory,
         targetRun: runDirectory,
         artifact,
-      }));
+      });
+      artifacts.push(copied);
+      throwIfPipelineCancelled(signal, item.stageId);
     }
+    throwIfPipelineCancelled(signal, item.stageId);
     const finishedAt = dependencies.now();
     const report = cachedReport(
       plan,
@@ -1140,6 +1144,7 @@ export async function runExecutionPlan(
             lockRunId,
             runDirectory,
             sourceRun,
+            input.signal,
             dependencies,
           );
           reports.push(cached);
@@ -1274,6 +1279,7 @@ export async function runExecutionPlan(
         scheduledContext,
         input.signal,
       );
+      throwIfPipelineCancelled(input.signal, item.stageId);
       const finishedAt = dependencies.now();
       const report = reportFromExecution(
         revalidated,

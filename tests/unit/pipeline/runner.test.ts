@@ -10,6 +10,7 @@ import {
   type WorkDirectoryScope,
 } from '../../../src/fs/app-directory-scopes';
 import {
+  copyRunArtifact,
   hashRunArtifact,
   verifyRunArtifact,
   type PipelineArtifact,
@@ -946,6 +947,199 @@ describe('Pipeline Runner', () => {
       partialArtifacts: [narrationPartial],
     }));
     expect(runtime.release).toHaveBeenCalledOnce();
+  });
+
+  it('does not commit a final Stage that self-cancels before returning passed', async () => {
+    const controller = new AbortController();
+    const previousOutput = currentPointer('run-previous', 'release', {
+      relativePath: 'releases/run-previous',
+    });
+    const releasePartial: PipelinePartialArtifact = {
+      scope: 'run',
+      path: 'partials/release.tmp',
+    };
+    const cleanupFailedStage = vi.fn(async () => undefined);
+    const runtime = createMemoryRuntime({
+      outputCurrent: previousOutput,
+      partialArtifacts: {release: [releasePartial]},
+      execute: {
+        release: async () => {
+          controller.abort('SIGINT');
+          return {
+            state: 'passed',
+            fingerprint: stageFingerprint('release'),
+            outputs: {release: 'run-self-abort'},
+            artifacts: [],
+            checks: [],
+            outputCurrent: currentPointer('run-self-abort', 'release', {
+              relativePath: 'releases/run-self-abort',
+            }),
+          };
+        },
+      },
+    });
+    runtime.dependencies.cleanupFailedStage = cleanupFailedStage;
+    const plan = makePlan({
+      preset: 'release',
+      stageIds: ['preflight', 'release'],
+      actions: ['run', 'run'],
+      runMode: 'new',
+      targetRunId: 'run-self-abort',
+    });
+
+    await expect(runExecutionPlan({
+      ...executionInput(plan),
+      signal: controller.signal,
+    }, runtime.dependencies)).rejects.toMatchObject({
+      code: 'PIPELINE_CANCELLED',
+      stageId: 'release',
+    });
+
+    expect(runtime.stageCalls).toEqual(['preflight', 'release']);
+    expect(runtime.report('run-self-abort', 'preflight')).toMatchObject({state: 'passed'});
+    expect(runtime.report('run-self-abort', 'release')).toBeUndefined();
+    expect(runtime.workCurrent).toMatchObject({
+      runId: 'run-self-abort',
+      completedStage: 'preflight',
+      state: 'passed',
+    });
+    expect(runtime.outputCurrent).toEqual(previousOutput);
+    expect(runtime.attempts).toEqual([
+      expect.objectContaining({
+        runId: 'run-self-abort',
+        stageId: 'release',
+        state: 'cancelled',
+        error: expect.objectContaining({code: 'PIPELINE_CANCELLED'}),
+      }),
+    ]);
+    expect(cleanupFailedStage).toHaveBeenCalledOnce();
+    expect(cleanupFailedStage).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: 'demo',
+      runId: 'run-self-abort',
+      stageId: 'release',
+      partialArtifacts: [releasePartial],
+    }));
+    expect(runtime.release).toHaveBeenCalledOnce();
+  });
+
+  it('cancels cached materialization after copying before report or pointer publication', async () => {
+    const tempProject = await createTempProject();
+    tempProjects.push(tempProject);
+    const project = await loadProject(tempProject.workspaceRoot, 'demo');
+    const runStore = createRunStore(tempProject.workspaceRoot);
+    const outputStore = createOutputStore(tempProject.workspaceRoot);
+    const reportStore = createStageReportStore();
+    const sourceRunId = 'run-cache-source';
+    const targetRunId = 'run-cache-abort';
+    const sourceRun = await runStore.createRun('demo', sourceRunId);
+    const firstCachedArtifact = await writeRunArtifact(
+      sourceRun,
+      'assets/first.json',
+      'first cached bytes',
+    );
+    const secondCachedArtifact = await writeRunArtifact(
+      sourceRun,
+      'assets/second.json',
+      'second cached bytes',
+    );
+    await reportStore.writeStage(sourceRun, makeReport({
+      runId: sourceRunId,
+      preset: 'assets',
+      stageId: 'preflight',
+    }));
+    await reportStore.writeStage(sourceRun, makeReport({
+      runId: sourceRunId,
+      preset: 'assets',
+      stageId: 'ingest',
+      artifacts: [firstCachedArtifact, secondCachedArtifact],
+    }));
+
+    const controller = new AbortController();
+    const ingestPartial: PipelinePartialArtifact = {
+      scope: 'run',
+      path: 'partials/ingest.tmp',
+    };
+    const cleanupFailedStage = vi.fn(async () => undefined);
+    const writeAttempt = vi.spyOn(reportStore, 'writeAttempt');
+    const release = vi.fn(async () => undefined);
+    const events: string[] = [];
+    const stageCalls: StageId[] = [];
+    const registry = createStages(events, stageCalls, {
+      partialArtifacts: {ingest: [ingestPartial]},
+    });
+    const copyCachedArtifact = vi.fn<NonNullable<RunnerDependencies['copyRunArtifact']>>(
+      async (input) => {
+        const copied = await copyRunArtifact(input);
+        controller.abort('SIGTERM');
+        return copied;
+      },
+    );
+    const dependencies: RunnerDependencies = {
+      registry,
+      runStore,
+      outputStore,
+      reportStore,
+      acquireProjectLock: vi.fn(async () => ({
+        record: {
+          pid: 1,
+          hostname: 'test',
+          processStart: 'test',
+          createdAt: NOW,
+          runId: targetRunId,
+        },
+        release,
+      })) as unknown as RunnerDependencies['acquireProjectLock'],
+      copyRunArtifact: copyCachedArtifact,
+      cleanupFailedStage,
+      createRunId: vi.fn(() => targetRunId),
+      now: vi.fn(() => NOW),
+    };
+    const plan = makePlan({
+      preset: 'assets',
+      stageIds: ['preflight', 'ingest'],
+      actions: ['run', 'cached'],
+      runMode: 'new',
+      sourceRunId,
+      targetRunId,
+    });
+
+    await expect(runExecutionPlan({
+      ...executionInput(plan, project),
+      signal: controller.signal,
+    }, dependencies)).rejects.toMatchObject({
+      code: 'PIPELINE_CANCELLED',
+      stageId: 'ingest',
+    });
+
+    const targetRun = await runStore.openExistingRun('demo', targetRunId);
+    expect(stageCalls).toEqual(['preflight']);
+    expect(copyCachedArtifact).toHaveBeenCalledOnce();
+    await expect(reportStore.readStage(targetRun, 'preflight'))
+      .resolves.toMatchObject({state: 'passed'});
+    await expect(reportStore.readStage(targetRun, 'ingest')).resolves.toBeNull();
+    await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
+      runId: targetRunId,
+      completedStage: 'preflight',
+      state: 'passed',
+    });
+    await expect(outputStore.readCurrentReadonly('demo')).resolves.toBeNull();
+    await expect(verifyRunArtifact(targetRun, firstCachedArtifact)).resolves.toBe(false);
+    await expect(verifyRunArtifact(targetRun, secondCachedArtifact)).resolves.toBe(false);
+    expect(writeAttempt).toHaveBeenCalledOnce();
+    expect(writeAttempt.mock.calls[0]?.[1]).toMatchObject({
+      runId: targetRunId,
+      stageId: 'ingest',
+      state: 'cancelled',
+      error: expect.objectContaining({code: 'PIPELINE_CANCELLED'}),
+    });
+    expect(cleanupFailedStage).toHaveBeenCalledOnce();
+    expect(cleanupFailedStage).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: 'demo',
+      runId: targetRunId,
+      stageId: 'ingest',
+      partialArtifacts: [ingestPartial],
+    }));
+    expect(release).toHaveBeenCalledOnce();
   });
 
   it('runs an unnumbered Preflight Gate for noop without writes or a lock', async () => {
