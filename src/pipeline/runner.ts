@@ -207,6 +207,19 @@ const NOOP_FAILED_STAGE_CLEANUP = async (
   _input: FailedStageCleanupInput,
 ): Promise<void> => undefined;
 
+const throwIfPipelineCancelled = (
+  signal: AbortSignal,
+  stageId?: StageId,
+): void => {
+  if (!signal.aborted) return;
+  throw new PipelineRuntimeError(
+    'PIPELINE_CANCELLED',
+    'Pipeline execution was cancelled.',
+    stageId,
+    {cause: signal.reason},
+  );
+};
+
 const safeBoundaryMessage = (
   error: PipelineRuntimeError,
   active: ActiveStageFailure,
@@ -491,6 +504,7 @@ const runPreflight = async (
   onStart?: (start: PreflightExecutionStart) => void,
 ): Promise<PreflightExecution> => {
   const stage = stageById(dependencies.registry, 'preflight');
+  throwIfPipelineCancelled(input.signal, stage.id);
   const startedAt = dependencies.now();
   const context = executionContext(input, plan, dependencies, {
     ...(sourceRun === undefined ? {} : {sourceRun}),
@@ -501,6 +515,7 @@ const runPreflight = async (
     input.signal,
   );
   const finishedAt = dependencies.now();
+  throwIfPipelineCancelled(input.signal, stage.id);
   return {
     preflight: parsePreflightResult(result),
     result,
@@ -888,9 +903,11 @@ export async function runExecutionPlan(
   if (plan.projectId !== input.project.project.id) {
     return planStale('the Execution Plan belongs to another project');
   }
+  throwIfPipelineCancelled(input.signal, 'preflight');
 
   if (plan.items.length === 1 && plan.items[0]?.stageId === 'preflight') {
     const execution = await runPreflight(input, plan, dependencies);
+    throwIfPipelineCancelled(input.signal, 'preflight');
     if (aggregateChecks(execution.preflight.checks) === 'failed') {
       return preflightFailed(plan, execution.preflight);
     }
@@ -913,11 +930,13 @@ export async function runExecutionPlan(
       createRunId: dependencies.createRunId,
     };
     let revalidated = await revalidateExecutionPlan(plan, context);
+    throwIfPipelineCancelled(input.signal, 'preflight');
     const sourceRun = await loadSourceRun(revalidated, dependencies);
     let preflight: PreflightResult | undefined;
     if (revalidated.requiresRuntimePreflight) {
       const execution = await runPreflight(input, revalidated, dependencies, sourceRun);
       preflight = execution.preflight;
+      throwIfPipelineCancelled(input.signal, 'preflight');
       if (aggregateChecks(preflight.checks) === 'failed') {
         return preflightFailed(revalidated, preflight, revalidated.sourceRunId);
       }
@@ -934,6 +953,7 @@ export async function runExecutionPlan(
         execution.preflight,
       );
     }
+    throwIfPipelineCancelled(input.signal, 'preflight');
     const reports = noopReports(revalidated, sourceRun);
     return result(revalidated, {
       ...(revalidated.sourceRunId === undefined
@@ -962,6 +982,7 @@ export async function runExecutionPlan(
     | {ok: false; error: unknown}
     | undefined;
   const executeLocked = async (): Promise<PipelineRunResult> => {
+    throwIfPipelineCancelled(input.signal, 'preflight');
     const context: ExecutionPlanContext = {
       project: input.project,
       sourceCatalog: input.sourceCatalog,
@@ -1000,6 +1021,7 @@ export async function runExecutionPlan(
         };
       },
     );
+    throwIfPipelineCancelled(input.signal, 'preflight');
     activeStageFailure = undefined;
     if (aggregateChecks(preflightExecution.preflight.checks) === 'failed') {
       return preflightFailed(
@@ -1023,6 +1045,7 @@ export async function runExecutionPlan(
       context,
       preflightExecution.preflight,
     );
+    throwIfPipelineCancelled(input.signal, 'preflight');
 
     let workCurrent = revalidated.runMode === 'resume'
       ? await dependencies.runStore.readCurrentReadonly(revalidated.projectId)
@@ -1055,6 +1078,7 @@ export async function runExecutionPlan(
         startedAt: preflightExecution.startedAt,
         boundary: 'canonical-report',
       };
+      throwIfPipelineCancelled(input.signal, preflightStage.id);
       const preflightReport = reportFromExecution(
         revalidated,
         lockRunId,
@@ -1091,22 +1115,25 @@ export async function runExecutionPlan(
 
     for (const item of revalidated.items) {
       if (item.stageId === 'preflight') continue;
+      const scheduledStage = stageById(dependencies.registry, item.stageId);
+      const scheduledContext = executionContext(input, revalidated, dependencies, {
+        ...(sourceRun === undefined ? {} : {sourceRun}),
+        preflight: preflightExecution.preflight,
+        runId: lockRunId,
+        runDirectory,
+      });
+      const scheduledAt = dependencies.now();
+      activeStageFailure = {
+        plan: revalidated,
+        item,
+        stage: scheduledStage,
+        context: scheduledContext,
+        startedAt: scheduledAt,
+        boundary: item.action === 'cached' ? 'materialize' : 'execute',
+      };
+      throwIfPipelineCancelled(input.signal, item.stageId);
       if (item.action === 'cached') {
         if (revalidated.runMode === 'new') {
-          const cachedStage = stageById(dependencies.registry, item.stageId);
-          activeStageFailure = {
-            plan: revalidated,
-            item,
-            stage: cachedStage,
-            context: executionContext(input, revalidated, dependencies, {
-              ...(sourceRun === undefined ? {} : {sourceRun}),
-              preflight: preflightExecution.preflight,
-              runId: lockRunId,
-              runDirectory,
-            }),
-            startedAt: dependencies.now(),
-            boundary: 'materialize',
-          };
           const cached = await materializeCachedStage(
             revalidated,
             item,
@@ -1118,12 +1145,13 @@ export async function runExecutionPlan(
           reports.push(cached);
           activeStageFailure = undefined;
         } else {
+          activeStageFailure = undefined;
           const cached = requireSourceReport(sourceRun, item.stageId);
           if (item.stageId === 'release') {
             if (cached.state !== 'passed') {
               return planStale('the recovered Release report is not passed', 'release');
             }
-            const releaseStage = stageById(dependencies.registry, 'release');
+            const releaseStage = scheduledStage;
             let verified = false;
             try {
               verified = await releaseStage.verify(
@@ -1215,11 +1243,10 @@ export async function runExecutionPlan(
             });
           }
           if (needsRecoveredWorkProgress(workCurrent, lockRunId, cached)) {
-            const cachedStage = stageById(dependencies.registry, item.stageId);
             activeStageFailure = {
               plan: revalidated,
               item,
-              stage: cachedStage,
+              stage: scheduledStage,
               context: executionContext(input, revalidated, dependencies, {
                 ...(sourceRun === undefined ? {} : {sourceRun}),
                 preflight: preflightExecution.preflight,
@@ -1243,24 +1270,8 @@ export async function runExecutionPlan(
         continue;
       }
 
-      const stage = stageById(dependencies.registry, item.stageId);
-      const startedAt = dependencies.now();
-      const stageContext = executionContext(input, revalidated, dependencies, {
-        ...(sourceRun === undefined ? {} : {sourceRun}),
-        preflight: preflightExecution.preflight,
-        runId: lockRunId,
-        runDirectory,
-      });
-      activeStageFailure = {
-        plan: revalidated,
-        item,
-        stage,
-        context: stageContext,
-        startedAt,
-        boundary: 'execute',
-      };
-      const stageResult = await stage.execute(
-        stageContext,
+      const stageResult = await scheduledStage.execute(
+        scheduledContext,
         input.signal,
       );
       const finishedAt = dependencies.now();
@@ -1269,7 +1280,7 @@ export async function runExecutionPlan(
         lockRunId,
         item,
         stageResult,
-        startedAt,
+        scheduledAt,
         finishedAt,
       );
 
