@@ -1,5 +1,5 @@
 import {spawnSync} from 'node:child_process';
-import {lstat, mkdtemp, rm, writeFile} from 'node:fs/promises';
+import {lstat, mkdtemp, readdir, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
@@ -9,14 +9,17 @@ import {loadProject, type ProjectInputs} from '../../../src/domain/load-project'
 import {JsonFileError} from '../../../src/fs/json-files';
 import type {ProjectDirectoryScope} from '../../../src/fs/project-paths';
 import {
+  buildExecutionPlan as buildPipelineExecutionPlan,
   ExecutionPlanError,
   type ExecutionPlan,
   type ExecutionPlanRequest,
 } from '../../../src/pipeline/execution-plan';
-import {acquireProjectLock} from '../../../src/pipeline/project-lock';
+import {
+  acquireProjectLock,
+  ProjectLockError,
+} from '../../../src/pipeline/project-lock';
 import {PipelineRuntimeError} from '../../../src/pipeline/runtime-errors';
 import {
-  createRunId,
   runExecutionPlan,
   type PipelineRunResult,
   type RunExecutionInput,
@@ -24,13 +27,17 @@ import {
 import {
   createOutputStore,
   createRunStore,
+  type CurrentPointer,
 } from '../../../src/pipeline/run-store';
 import type {PipelineSignalHandle} from '../../../src/pipeline/signals';
 import {
   discoverProjectSourceCatalog,
   type ProjectSourceCatalog,
 } from '../../../src/pipeline/source-assets';
-import {createStageReportStore} from '../../../src/pipeline/stage-report';
+import {
+  createStageReportStore,
+  type StageReport,
+} from '../../../src/pipeline/stage-report';
 import type {PreflightResult} from '../../../src/pipeline/stages/preflight';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
 import {
@@ -47,6 +54,7 @@ import {
 import {
   fakePreflightResult,
   fakeStage,
+  passedStageReport,
 } from '../../helpers/pipeline-fixtures';
 
 const project = (): ProjectInputs => ({
@@ -221,6 +229,100 @@ const makeDependencies = () => {
     stdout: () => stdout,
     stderr: () => stderr,
   };
+};
+
+const PREFLIGHT_FINGERPRINT = `sha256:${'e'.repeat(64)}`;
+const INGEST_FINGERPRINT = `sha256:${'f'.repeat(64)}`;
+
+const resumePointer = (runId: string): CurrentPointer => ({
+  runId,
+  relativePath: `runs/${runId}`,
+  preset: 'assets',
+  stageIds: ['preflight', 'ingest'],
+  completedStage: 'preflight',
+  state: 'passed',
+  publishedAt: '2026-08-12T00:00:00.000Z',
+});
+
+const createRealResumeRaceFixture = async () => {
+  const tempProject = await createTempProject();
+  try {
+    const loaded = await loadProject(tempProject.workspaceRoot, 'demo');
+    const runStore = createRunStore(tempProject.workspaceRoot);
+    const outputStore = createOutputStore(tempProject.workspaceRoot);
+    const reportStore = createStageReportStore();
+    const stageCalls: string[] = [];
+    const registry = [
+      fakeStage('preflight', {
+        fingerprint: async () => PREFLIGHT_FINGERPRINT,
+        verify: async (_context, report) => (
+          report.fingerprint === PREFLIGHT_FINGERPRINT
+        ),
+        execute: async () => {
+          stageCalls.push('preflight');
+          return {
+            state: 'passed',
+            fingerprint: PREFLIGHT_FINGERPRINT,
+            outputs: fakePreflightResult(),
+            artifacts: [],
+            checks: [],
+          };
+        },
+      }),
+      fakeStage('ingest', {
+        prerequisites: ['preflight'],
+        fingerprint: async () => INGEST_FINGERPRINT,
+        verify: async (_context, report) => (
+          report.fingerprint === INGEST_FINGERPRINT
+        ),
+        execute: async () => {
+          stageCalls.push('ingest');
+          return {
+            state: 'passed',
+            fingerprint: INGEST_FINGERPRINT,
+            outputs: {stageId: 'ingest'},
+            artifacts: [],
+            checks: [],
+          };
+        },
+      }),
+    ];
+    const seedRun = async (runId: string) => {
+      const runDirectory = await runStore.createRun('demo', runId);
+      await reportStore.writeStage(runDirectory, passedStageReport({
+        projectId: 'demo',
+        runId,
+        preset: 'assets',
+        stageId: 'preflight',
+        position: 1,
+        total: 2,
+        fingerprint: PREFLIGHT_FINGERPRINT,
+        outputs: fakePreflightResult() as unknown as NonNullable<
+          StageReport['outputs']
+        >,
+        artifacts: [],
+        checks: [],
+      }));
+      return runDirectory;
+    };
+    const runA = await seedRun('run-a');
+    const runB = await seedRun('run-b');
+    await runStore.publishCurrent('demo', resumePointer('run-a'));
+    return {
+      tempProject,
+      loaded,
+      runStore,
+      outputStore,
+      reportStore,
+      registry,
+      runA,
+      runB,
+      stageCalls,
+    };
+  } catch (error) {
+    await tempProject.cleanup();
+    throw error;
+  }
 };
 
 describe('pipeline CLI commands', () => {
@@ -649,6 +751,35 @@ describe('pipeline CLI commands', () => {
     expect(fixture.stdout()).not.toContain('secret-cause');
   });
 
+  it('does not retry a retry-safe stale mixed with a project lock failure', async () => {
+    const fixture = makeDependencies();
+    const stale = retrySafeStale('source Run changed before writes');
+    fixture.dependencies.runExecutionPlan.mockRejectedValueOnce(new AggregateError([
+      stale,
+      new ProjectLockError(
+        'PROJECT_LOCK_INVALID',
+        'secret lock release failure at /private/project/.work/demo/pipeline.lock',
+      ),
+    ], 'Runner and lock release failed', {cause: stale}));
+
+    const exitCode = await runPipelineCommand(
+      'demo',
+      {json: true},
+      fixture.dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.environmentFailed);
+    expect(fixture.dependencies.buildExecutionPlan).toHaveBeenCalledOnce();
+    expect(fixture.dependencies.runExecutionPlan).toHaveBeenCalledOnce();
+    expect(JSON.parse(fixture.stdout())).toEqual({
+      projectId: 'demo',
+      code: 'PROJECT_LOCK_INVALID',
+      message: 'Pipeline project lock state is uncertain.',
+    });
+    expect(fixture.stdout()).not.toContain('/private/project');
+    expect(fixture.stdout()).not.toContain('secret lock release failure');
+  });
+
   it('rebuilds and retries a cause-wrapped retry-safe PLAN_STALE exactly once', async () => {
     const fixture = makeDependencies();
     const firstPlan = executionPlan({targetRunId: 'run-first'});
@@ -731,84 +862,91 @@ describe('pipeline CLI commands', () => {
     });
   });
 
-  it('retries a real Runner pre-write stale only after proving zero persistent writes', async () => {
-    const tempProject = await createTempProject();
+  it('retries a real locked resume revalidation stale with zero persistent outcomes', async () => {
+    const fixture = await createRealResumeRaceFixture();
     try {
-      const loaded = await loadProject(tempProject.workspaceRoot, 'demo');
-      const runStore = createRunStore(tempProject.workspaceRoot);
-      const outputStore = createOutputStore(tempProject.workspaceRoot);
-      const reportStore = createStageReportStore();
-      const registry = [fakeStage('preflight', {
-        execute: async () => ({
-          state: 'passed',
-          fingerprint: 'sha256:preflight',
-          outputs: fakePreflightResult(),
-          artifacts: [],
-          checks: [],
-        }),
-      })];
+      let lockAcquisitions = 0;
+      const acquireWithCurrentRace: typeof acquireProjectLock = async (
+        work,
+        runId,
+      ) => {
+        const lease = await acquireProjectLock(work, runId);
+        lockAcquisitions += 1;
+        if (lockAcquisitions === 1) {
+          try {
+            await fixture.runStore.publishCurrent('demo', resumePointer('run-b'));
+          } catch (error) {
+            await lease.release();
+            throw error;
+          }
+        }
+        return lease;
+      };
       const runnerDependencies = {
-        registry,
-        runStore,
-        outputStore,
-        reportStore,
-        acquireProjectLock,
-        createRunId,
+        registry: fixture.registry,
+        runStore: fixture.runStore,
+        outputStore: fixture.outputStore,
+        reportStore: fixture.reportStore,
+        acquireProjectLock: acquireWithCurrentRace,
+        createRunId: () => 'run-unused',
         now: () => '2026-08-12T00:00:00.000Z',
       };
-      const validPlan = executionPlan({
-        projectId: 'demo',
-        preset: 'release',
-        stageIds: ['preflight'],
-        targetRunId: 'run-fresh',
-        items: [{
-          position: 1,
-          total: 1,
-          stageId: 'preflight',
-          displayName: 'Preflight',
-          action: 'run',
-          fingerprint: null,
-          materialize: false,
-        }],
-      });
-      const stalePlan = {...validPlan, projectId: 'other-project'};
       let runAttempts = 0;
       let verifiedNoWrites = false;
       let stdout = '';
       let stderr = '';
+      const builtPlans: ExecutionPlan[] = [];
       const dependencies = {
-        workspaceRoot: tempProject.workspaceRoot,
+        workspaceRoot: fixture.tempProject.workspaceRoot,
         stdout: {write: (chunk: string) => { stdout += chunk; }},
         stderr: {write: (chunk: string) => { stderr += chunk; }},
-        loadProject: vi.fn(async () => loaded),
+        loadProject: vi.fn(async () => fixture.loaded),
         discoverProjectSourceCatalog: vi.fn(async () => sourceCatalog()),
-        buildExecutionPlan: vi.fn()
-          .mockResolvedValueOnce(stalePlan)
-          .mockResolvedValueOnce(validPlan),
+        buildExecutionPlan: vi.fn(async (projectInput, catalog, request) => {
+          const plan = await buildPipelineExecutionPlan({
+            project: projectInput,
+            sourceCatalog: catalog,
+            registry: fixture.registry,
+            runStore: fixture.runStore,
+            outputStore: fixture.outputStore,
+            reportStore: fixture.reportStore,
+            createRunId: () => 'run-unused',
+          }, request);
+          builtPlans.push(plan);
+          return plan;
+        }),
         runExecutionPlan: vi.fn(async (input: RunExecutionInput) => {
           runAttempts += 1;
           try {
             return await runExecutionPlan(input, runnerDependencies);
           } catch (error) {
             if (runAttempts === 1) {
+              expect(lockAcquisitions).toBe(1);
               expect(error).toMatchObject({
                 code: 'PLAN_STALE',
                 retrySafe: true,
               });
-              await expect(runStore.readCurrentReadonly('demo')).resolves.toBeNull();
-              await expect(outputStore.readCurrentReadonly('demo')).resolves.toBeNull();
-              await expect(lstat(path.join(
-                tempProject.workspaceRoot,
+              await expect(fixture.runStore.readCurrentReadonly('demo'))
+                .resolves.toEqual(resumePointer('run-b'));
+              await expect(fixture.outputStore.readCurrentReadonly('demo'))
+                .resolves.toBeNull();
+              await expect(fixture.reportStore.readStage(fixture.runA, 'ingest'))
+                .resolves.toBeNull();
+              await expect(fixture.reportStore.readStage(fixture.runB, 'ingest'))
+                .resolves.toBeNull();
+              expect((await readdir(path.join(
+                fixture.tempProject.workspaceRoot,
                 '.work',
                 'demo',
                 'runs',
-              ))).rejects.toMatchObject({code: 'ENOENT'});
+              ))).sort()).toEqual(['run-a', 'run-b']);
               await expect(lstat(path.join(
-                tempProject.workspaceRoot,
+                fixture.tempProject.workspaceRoot,
                 '.work',
                 'demo',
                 'pipeline.lock',
               ))).rejects.toMatchObject({code: 'ENOENT'});
+              expect(fixture.stageCalls).toEqual([]);
               verifiedNoWrites = true;
               throw new AggregateError([error], 'wrapped Runner stale', {cause: error});
             }
@@ -821,16 +959,136 @@ describe('pipeline CLI commands', () => {
         })),
       } satisfies PipelineCommandDependencies;
 
-      const exitCode = await runPipelineCommand('demo', {}, dependencies);
+      const exitCode = await runPipelineCommand('demo', {
+        preset: 'assets',
+        to: 'ingest',
+        resume: true,
+      }, dependencies);
 
       expect(exitCode).toBe(EXIT_CODES.success);
       expect(verifiedNoWrites).toBe(true);
+      expect(lockAcquisitions).toBe(2);
       expect(dependencies.buildExecutionPlan).toHaveBeenCalledTimes(2);
       expect(dependencies.runExecutionPlan).toHaveBeenCalledTimes(2);
+      expect(builtPlans).toMatchObject([
+        {runMode: 'resume', sourceRunId: 'run-a', targetRunId: 'run-a'},
+        {runMode: 'resume', sourceRunId: 'run-b', targetRunId: 'run-b'},
+      ]);
+      expect(fixture.stageCalls).toEqual(['preflight', 'ingest']);
       expect(stdout).toContain('State: passed');
       expect(stderr).toBe('');
     } finally {
-      await tempProject.cleanup();
+      await fixture.tempProject.cleanup();
+    }
+  });
+
+  it('classifies a real Runner stale plus lock release Aggregate as environment failure', async () => {
+    const fixture = await createRealResumeRaceFixture();
+    try {
+      const releaseSecret = path.join(
+        fixture.tempProject.workspaceRoot,
+        '.work',
+        'demo',
+        'pipeline.lock',
+      );
+      let lockAcquisitions = 0;
+      const acquireWithReleaseFailure: typeof acquireProjectLock = async (
+        work,
+        runId,
+      ) => {
+        const lease = await acquireProjectLock(work, runId);
+        lockAcquisitions += 1;
+        await fixture.runStore.publishCurrent('demo', resumePointer('run-b'));
+        return {
+          record: lease.record,
+          release: async () => {
+            await lease.release();
+            throw new Error(`secret lock release failure at ${releaseSecret}`);
+          },
+        };
+      };
+      let stdout = '';
+      let stderr = '';
+      const dependencies = {
+        workspaceRoot: fixture.tempProject.workspaceRoot,
+        stdout: {write: (chunk: string) => { stdout += chunk; }},
+        stderr: {write: (chunk: string) => { stderr += chunk; }},
+        loadProject: vi.fn(async () => fixture.loaded),
+        discoverProjectSourceCatalog: vi.fn(async () => sourceCatalog()),
+        buildExecutionPlan: vi.fn(async (projectInput, catalog, request) => (
+          await buildPipelineExecutionPlan({
+            project: projectInput,
+            sourceCatalog: catalog,
+            registry: fixture.registry,
+            runStore: fixture.runStore,
+            outputStore: fixture.outputStore,
+            reportStore: fixture.reportStore,
+            createRunId: () => 'run-unused',
+          }, request)
+        )),
+        runExecutionPlan: vi.fn(async (input: RunExecutionInput) => {
+          try {
+            return await runExecutionPlan(input, {
+              registry: fixture.registry,
+              runStore: fixture.runStore,
+              outputStore: fixture.outputStore,
+              reportStore: fixture.reportStore,
+              acquireProjectLock: acquireWithReleaseFailure,
+              createRunId: () => 'run-unused',
+              now: () => '2026-08-12T00:00:00.000Z',
+            });
+          } catch (error) {
+            expect(error).toBeInstanceOf(AggregateError);
+            expect((error as AggregateError).errors).toMatchObject([
+              {code: 'PLAN_STALE', retrySafe: true},
+              {message: expect.stringContaining('secret lock release failure')},
+            ]);
+            throw error;
+          }
+        }),
+        installPipelineSignalHandlers: vi.fn(() => ({
+          signal: new AbortController().signal,
+          dispose: vi.fn(),
+        })),
+      } satisfies PipelineCommandDependencies;
+
+      const exitCode = await runPipelineCommand('demo', {
+        preset: 'assets',
+        to: 'ingest',
+        resume: true,
+        json: true,
+      }, dependencies);
+
+      expect(exitCode).toBe(EXIT_CODES.environmentFailed);
+      expect(lockAcquisitions).toBe(1);
+      expect(dependencies.buildExecutionPlan).toHaveBeenCalledOnce();
+      expect(dependencies.runExecutionPlan).toHaveBeenCalledOnce();
+      expect(JSON.parse(stdout)).toEqual({
+        projectId: 'demo',
+        code: 'PIPELINE_EXECUTION_FAILED',
+        message: 'Pipeline execution failed unexpectedly.',
+      });
+      expect(stdout).not.toContain(releaseSecret);
+      expect(stdout).not.toContain('secret lock release failure');
+      expect(stderr).toBe('');
+      await expect(fixture.runStore.readCurrentReadonly('demo'))
+        .resolves.toEqual(resumePointer('run-b'));
+      await expect(fixture.outputStore.readCurrentReadonly('demo'))
+        .resolves.toBeNull();
+      await expect(fixture.reportStore.readStage(fixture.runA, 'ingest'))
+        .resolves.toBeNull();
+      await expect(fixture.reportStore.readStage(fixture.runB, 'ingest'))
+        .resolves.toBeNull();
+      await expect(lstat(releaseSecret)).rejects.toMatchObject({code: 'ENOENT'});
+      expect((await readdir(path.join(
+        fixture.tempProject.workspaceRoot,
+        '.work',
+        'demo',
+        'runs',
+      ))).sort()).toEqual(['run-a', 'run-b']);
+      expect(fixture.stageCalls).toEqual([]);
+    } finally {
+      await fixture.tempProject.cleanup();
     }
   });
 

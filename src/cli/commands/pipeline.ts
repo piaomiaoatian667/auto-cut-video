@@ -319,6 +319,9 @@ const environmentMessage = (code: string | undefined): string | undefined => {
     case 'ENOMEM':
       return 'Pipeline environment memory was exhausted.';
     default:
+      if (code?.startsWith('PROJECT_LOCK_') === true) {
+        return 'Pipeline project lock state is uncertain.';
+      }
       return code?.startsWith('ENV_') === true
         ? 'Pipeline environment validation failed.'
         : undefined;
@@ -485,9 +488,12 @@ const executionFailure = (
   const planError = entries.find(
     ({error: entry}) => isTrustedPlanError(entry),
   )?.error;
-  return planError === undefined
-    ? environmentFailure(projectId, error, entries)
-    : validationFailure(projectId, planError);
+  if (planError === undefined) {
+    return environmentFailure(projectId, error, entries);
+  }
+  return isTrustedPlanError(error) || isRetrySafePlanStale(error)
+    ? validationFailure(projectId, planError)
+    : environmentFailure(projectId, error, entries);
 };
 
 const resultExitCode = (result: PipelineRunResult): number => {
