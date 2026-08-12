@@ -50,6 +50,7 @@ import {
 import type {PreflightResult} from '../../../src/pipeline/stages/preflight';
 import type {NarrationStageInput} from '../../../src/pipeline/stages/narration';
 import {runCompile as runConcreteCompile} from '../../../src/pipeline/stages/compile';
+import {evaluateReview} from '../../../src/pipeline/stages/review';
 import type {
   DraftReport,
   DraftStageInput,
@@ -1239,6 +1240,153 @@ describe('Review Draft project binding', () => {
       new AbortController().signal,
     )).rejects.toThrow(/PIPELINE_CONTEXT_INVALID/u);
     expect(evaluateReview).not.toHaveBeenCalled();
+  });
+});
+
+describe('Review approval commit marker', () => {
+  const currentDraftReport = async (): Promise<DraftReport> => {
+    const draftVideo = await hashRunArtifact(targetRun, 'draft/draft.mp4');
+    const contactSheet = await hashRunArtifact(targetRun, 'draft/contact-sheet.jpg');
+    const reviewFrame = await hashRunArtifact(targetRun, 'draft/frames/frame-000000.jpg');
+    return draftReport({
+      draftVideo: {path: draftVideo.path, sha256: draftVideo.sha256},
+      contactSheet: {path: contactSheet.path, sha256: contactSheet.sha256},
+      reviewFrames: [{path: reviewFrame.path, sha256: reviewFrame.sha256}],
+    });
+  };
+
+  const canonicalReviewReport = (
+    draft: DraftReport,
+    review: Review,
+  ): StageReport => {
+    const evidence = draftReviewEvidenceArtifacts(draft);
+    return passedStageReport({
+      stageId: 'review',
+      runId: 'target-run',
+      fingerprint: fingerprintValue({
+        algorithmVersion: STAGE_ALGORITHM_VERSIONS.review,
+        evidence,
+      }),
+      artifacts: [],
+      outputs: {evidence, review},
+    });
+  };
+
+  it('ignores orphan approval after Draft hashes change at identical paths', async () => {
+    const draft = await currentDraftReport();
+    const previousDraft = draftReport({
+      ...draft.outputs,
+      contactSheet: {
+        ...draft.outputs.contactSheet,
+        sha256: hash('previous-contact-sheet'),
+      },
+    });
+    const previousEvidence = draftReviewEvidenceArtifacts(previousDraft);
+    const currentEvidence = draftReviewEvidenceArtifacts(draft);
+    expect(previousEvidence.map((artifact) => artifact.path)).toEqual(
+      currentEvidence.map((artifact) => artifact.path),
+    );
+    expect(fingerprintValue(previousEvidence)).not.toBe(fingerprintValue(currentEvidence));
+    const review = approvedReview({
+      runId: 'target-run',
+      evidencePaths: previousEvidence.map((artifact) => artifact.path),
+    });
+    const readReview = vi.fn(async () => review);
+    const evaluate = vi.fn(evaluateReview);
+    const stage = createReviewStage({
+      readDraftReport: async () => draft,
+      readReview,
+      readStageReport: async () => null,
+      evaluateReview: evaluate,
+    });
+
+    await expect(stage.execute(
+      executionContext(),
+      new AbortController().signal,
+    )).resolves.toMatchObject({
+      state: 'needs_review',
+      outputs: {review: null},
+    });
+    expect(readReview).not.toHaveBeenCalled();
+    expect(evaluate).toHaveBeenCalledWith(expect.not.objectContaining({review}));
+  });
+
+  it('ignores orphan approval when canonical evidence hashes no longer match Draft', async () => {
+    const draft = await currentDraftReport();
+    const review = approvedReview({runId: 'target-run'});
+    const oldDraft = draftReport({
+      ...draft.outputs,
+      contactSheet: {
+        ...draft.outputs.contactSheet,
+        sha256: hash('old-contact-sheet'),
+      },
+    });
+    const readReview = vi.fn(async () => review);
+    const evaluate = vi.fn(evaluateReview);
+    const stage = createReviewStage({
+      readDraftReport: async () => draft,
+      readReview,
+      readStageReport: async () => canonicalReviewReport(oldDraft, review),
+      evaluateReview: evaluate,
+    });
+
+    await expect(stage.execute(
+      executionContext(),
+      new AbortController().signal,
+    )).resolves.toMatchObject({
+      state: 'needs_review',
+      outputs: {review: null},
+    });
+    expect(readReview).not.toHaveBeenCalled();
+    expect(evaluate).toHaveBeenCalledWith(expect.not.objectContaining({review}));
+  });
+
+  it('ignores approval when review.json differs from the canonical Review object', async () => {
+    const draft = await currentDraftReport();
+    const canonicalReview = approvedReview({runId: 'target-run'});
+    const currentReview = approvedReview({
+      runId: 'target-run',
+      reason: 'different approval',
+    });
+    const evaluate = vi.fn(evaluateReview);
+    const stage = createReviewStage({
+      readDraftReport: async () => draft,
+      readReview: async () => currentReview,
+      readStageReport: async () => canonicalReviewReport(draft, canonicalReview),
+      evaluateReview: evaluate,
+    });
+
+    await expect(stage.execute(
+      executionContext(),
+      new AbortController().signal,
+    )).resolves.toMatchObject({
+      state: 'needs_review',
+      outputs: {review: null},
+    });
+    expect(evaluate).toHaveBeenCalledWith(expect.not.objectContaining({review: currentReview}));
+  });
+
+  it('uses approval only when canonical report and review.json match current Draft', async () => {
+    const draft = await currentDraftReport();
+    const review = approvedReview({runId: 'target-run'});
+    const readReview = vi.fn(async () => review);
+    const evaluate = vi.fn(evaluateReview);
+    const stage = createReviewStage({
+      readDraftReport: async () => draft,
+      readReview,
+      readStageReport: async () => canonicalReviewReport(draft, review),
+      evaluateReview: evaluate,
+    });
+
+    await expect(stage.execute(
+      executionContext(),
+      new AbortController().signal,
+    )).resolves.toMatchObject({
+      state: 'passed',
+      outputs: {review},
+    });
+    expect(readReview).toHaveBeenCalledWith(targetRun);
+    expect(evaluate).toHaveBeenCalledWith(expect.objectContaining({review}));
   });
 });
 

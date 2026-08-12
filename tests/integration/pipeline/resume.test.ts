@@ -34,7 +34,10 @@ import {
   type PipelineStage,
 } from '../../../src/pipeline/stage';
 import {createReviewStage} from '../../../src/pipeline/stage-adapters/review';
-import {createStageReportStore} from '../../../src/pipeline/stage-report';
+import {
+  createStageReportStore,
+  type StageReportStore,
+} from '../../../src/pipeline/stage-report';
 import {
   DraftReportSchema,
   draftReviewEvidenceArtifacts,
@@ -46,6 +49,7 @@ import {fakePreflightResult} from '../../helpers/pipeline-fixtures';
 import {createTempProject} from '../../helpers/temp-project';
 
 const NOW = '2026-08-11T15:00:00.000Z';
+const ORPHAN_APPROVED_AT = '2026-08-11T15:04:00.000Z';
 const APPROVED_AT = '2026-08-11T15:05:00.000Z';
 const SOURCE_HASH = fingerprintValue({source: 'resume'});
 
@@ -344,6 +348,80 @@ describe('Pipeline resume', () => {
         path.join(attemptDirectory, attemptNamesBefore[0]!),
       )).resolves.toEqual(attemptBytesBefore);
 
+      const canonicalWriteFailure = new Error('canonical Review write failed');
+      const failingReportStore: StageReportStore = {
+        readStage: reportStore.readStage,
+        writeStage: async () => { throw canonicalWriteFailure; },
+        writeAttempt: reportStore.writeAttempt,
+        deleteStage: reportStore.deleteStage,
+      };
+      await expect(runReviewCommand(
+        'demo',
+        {approve: true, reason: 'orphan approval', reviewer: 'tester'},
+        {
+          workspaceRoot: tempProject.workspaceRoot,
+          stdout: {write: () => undefined},
+          stderr: {write: () => undefined},
+          now: () => ORPHAN_APPROVED_AT,
+          stageReportStore: failingReportStore,
+        },
+      )).rejects.toBe(canonicalWriteFailure);
+      await expect(reportStore.readStage(runDirectory, 'review')).resolves.toBeNull();
+      await expect(readRunJson(runDirectory, 'review.json')).resolves.toMatchObject({
+        status: 'approved',
+        reviewedAt: ORPHAN_APPROVED_AT,
+        reason: 'orphan approval',
+      });
+      await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
+        runId: 'run-review',
+        completedStage: 'review',
+        state: 'needs_review',
+      });
+
+      executionCalls.length = 0;
+      reviewEvaluations.mockClear();
+      const orphanResumePlan = await buildExecutionPlan(
+        planningContext(() => 'run-orphan-replacement'),
+        {preset: 'release', resume: true},
+      );
+      expect(orphanResumePlan).toMatchObject({
+        runMode: 'resume',
+        sourceRunId: 'run-review',
+        targetRunId: 'run-review',
+      });
+      expect(orphanResumePlan.items.find((item) => item.stageId === 'review'))
+        .toMatchObject({action: 'resume', materialize: false});
+      expect(orphanResumePlan.items.find((item) => item.stageId === 'release'))
+        .toMatchObject({action: 'run', materialize: false});
+
+      const orphanResume = await runExecutionPlan({
+        plan: orphanResumePlan,
+        project,
+        sourceCatalog,
+        signal,
+      }, dependencies);
+
+      expect(orphanResume).toMatchObject({
+        state: 'needs_review',
+        runId: 'run-review',
+        completedStage: 'review',
+      });
+      expect(executionCalls).toEqual(['preflight', 'review']);
+      expect(executionCalls).not.toContain('release');
+      expect(reviewEvaluations).toHaveBeenCalled();
+      await expect(reportStore.readStage(runDirectory, 'review')).resolves.toBeNull();
+      await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
+        runId: 'run-review',
+        completedStage: 'review',
+        state: 'needs_review',
+      });
+      const attemptNamesAfterOrphanResume = await readdir(attemptDirectory);
+      expect(attemptNamesAfterOrphanResume).toHaveLength(3);
+      expect(attemptNamesAfterOrphanResume).toContain(attemptNamesBefore[0]);
+      await expect(readFile(
+        path.join(attemptDirectory, attemptNamesBefore[0]!),
+      )).resolves.toEqual(attemptBytesBefore);
+
       let reviewStdout = '';
       let reviewStderr = '';
       const approval = await runReviewCommand(
@@ -382,7 +460,7 @@ describe('Pipeline resume', () => {
         state: 'passed',
       });
       const attemptNamesAfter = await readdir(attemptDirectory);
-      expect(attemptNamesAfter.sort()).toEqual(attemptNamesAwaitingApproval.sort());
+      expect(attemptNamesAfter.sort()).toEqual(attemptNamesAfterOrphanResume.sort());
       await expect(readFile(
         path.join(attemptDirectory, attemptNamesBefore[0]!),
       )).resolves.toEqual(attemptBytesBefore);
@@ -422,7 +500,7 @@ describe('Pipeline resume', () => {
         runId: 'run-review',
         completedStage: 'release',
       });
-      expect(releaseLock).toHaveBeenCalledTimes(3);
+      expect(releaseLock).toHaveBeenCalledTimes(4);
     } finally {
       await tempProject.cleanup();
     }

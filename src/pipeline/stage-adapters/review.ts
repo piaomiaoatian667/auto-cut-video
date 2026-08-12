@@ -10,6 +10,10 @@ import {
   type PipelineStage,
 } from '../stage';
 import {
+  createStageReportStore,
+  type StageReport,
+} from '../stage-report';
+import {
   DraftReportSchema,
   draftReviewEvidenceArtifacts,
   type DraftReport,
@@ -42,6 +46,10 @@ export interface ReviewStageAdapterDependencies {
   algorithmVersion?: string;
   readDraftReport?: (runDirectory: RunDirectoryScope) => Promise<DraftReport>;
   readReview?: (runDirectory: RunDirectoryScope) => Promise<Review | undefined>;
+  readStageReport?: (
+    runDirectory: RunDirectoryScope,
+    stageId: 'review',
+  ) => Promise<StageReport | null>;
   evaluateReview?: typeof evaluateReview;
 }
 
@@ -64,12 +72,60 @@ export const createReviewStage = (
       'review.json',
       (value) => ReviewSchema.parse(value),
     ));
+  const stageReportStore = createStageReportStore();
+  const readStageReport = dependencies.readStageReport
+    ?? (async (runDirectory, stageId) => await stageReportStore.readStage(
+      runDirectory,
+      stageId,
+    ));
   const evaluate = dependencies.evaluateReview ?? evaluateReview;
 
   const fingerprintFromDraft = (report: DraftReport): string => fingerprintValue({
     algorithmVersion,
     evidence: evidenceFromDraft(report),
   });
+
+  const readCommittedReview = async (
+    runDirectory: RunDirectoryScope,
+    projectId: string,
+    runId: string,
+    draft: DraftReport,
+  ): Promise<Review | undefined> => {
+    try {
+      const report = await readStageReport(runDirectory, 'review');
+      if (
+        report === null
+        || report.projectId !== projectId
+        || report.runId !== runId
+        || report.stageId !== 'review'
+        || report.state !== 'passed'
+      ) {
+        return undefined;
+      }
+      const parsed = ReviewAdapterOutputSchema.safeParse(report.outputs);
+      if (!parsed.success || parsed.data.review?.status !== 'approved') {
+        return undefined;
+      }
+      const evidence = evidenceFromDraft(draft);
+      if (
+        fingerprintValue(parsed.data.evidence) !== fingerprintValue(evidence)
+        || report.fingerprint !== fingerprintFromDraft(draft)
+      ) {
+        return undefined;
+      }
+      const review = await readReview(runDirectory);
+      if (
+        review === undefined
+        || fingerprintValue(review) !== fingerprintValue(parsed.data.review)
+      ) {
+        return undefined;
+      }
+      return review;
+    } catch (error) {
+      if (isOrdinaryPersistedInputMiss(error)) return undefined;
+      throw error;
+    }
+  };
 
   return {
     id: 'review',
@@ -150,7 +206,12 @@ export const createReviewStage = (
           );
         }
       }
-      const review = await readReview(runDirectory);
+      const review = await readCommittedReview(
+        runDirectory,
+        context.project.project.id,
+        runId,
+        draft,
+      );
       const reviewContext: ReviewContext = {
         projectId: context.project.project.id,
         runId,

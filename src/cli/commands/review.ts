@@ -26,6 +26,7 @@ import {
   createStageReportStore,
   StageReportSchema,
   type StageReport,
+  type StageReportStore,
 } from '../../pipeline/stage-report';
 import {
   DraftReportSchema,
@@ -54,6 +55,7 @@ export interface ReviewCommandDependencies {
   verifyRunArtifact?: typeof verifyRunArtifact;
   acquireProjectLock?: typeof acquireProjectLock;
   reviewFileOps?: Partial<ReviewFileOperations>;
+  stageReportStore?: StageReportStore;
 }
 
 interface ReviewFileOperations {
@@ -432,6 +434,7 @@ export const runReviewCommand = async (
   const reason = options.reason;
 
   const store = createRunStore(dependencies.workspaceRoot);
+  const reportStore = dependencies.stageReportStore ?? createStageReportStore();
   const current = await store.readCurrentReadonly(projectId);
   if (current === null) {
     dependencies.stderr.write(`No current run for project ${projectId}.\n`);
@@ -490,7 +493,6 @@ export const runReviewCommand = async (
       return EXIT_CODES.validationFailed;
     }
     const evidencePaths = evidence.map((artifact) => artifact.path);
-    const reportStore = createStageReportStore();
     const existingReport = await reportStore.readStage(runDirectory, 'review');
     let review: Review;
     if (existingReport !== null) {
