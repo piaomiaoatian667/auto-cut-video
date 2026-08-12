@@ -628,6 +628,22 @@ describe('adapter fingerprints', () => {
       .not.toBe(await createPreflightStage().fingerprint(context));
   });
 
+  it('passes the Stage AbortSignal into Preflight execution', async () => {
+    const controller = new AbortController();
+    const runPreflight = vi.fn(async (
+      _input: unknown,
+      _options?: {signal?: AbortSignal},
+    ) => preflightResult());
+    const stage = createPreflightStage({runPreflight});
+
+    await stage.execute(executionContext(), controller.signal);
+
+    expect(runPreflight).toHaveBeenCalledWith(
+      expect.objectContaining({workspaceRoot: project.workspaceRoot}),
+      {signal: controller.signal},
+    );
+  });
+
   it.each([
     ['source hash', (context: StagePlanningContext) => ({
       ...context,

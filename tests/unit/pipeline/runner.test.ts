@@ -272,6 +272,7 @@ const createStages = (
 
 interface MemoryRuntimeOptions extends StageOptions {
   afterAttemptWrite?: (report: StageReport) => Promise<void> | void;
+  afterOutputPublish?: (pointer: CurrentPointer) => Promise<void> | void;
   afterStageReportWrite?: (report: StageReport) => Promise<void> | void;
   afterWorkPublish?: (pointer: CurrentPointer) => Promise<void> | void;
   current?: CurrentPointer | null;
@@ -371,6 +372,7 @@ const createMemoryRuntime = (options: MemoryRuntimeOptions = {}) => {
         throw new Error('output pointer failed');
       }
       outputCurrent = pointer;
+      await options.afterOutputPublish?.(pointer);
     }),
   } as unknown as OutputStore;
 
@@ -767,6 +769,38 @@ describe('Pipeline Runner', () => {
     expect(runtime.acquireProjectLock).not.toHaveBeenCalled();
     expect(runtime.runStore.publishCurrent).not.toHaveBeenCalled();
     expect(runtime.outputStore.publishCurrent).not.toHaveBeenCalled();
+  });
+
+  it('normalizes a preflight-only process abort without creating a Run', async () => {
+    const runtime = createMemoryRuntime({
+      execute: {
+        preflight: async () => {
+          throw Object.assign(
+            new Error('secret command output from /private/input.mov'),
+            {code: 'PROCESS_ABORTED'},
+          );
+        },
+      },
+    });
+    const plan = makePlan({
+      preset: 'assets',
+      stageIds: ['preflight'],
+      actions: ['run'],
+      runMode: 'new',
+      targetRunId: 'run-unused',
+    });
+
+    await expect(runExecutionPlan(executionInput(plan), runtime.dependencies))
+      .rejects.toMatchObject({
+        name: 'PipelineRuntimeError',
+        code: 'PIPELINE_CANCELLED',
+        stageId: 'preflight',
+        message: 'PIPELINE_CANCELLED: Pipeline execution was cancelled.',
+      });
+
+    expect(runtime.runStore.createWork).not.toHaveBeenCalled();
+    expect(runtime.runStore.createRun).not.toHaveBeenCalled();
+    expect(runtime.acquireProjectLock).not.toHaveBeenCalled();
   });
 
   it('does not schedule any Stage when execution is already cancelled', async () => {
@@ -1553,6 +1587,7 @@ describe('Pipeline Runner', () => {
     });
 
     expect(runtime.stageCalls).toEqual(['preflight']);
+    expect(runtime.report('run-preflight-report-abort', 'preflight')).toBeUndefined();
     expect(runtime.workCurrent).toEqual(previousWork);
     expect(runtime.outputCurrent).toEqual(previousOutput);
     expect(runtime.attempts).toEqual([
@@ -1679,6 +1714,193 @@ describe('Pipeline Runner', () => {
     expect(runtime.reportStore.writeAttempt).not.toHaveBeenCalled();
     expect(runtime.runStore.publishCurrent).not.toHaveBeenCalled();
     expect(runtime.outputStore.publishCurrent).not.toHaveBeenCalled();
+  });
+
+  it('normalizes an unknown noop runtime Preflight failure without leaking details', async () => {
+    const sourceRunId = 'run-current';
+    const secret = 'private probe failed for /Users/demo/source.mov';
+    const runtime = createMemoryRuntime({
+      current: currentPointer(sourceRunId, 'compile', {
+        preset: 'draft',
+        stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft'],
+      }),
+      execute: {
+        preflight: async () => {
+          throw new Error(secret);
+        },
+      },
+    });
+    runtime.seedRun(sourceRunId, reportsThrough(sourceRunId, 'draft', 'compile'));
+    const plan = makePlan({
+      preset: 'draft',
+      stageIds: ['compile'],
+      actions: ['cached'],
+      runMode: 'noop',
+      sourceRunId,
+      targetRunId: sourceRunId,
+      requiresRuntimePreflight: true,
+    });
+
+    let runError: unknown;
+    try {
+      await runExecutionPlan(executionInput(plan), runtime.dependencies);
+    } catch (error) {
+      runError = error;
+    }
+
+    expect(runError).toMatchObject({
+      name: 'PipelineRuntimeError',
+      code: 'PIPELINE_STAGE_FAILED',
+      stageId: 'preflight',
+      message: 'PIPELINE_STAGE_FAILED: Pipeline stage preflight failed.',
+    });
+    expect((runError as Error).message).not.toContain(secret);
+    expect(runtime.runStore.createWork).not.toHaveBeenCalled();
+    expect(runtime.acquireProjectLock).not.toHaveBeenCalled();
+  });
+
+  it('attributes prerequisite Preflight ENOSPC persistence to Preflight recovery', async () => {
+    const sourceRunId = 'run-source';
+    const targetRunId = 'run-prerequisite-enospc';
+    const previousWork = currentPointer(sourceRunId, 'narration', {
+      preset: 'draft',
+      stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft'],
+    });
+    const previousOutput = currentPointer('run-previous', 'release', {
+      relativePath: 'releases/run-previous',
+    });
+    const preflightPartial: PipelinePartialArtifact = {
+      scope: 'run',
+      path: 'partials/preflight.tmp',
+    };
+    const cleanupFailedStage = vi.fn(async () => undefined);
+    const runtime = createMemoryRuntime({
+      current: previousWork,
+      outputCurrent: previousOutput,
+      partialArtifacts: {
+        preflight: [preflightPartial],
+        compile: [{scope: 'run', path: 'partials/compile.tmp'}],
+      },
+    });
+    runtime.dependencies.cleanupFailedStage = cleanupFailedStage;
+    runtime.seedRun(
+      sourceRunId,
+      reportsThrough(sourceRunId, 'draft', 'narration'),
+    );
+    vi.mocked(runtime.reportStore.writeStage).mockRejectedValueOnce(Object.assign(
+      new Error('no space while writing a private Preflight report path'),
+      {code: 'ENOSPC'},
+    ));
+    const plan = makePlan({
+      preset: 'draft',
+      stageIds: ['compile'],
+      actions: ['run'],
+      runMode: 'new',
+      sourceRunId,
+      targetRunId,
+      requiresRuntimePreflight: true,
+    });
+
+    await expect(runExecutionPlan(executionInput(plan), runtime.dependencies))
+      .rejects.toMatchObject({
+        code: 'DISK_SPACE_EXHAUSTED',
+        stageId: 'preflight',
+      });
+
+    expect(runtime.stageCalls).toEqual(['preflight']);
+    expect(runtime.report(targetRunId, 'preflight')).toBeUndefined();
+    expect(runtime.workCurrent).toEqual(previousWork);
+    expect(runtime.outputCurrent).toEqual(previousOutput);
+    expect(runtime.attempts).toEqual([
+      expect.objectContaining({
+        runId: targetRunId,
+        stageId: 'preflight',
+        state: 'failed',
+        error: expect.objectContaining({code: 'DISK_SPACE_EXHAUSTED'}),
+      }),
+    ]);
+    expect(cleanupFailedStage).toHaveBeenCalledOnce();
+    expect(cleanupFailedStage).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: 'demo',
+      runId: targetRunId,
+      stageId: 'preflight',
+      partialArtifacts: [preflightPartial],
+    }));
+    expect(runtime.release).toHaveBeenCalledOnce();
+  });
+
+  it('attributes prerequisite Preflight cancellation to Preflight and rolls back its report', async () => {
+    const sourceRunId = 'run-source';
+    const targetRunId = 'run-prerequisite-cancelled';
+    const controller = new AbortController();
+    const previousWork = currentPointer(sourceRunId, 'narration', {
+      preset: 'draft',
+      stageIds: ['preflight', 'ingest', 'narration', 'compile', 'draft'],
+    });
+    const previousOutput = currentPointer('run-previous', 'release', {
+      relativePath: 'releases/run-previous',
+    });
+    const preflightPartial: PipelinePartialArtifact = {
+      scope: 'run',
+      path: 'partials/preflight.tmp',
+    };
+    const cleanupFailedStage = vi.fn(async () => undefined);
+    const runtime = createMemoryRuntime({
+      current: previousWork,
+      outputCurrent: previousOutput,
+      partialArtifacts: {
+        preflight: [preflightPartial],
+        compile: [{scope: 'run', path: 'partials/compile.tmp'}],
+      },
+      afterStageReportWrite: (report) => {
+        if (report.runId === targetRunId && report.stageId === 'preflight') {
+          controller.abort('SIGINT');
+        }
+      },
+    });
+    runtime.dependencies.cleanupFailedStage = cleanupFailedStage;
+    runtime.seedRun(
+      sourceRunId,
+      reportsThrough(sourceRunId, 'draft', 'narration'),
+    );
+    const plan = makePlan({
+      preset: 'draft',
+      stageIds: ['compile'],
+      actions: ['run'],
+      runMode: 'new',
+      sourceRunId,
+      targetRunId,
+      requiresRuntimePreflight: true,
+    });
+
+    await expect(runExecutionPlan({
+      ...executionInput(plan),
+      signal: controller.signal,
+    }, runtime.dependencies)).rejects.toMatchObject({
+      code: 'PIPELINE_CANCELLED',
+      stageId: 'preflight',
+    });
+
+    expect(runtime.stageCalls).toEqual(['preflight']);
+    expect(runtime.report(targetRunId, 'preflight')).toBeUndefined();
+    expect(runtime.workCurrent).toEqual(previousWork);
+    expect(runtime.outputCurrent).toEqual(previousOutput);
+    expect(runtime.attempts).toEqual([
+      expect.objectContaining({
+        runId: targetRunId,
+        stageId: 'preflight',
+        state: 'cancelled',
+        error: expect.objectContaining({code: 'PIPELINE_CANCELLED'}),
+      }),
+    ]);
+    expect(cleanupFailedStage).toHaveBeenCalledOnce();
+    expect(cleanupFailedStage).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: 'demo',
+      runId: targetRunId,
+      stageId: 'preflight',
+      partialArtifacts: [preflightPartial],
+    }));
+    expect(runtime.release).toHaveBeenCalledOnce();
   });
 
   it('revalidates under the lock before writes and upgrades stale new-Run cache downstream', async () => {
@@ -2353,6 +2575,115 @@ describe('Pipeline Runner', () => {
     expect(runtime.events.filter((event) => event === 'verify:release').length)
       .toBeGreaterThan(1);
     expect(runtime.acquireProjectLock).toHaveBeenCalledOnce();
+  });
+
+  it('cancels recovered Release after verification before Output publication', async () => {
+    const runId = 'run-release';
+    const controller = new AbortController();
+    const project = memoryProject();
+    const releasePartial: PipelinePartialArtifact = {
+      scope: 'output',
+      path: `releases/${runId}/partial.tmp`,
+    };
+    const cleanupFailedStage = vi.fn(async () => undefined);
+    const runtime = createMemoryRuntime({
+      current: currentPointer(runId, 'review'),
+      partialArtifacts: {release: [releasePartial]},
+    });
+    runtime.dependencies.cleanupFailedStage = cleanupFailedStage;
+    runtime.seedRun(runId, reportsThrough(runId, 'release', 'release'));
+    const plan = await buildExecutionPlan(planningContext(runtime, project), {
+      preset: 'release',
+      from: 'release',
+      to: 'release',
+      resume: true,
+    });
+    const releaseStage = runtime.registry.find((stage) => stage.id === 'release')!;
+    const verifyRelease = releaseStage.verify.bind(releaseStage);
+    let releaseVerifyCalls = 0;
+    releaseStage.verify = async (context, report) => {
+      const verified = await verifyRelease(context, report);
+      releaseVerifyCalls += 1;
+      if (releaseVerifyCalls === 3) {
+        controller.abort('SIGTERM');
+        return false;
+      }
+      return verified;
+    };
+
+    await expect(runExecutionPlan({
+      ...executionInput(plan, project),
+      signal: controller.signal,
+    }, runtime.dependencies)).rejects.toMatchObject({
+      code: 'PIPELINE_CANCELLED',
+      stageId: 'release',
+    });
+
+    expect(runtime.stageCalls).toEqual(['preflight']);
+    expect(runtime.outputCurrent).toBeNull();
+    expect(runtime.outputStore.publishCurrent).not.toHaveBeenCalled();
+    expect(runtime.workCurrent).toMatchObject({
+      runId,
+      completedStage: 'review',
+    });
+    expect(runtime.attempts).toEqual([
+      expect.objectContaining({
+        runId,
+        stageId: 'release',
+        state: 'cancelled',
+      }),
+    ]);
+    expect(cleanupFailedStage).toHaveBeenCalledOnce();
+    expect(cleanupFailedStage).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: 'demo',
+      runId,
+      stageId: 'release',
+      partialArtifacts: [releasePartial],
+    }));
+    expect(runtime.release).toHaveBeenCalledOnce();
+  });
+
+  it('preserves recovered Output when cancellation precedes its best-effort Work update', async () => {
+    const runId = 'run-release';
+    const controller = new AbortController();
+    const project = memoryProject();
+    const cleanupFailedStage = vi.fn(async () => undefined);
+    const runtime = createMemoryRuntime({
+      current: currentPointer(runId, 'review'),
+      afterOutputPublish: (pointer) => {
+        if (pointer.runId === runId) controller.abort('SIGINT');
+      },
+    });
+    runtime.dependencies.cleanupFailedStage = cleanupFailedStage;
+    runtime.seedRun(runId, reportsThrough(runId, 'release', 'release'));
+    const plan = await buildExecutionPlan(planningContext(runtime, project), {
+      preset: 'release',
+      from: 'release',
+      to: 'release',
+      resume: true,
+    });
+
+    const result = await runExecutionPlan({
+      ...executionInput(plan, project),
+      signal: controller.signal,
+    }, runtime.dependencies);
+
+    expect(result).toMatchObject({
+      runId,
+      state: 'passed',
+      completedStage: 'release',
+      warnings: [{code: 'WORK_POINTER_LAGGING'}],
+    });
+    expect(runtime.outputCurrent).toEqual(currentPointer(runId, 'release', {
+      relativePath: `releases/${runId}`,
+    }));
+    expect(runtime.workCurrent).toMatchObject({
+      runId,
+      completedStage: 'review',
+    });
+    expect(runtime.attempts).toEqual([]);
+    expect(cleanupFailedStage).not.toHaveBeenCalled();
+    expect(runtime.release).toHaveBeenCalledOnce();
   });
 
   it('returns recovered Release success when Work read-back is unreadable', async () => {

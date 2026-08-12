@@ -6,6 +6,7 @@ import {
   runPreflight,
   type PreflightInput,
   type PreflightResult,
+  type PreflightRunOptions,
 } from '../stages/preflight';
 import {
   STAGE_ALGORITHM_VERSIONS,
@@ -98,7 +99,10 @@ export const parsePreflightAdapterOutput = (
 
 export interface PreflightStageAdapterDependencies {
   algorithmVersion?: string;
-  runPreflight?: (input: PreflightInput) => Promise<PreflightResult>;
+  runPreflight?: (
+    input: PreflightInput,
+    options?: PreflightRunOptions,
+  ) => Promise<PreflightResult>;
 }
 
 const preflightFingerprint = (
@@ -138,9 +142,10 @@ export const createPreflightStage = (
   const algorithmVersion = dependencies.algorithmVersion
     ?? STAGE_ALGORITHM_VERSIONS.preflight;
   const executePreflight = dependencies.runPreflight
-    ?? (async (input: PreflightInput) => await runPreflight(
+    ?? (async (input: PreflightInput, options?: PreflightRunOptions) => await runPreflight(
       input,
       createSystemPreflightDependencies(),
+      options,
     ));
 
   return {
@@ -166,14 +171,14 @@ export const createPreflightStage = (
       return await verifyReportedArtifacts({context, report, expected: []});
     },
     partialArtifacts: () => [],
-    execute: async (context) => {
+    execute: async (context, signal) => {
       const result = await executePreflight({
         workspaceRoot: context.project.workspaceRoot,
         projectDirectory: context.project.projectDirectory,
         project: context.project.project,
         script: context.project.script,
         sourceBytes: context.sourceCatalog.totalBytes,
-      });
+      }, {signal});
       return {
         state: 'passed',
         fingerprint: preflightFingerprint(context, result, algorithmVersion),

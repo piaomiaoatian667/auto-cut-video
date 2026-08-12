@@ -19,6 +19,7 @@ import {
 import {
   runProcess as runSystemProcess,
   type ProcessResult,
+  type RunProcessOptions,
 } from '../../process/run-process';
 import {fingerprintValue} from '../fingerprint';
 import type {CheckResult} from '../types';
@@ -119,6 +120,7 @@ export interface PreflightDependencies {
   runProcess(
     command: string,
     args: readonly string[],
+    options?: RunProcessOptions,
   ): Promise<PreflightProcessResult>;
   resolveExecutable(selection: string): Promise<string>;
   fileSystem: PreflightFileSystem;
@@ -133,6 +135,10 @@ export interface PreflightInput {
   workDirectory?: string;
   ffmpegExecutable?: string;
   ffprobeExecutable?: string;
+}
+
+export interface PreflightRunOptions {
+  signal?: AbortSignal;
 }
 
 export interface PreflightVersions {
@@ -358,12 +364,29 @@ const probe = async (
   dependencies: PreflightDependencies,
   command: string,
   args: readonly string[],
+  options: PreflightRunOptions,
 ): Promise<ProbeOutput | null> => {
   try {
-    const result = await dependencies.runProcess(command, args);
+    const result = options.signal === undefined
+      ? await dependencies.runProcess(command, args)
+      : await dependencies.runProcess(command, args, {signal: options.signal});
     if (result.exitCode !== 0 || result.signal !== null) return null;
     return {stdout: result.stdout, stderr: result.stderr};
-  } catch {
+  } catch (error) {
+    const code = error !== null && typeof error === 'object' && 'code' in error
+      ? error.code
+      : undefined;
+    const name = error !== null && typeof error === 'object' && 'name' in error
+      ? error.name
+      : undefined;
+    if (
+      options.signal?.aborted === true
+      || code === 'PROCESS_ABORTED'
+      || code === 'ABORT_ERR'
+      || name === 'AbortError'
+    ) {
+      throw error;
+    }
     return null;
   }
 };
@@ -385,6 +408,7 @@ const probeExecutable = async (
   dependencies: PreflightDependencies,
   executable: ResolvedExecutable,
   args: readonly string[],
+  options: PreflightRunOptions,
 ): Promise<{changed: boolean; output: ProbeOutput | null}> => {
   if (!await safeRevalidate(executable.authority)) {
     return {changed: true, output: null};
@@ -393,6 +417,7 @@ const probeExecutable = async (
     dependencies,
     executable.authority.executionPath,
     args,
+    options,
   );
   if (!await safeRevalidate(executable.authority)) {
     return {changed: true, output: null};
@@ -438,6 +463,7 @@ const closeAuthorities = async (
 export async function runPreflight(
   input: PreflightInput,
   dependencies: PreflightDependencies,
+  options: PreflightRunOptions = {},
 ): Promise<PreflightResult> {
   const heldAuthorities: PreflightExecutableAuthority[] = [];
   try {
@@ -484,7 +510,7 @@ export async function runPreflight(
       ffprobe: null,
     };
 
-    const nodeOutput = await probe(dependencies, 'node', ['--version']);
+    const nodeOutput = await probe(dependencies, 'node', ['--version'], options);
     versions.node = nodeOutput === null
       ? null
       : parseSimpleVersion(combinedOutput(nodeOutput));
@@ -494,7 +520,7 @@ export async function runPreflight(
       addInfo(checks, 'node', 'Node.js is available.', {value: versions.node});
     }
 
-    const pnpmOutput = await probe(dependencies, 'pnpm', ['--version']);
+    const pnpmOutput = await probe(dependencies, 'pnpm', ['--version'], options);
     versions.pnpm = pnpmOutput === null
       ? null
       : parseSimpleVersion(combinedOutput(pnpmOutput));
@@ -508,6 +534,7 @@ export async function runPreflight(
       dependencies,
       '/usr/bin/sw_vers',
       ['-productVersion'],
+      options,
     );
     const macosReported = macosOutput === null
       ? null
@@ -621,6 +648,7 @@ export async function runPreflight(
         dependencies,
         ffmpeg,
         ['-version'],
+        options,
       );
       ffmpegChanged = versionProbe.changed;
       ffmpegVersionOutput = versionProbe.output;
@@ -633,6 +661,7 @@ export async function runPreflight(
         dependencies,
         ffprobe,
         ['-version'],
+        options,
       );
       ffprobeChanged = versionProbe.changed;
       ffprobeOutput = versionProbe.output;
@@ -643,6 +672,7 @@ export async function runPreflight(
         dependencies,
         ffmpeg,
         ['-hide_banner', '-encoders'],
+        options,
       );
       ffmpegChanged = encodersProbe.changed;
       encoderOutput = encodersProbe.output;
@@ -652,6 +682,7 @@ export async function runPreflight(
         dependencies,
         ffmpeg,
         ['-hide_banner', '-filters'],
+        options,
       );
       ffmpegChanged = filtersProbe.changed;
       filterOutput = filtersProbe.output;
@@ -745,7 +776,7 @@ export async function runPreflight(
     const provider = input.project.tts.provider;
     const sayOutput = provider === 'file'
       ? null
-      : await probe(dependencies, '/usr/bin/say', ['-v', '?']);
+      : await probe(dependencies, '/usr/bin/say', ['-v', '?'], options);
     const segmentedWavFallback = provider === 'file'
       && allSegmentsHaveAudio(input.script);
     const voiceAvailable = sayOutput !== null && hasVoice(

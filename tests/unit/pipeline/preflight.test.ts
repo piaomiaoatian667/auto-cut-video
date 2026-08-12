@@ -5,6 +5,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readFile,
   realpath,
   rename,
   rm,
@@ -41,6 +42,10 @@ import {
   type SourceMeterStat,
 } from '../../../src/pipeline/source-assets';
 import {createRunStore} from '../../../src/pipeline/run-store';
+import {
+  runProcess as runSystemProcess,
+  type RunProcessOptions,
+} from '../../../src/process/run-process';
 
 const GIB = 1024 ** 3;
 const FFMPEG_SELECTION = '/configured/ffmpeg';
@@ -59,6 +64,20 @@ const makeWorkInspectionDirectory = async (prefix: string): Promise<string> => {
   const directory = await mkdtemp(path.join(tmpdir(), prefix));
   workInspectionTempDirectories.push(directory);
   return directory;
+};
+
+const waitForFileContents = async (target: string): Promise<string> => {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      return await readFile(target, 'utf8');
+    } catch (error) {
+      if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw new Error(`timed out waiting for ${target}`);
 };
 
 afterEach(async () => {
@@ -215,6 +234,7 @@ const fixture = (overrides: FixtureOverrides = {}) => {
   const runProcess = vi.fn(async (
     command: string,
     args: readonly string[],
+    _options?: RunProcessOptions,
   ): Promise<PreflightProcessResult> => {
     if (
       overrides.processFailure?.command === command
@@ -1316,6 +1336,66 @@ describe('scoped source measurement', () => {
 });
 
 describe('runPreflight', () => {
+  it('passes one AbortSignal to every process probe', async () => {
+    const controller = new AbortController();
+    const {dependencies, input, runProcess} = fixture();
+
+    await runPreflight(input, dependencies, {signal: controller.signal});
+
+    for (const [command, args] of [
+      ['node', ['--version']],
+      [FFMPEG_AUTHORITY, ['-version']],
+      [FFPROBE_AUTHORITY, ['-version']],
+      ['/usr/bin/say', ['-v', '?']],
+    ] as const) {
+      expect(runProcess).toHaveBeenCalledWith(
+        command,
+        args,
+        {signal: controller.signal},
+      );
+    }
+  });
+
+  it('aborts and terminates a hanging real Preflight probe', async () => {
+    const directory = await makeWorkInspectionDirectory('preflight-abort-');
+    const marker = path.join(directory, 'probe.pid');
+    const controller = new AbortController();
+    const fixtureValue = fixture();
+    const fallbackRunProcess = fixtureValue.dependencies.runProcess;
+    fixtureValue.dependencies.runProcess = async (
+      command: string,
+      args: readonly string[],
+      options?: RunProcessOptions,
+    ) => {
+      if (command !== 'node') return await fallbackRunProcess(command, args);
+      return await runSystemProcess(process.execPath, [
+        '-e',
+        [
+          "const {writeFileSync} = require('node:fs');",
+          'writeFileSync(process.argv[1], String(process.pid));',
+          'setInterval(() => undefined, 1_000);',
+        ].join(''),
+        marker,
+      ], {...options, timeoutMs: 1_000});
+    };
+    const running = runPreflight(
+      fixtureValue.input,
+      fixtureValue.dependencies,
+      {signal: controller.signal},
+    );
+    const childPid = Number.parseInt(await waitForFileContents(marker), 10);
+    controller.abort('SIGINT');
+
+    await expect(running).rejects.toMatchObject({code: 'PROCESS_ABORTED'});
+    let processLookupError: unknown;
+    try {
+      process.kill(childPid, 0);
+    } catch (error) {
+      processLookupError = error;
+    }
+    expect(processLookupError).toMatchObject({code: 'ESRCH'});
+  });
+
   it.each([
     {platform: 'linux' as const, arch: 'arm64'},
     {platform: 'darwin' as const, arch: 'x64'},
