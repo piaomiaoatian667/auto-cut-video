@@ -100,10 +100,6 @@ const readStageId = (error: unknown): StageId | undefined => {
   }
 };
 
-const isPublicErrorCode = (code: string): boolean => (
-  /^(?:PLAN|PIPELINE|PROJECT)_[A-Z0-9_]+$/u.test(code)
-);
-
 const stripCodePrefix = (code: string, message: string): string => {
   const prefix = `${code}: `;
   return message.startsWith(prefix) ? message.slice(prefix.length) : message;
@@ -121,7 +117,7 @@ const publicFailure = (
     && (
       error instanceof ExecutionPlanError
       || error instanceof PipelineRuntimeError
-      || isPublicErrorCode(code)
+      || code.startsWith('PLAN_')
     )
   ) {
     const stageId = error instanceof ExecutionPlanError
@@ -136,6 +132,60 @@ const publicFailure = (
     };
   }
   return {projectId, code: fallbackCode, message: fallbackMessage};
+};
+
+const errorName = (error: unknown): string | undefined => {
+  if (error === null || typeof error !== 'object') return undefined;
+  try {
+    const name = (error as {name?: unknown}).name;
+    return typeof name === 'string' ? name : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const isSchemaValidationError = (error: unknown): boolean => (
+  errorName(error) === 'ZodError'
+  || error instanceof SyntaxError
+);
+
+const isProjectLoadValidationError = (error: unknown): boolean => {
+  const code = readCode(error);
+  return isSchemaValidationError(error)
+    || code === 'PROJECT_ID_MISMATCH'
+    || code === 'APP_PATH_OUTSIDE_SCOPE'
+    || code === 'ASSET_PATH_OUTSIDE_PROJECT'
+    || code === 'SCRIPT_SEGMENT_TEXT_TOO_LONG'
+    || code === 'ENOENT';
+};
+
+const isSourceCatalogValidationError = (error: unknown): boolean => {
+  const code = readCode(error);
+  return isSchemaValidationError(error)
+    || code?.startsWith('PROJECT_SOURCE_') === true;
+};
+
+const isPlanValidationError = (error: unknown): boolean => (
+  isSchemaValidationError(error)
+  || error instanceof ExecutionPlanError
+  || readCode(error)?.startsWith('PLAN_') === true
+);
+
+const environmentMessage = (code: string | undefined): string | undefined => {
+  switch (code) {
+    case 'EACCES':
+    case 'EPERM':
+      return 'Pipeline environment access was denied.';
+    case 'ENV_TOOL_MISSING':
+      return 'Required pipeline tooling is unavailable.';
+    case 'ENOSPC':
+    case 'DISK_SPACE_EXHAUSTED':
+      return 'Pipeline storage is exhausted.';
+    default:
+      return code?.startsWith('ENV_') === true
+        ? 'Pipeline environment validation failed.'
+        : undefined;
+  }
 };
 
 const validationFailure = (
@@ -155,16 +205,27 @@ const validationFailure = (
 const environmentFailure = (
   projectId: string,
   error: unknown,
-): PipelineCommandOutcome => ({
-  kind: 'failure',
-  exitCode: EXIT_CODES.environmentFailed,
-  failure: publicFailure(
-    projectId,
-    error,
-    'PIPELINE_EXECUTION_FAILED',
-    'Pipeline execution failed unexpectedly.',
-  ),
-});
+): PipelineCommandOutcome => {
+  const code = readCode(error);
+  const message = environmentMessage(code);
+  return {
+    kind: 'failure',
+    exitCode: EXIT_CODES.environmentFailed,
+    failure: message === undefined
+      ? publicFailure(
+        projectId,
+        error,
+        'PIPELINE_EXECUTION_FAILED',
+        'Pipeline execution failed unexpectedly.',
+      )
+      : {
+        projectId,
+        code: code!,
+        message,
+        ...(readStageId(error) === undefined ? {} : {stageId: readStageId(error)!}),
+      },
+  };
+};
 
 const signalFailure = (
   projectId: string,
@@ -179,10 +240,35 @@ const signalFailure = (
   },
 });
 
-const isPlanningFailure = (error: unknown): boolean => (
-  error instanceof ExecutionPlanError
-  || readCode(error)?.startsWith('PLAN_') === true
-);
+const projectLoadFailure = (
+  projectId: string,
+  error: unknown,
+): PipelineCommandOutcome => isProjectLoadValidationError(error)
+  ? {
+    kind: 'failure',
+    exitCode: EXIT_CODES.validationFailed,
+    failure: {
+      projectId,
+      code: 'PROJECT_LOAD_FAILED',
+      message: 'Unable to load or validate project.',
+    },
+  }
+  : environmentFailure(projectId, error);
+
+const sourceCatalogFailure = (
+  projectId: string,
+  error: unknown,
+): PipelineCommandOutcome => isSourceCatalogValidationError(error)
+  ? {
+    kind: 'failure',
+    exitCode: EXIT_CODES.validationFailed,
+    failure: {
+      projectId,
+      code: 'PROJECT_SOURCE_INVALID',
+      message: 'Project source assets could not be discovered safely.',
+    },
+  }
+  : environmentFailure(projectId, error);
 
 const resultExitCode = (result: PipelineRunResult): number => {
   switch (result.state) {
@@ -208,31 +294,15 @@ export async function executePipelineCommand(
       dependencies.workspaceRoot,
       projectId,
     );
-  } catch {
-    return {
-      kind: 'failure',
-      exitCode: EXIT_CODES.validationFailed,
-      failure: {
-        projectId,
-        code: 'PROJECT_LOAD_FAILED',
-        message: 'Unable to load or validate project.',
-      },
-    };
+  } catch (error) {
+    return projectLoadFailure(projectId, error);
   }
 
   let sourceCatalog: ProjectSourceCatalog;
   try {
     sourceCatalog = await dependencies.discoverProjectSourceCatalog(project);
-  } catch {
-    return {
-      kind: 'failure',
-      exitCode: EXIT_CODES.validationFailed,
-      failure: {
-        projectId,
-        code: 'PROJECT_SOURCE_INVALID',
-        message: 'Project source assets could not be discovered safely.',
-      },
-    };
+  } catch (error) {
+    return sourceCatalogFailure(projectId, error);
   }
 
   const request = executionRequest(options);
@@ -240,7 +310,9 @@ export async function executePipelineCommand(
   try {
     plan = await dependencies.buildExecutionPlan(project, sourceCatalog, request);
   } catch (error) {
-    return validationFailure(projectId, error);
+    return isPlanValidationError(error)
+      ? validationFailure(projectId, error)
+      : environmentFailure(projectId, error);
   }
 
   if (options.plan === true) {
@@ -278,11 +350,13 @@ export async function executePipelineCommand(
               request,
             );
           } catch (rebuildError) {
-            return validationFailure(projectId, rebuildError);
+            return isPlanValidationError(rebuildError)
+              ? validationFailure(projectId, rebuildError)
+              : environmentFailure(projectId, rebuildError);
           }
           continue;
         }
-        return isPlanningFailure(error)
+        return isPlanValidationError(error)
           ? validationFailure(projectId, error)
           : environmentFailure(projectId, error);
       }

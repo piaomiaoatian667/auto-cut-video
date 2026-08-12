@@ -695,35 +695,31 @@ describe('videoctl review', () => {
     expect(fixture.stderr()).toBe('Choose exactly one of --approve or --reject.\n');
   });
 
-  it('records a rejection under the project lock and leaves review pending', async () => {
+  it('accepts --reject but returns validation failure without writing review state', async () => {
     const fixture = await makeFixture();
+    const pointerBefore = await createRunStore(fixture.workspaceRoot)
+      .readCurrentReadonly('demo');
+    const attemptBefore = await readRunJson(
+      fixture.workspaceRoot,
+      fixture.runId,
+      fixture.reviewAttemptPath,
+    );
 
     const exitCode = await runVideoctl([
       'review', 'demo', '--reject', '--reason', 'needs changes',
     ], fixture.dependencies);
 
-    expect(exitCode).toBe(EXIT_CODES.success);
-    expect(fixture.stdout()).toBe('Review rejected: run-review\n');
-    expect(fixture.stderr()).toBe('');
-    expect(await readRunJson(
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(fixture.stdout()).toBe('');
+    expect(fixture.stderr()).toBe('Review rejection is not supported in MVP.\n');
+    await expect(createRunStore(fixture.workspaceRoot).readCurrentReadonly('demo'))
+      .resolves.toEqual(pointerBefore);
+    await expect(readRunJson(
       fixture.workspaceRoot,
       fixture.runId,
-      'review.json',
-    )).toMatchObject({
-      version: 1,
-      projectId: 'demo',
-      runId: fixture.runId,
-      status: 'rejected',
-      reviewer: process.env.USER ?? 'unknown',
-      reason: 'needs changes',
-      evidencePaths: fixture.evidence.map((artifact) => artifact.path),
-    });
-    await expect(createRunStore(fixture.workspaceRoot).readCurrentReadonly('demo'))
-      .resolves.toMatchObject({state: 'needs_review'});
-    const runDirectory = await createRunStore(fixture.workspaceRoot)
-      .openExistingRun('demo', fixture.runId);
-    await expect(createStageReportStore().readStage(runDirectory, 'review'))
-      .resolves.toBeNull();
+      fixture.reviewAttemptPath,
+    )).resolves.toEqual(attemptBefore);
+    await expectNoCanonicalApproval(fixture);
     await expect(readFile(
       path.join(fixture.workspaceRoot, '.work', 'demo', 'pipeline.lock'),
       'utf8',

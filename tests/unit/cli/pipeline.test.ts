@@ -277,6 +277,67 @@ describe('pipeline CLI commands', () => {
     expect(fixture.stderr()).toContain('PLAN_RANGE_INVALID');
   });
 
+  it.each([
+    ['project load', (fixture: ReturnType<typeof makeDependencies>, failure: Error) => {
+      fixture.dependencies.loadProject.mockRejectedValueOnce(failure);
+    }],
+    ['source catalog', (fixture: ReturnType<typeof makeDependencies>, failure: Error) => {
+      fixture.dependencies.discoverProjectSourceCatalog.mockRejectedValueOnce(failure);
+    }],
+    ['plan build', (fixture: ReturnType<typeof makeDependencies>, failure: Error) => {
+      fixture.dependencies.buildExecutionPlan.mockRejectedValueOnce(failure);
+    }],
+  ] as const)('maps trusted EACCES from %s to a sanitized environment failure', async (
+    _phase,
+    arrange,
+  ) => {
+    const fixture = makeDependencies();
+    const failure = Object.assign(
+      new Error('permission denied at /private/secret-authority token=hidden'),
+      {code: 'EACCES'},
+    );
+    arrange(fixture, failure);
+
+    const exitCode = await runPipelineCommand(
+      'demo',
+      {json: true},
+      fixture.dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.environmentFailed);
+    expect(JSON.parse(fixture.stdout())).toEqual({
+      projectId: 'demo',
+      code: 'EACCES',
+      message: 'Pipeline environment access was denied.',
+    });
+    expect(fixture.stdout()).not.toContain('/private/secret-authority');
+    expect(fixture.stdout()).not.toContain('token=hidden');
+    expect(fixture.dependencies.installPipelineSignalHandlers).not.toHaveBeenCalled();
+    expect(fixture.dependencies.runExecutionPlan).not.toHaveBeenCalled();
+  });
+
+  it('keeps authoring validation failures at exit 3', async () => {
+    const fixture = makeDependencies();
+    fixture.dependencies.loadProject.mockRejectedValueOnce(Object.assign(
+      new Error('segment secret-text is too long'),
+      {code: 'SCRIPT_SEGMENT_TEXT_TOO_LONG'},
+    ));
+
+    const exitCode = await runPipelineCommand(
+      'demo',
+      {json: true},
+      fixture.dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(JSON.parse(fixture.stdout())).toEqual({
+      projectId: 'demo',
+      code: 'PROJECT_LOAD_FAILED',
+      message: 'Unable to load or validate project.',
+    });
+    expect(fixture.stdout()).not.toContain('secret-text');
+  });
+
   it('rebuilds and retries exactly once after a pre-write PLAN_STALE', async () => {
     const fixture = makeDependencies();
     const firstPlan = executionPlan({targetRunId: 'run-first'});
@@ -407,5 +468,56 @@ describe('pipeline CLI commands', () => {
 
     expect(exitCode).toBe(EXIT_CODES.validationFailed);
     expect(fixture.dependencies.buildExecutionPlan).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['invalid preset', ['pipeline', 'demo', '--preset', 'release\nSTATUS forged\u001b[31m']],
+    ['invalid stage', ['pipeline', 'demo', '--from', 'draft\nSTATUS forged\u001b[31m']],
+    ['missing required option', ['run', 'demo']],
+    ['unknown option', ['pipeline', 'demo', '--unknown\nSTATUS forged\u001b[31m']],
+  ] as const)('formats %s Commander failures without raw output', async (
+    _label,
+    argv,
+  ) => {
+    const fixture = makeDependencies();
+
+    const exitCode = await runVideoctl(
+      argv,
+      fixture.dependencies as VideoctlDependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(fixture.stdout()).toBe('');
+    expect(fixture.stderr()).toBe(
+      'Pipeline failure: CLI_ARGUMENT_INVALID: Invalid command-line arguments.\n',
+    );
+    expect(fixture.stderr()).not.toContain('\u001b');
+    expect(fixture.stderr()).not.toContain('STATUS forged');
+    expect(fixture.stderr()).not.toContain('error:');
+    expect(fixture.dependencies.loadProject).not.toHaveBeenCalled();
+    expect(fixture.dependencies.buildExecutionPlan).not.toHaveBeenCalled();
+  });
+
+  it('formats injected invalid preset failures as stable JSON', async () => {
+    const fixture = makeDependencies();
+
+    const exitCode = await runVideoctl([
+      'pipeline',
+      'demo',
+      '--preset',
+      'release\nSTATUS forged\u001b[31m',
+      '--json',
+    ], fixture.dependencies as VideoctlDependencies);
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(fixture.stderr()).toBe('');
+    expect(JSON.parse(fixture.stdout())).toEqual({
+      projectId: 'demo',
+      code: 'CLI_ARGUMENT_INVALID',
+      message: 'Invalid command-line arguments.',
+    });
+    expect(fixture.stdout()).not.toContain('STATUS forged');
+    expect(fixture.stdout()).not.toContain('allowed choices');
+    expect(fixture.dependencies.loadProject).not.toHaveBeenCalled();
   });
 });

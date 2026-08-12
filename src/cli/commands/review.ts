@@ -419,6 +419,10 @@ export const runReviewCommand = async (
     dependencies.stderr.write('Choose exactly one of --approve or --reject.\n');
     return EXIT_CODES.validationFailed;
   }
+  if (options.reject === true) {
+    dependencies.stderr.write('Review rejection is not supported in MVP.\n');
+    return EXIT_CODES.validationFailed;
+  }
   if (options.reason === undefined || options.reason.trim().length === 0) {
     dependencies.stderr.write('--reason is required.\n');
     return EXIT_CODES.validationFailed;
@@ -446,63 +450,7 @@ export const runReviewCommand = async (
     return EXIT_CODES.validationFailed;
   }
   const fileOperations = reviewFileOperations(dependencies);
-  let decisionCommitted = false;
-
-  const rejectLocked = async (): Promise<number> => {
-    const lockedCurrent = await store.readCurrentReadonly(projectId);
-    if (!pointersEqual(lockedCurrent, current)) {
-      dependencies.stderr.write('Current run changed before review rejection.\n');
-      return EXIT_CODES.validationFailed;
-    }
-    const runDirectory = await store.openExistingRun(projectId, current.runId);
-    const verifyArtifact = dependencies.verifyRunArtifact ?? verifyRunArtifact;
-    let evidence: ReturnType<typeof draftReviewEvidenceArtifacts>;
-    try {
-      const draftReport = DraftReportSchema.parse(
-        await readRunJson(runDirectory, 'draft/draft-report.json'),
-      );
-      if (draftReport.projectId !== projectId) {
-        dependencies.stderr.write('Draft report belongs to another project.\n');
-        return EXIT_CODES.validationFailed;
-      }
-      evidence = draftReviewEvidenceArtifacts(draftReport);
-      for (const artifact of evidence) {
-        if (!await verifyArtifact(runDirectory, {scope: 'run', ...artifact})) {
-          dependencies.stderr.write('Draft review evidence is missing or changed.\n');
-          return EXIT_CODES.validationFailed;
-        }
-      }
-    } catch (error) {
-      if (isReviewValidationMiss(error)) {
-        dependencies.stderr.write('Draft review evidence is invalid.\n');
-        return EXIT_CODES.validationFailed;
-      }
-      throw error;
-    }
-    const currentAfterEvidence = await store.readCurrentReadonly(projectId);
-    if (!pointersEqual(currentAfterEvidence, current)) {
-      dependencies.stderr.write('Current run changed while review evidence was verified.\n');
-      return EXIT_CODES.validationFailed;
-    }
-    if (await reportStore.readStage(runDirectory, 'review') !== null) {
-      dependencies.stderr.write('Current review is already approved.\n');
-      return EXIT_CODES.validationFailed;
-    }
-    await removeOrphanReview(runDirectory, fileOperations);
-    const review = ReviewSchema.parse({
-      version: 1,
-      projectId,
-      runId: current.runId,
-      status: 'rejected',
-      reviewer: reviewerName(options),
-      reviewedAt: dependencies.now?.() ?? new Date().toISOString(),
-      reason,
-      evidencePaths: evidence.map((artifact) => artifact.path),
-    });
-    await writeImmutableReview(runDirectory, review, fileOperations);
-    decisionCommitted = true;
-    return EXIT_CODES.success;
-  };
+  let approvalCommitted = false;
 
   const approveLocked = async (): Promise<number> => {
     const lockedCurrent = await store.readCurrentReadonly(projectId);
@@ -598,7 +546,7 @@ export const runReviewCommand = async (
       await reportStore.writeStage(runDirectory, reviewReport);
     }
     await store.publishCurrent(projectId, passedPointer(current, review.reviewedAt));
-    decisionCommitted = true;
+    approvalCommitted = true;
     return EXIT_CODES.success;
   };
 
@@ -610,12 +558,7 @@ export const runReviewCommand = async (
     | undefined;
   try {
     lease = await acquireLock(work, current.runId);
-    outcome = {
-      ok: true,
-      value: options.reject === true
-        ? await rejectLocked()
-        : await approveLocked(),
-    };
+    outcome = {ok: true, value: await approveLocked()};
   } catch (error) {
     outcome = {ok: false, error};
   }
@@ -640,20 +583,16 @@ export const runReviewCommand = async (
     throw outcome.error;
   }
   if (releaseError !== undefined) {
-    if (decisionCommitted && outcome.value === EXIT_CODES.success) {
+    if (approvalCommitted && outcome.value === EXIT_CODES.success) {
       dependencies.stderr.write(
-        options.reject === true
-          ? 'Review rejected, but the project lock could not be released.\n'
-          : 'Review approved, but the project lock could not be released.\n',
+        'Review approved, but the project lock could not be released.\n',
       );
     } else {
       throw releaseError;
     }
   }
   if (outcome.value === EXIT_CODES.success) {
-    dependencies.stdout.write(
-      `Review ${options.reject === true ? 'rejected' : 'approved'}: ${current.runId}\n`,
-    );
+    dependencies.stdout.write(`Review approved: ${current.runId}\n`);
   }
   return outcome.value;
 };

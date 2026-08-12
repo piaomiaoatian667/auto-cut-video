@@ -256,7 +256,9 @@ describe('videoctl doctor', () => {
   it('reports project loading failures without leaking exception details', async () => {
     const {dependencies, stdout, stderr} = fixture();
     dependencies.loadProject.mockRejectedValueOnce(
-      new Error('secret workspace authority /private/projects'),
+      Object.assign(new Error('secret workspace authority /private/projects'), {
+        code: 'PROJECT_ID_MISMATCH',
+      }),
     );
 
     const exitCode = await runVideoctl(['doctor', 'demo'], dependencies);
@@ -268,7 +270,10 @@ describe('videoctl doctor', () => {
 
   it('sanitizes project identifiers in text loading failures', async () => {
     const {dependencies, stderr} = fixture();
-    dependencies.loadProject.mockRejectedValueOnce(new Error('invalid project id'));
+    dependencies.loadProject.mockRejectedValueOnce(Object.assign(
+      new Error('invalid project id'),
+      {code: 'PROJECT_ID_MISMATCH'},
+    ));
 
     const exitCode = await runVideoctl([
       'doctor',
@@ -284,7 +289,9 @@ describe('videoctl doctor', () => {
   it('maps source discovery failures to sanitized validation JSON', async () => {
     const {dependencies, stdout, stderr} = fixture();
     dependencies.discoverProjectSourceCatalog.mockRejectedValueOnce(
-      new Error('secret source path /private/source.mov'),
+      Object.assign(new Error('secret source path /private/source.mov'), {
+        code: 'PROJECT_SOURCE_INVALID',
+      }),
     );
 
     const exitCode = await runVideoctl(['doctor', 'demo', '--json'], dependencies);

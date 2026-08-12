@@ -42,6 +42,7 @@ import {
   formatDoctorFailure,
   formatDoctorJson,
   formatDoctorTable,
+  formatPipelineFailure,
   sanitizeTerminalText,
 } from './output';
 
@@ -119,6 +120,42 @@ const pipelineOptions = (options: PipelineCommandOptions): PipelineCommandOption
   ...(options.json === undefined ? {} : {json: options.json}),
 });
 
+const PRESET_IDS = [
+  'assets',
+  'draft',
+  'release',
+] as const satisfies readonly PipelinePreset[];
+
+const STAGE_IDS = [
+  'preflight',
+  'ingest',
+  'narration',
+  'compile',
+  'draft',
+  'review',
+  'release',
+] as const satisfies readonly StageId[];
+
+const commandProjectId = (argv: readonly string[]): string => (
+  argv[1] !== undefined && !argv[1].startsWith('-') ? argv[1] : 'unknown'
+);
+
+const writeCommandFailure = (
+  argv: readonly string[],
+  dependencies: VideoctlDependencies,
+  code: string,
+  message: string,
+): void => {
+  const json = argv.includes('--json');
+  const output = formatPipelineFailure({
+    projectId: commandProjectId(argv),
+    code,
+    message,
+  }, json);
+  if (json) dependencies.stdout.write(output);
+  else dependencies.stderr.write(output);
+};
+
 export async function runVideoctl(
   argv: readonly string[],
   dependencies: VideoctlDependencies,
@@ -130,7 +167,7 @@ export async function runVideoctl(
     .exitOverride()
     .configureOutput({
       writeOut: (value) => { dependencies.stdout.write(value); },
-      writeErr: (value) => { dependencies.stderr.write(value); },
+      writeErr: () => undefined,
     });
 
   command
@@ -182,12 +219,21 @@ export async function runVideoctl(
     .command('pipeline')
     .description('Plan or execute a pipeline range')
     .argument('<project>')
-    .addOption(new Option('--preset <preset>').choices(['assets', 'draft', 'release']))
+    .addOption(new Option('--preset <preset>').choices([...PRESET_IDS]))
     .option('--plan', 'print the execution plan without running')
-    .option('--from <stage>', 'start at a stable Stage ID')
-    .option('--to <stage>', 'stop at a stable Stage ID')
+    .addOption(new Option(
+      '--from <stage>',
+      'start at a stable Stage ID',
+    ).choices([...STAGE_IDS]))
+    .addOption(new Option(
+      '--to <stage>',
+      'stop at a stable Stage ID',
+    ).choices([...STAGE_IDS]))
     .option('--resume', 'resume the current Run')
-    .option('--force <stage>', 'force a Stage inside the selected range')
+    .addOption(new Option(
+      '--force <stage>',
+      'force a Stage inside the selected range',
+    ).choices([...STAGE_IDS]))
     .option('--json', 'print machine-readable JSON')
     .action(async (project: string, options: PipelineCommandOptions) => {
       exitCode = await runPipelineCommand(
@@ -249,7 +295,22 @@ export async function runVideoctl(
     ) {
       return EXIT_CODES.success;
     }
-    return EXIT_CODES.validationFailed;
+    if (error instanceof CommanderError) {
+      writeCommandFailure(
+        argv,
+        dependencies,
+        'CLI_ARGUMENT_INVALID',
+        'Invalid command-line arguments.',
+      );
+      return EXIT_CODES.validationFailed;
+    }
+    writeCommandFailure(
+      argv,
+      dependencies,
+      'PIPELINE_EXECUTION_FAILED',
+      'Pipeline execution failed unexpectedly.',
+    );
+    return EXIT_CODES.environmentFailed;
   }
 }
 
