@@ -1,10 +1,12 @@
 import {constants, type BigIntStats} from 'node:fs';
 import {
+  link,
   mkdir,
   lstat,
   mkdtemp,
   open,
   readFile,
+  readdir,
   realpath,
   rename,
   rm,
@@ -1413,6 +1415,74 @@ describe('app-owned directory scopes', () => {
     const run = await runStore.createRun('demo', 'run-one');
 
     await expect(unlinkRunFile(run, 'missing/child.bin')).resolves.toBeUndefined();
+  });
+
+  it('fails closed without unlinking a multiply linked Run file', async () => {
+    const workspaceRoot = await makeTempDirectory('app-scopes-unlink-hardlink-');
+    const run = await createRunStore(workspaceRoot).createRun('demo', 'run-one');
+    const runRoot = path.join(workspaceRoot, '.work', 'demo', 'runs', 'run-one');
+    const targetPath = path.join(runRoot, 'artifact.bin');
+    const siblingPath = path.join(runRoot, 'artifact-sibling.bin');
+    await writeAndClose(await openNewRunFile(run, 'artifact.bin'), 'original');
+    await link(targetPath, siblingPath);
+    const original = await lstat(targetPath, {bigint: true});
+
+    await expect(unlinkRunFile(run, 'artifact.bin')).rejects.toMatchObject({
+      code: 'APP_SCOPE_AUTHORITY_CHANGED',
+    });
+
+    const target = await lstat(targetPath, {bigint: true});
+    const sibling = await lstat(siblingPath, {bigint: true});
+    expect({dev: target.dev, ino: target.ino, nlink: target.nlink}).toEqual({
+      dev: original.dev,
+      ino: original.ino,
+      nlink: 2n,
+    });
+    expect({dev: sibling.dev, ino: sibling.ino, nlink: sibling.nlink}).toEqual({
+      dev: original.dev,
+      ino: original.ino,
+      nlink: 2n,
+    });
+    expect((await readdir(runRoot)).some((entry) => entry.startsWith('.cleanup-')))
+      .toBe(false);
+  });
+
+  it('fails closed without removing a tree containing a multiply linked file', async () => {
+    const workspaceRoot = await makeTempDirectory('app-scopes-tree-hardlink-');
+    const run = await createRunStore(workspaceRoot).createRun('demo', 'run-one');
+    await ensureRunDirectory(run, 'draft');
+    const draftRoot = path.join(
+      workspaceRoot,
+      '.work',
+      'demo',
+      'runs',
+      'run-one',
+      'draft',
+    );
+    const targetPath = path.join(draftRoot, 'artifact.bin');
+    const siblingPath = path.join(draftRoot, 'artifact-sibling.bin');
+    await writeAndClose(await openNewRunFile(run, 'draft/artifact.bin'), 'original');
+    await link(targetPath, siblingPath);
+    const original = await lstat(targetPath, {bigint: true});
+
+    await expect(removeRunTree(run, 'draft')).rejects.toMatchObject({
+      code: 'APP_SCOPE_AUTHORITY_CHANGED',
+    });
+
+    const target = await lstat(targetPath, {bigint: true});
+    const sibling = await lstat(siblingPath, {bigint: true});
+    expect({dev: target.dev, ino: target.ino, nlink: target.nlink}).toEqual({
+      dev: original.dev,
+      ino: original.ino,
+      nlink: 2n,
+    });
+    expect({dev: sibling.dev, ino: sibling.ino, nlink: sibling.nlink}).toEqual({
+      dev: original.dev,
+      ino: original.ino,
+      nlink: 2n,
+    });
+    expect((await readdir(draftRoot)).some((entry) => entry.startsWith('.cleanup-')))
+      .toBe(false);
   });
 
   it.each([

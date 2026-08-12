@@ -1600,11 +1600,19 @@ const removeAnchoredEntryThroughQuarantine = async (
       authorityError(`cleanup target changed while entering quarantine: ${relativePath}`),
     );
   }
-  const hardlinkedFile = expected.kind === 'file' && quarantined.stats.nlink !== 1n;
+  if (expected.kind === 'file' && quarantined.stats.nlink !== 1n) {
+    return await restoreQuarantineAfterFailure(
+      state,
+      anchor,
+      quarantineBasename,
+      relativePath,
+      expectedEntry,
+      authorityError(`cleanup target has unexpected hard links: ${relativePath}`),
+    );
+  }
 
   try {
-    if (hardlinkedFile) await unlink(quarantinePath);
-    else if (expected.kind === 'file') {
+    if (expected.kind === 'file') {
       await unlink(volumePath(expected.dev, expected.ino));
     }
     else await rmdir(volumePath(expected.dev, expected.ino));
@@ -2911,11 +2919,6 @@ const publishPointer = async <Scope>(
   let published = false;
   let committed = false;
   try {
-    if (oldRaw !== null) {
-      await authority.link(scope, CURRENT_PATH, ROLLBACK_PATH);
-      backupCreated = true;
-    }
-
     tempHandle = await authority.openNew(scope, TEMP_PATH);
     tempCreated = true;
     await fileOps.writeFile(tempHandle, serializePointer(pointer));
@@ -2925,6 +2928,10 @@ const publishPointer = async <Scope>(
 
     await fileOps.rename(
       async () => {
+        if (oldRaw !== null) {
+          await authority.link(scope, CURRENT_PATH, ROLLBACK_PATH);
+          backupCreated = true;
+        }
         await authority.rename(scope, TEMP_PATH, CURRENT_PATH);
         tempCreated = false;
         published = true;

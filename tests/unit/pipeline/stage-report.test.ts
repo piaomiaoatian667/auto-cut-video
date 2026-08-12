@@ -1007,10 +1007,16 @@ describe('StageReportStore', () => {
 
       delete probe.fault;
       delete probe.linkedSource;
-      await scopes.unlinkRunFile(runDirectory, `reports/${tempEntry!}`);
+      await expect(scopes.unlinkRunFile(
+        runDirectory,
+        `reports/${tempEntry!}`,
+      )).rejects.toMatchObject({code: 'APP_SCOPE_AUTHORITY_CHANGED'});
       await expect(store.writeStage(runDirectory, report))
         .rejects.toMatchObject({code: 'EEXIST'});
-      expect(await readdir(reportsPath)).toEqual(['ingest.json']);
+      expect((await readdir(reportsPath)).sort()).toEqual([
+        tempEntry!,
+        'ingest.json',
+      ].sort());
     } finally {
       vi.doUnmock('node:fs/promises');
       vi.resetModules();
