@@ -203,6 +203,131 @@ interface ScopedDeleteRaceProbe {
   quarantinePath?: string;
 }
 
+interface QuarantineRestoreRaceProbe {
+  operation: 'unlinkRunFile' | 'removeRunTree';
+  timing: 'before' | 'during';
+  replacementKind: 'file' | 'symlink';
+  targetPath: string;
+  outsidePath: string;
+  quarantinePath?: string;
+  replacementInstalled: boolean;
+  restoreFaultInjected: boolean;
+}
+
+const importScopesWithQuarantineRestoreRace = async (
+  probe: QuarantineRestoreRaceProbe,
+): Promise<typeof import('../../../src/fs/app-directory-scopes')> => {
+  vi.resetModules();
+  vi.doMock('node:fs/promises', async () => {
+    const actual = await vi.importActual<typeof import('node:fs/promises')>(
+      'node:fs/promises',
+    );
+    const installReplacement = async (): Promise<void> => {
+      if (probe.replacementInstalled) return;
+      probe.replacementInstalled = true;
+      if (probe.replacementKind === 'file') {
+        await actual.writeFile(probe.targetPath, 'replacement');
+      } else {
+        await actual.symlink(probe.outsidePath, probe.targetPath);
+      }
+    };
+    return {
+      ...actual,
+      rename: async (source: string, target: string) => {
+        if (
+          path.basename(source) === path.basename(probe.targetPath)
+          && path.basename(target).startsWith('.cleanup-')
+        ) {
+          probe.quarantinePath = target;
+          await actual.rename(source, target);
+          return;
+        }
+        if (
+          probe.timing === 'during'
+          && (
+            probe.quarantinePath === source
+            || source.startsWith('/.vol/')
+          )
+          && path.basename(target) === path.basename(probe.targetPath)
+        ) {
+          await installReplacement();
+        }
+        await actual.rename(source, target);
+      },
+      link: async (source: string, target: string) => {
+        if (
+          probe.timing === 'during'
+          && (
+            probe.quarantinePath === source
+            || source.startsWith('/.vol/')
+          )
+          && path.basename(target) === path.basename(probe.targetPath)
+        ) {
+          await installReplacement();
+        }
+        await actual.link(source, target);
+      },
+      unlink: async (target: string) => {
+        if (
+          !probe.restoreFaultInjected
+          && probe.quarantinePath !== undefined
+          && target.startsWith('/.vol/')
+        ) {
+          probe.restoreFaultInjected = true;
+          if (probe.timing === 'before') await installReplacement();
+          throw Object.assign(new Error('injected quarantine delete failure'), {
+            code: 'EIO',
+          });
+        }
+        await actual.unlink(target);
+      },
+    };
+  });
+  return await import('../../../src/fs/app-directory-scopes');
+};
+
+interface PostValidationHardlinkProbe {
+  targetPath: string;
+  heldPath: string;
+  quarantinePath?: string;
+  hardlinkAdded: boolean;
+}
+
+const importScopesWithPostValidationHardlink = async (
+  probe: PostValidationHardlinkProbe,
+): Promise<typeof import('../../../src/fs/app-directory-scopes')> => {
+  vi.resetModules();
+  vi.doMock('node:fs/promises', async () => {
+    const actual = await vi.importActual<typeof import('node:fs/promises')>(
+      'node:fs/promises',
+    );
+    return {
+      ...actual,
+      rename: async (source: string, target: string) => {
+        if (
+          path.basename(source) === path.basename(probe.targetPath)
+          && path.basename(target).startsWith('.cleanup-')
+        ) {
+          probe.quarantinePath = target;
+        }
+        await actual.rename(source, target);
+      },
+      unlink: async (target: string) => {
+        if (
+          !probe.hardlinkAdded
+          && probe.quarantinePath !== undefined
+          && target.startsWith('/.vol/')
+        ) {
+          probe.hardlinkAdded = true;
+          await actual.link(probe.quarantinePath, probe.heldPath);
+        }
+        await actual.unlink(target);
+      },
+    };
+  });
+  return await import('../../../src/fs/app-directory-scopes');
+};
+
 const importScopesWithDeleteRace = async (
   probe: ScopedDeleteRaceProbe,
 ): Promise<typeof import('../../../src/fs/app-directory-scopes')> => {
@@ -1484,6 +1609,122 @@ describe('app-owned directory scopes', () => {
     expect((await readdir(draftRoot)).some((entry) => entry.startsWith('.cleanup-')))
       .toBe(false);
   });
+
+  it.each([
+    ['unlinkRunFile', 'before', 'file'],
+    ['unlinkRunFile', 'before', 'symlink'],
+    ['unlinkRunFile', 'during', 'file'],
+    ['unlinkRunFile', 'during', 'symlink'],
+    ['removeRunTree', 'before', 'file'],
+    ['removeRunTree', 'before', 'symlink'],
+    ['removeRunTree', 'during', 'file'],
+    ['removeRunTree', 'during', 'symlink'],
+  ] as const)(
+    'preserves a %s %s replacement installed %s quarantine restore',
+    async (operation, timing, replacementKind) => {
+      const workspaceRoot = await makeTempDirectory('app-scopes-restore-race-');
+      const outsideRoot = await makeTempDirectory('app-scopes-restore-outside-');
+      const outsidePath = path.join(outsideRoot, 'outside.txt');
+      await writeFile(outsidePath, 'outside');
+      const runRoot = path.join(workspaceRoot, '.work', 'demo', 'runs', 'run-one');
+      const relativePath = operation === 'unlinkRunFile'
+        ? 'artifact.bin'
+        : 'draft/artifact.bin';
+      const targetPath = path.join(runRoot, relativePath);
+      const probe: QuarantineRestoreRaceProbe = {
+        operation,
+        timing,
+        replacementKind,
+        targetPath,
+        outsidePath,
+        replacementInstalled: false,
+        restoreFaultInjected: false,
+      };
+      const scopes = await importScopesWithQuarantineRestoreRace(probe);
+      const run = await scopes.createRunStore(workspaceRoot).createRun(
+        'demo',
+        'run-one',
+      );
+      if (operation === 'removeRunTree') {
+        await scopes.ensureRunDirectory(run, 'draft');
+      }
+      await writeAndClose(
+        await scopes.openNewRunFile(run, relativePath),
+        'original',
+      );
+
+      const deletion = operation === 'unlinkRunFile'
+        ? scopes.unlinkRunFile(run, relativePath)
+        : scopes.removeRunTree(run, 'draft');
+      await expect(deletion).rejects.toMatchObject({
+        code: 'EIO',
+      });
+
+      expect(probe.replacementInstalled).toBe(true);
+      if (replacementKind === 'file') {
+        await expect(readFile(targetPath, 'utf8')).resolves.toBe('replacement');
+      } else {
+        await expect(lstat(targetPath)).resolves.toSatisfy((stats) => (
+          stats.isSymbolicLink()
+        ));
+        await expect(readFile(outsidePath, 'utf8')).resolves.toBe('outside');
+      }
+      const parentEntries = await readdir(path.dirname(targetPath));
+      expect(parentEntries.some((entry) => entry.startsWith('.cleanup-'))).toBe(false);
+    },
+  );
+
+  it.each(['unlinkRunFile', 'removeRunTree'] as const)(
+    'fails closed when %s gains a hardlink after single-link validation',
+    async (operation) => {
+      const workspaceRoot = await makeTempDirectory('app-scopes-late-hardlink-');
+      const runRoot = path.join(workspaceRoot, '.work', 'demo', 'runs', 'run-one');
+      const relativePath = operation === 'unlinkRunFile'
+        ? 'artifact.bin'
+        : 'draft/artifact.bin';
+      const targetPath = path.join(runRoot, relativePath);
+      const heldPath = path.join(runRoot, `held-${operation}.bin`);
+      const probe: PostValidationHardlinkProbe = {
+        targetPath,
+        heldPath,
+        hardlinkAdded: false,
+      };
+      const scopes = await importScopesWithPostValidationHardlink(probe);
+      const run = await scopes.createRunStore(workspaceRoot).createRun(
+        'demo',
+        'run-one',
+      );
+      if (operation === 'removeRunTree') {
+        await scopes.ensureRunDirectory(run, 'draft');
+      }
+      await writeAndClose(
+        await scopes.openNewRunFile(run, relativePath),
+        'original',
+      );
+      const original = await lstat(targetPath, {bigint: true});
+
+      const deletion = operation === 'unlinkRunFile'
+        ? scopes.unlinkRunFile(run, relativePath)
+        : scopes.removeRunTree(run, 'draft');
+      await expect(deletion).rejects.toMatchObject({
+        code: 'APP_SCOPE_AUTHORITY_CHANGED',
+      });
+
+      expect(probe.hardlinkAdded).toBe(true);
+      const restored = await lstat(targetPath, {bigint: true});
+      const held = await lstat(heldPath, {bigint: true});
+      expect({dev: restored.dev, ino: restored.ino}).toEqual({
+        dev: original.dev,
+        ino: original.ino,
+      });
+      expect({dev: held.dev, ino: held.ino}).toEqual({
+        dev: original.dev,
+        ino: original.ino,
+      });
+      const parentEntries = await readdir(path.dirname(targetPath));
+      expect(parentEntries.some((entry) => entry.startsWith('.cleanup-'))).toBe(false);
+    },
+  );
 
   it.each([
     ['unlinkRunFile', 'file'],

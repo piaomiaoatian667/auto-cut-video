@@ -10,10 +10,12 @@ import {
   lstat,
   mkdir,
   open,
+  readlink,
   readdir,
   realpath,
   rename,
   rmdir,
+  symlink,
   unlink,
   type FileHandle,
 } from 'node:fs/promises';
@@ -1471,10 +1473,6 @@ const restoreQuarantinedEntry = async (
   expected: ScopedDirectoryEntryIdentity,
 ): Promise<void> => {
   await assertScopedPathAnchorStable(state, anchor, relativePath);
-  const original = await inspectAnchoredEntry(anchor, relativePath);
-  if (original.kind !== 'missing') {
-    throw authorityError(`cleanup target was occupied before quarantine restore: ${relativePath}`);
-  }
   const quarantineAnchor = {parent: anchor.parent, basename: quarantineBasename};
   const quarantined = await inspectAnchoredEntry(quarantineAnchor, relativePath);
   if (quarantined.kind === 'missing') {
@@ -1484,18 +1482,138 @@ const restoreQuarantinedEntry = async (
   if (!anchoredEntryMatchesIdentity(quarantined.kind, quarantined.stats, expected)) {
     throw authorityError(`cleanup quarantine changed before restore: ${relativePath}`);
   }
-  await rename(
-    path.join(anchor.parent.volumePath, quarantineBasename),
-    path.join(anchor.parent.volumePath, anchor.basename),
-  );
-  await assertScopedPathAnchorStable(state, anchor, relativePath);
-  const restored = await inspectAnchoredEntry(anchor, relativePath);
-  if (!anchoredEntryMatchesIdentity(restored.kind, restored.stats, expected)) {
-    throw authorityError(`cleanup quarantine restore changed identity: ${relativePath}`);
+  const identityPath = volumePath(expected.dev, expected.ino);
+  const originalPath = path.join(anchor.parent.volumePath, anchor.basename);
+  let occupied = false;
+  try {
+    if (expected.kind === 'file') {
+      await link(identityPath, originalPath);
+    } else if (expected.kind === 'symlink') {
+      await symlink(await readlink(identityPath), originalPath);
+    } else {
+      throw authorityError(
+        `cleanup directory cannot be atomically restored without overwrite: ${relativePath}`,
+      );
+    }
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'EEXIST') occupied = true;
+    else throw error;
   }
+
+  try {
+    await unlink(identityPath);
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== 'ENOENT') throw error;
+  }
+  await assertScopedPathAnchorStable(state, anchor, relativePath);
   const remaining = await inspectAnchoredEntry(quarantineAnchor, relativePath);
   if (remaining.kind !== 'missing') {
     throw authorityError(`cleanup quarantine remained after restore: ${relativePath}`);
+  }
+  if (!occupied) {
+    const restored = await inspectAnchoredEntry(anchor, relativePath);
+    if (expected.kind === 'file') {
+      if (!anchoredEntryMatchesIdentity(restored.kind, restored.stats, expected)) {
+        throw authorityError(`cleanup quarantine restore changed identity: ${relativePath}`);
+      }
+    } else if (restored.kind !== 'symlink') {
+      throw authorityError(`cleanup quarantine restore changed type: ${relativePath}`);
+    }
+  }
+  await syncRemovedEntryParent(state, anchor, relativePath);
+};
+
+const inspectIdentityPath = async (
+  expected: ScopedDirectoryEntryIdentity,
+): Promise<BigIntStats | null> => {
+  try {
+    const stats = await lstat(volumePath(expected.dev, expected.ino), {bigint: true});
+    const kind: AppDirectoryEntryKind = stats.isSymbolicLink()
+      ? 'symlink'
+      : stats.isFile()
+        ? 'file'
+        : stats.isDirectory()
+          ? 'directory'
+          : 'other';
+    if (
+      kind !== expected.kind
+      || stats.dev !== expected.dev
+      || stats.ino !== expected.ino
+    ) {
+      throw authorityError('cleanup identity path changed after validation');
+    }
+    return stats;
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ENOENT') return null;
+    throw error;
+  }
+};
+
+const restoreRemainingFileIdentity = async (
+  state: ScopeState,
+  anchor: ScopedPathAnchor,
+  quarantineBasename: string,
+  relativePath: string,
+  expected: ScopedDirectoryEntryIdentity,
+): Promise<void> => {
+  const quarantineAnchor = {parent: anchor.parent, basename: quarantineBasename};
+  const quarantine = await inspectAnchoredEntry(quarantineAnchor, relativePath);
+  if (anchoredEntryMatchesIdentity(quarantine.kind, quarantine.stats, expected)) {
+    await restoreQuarantinedEntry(
+      state,
+      anchor,
+      quarantineBasename,
+      relativePath,
+      expected,
+    );
+    return;
+  }
+  let occupied = false;
+  try {
+    await link(
+      volumePath(expected.dev, expected.ino),
+      path.join(anchor.parent.volumePath, anchor.basename),
+    );
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'EEXIST') occupied = true;
+    else throw error;
+  }
+  await assertScopedPathAnchorStable(state, anchor, relativePath);
+  if (!occupied) {
+    const restored = await inspectAnchoredEntry(anchor, relativePath);
+    if (!anchoredEntryMatchesIdentity(restored.kind, restored.stats, expected)) {
+      throw authorityError(`cleanup remaining inode restore changed identity: ${relativePath}`);
+    }
+  }
+  const remainingQuarantine = await inspectAnchoredEntry(
+    quarantineAnchor,
+    relativePath,
+  );
+  if (remainingQuarantine.kind !== 'missing') {
+    throw authorityError(`cleanup quarantine remained after inode restore: ${relativePath}`);
+  }
+  await syncRemovedEntryParent(state, anchor, relativePath);
+};
+
+const removeAnchoredDirectoryByIdentity = async (
+  state: ScopeState,
+  anchor: ScopedPathAnchor,
+  relativePath: string,
+  expected: AnchoredTreeEntryIdentity,
+): Promise<void> => {
+  try {
+    await rmdir(volumePath(expected.dev, expected.ino));
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== 'ENOENT') throw error;
+  }
+  await assertScopedPathAnchorStable(state, anchor, relativePath);
+  if (await inspectIdentityPath(expected) !== null) {
+    throw authorityError(`cleanup directory identity remained after removal: ${relativePath}`);
+  }
+  const replacement = await inspectAnchoredEntry(anchor, relativePath);
+  if (replacement.kind !== 'missing') {
+    await syncRemovedEntryParent(state, anchor, relativePath);
+    throw authorityError(`cleanup target was replaced during removal: ${relativePath}`);
   }
   await syncRemovedEntryParent(state, anchor, relativePath);
 };
@@ -1532,12 +1650,20 @@ const removeAnchoredEntryThroughQuarantine = async (
   relativePath: string,
   expected: AnchoredTreeEntryIdentity,
 ): Promise<void> => {
-  if (await revalidateAnchoredTreeEntry(
+  const validated = await revalidateAnchoredTreeEntry(
     state,
     anchor,
     relativePath,
     expected,
-  ) === null) return;
+  );
+  if (validated === null) return;
+  if (expected.kind === 'directory') {
+    await removeAnchoredDirectoryByIdentity(state, anchor, relativePath, expected);
+    return;
+  }
+  if (validated.nlink !== 1n) {
+    throw authorityError(`cleanup target has unexpected hard links: ${relativePath}`);
+  }
 
   const quarantineBasename = await unusedQuarantineBasename(anchor, relativePath);
   const quarantineAnchor = {parent: anchor.parent, basename: quarantineBasename};
@@ -1612,10 +1738,7 @@ const removeAnchoredEntryThroughQuarantine = async (
   }
 
   try {
-    if (expected.kind === 'file') {
-      await unlink(volumePath(expected.dev, expected.ino));
-    }
-    else await rmdir(volumePath(expected.dev, expected.ino));
+    await unlink(volumePath(expected.dev, expected.ino));
   } catch (error) {
     if (!isNodeError(error) || error.code !== 'ENOENT') {
       return await restoreQuarantineAfterFailure(
@@ -1630,6 +1753,27 @@ const removeAnchoredEntryThroughQuarantine = async (
   }
 
   await assertScopedPathAnchorStable(state, anchor, relativePath);
+  if (await inspectIdentityPath(expectedEntry) !== null) {
+    const primaryError = authorityError(
+      `cleanup target gained hard links during removal: ${relativePath}`,
+    );
+    try {
+      await restoreRemainingFileIdentity(
+        state,
+        anchor,
+        quarantineBasename,
+        relativePath,
+        expectedEntry,
+      );
+    } catch (restoreError) {
+      throw new AggregateError(
+        [primaryError, restoreError],
+        `cleanup remaining inode and restore both failed for ${relativePath}`,
+        {cause: primaryError},
+      );
+    }
+    throw primaryError;
+  }
   const remaining = await inspectAnchoredEntry(quarantineAnchor, relativePath);
   if (remaining.kind !== 'missing') {
     if (remaining.stats === undefined) {
