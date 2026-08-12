@@ -773,6 +773,7 @@ const materializeCachedStage = async (
     );
     await dependencies.reportStore.writeStage(runDirectory, report);
     reportWritten = true;
+    throwIfPipelineCancelled(signal, item.stageId);
     await publishWorkProgress(plan, runId, report, 'passed', dependencies);
     return report;
   } catch (error) {
@@ -1092,6 +1093,7 @@ export async function runExecutionPlan(
         preflightExecution.finishedAt,
       );
       await dependencies.reportStore.writeStage(runDirectory, preflightReport);
+      throwIfPipelineCancelled(input.signal, preflightStage.id);
       activeStageFailure.boundary = 'work-pointer';
       workCurrent = await publishWorkProgress(
         revalidated,
@@ -1293,6 +1295,7 @@ export async function runExecutionPlan(
       if (stageResult.state === 'needs_review') {
         activeStageFailure.boundary = 'attempt-report';
         await dependencies.reportStore.writeAttempt(runDirectory, report);
+        throwIfPipelineCancelled(input.signal, item.stageId);
         activeStageFailure.boundary = 'work-pointer';
         workCurrent = await publishWorkProgress(
           revalidated,
@@ -1323,6 +1326,7 @@ export async function runExecutionPlan(
           activeStageFailure.boundary = 'canonical-report';
           await dependencies.reportStore.writeStage(runDirectory, report);
           reportWritten = true;
+          throwIfPipelineCancelled(input.signal, item.stageId);
           activeStageFailure.boundary = 'work-pointer';
           workCurrent = await publishWorkProgress(
             revalidated,
@@ -1359,11 +1363,25 @@ export async function runExecutionPlan(
       activeStageFailure.boundary = 'canonical-report';
       await dependencies.reportStore.writeStage(runDirectory, report);
       try {
+        throwIfPipelineCancelled(input.signal, item.stageId);
         activeStageFailure.boundary = 'output-pointer';
         await publishOutputProgress(revalidated.projectId, outputCurrent, dependencies);
         releaseOutputCommitted = true;
       } catch (error) {
         if (error instanceof PipelinePointerOutcomeError) throw error;
+        if (
+          error instanceof PipelineRuntimeError
+          && error.code === 'PIPELINE_CANCELLED'
+        ) {
+          return await rollbackStageProgress({
+            primaryError: error,
+            reportStore: dependencies.reportStore,
+            runDirectory,
+            stageId: item.stageId,
+            reportWritten: true,
+            artifacts: stageResult.artifacts,
+          });
+        }
         try {
           await deleteCanonicalReport(
             dependencies.reportStore,

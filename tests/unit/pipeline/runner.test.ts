@@ -271,6 +271,8 @@ const createStages = (
 }));
 
 interface MemoryRuntimeOptions extends StageOptions {
+  afterAttemptWrite?: (report: StageReport) => Promise<void> | void;
+  afterStageReportWrite?: (report: StageReport) => Promise<void> | void;
   afterWorkPublish?: (pointer: CurrentPointer) => Promise<void> | void;
   current?: CurrentPointer | null;
   outputCurrent?: CurrentPointer | null;
@@ -385,11 +387,13 @@ const createMemoryRuntime = (options: MemoryRuntimeOptions = {}) => {
         throw Object.assign(new Error('exists'), {code: 'EEXIST'});
       }
       runReports.set(validated.stageId, validated);
+      await options.afterStageReportWrite?.(validated);
     }),
     writeAttempt: vi.fn(async (_run, report) => {
       const validated = StageReportSchema.parse(report);
       events.push(`attempt:${validated.stageId}:${validated.state}`);
       attempts.push(validated);
+      await options.afterAttemptWrite?.(validated);
       return `${validated.stageId}-attempt`;
     }),
     deleteStage: vi.fn(async (run, stageId) => {
@@ -456,6 +460,27 @@ const executionInput = (plan: ExecutionPlan, project = memoryProject()) => ({
   project,
   sourceCatalog,
   signal: new AbortController().signal,
+});
+
+const abortAfterCanonicalReport = (
+  reportStore: StageReportStore,
+  controller: AbortController,
+  stageId: StageId,
+  signal: NodeJS.Signals,
+): StageReportStore => ({
+  readStage: async (run, requestedStageId) => await reportStore.readStage(
+    run,
+    requestedStageId,
+  ),
+  writeStage: async (run, report) => {
+    await reportStore.writeStage(run, report);
+    if (report.stageId === stageId) controller.abort(signal);
+  },
+  writeAttempt: async (run, report) => await reportStore.writeAttempt(run, report),
+  deleteStage: async (run, requestedStageId) => await reportStore.deleteStage(
+    run,
+    requestedStageId,
+  ),
 });
 
 const planningContext = (
@@ -1140,6 +1165,483 @@ describe('Pipeline Runner', () => {
       partialArtifacts: [ingestPartial],
     }));
     expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('rolls back an ordinary report and artifact when cancellation follows report persistence', async () => {
+    const tempProject = await createTempProject();
+    tempProjects.push(tempProject);
+    const project = await loadProject(tempProject.workspaceRoot, 'demo');
+    const runStore = createRunStore(tempProject.workspaceRoot);
+    const outputStore = createOutputStore(tempProject.workspaceRoot);
+    const durableReportStore = createStageReportStore();
+    const controller = new AbortController();
+    const reportStore = abortAfterCanonicalReport(
+      durableReportStore,
+      controller,
+      'ingest',
+      'SIGINT',
+    );
+    const writeAttempt = vi.spyOn(durableReportStore, 'writeAttempt');
+    const cleanupFailedStage = vi.fn(async () => undefined);
+    const release = vi.fn(async () => undefined);
+    const ingestPartial: PipelinePartialArtifact = {
+      scope: 'run',
+      path: 'partials/ingest.tmp',
+    };
+    const artifactPath = 'assets/report-window.json';
+    const events: string[] = [];
+    const stageCalls: StageId[] = [];
+    const registry = createStages(events, stageCalls, {
+      partialArtifacts: {ingest: [ingestPartial]},
+      execute: {
+        ingest: async (context) => {
+          if (context.runDirectory === undefined) throw new Error('missing Run');
+          const artifact = await writeRunArtifact(
+            context.runDirectory,
+            artifactPath,
+            'ordinary report window',
+          );
+          return {
+            state: 'passed',
+            fingerprint: stageFingerprint('ingest'),
+            outputs: {stageId: 'ingest'},
+            artifacts: [artifact],
+            checks: [],
+          };
+        },
+      },
+    });
+    const runId = 'run-report-abort';
+    const dependencies: RunnerDependencies = {
+      registry,
+      runStore,
+      outputStore,
+      reportStore,
+      acquireProjectLock: vi.fn(async () => ({
+        record: {
+          pid: 1,
+          hostname: 'test',
+          processStart: 'test',
+          createdAt: NOW,
+          runId,
+        },
+        release,
+      })) as unknown as RunnerDependencies['acquireProjectLock'],
+      cleanupFailedStage,
+      createRunId: vi.fn(() => runId),
+      now: vi.fn(() => NOW),
+    };
+    const plan = makePlan({
+      preset: 'assets',
+      stageIds: ['preflight', 'ingest'],
+      actions: ['run', 'run'],
+      runMode: 'new',
+      targetRunId: runId,
+    });
+
+    await expect(runExecutionPlan({
+      ...executionInput(plan, project),
+      signal: controller.signal,
+    }, dependencies)).rejects.toMatchObject({
+      code: 'PIPELINE_CANCELLED',
+      stageId: 'ingest',
+    });
+
+    const runDirectory = await runStore.openExistingRun('demo', runId);
+    expect(stageCalls).toEqual(['preflight', 'ingest']);
+    await expect(durableReportStore.readStage(runDirectory, 'ingest')).resolves.toBeNull();
+    await expect(readFile(path.join(
+      tempProject.workspaceRoot,
+      '.work/demo/runs',
+      runId,
+      artifactPath,
+    ), 'utf8')).rejects.toMatchObject({code: 'ENOENT'});
+    await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
+      runId,
+      completedStage: 'preflight',
+      state: 'passed',
+    });
+    await expect(outputStore.readCurrentReadonly('demo')).resolves.toBeNull();
+    expect(writeAttempt).toHaveBeenCalledOnce();
+    expect(writeAttempt.mock.calls[0]?.[1]).toMatchObject({
+      runId,
+      stageId: 'ingest',
+      state: 'cancelled',
+      error: expect.objectContaining({code: 'PIPELINE_CANCELLED'}),
+    });
+    expect(cleanupFailedStage).toHaveBeenCalledOnce();
+    expect(cleanupFailedStage).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: 'demo',
+      runId,
+      stageId: 'ingest',
+      partialArtifacts: [ingestPartial],
+    }));
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('rolls back a cached report and copied artifacts when cancellation follows report persistence', async () => {
+    const tempProject = await createTempProject();
+    tempProjects.push(tempProject);
+    const project = await loadProject(tempProject.workspaceRoot, 'demo');
+    const runStore = createRunStore(tempProject.workspaceRoot);
+    const outputStore = createOutputStore(tempProject.workspaceRoot);
+    const durableReportStore = createStageReportStore();
+    const sourceRunId = 'run-cached-source';
+    const runId = 'run-cached-report-abort';
+    const sourceRun = await runStore.createRun('demo', sourceRunId);
+    const artifacts = [
+      await writeRunArtifact(sourceRun, 'assets/first.json', 'first cached report'),
+      await writeRunArtifact(sourceRun, 'assets/second.json', 'second cached report'),
+    ];
+    await durableReportStore.writeStage(sourceRun, makeReport({
+      runId: sourceRunId,
+      preset: 'assets',
+      stageId: 'preflight',
+    }));
+    await durableReportStore.writeStage(sourceRun, makeReport({
+      runId: sourceRunId,
+      preset: 'assets',
+      stageId: 'ingest',
+      artifacts,
+    }));
+    const controller = new AbortController();
+    const reportStore = abortAfterCanonicalReport(
+      durableReportStore,
+      controller,
+      'ingest',
+      'SIGTERM',
+    );
+    const writeAttempt = vi.spyOn(durableReportStore, 'writeAttempt');
+    const cleanupFailedStage = vi.fn(async () => undefined);
+    const release = vi.fn(async () => undefined);
+    const ingestPartial: PipelinePartialArtifact = {
+      scope: 'run',
+      path: 'partials/cached-ingest.tmp',
+    };
+    const events: string[] = [];
+    const stageCalls: StageId[] = [];
+    const registry = createStages(events, stageCalls, {
+      partialArtifacts: {ingest: [ingestPartial]},
+    });
+    const dependencies: RunnerDependencies = {
+      registry,
+      runStore,
+      outputStore,
+      reportStore,
+      acquireProjectLock: vi.fn(async () => ({
+        record: {
+          pid: 1,
+          hostname: 'test',
+          processStart: 'test',
+          createdAt: NOW,
+          runId,
+        },
+        release,
+      })) as unknown as RunnerDependencies['acquireProjectLock'],
+      cleanupFailedStage,
+      createRunId: vi.fn(() => runId),
+      now: vi.fn(() => NOW),
+    };
+    const plan = makePlan({
+      preset: 'assets',
+      stageIds: ['preflight', 'ingest'],
+      actions: ['run', 'cached'],
+      runMode: 'new',
+      sourceRunId,
+      targetRunId: runId,
+    });
+
+    await expect(runExecutionPlan({
+      ...executionInput(plan, project),
+      signal: controller.signal,
+    }, dependencies)).rejects.toMatchObject({
+      code: 'PIPELINE_CANCELLED',
+      stageId: 'ingest',
+    });
+
+    const runDirectory = await runStore.openExistingRun('demo', runId);
+    expect(stageCalls).toEqual(['preflight']);
+    await expect(durableReportStore.readStage(runDirectory, 'ingest')).resolves.toBeNull();
+    for (const artifact of artifacts) {
+      await expect(readFile(path.join(
+        tempProject.workspaceRoot,
+        '.work/demo/runs',
+        runId,
+        artifact.path,
+      ), 'utf8')).rejects.toMatchObject({code: 'ENOENT'});
+    }
+    await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
+      runId,
+      completedStage: 'preflight',
+      state: 'passed',
+    });
+    await expect(outputStore.readCurrentReadonly('demo')).resolves.toBeNull();
+    expect(writeAttempt).toHaveBeenCalledOnce();
+    expect(writeAttempt.mock.calls[0]?.[1]).toMatchObject({
+      runId,
+      stageId: 'ingest',
+      state: 'cancelled',
+      error: expect.objectContaining({code: 'PIPELINE_CANCELLED'}),
+    });
+    expect(cleanupFailedStage).toHaveBeenCalledOnce();
+    expect(cleanupFailedStage).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: 'demo',
+      runId,
+      stageId: 'ingest',
+      partialArtifacts: [ingestPartial],
+    }));
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it('rolls back a Release report and Run artifacts when cancellation precedes Output publication', async () => {
+    const tempProject = await createTempProject();
+    tempProjects.push(tempProject);
+    const project = await loadProject(tempProject.workspaceRoot, 'demo');
+    const runStore = createRunStore(tempProject.workspaceRoot);
+    const outputStore = createOutputStore(tempProject.workspaceRoot);
+    const durableReportStore = createStageReportStore();
+    await outputStore.createRelease('demo', 'run-previous');
+    const previousOutput = currentPointer('run-previous', 'release', {
+      relativePath: 'releases/run-previous',
+    });
+    await outputStore.publishCurrent('demo', previousOutput);
+    const controller = new AbortController();
+    const reportStore = abortAfterCanonicalReport(
+      durableReportStore,
+      controller,
+      'release',
+      'SIGTERM',
+    );
+    const writeAttempt = vi.spyOn(durableReportStore, 'writeAttempt');
+    const cleanupFailedStage = vi.fn(async () => undefined);
+    const releaseLock = vi.fn(async () => undefined);
+    const releasePartial: PipelinePartialArtifact = {
+      scope: 'run',
+      path: 'partials/release.tmp',
+    };
+    const artifactPath = 'release/audit.json';
+    const events: string[] = [];
+    const stageCalls: StageId[] = [];
+    const registry = createStages(events, stageCalls, {
+      partialArtifacts: {release: [releasePartial]},
+      execute: {
+        release: async (context) => {
+          if (context.runDirectory === undefined || context.runId === undefined) {
+            throw new Error('missing Run');
+          }
+          const artifact = await writeRunArtifact(
+            context.runDirectory,
+            artifactPath,
+            'release report window',
+          );
+          await outputStore.createRelease('demo', context.runId);
+          return {
+            state: 'passed',
+            fingerprint: stageFingerprint('release'),
+            outputs: {release: context.runId},
+            artifacts: [artifact],
+            checks: [],
+            outputCurrent: currentPointer(context.runId, 'release', {
+              relativePath: `releases/${context.runId}`,
+            }),
+          };
+        },
+      },
+    });
+    const runId = 'run-release-report-abort';
+    const dependencies: RunnerDependencies = {
+      registry,
+      runStore,
+      outputStore,
+      reportStore,
+      acquireProjectLock: vi.fn(async () => ({
+        record: {
+          pid: 1,
+          hostname: 'test',
+          processStart: 'test',
+          createdAt: NOW,
+          runId,
+        },
+        release: releaseLock,
+      })) as unknown as RunnerDependencies['acquireProjectLock'],
+      cleanupFailedStage,
+      createRunId: vi.fn(() => runId),
+      now: vi.fn(() => NOW),
+    };
+    const plan = makePlan({
+      preset: 'release',
+      stageIds: ['preflight', 'release'],
+      actions: ['run', 'run'],
+      runMode: 'new',
+      targetRunId: runId,
+    });
+
+    await expect(runExecutionPlan({
+      ...executionInput(plan, project),
+      signal: controller.signal,
+    }, dependencies)).rejects.toMatchObject({
+      code: 'PIPELINE_CANCELLED',
+      stageId: 'release',
+    });
+
+    const runDirectory = await runStore.openExistingRun('demo', runId);
+    expect(stageCalls).toEqual(['preflight', 'release']);
+    await expect(durableReportStore.readStage(runDirectory, 'release')).resolves.toBeNull();
+    await expect(readFile(path.join(
+      tempProject.workspaceRoot,
+      '.work/demo/runs',
+      runId,
+      artifactPath,
+    ), 'utf8')).rejects.toMatchObject({code: 'ENOENT'});
+    await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
+      runId,
+      completedStage: 'preflight',
+      state: 'passed',
+    });
+    await expect(outputStore.readCurrentReadonly('demo')).resolves.toEqual(previousOutput);
+    expect(writeAttempt).toHaveBeenCalledOnce();
+    expect(writeAttempt.mock.calls[0]?.[1]).toMatchObject({
+      runId,
+      stageId: 'release',
+      state: 'cancelled',
+      error: expect.objectContaining({code: 'PIPELINE_CANCELLED'}),
+    });
+    expect(cleanupFailedStage).toHaveBeenCalledOnce();
+    expect(cleanupFailedStage).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: 'demo',
+      runId,
+      stageId: 'release',
+      partialArtifacts: [releasePartial],
+    }));
+    expect(releaseLock).toHaveBeenCalledOnce();
+  });
+
+  it('does not publish selected Preflight progress after its report aborts the signal', async () => {
+    const controller = new AbortController();
+    const previousWork = currentPointer('run-previous', 'release');
+    const previousOutput = currentPointer('run-previous', 'release', {
+      relativePath: 'releases/run-previous',
+    });
+    const preflightPartial: PipelinePartialArtifact = {
+      scope: 'run',
+      path: 'partials/preflight.tmp',
+    };
+    const cleanupFailedStage = vi.fn(async () => undefined);
+    const runtime = createMemoryRuntime({
+      current: previousWork,
+      outputCurrent: previousOutput,
+      partialArtifacts: {preflight: [preflightPartial]},
+      afterStageReportWrite: (report) => {
+        if (report.stageId === 'preflight') controller.abort('SIGINT');
+      },
+    });
+    runtime.dependencies.cleanupFailedStage = cleanupFailedStage;
+    const plan = makePlan({
+      preset: 'assets',
+      stageIds: ['preflight', 'ingest'],
+      actions: ['run', 'run'],
+      runMode: 'new',
+      targetRunId: 'run-preflight-report-abort',
+    });
+
+    await expect(runExecutionPlan({
+      ...executionInput(plan),
+      signal: controller.signal,
+    }, runtime.dependencies)).rejects.toMatchObject({
+      code: 'PIPELINE_CANCELLED',
+      stageId: 'preflight',
+    });
+
+    expect(runtime.stageCalls).toEqual(['preflight']);
+    expect(runtime.workCurrent).toEqual(previousWork);
+    expect(runtime.outputCurrent).toEqual(previousOutput);
+    expect(runtime.attempts).toEqual([
+      expect.objectContaining({
+        runId: 'run-preflight-report-abort',
+        stageId: 'preflight',
+        state: 'cancelled',
+      }),
+    ]);
+    expect(cleanupFailedStage).toHaveBeenCalledOnce();
+    expect(cleanupFailedStage).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: 'demo',
+      runId: 'run-preflight-report-abort',
+      stageId: 'preflight',
+      partialArtifacts: [preflightPartial],
+    }));
+    expect(runtime.release).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a needs_review attempt diagnostic without publishing cancelled progress', async () => {
+    const controller = new AbortController();
+    const previousOutput = currentPointer('run-previous', 'release', {
+      relativePath: 'releases/run-previous',
+    });
+    const reviewPartial: PipelinePartialArtifact = {
+      scope: 'run',
+      path: 'partials/review.tmp',
+    };
+    const cleanupFailedStage = vi.fn(async () => undefined);
+    const reviewResult: StageExecutionResult = {
+      state: 'needs_review',
+      fingerprint: stageFingerprint('review'),
+      outputs: {review: null},
+      artifacts: [],
+      checks: [{
+        id: 'review-required',
+        severity: 'warning',
+        message: 'Review required.',
+        requiresReview: true,
+      }],
+    };
+    const runtime = createMemoryRuntime({
+      outputCurrent: previousOutput,
+      partialArtifacts: {review: [reviewPartial]},
+      results: {review: reviewResult},
+      afterAttemptWrite: (report) => {
+        if (report.state === 'needs_review') controller.abort('SIGTERM');
+      },
+    });
+    runtime.dependencies.cleanupFailedStage = cleanupFailedStage;
+    const plan = makePlan({
+      preset: 'release',
+      stageIds: ['preflight', 'review', 'release'],
+      actions: ['run', 'run', 'run'],
+      runMode: 'new',
+      targetRunId: 'run-review-report-abort',
+    });
+
+    await expect(runExecutionPlan({
+      ...executionInput(plan),
+      signal: controller.signal,
+    }, runtime.dependencies)).rejects.toMatchObject({
+      code: 'PIPELINE_CANCELLED',
+      stageId: 'review',
+    });
+
+    expect(runtime.stageCalls).toEqual(['preflight', 'review']);
+    expect(runtime.workCurrent).toMatchObject({
+      runId: 'run-review-report-abort',
+      completedStage: 'preflight',
+      state: 'passed',
+    });
+    expect(runtime.outputCurrent).toEqual(previousOutput);
+    expect(runtime.attempts).toEqual([
+      expect.objectContaining({stageId: 'review', state: 'needs_review'}),
+      expect.objectContaining({
+        stageId: 'review',
+        state: 'cancelled',
+        error: expect.objectContaining({code: 'PIPELINE_CANCELLED'}),
+      }),
+    ]);
+    expect(cleanupFailedStage).toHaveBeenCalledOnce();
+    expect(cleanupFailedStage).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: 'demo',
+      runId: 'run-review-report-abort',
+      stageId: 'review',
+      partialArtifacts: [reviewPartial],
+    }));
+    expect(runtime.release).toHaveBeenCalledOnce();
   });
 
   it('runs an unnumbered Preflight Gate for noop without writes or a lock', async () => {
