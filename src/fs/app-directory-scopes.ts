@@ -1865,7 +1865,13 @@ const unlinkScopedFile = async (
   state: ScopeState,
   relativePath: string,
 ): Promise<void> => {
-  const anchor = await openScopedPathAnchor(state, relativePath);
+  let anchor: ScopedPathAnchor;
+  try {
+    anchor = await openScopedPathAnchor(state, relativePath);
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ENOENT') return;
+    throw error;
+  }
   try {
     const {kind} = await inspectAnchoredEntry(anchor, relativePath);
     if (kind === 'missing') {

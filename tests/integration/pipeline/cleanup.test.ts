@@ -21,6 +21,7 @@ import {
   removeWorkTree,
   type CurrentPointer,
 } from '../../../src/pipeline/run-store';
+import {acquireProjectLock} from '../../../src/pipeline/project-lock';
 
 const tempDirectories: string[] = [];
 
@@ -175,6 +176,88 @@ describe('pipeline cleanup integration', () => {
       'demo',
       'releases',
       'release-next',
+    ))).resolves.toMatchObject({mode: expect.any(Number)});
+  });
+
+  it('serializes Work pointer publication across the final read-to-remove window', async () => {
+    const workspaceRoot = await makeWorkspace();
+    const runStore = createRunStore(workspaceRoot);
+    await runStore.createRun('demo', 'run-current');
+    await runStore.createRun('demo', 'run-old');
+    await runStore.publishCurrent('demo', workPointer('run-current'));
+    const outputStore = createOutputStore(workspaceRoot);
+    const plan = await buildCleanupPlan({workspaceRoot, projectId: 'demo'});
+    const work = await runStore.createWork('demo');
+    let publicationAttempted = false;
+
+    await expect(executeCleanupPlan(plan, {
+      runStore,
+      outputStore,
+      removeWorkTree: async (scope, relativePath) => {
+        publicationAttempted = true;
+        const lease = await acquireProjectLock(work, 'run-writer');
+        try {
+          await runStore.publishCurrent('demo', workPointer('run-old'));
+        } finally {
+          await lease.release();
+        }
+        await removeWorkTree(scope, relativePath);
+      },
+      removeOutputTree,
+    })).rejects.toMatchObject({code: 'PROJECT_LOCKED'});
+
+    expect(publicationAttempted).toBe(true);
+    await expect(runStore.readCurrentReadonly('demo')).resolves.toMatchObject({
+      runId: 'run-current',
+    });
+    await expect(lstat(path.join(
+      workspaceRoot,
+      '.work',
+      'demo',
+      'runs',
+      'run-old',
+    ))).resolves.toMatchObject({mode: expect.any(Number)});
+  });
+
+  it('serializes Output pointer publication across the final read-to-remove window', async () => {
+    const workspaceRoot = await makeWorkspace();
+    const runStore = createRunStore(workspaceRoot);
+    await runStore.createRun('demo', 'run-current');
+    await runStore.publishCurrent('demo', workPointer('run-current'));
+    const outputStore = createOutputStore(workspaceRoot);
+    await outputStore.createRelease('demo', 'release-current');
+    await outputStore.createRelease('demo', 'release-old');
+    await outputStore.publishCurrent('demo', outputPointer('release-current'));
+    const plan = await buildCleanupPlan({workspaceRoot, projectId: 'demo'});
+    const work = await runStore.createWork('demo');
+    let publicationAttempted = false;
+
+    await expect(executeCleanupPlan(plan, {
+      runStore,
+      outputStore,
+      removeWorkTree,
+      removeOutputTree: async (scope, relativePath) => {
+        publicationAttempted = true;
+        const lease = await acquireProjectLock(work, 'release-writer');
+        try {
+          await outputStore.publishCurrent('demo', outputPointer('release-old'));
+        } finally {
+          await lease.release();
+        }
+        await removeOutputTree(scope, relativePath);
+      },
+    })).rejects.toMatchObject({code: 'PROJECT_LOCKED'});
+
+    expect(publicationAttempted).toBe(true);
+    await expect(outputStore.readCurrentReadonly('demo')).resolves.toMatchObject({
+      runId: 'release-current',
+    });
+    await expect(lstat(path.join(
+      workspaceRoot,
+      'output',
+      'demo',
+      'releases',
+      'release-old',
     ))).resolves.toMatchObject({mode: expect.any(Number)});
   });
 

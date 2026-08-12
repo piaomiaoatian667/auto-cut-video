@@ -1357,6 +1357,14 @@ describe('app-owned directory scopes', () => {
     await expect(removeRunTree(run, 'draft/missing/child')).resolves.toBeUndefined();
   });
 
+  it('treats a missing Run file parent as an idempotent unlink', async () => {
+    const workspaceRoot = await makeTempDirectory('app-scopes-unlink-missing-parent-');
+    const runStore = createRunStore(workspaceRoot);
+    const run = await runStore.createRun('demo', 'run-one');
+
+    await expect(unlinkRunFile(run, 'missing/child.bin')).resolves.toBeUndefined();
+  });
+
   it('lists and removes only the requested Work and Output trees', async () => {
     const workspaceRoot = await makeTempDirectory('app-scopes-owned-tree-');
     const runStore = createRunStore(workspaceRoot);

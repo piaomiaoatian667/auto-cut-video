@@ -30,7 +30,11 @@ import type {ProjectLockLease} from '../../../src/pipeline/project-lock';
 import {runExecutionPlan} from '../../../src/pipeline/runner';
 import type {ProjectSourceCatalog} from '../../../src/pipeline/source-assets';
 import type {PipelineStage} from '../../../src/pipeline/stage';
-import {createStageReportStore} from '../../../src/pipeline/stage-report';
+import {
+  createStageReportStore,
+  StageReportSchema,
+  type StageReport,
+} from '../../../src/pipeline/stage-report';
 import {fakePreflightResult} from '../../helpers/pipeline-fixtures';
 import {
   createEditFixture,
@@ -256,9 +260,11 @@ describe('artifact copy rollback', () => {
         unlink: async (...args: Parameters<typeof actual.unlink>) => {
           if (armed) {
             const targetPath = String(args[0]);
-            events.push(path.basename(targetPath) === path.basename(relativePath)
-              ? 'unlink-target'
-              : 'unlink-other');
+            events.push(targetPath.endsWith(relativePath)
+              ? 'unlink-path'
+              : targetPath.startsWith('/.vol/')
+                ? 'unlink-identity'
+                : 'unlink-other');
           }
           await Reflect.apply(actual.unlink, undefined, args);
         },
@@ -289,7 +295,8 @@ describe('artifact copy rollback', () => {
     })).rejects.toMatchObject({code: 'ARTIFACT_HASH_MISMATCH'});
 
     expect(events.indexOf('close-target')).toBeGreaterThanOrEqual(0);
-    expect(events.indexOf('close-target')).toBeLessThan(events.indexOf('unlink-target'));
+    expect(events.indexOf('close-target')).toBeLessThan(events.indexOf('unlink-identity'));
+    expect(events).not.toContain('unlink-path');
     expect(events).not.toContain('unlink-other');
     await expect(readFile(path.join(
       workspaceRoot,
@@ -309,9 +316,263 @@ describe('artifact copy rollback', () => {
       'sibling.bin',
     ), 'utf8')).resolves.toBe('sibling bytes');
   });
+
+  it('preserves a regular-file replacement installed after the target closes', async () => {
+    const workspaceRoot = await makeWorkspace();
+    const relativePath = 'cache/replaced.bin';
+    const replacement = 'replacement bytes';
+    let armed = false;
+    let replaced = false;
+    vi.resetModules();
+    vi.doMock('node:fs/promises', async () => {
+      const actual = await vi.importActual<typeof import('node:fs/promises')>(
+        'node:fs/promises',
+      );
+      return {
+        ...actual,
+        open: async (...args: Parameters<typeof actual.open>) => {
+          const handle = await Reflect.apply(actual.open, undefined, args);
+          const openedPath = String(args[0]);
+          const flags = Number(args[1]);
+          if (
+            !armed
+            || (flags & constants.O_CREAT) === 0
+            || path.basename(openedPath) !== path.basename(relativePath)
+          ) return handle;
+          return new Proxy(handle, {
+            get(target, property) {
+              if (property === 'close') {
+                return async () => {
+                  await target.close();
+                  if (replaced) return;
+                  replaced = true;
+                  await actual.rename(openedPath, `${openedPath}.original`);
+                  await actual.writeFile(openedPath, replacement);
+                };
+              }
+              const value = Reflect.get(target, property, target);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+        },
+      };
+    });
+    const scopes = await import('../../../src/fs/app-directory-scopes');
+    const artifacts = await import('../../../src/pipeline/artifacts');
+    const runStore = scopes.createRunStore(workspaceRoot);
+    const sourceRun = await runStore.createRun('demo', 'source-run');
+    const targetRun = await runStore.createRun('demo', 'target-run');
+    await scopes.ensureRunDirectory(sourceRun, 'cache');
+    await scopes.ensureRunDirectory(targetRun, 'cache');
+    await writeAndClose(
+      await scopes.openNewRunFile(sourceRun, relativePath),
+      'source bytes',
+    );
+    const artifact = await artifacts.hashRunArtifact(sourceRun, relativePath);
+    armed = true;
+
+    await expect(artifacts.copyRunArtifact({
+      sourceRun,
+      targetRun,
+      artifact: {...artifact, sha256: 'sha256:wrong'},
+    })).rejects.toMatchObject({code: 'ARTIFACT_HASH_MISMATCH'});
+
+    expect(replaced).toBe(true);
+    await expect(readFile(path.join(
+      workspaceRoot,
+      '.work',
+      'demo',
+      'runs',
+      'target-run',
+      relativePath,
+    ), 'utf8')).resolves.toBe(replacement);
+    await expect(readFile(path.join(
+      workspaceRoot,
+      '.work',
+      'demo',
+      'runs',
+      'target-run',
+      `${relativePath}.original`,
+    ))).rejects.toMatchObject({code: 'ENOENT'});
+  });
 });
 
 describe('Runner failed-stage cleanup', () => {
+  it('preserves an existing same-Run cached Stage artifact when Work publication fails', async () => {
+    const workspaceRoot = await makeWorkspace();
+    const runId = 'run-resume';
+    const existingArtifact = 'ingest/current.bin';
+    const normalRunStore = createRunStore(workspaceRoot);
+    const runDirectory = await normalRunStore.createRun('demo', runId);
+    await ensureRunDirectory(runDirectory, 'ingest');
+    await writeAndClose(
+      await openNewRunFile(runDirectory, existingArtifact),
+      'current artifact',
+    );
+    const preflight = fakePreflightResult();
+    const reportStore = createStageReportStore();
+    const report = (
+      stageId: 'preflight' | 'ingest',
+      fingerprint: string,
+      outputs: unknown,
+    ): StageReport => StageReportSchema.parse({
+      version: 1,
+      projectId: 'demo',
+      runId,
+      preset: 'assets',
+      stageId,
+      position: stageId === 'preflight' ? 1 : 2,
+      total: 2,
+      state: 'passed',
+      fingerprint,
+      startedAt: '2026-08-12T00:00:00.000Z',
+      finishedAt: '2026-08-12T00:00:00.000Z',
+      artifacts: [],
+      outputs,
+      checks: [],
+    });
+    await reportStore.writeStage(runDirectory, report(
+      'preflight',
+      'preflight-fingerprint',
+      preflight,
+    ));
+    await reportStore.writeStage(runDirectory, report(
+      'ingest',
+      'ingest-fingerprint',
+      {ingest: 'complete'},
+    ));
+    await normalRunStore.publishCurrent('demo', {
+      runId,
+      relativePath: `runs/${runId}`,
+      preset: 'assets',
+      stageIds: ['preflight', 'ingest'],
+      completedStage: 'preflight',
+      state: 'passed',
+      publishedAt: '2026-08-12T00:00:00.000Z',
+    });
+
+    const pointerFailure = new Error('cached Work pointer failed');
+    const runStore = createRunStore(workspaceRoot, {
+      fileOps: {
+        writeFile: async (handle, data) => {
+          const current = JSON.parse(data) as CurrentPointer;
+          if (current.completedStage === 'ingest') throw pointerFailure;
+          await handle.writeFile(data);
+        },
+      },
+    });
+    const outputStore = createOutputStore(workspaceRoot);
+    const executeIngest = vi.fn<PipelineStage['execute']>();
+    const stages: readonly PipelineStage[] = [
+      {
+        id: 'preflight',
+        displayName: 'preflight',
+        prerequisites: [],
+        fingerprint: async () => null,
+        verify: async () => true,
+        partialArtifacts: () => [],
+        execute: async () => ({
+          state: 'passed',
+          fingerprint: 'preflight-fingerprint',
+          outputs: preflight,
+          artifacts: [],
+          checks: preflight.checks,
+        }),
+      },
+      {
+        id: 'ingest',
+        displayName: 'ingest',
+        prerequisites: [],
+        fingerprint: async () => 'ingest-fingerprint',
+        verify: async () => true,
+        partialArtifacts: () => [{scope: 'run', path: existingArtifact}],
+        execute: executeIngest,
+      },
+    ];
+    const plan: ExecutionPlan = {
+      version: 1,
+      projectId: 'demo',
+      preset: 'assets',
+      stageIds: ['preflight', 'ingest'],
+      runMode: 'resume',
+      requiresProgressReconciliation: false,
+      requiresRuntimePreflight: false,
+      sourceRunId: runId,
+      targetRunId: runId,
+      items: [
+        {
+          position: 1,
+          total: 2,
+          stageId: 'preflight',
+          displayName: 'preflight',
+          action: 'run',
+          fingerprint: null,
+          materialize: false,
+        },
+        {
+          position: 2,
+          total: 2,
+          stageId: 'ingest',
+          displayName: 'ingest',
+          action: 'cached',
+          fingerprint: 'ingest-fingerprint',
+          sourceRunId: runId,
+          materialize: false,
+        },
+      ],
+    };
+    const project: ProjectInputs = {
+      workspaceRoot,
+      projectDirectory: {} as ProjectInputs['projectDirectory'],
+      project: createProjectFixture(),
+      script: createScriptFixture(),
+      edit: createEditFixture(),
+    };
+    const sourceCatalog: ProjectSourceCatalog = {
+      assets: [],
+      totalBytes: 0,
+      fingerprint: `sha256:${'a'.repeat(64)}`,
+    };
+    const lease: ProjectLockLease = {
+      record: {
+        pid: process.pid,
+        hostname: 'test',
+        processStart: 'test',
+        createdAt: '2026-08-12T00:00:00.000Z',
+        runId,
+      },
+      release: async () => undefined,
+    };
+
+    await expect(runExecutionPlan({
+      plan,
+      project,
+      sourceCatalog,
+      signal: new AbortController().signal,
+    }, {
+      registry: stages,
+      runStore,
+      outputStore,
+      reportStore,
+      acquireProjectLock: async () => lease,
+      createRunId: () => runId,
+      now: () => '2026-08-12T00:00:00.000Z',
+    })).rejects.toMatchObject({
+      code: 'PIPELINE_STAGE_FAILED',
+      stageId: 'ingest',
+    });
+
+    expect(executeIngest).not.toHaveBeenCalled();
+    await expect(readFile(path.join(
+      workspaceRoot,
+      '.work',
+      'demo',
+      'runs',
+      runId,
+      existingArtifact,
+    ), 'utf8')).resolves.toBe('current artifact');
+  });
+
   it('uses the shared cleanup implementation when no override is injected', async () => {
     const workspaceRoot = await makeWorkspace();
     const runId = 'run-default-cleanup';

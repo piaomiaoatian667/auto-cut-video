@@ -122,6 +122,7 @@ interface ActiveStageFailure {
   context: StageExecutionContext;
   startedAt: string;
   boundary: ActiveStageBoundary;
+  cleanupPartials: boolean;
 }
 
 type PointerOwner = 'Work' | 'Output';
@@ -354,35 +355,37 @@ const recoverActiveStageFailure = async (
     recoveryErrors.push(attemptError);
   }
 
-  let partialArtifacts: readonly PipelinePartialArtifact[] = [];
-  try {
-    partialArtifacts = [...active.stage.partialArtifacts(active.context)];
-  } catch (partialError) {
-    recoveryErrors.push(partialError);
-  }
-
-  let outputDirectory: OutputDirectoryScope | undefined;
-  if (partialArtifacts.some((artifact) => artifact.scope === 'output')) {
+  if (active.cleanupPartials) {
+    let partialArtifacts: readonly PipelinePartialArtifact[] = [];
     try {
-      outputDirectory = await dependencies.outputStore.openExistingProject(
-        active.plan.projectId,
-      ) ?? undefined;
-    } catch (outputError) {
-      recoveryErrors.push(outputError);
+      partialArtifacts = [...active.stage.partialArtifacts(active.context)];
+    } catch (partialError) {
+      recoveryErrors.push(partialError);
     }
-  }
 
-  try {
-    await (dependencies.cleanupFailedStage ?? sharedCleanupFailedStage)({
-      projectId: active.plan.projectId,
-      ...(active.context.runId === undefined ? {} : {runId: active.context.runId}),
-      stageId: active.stage.id,
-      ...(runDirectory === undefined ? {} : {runDirectory}),
-      ...(outputDirectory === undefined ? {} : {outputDirectory}),
-      partialArtifacts,
-    });
-  } catch (cleanupError) {
-    recoveryErrors.push(cleanupError);
+    let outputDirectory: OutputDirectoryScope | undefined;
+    if (partialArtifacts.some((artifact) => artifact.scope === 'output')) {
+      try {
+        outputDirectory = await dependencies.outputStore.openExistingProject(
+          active.plan.projectId,
+        ) ?? undefined;
+      } catch (outputError) {
+        recoveryErrors.push(outputError);
+      }
+    }
+
+    try {
+      await (dependencies.cleanupFailedStage ?? sharedCleanupFailedStage)({
+        projectId: active.plan.projectId,
+        ...(active.context.runId === undefined ? {} : {runId: active.context.runId}),
+        stageId: active.stage.id,
+        ...(runDirectory === undefined ? {} : {runDirectory}),
+        ...(outputDirectory === undefined ? {} : {outputDirectory}),
+        partialArtifacts,
+      });
+    } catch (cleanupError) {
+      recoveryErrors.push(cleanupError);
+    }
   }
 
   attachRecoveryErrors(primary, recoveryErrors);
@@ -1037,6 +1040,7 @@ export async function runExecutionPlan(
           context: stageContext,
           startedAt,
           boundary: 'execute',
+          cleanupPartials: true,
         };
       },
     );
@@ -1096,6 +1100,7 @@ export async function runExecutionPlan(
         context: preflightContext,
         startedAt: preflightExecution.startedAt,
         boundary: 'canonical-report',
+        cleanupPartials: true,
       };
       throwIfPipelineCancelled(input.signal, preflightStage.id);
       const preflightReport = reportFromExecution(
@@ -1170,6 +1175,7 @@ export async function runExecutionPlan(
         }),
         startedAt: preflightExecution.startedAt,
         boundary: 'canonical-report',
+        cleanupPartials: true,
       };
       let prerequisiteReportWritten = false;
       try {
@@ -1215,6 +1221,7 @@ export async function runExecutionPlan(
         context: scheduledContext,
         startedAt: scheduledAt,
         boundary: item.action === 'cached' ? 'materialize' : 'execute',
+        cleanupPartials: true,
       };
       throwIfPipelineCancelled(input.signal, item.stageId);
       if (item.action === 'cached') {
@@ -1261,6 +1268,7 @@ export async function runExecutionPlan(
               context: scheduledContext,
               startedAt: scheduledAt,
               boundary: 'output-pointer',
+              cleanupPartials: false,
             };
             throwIfPipelineCancelled(input.signal, item.stageId);
             if (!verified) {
@@ -1297,6 +1305,7 @@ export async function runExecutionPlan(
                   context: scheduledContext,
                   startedAt: scheduledAt,
                   boundary: 'work-pointer',
+                  cleanupPartials: false,
                 };
                 throwIfPipelineCancelled(input.signal, item.stageId);
                 workCurrent = await publishWorkProgress(
@@ -1337,6 +1346,7 @@ export async function runExecutionPlan(
               }),
               startedAt: dependencies.now(),
               boundary: 'work-pointer',
+              cleanupPartials: false,
             };
             workCurrent = await publishWorkProgress(
               revalidated,

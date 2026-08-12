@@ -17,6 +17,7 @@ import {
   type StageId,
 } from './run-store';
 import type {PipelinePartialArtifact} from './stage';
+import {acquireProjectLock} from './project-lock';
 
 export interface CleanupPlan {
   projectId: string;
@@ -148,12 +149,11 @@ const candidateEntry = (
   (entry) => entry.name === candidateId,
 );
 
-export async function executeCleanupPlan(
+const executeCleanupPlanLocked = async (
   plan: CleanupPlan,
-  dependencies?: CleanupDependencies,
-): Promise<CleanupResult> {
-  const resolved = requireCleanupDependencies(plan, dependencies);
-  const authority = cleanupPlanAuthorities.get(plan);
+  resolved: CleanupDependencies,
+  authority: CleanupPlanAuthority | undefined,
+): Promise<CleanupResult> => {
   const projectId = StableIdSchema.parse(plan.projectId);
   const removedRuns: string[] = [];
   const removedReleases: string[] = [];
@@ -215,6 +215,50 @@ export async function executeCleanupPlan(
   }
 
   return {removedRuns, removedReleases};
+};
+
+export async function executeCleanupPlan(
+  plan: CleanupPlan,
+  dependencies?: CleanupDependencies,
+): Promise<CleanupResult> {
+  const resolved = requireCleanupDependencies(plan, dependencies);
+  const projectId = StableIdSchema.parse(plan.projectId);
+  const work = await resolved.runStore.createWork(projectId);
+  const lease = await acquireProjectLock(work, 'cleanup');
+  let outcome:
+    | {ok: true; value: CleanupResult}
+    | {ok: false; error: unknown};
+  try {
+    outcome = {
+      ok: true,
+      value: await executeCleanupPlanLocked(
+        plan,
+        resolved,
+        cleanupPlanAuthorities.get(plan),
+      ),
+    };
+  } catch (error) {
+    outcome = {ok: false, error};
+  }
+
+  let releaseError: unknown;
+  try {
+    await lease.release();
+  } catch (error) {
+    releaseError = error;
+  }
+  if (!outcome.ok) {
+    if (releaseError !== undefined) {
+      throw new AggregateError(
+        [outcome.error, releaseError],
+        'Cleanup execution and project lock release both failed',
+        {cause: outcome.error},
+      );
+    }
+    throw outcome.error;
+  }
+  if (releaseError !== undefined) throw releaseError;
+  return outcome.value;
 }
 
 const throwCleanupErrors = (

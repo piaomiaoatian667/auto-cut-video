@@ -2690,13 +2690,7 @@ describe('Pipeline Runner', () => {
         state: 'cancelled',
       }),
     ]);
-    expect(cleanupFailedStage).toHaveBeenCalledOnce();
-    expect(cleanupFailedStage).toHaveBeenCalledWith(expect.objectContaining({
-      projectId: 'demo',
-      runId,
-      stageId: 'release',
-      partialArtifacts: [releasePartial],
-    }));
+    expect(cleanupFailedStage).not.toHaveBeenCalled();
     expect(runtime.release).toHaveBeenCalledOnce();
   });
 
