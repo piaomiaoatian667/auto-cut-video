@@ -245,25 +245,51 @@ const copyFileHandles = async (
 };
 
 const rollbackRunArtifact = async (
+  targetRun: RunDirectoryScope,
   target: AppDirectoryWriteFileAuthority,
   relativePath: string,
   primaryError: unknown,
 ): Promise<never> => {
   const cleanupErrors: unknown[] = [];
+  const addCleanupError = (error: unknown): void => {
+    if (!cleanupErrors.includes(error)) cleanupErrors.push(error);
+  };
+  if (typeof target.handle.close === 'function') {
+    try {
+      await target.handle.close();
+    } catch (cleanupError) {
+      addCleanupError(cleanupError);
+    }
+  }
+  let scopedUnlinkError: unknown;
+  try {
+    await unlinkRunFile(targetRun, relativePath);
+  } catch (cleanupError) {
+    scopedUnlinkError = cleanupError;
+  }
   try {
     await target.unlink();
   } catch (cleanupError) {
-    cleanupErrors.push(cleanupError);
+    addCleanupError(cleanupError);
+  }
+  if (
+    scopedUnlinkError !== undefined
+    && !(
+      scopedUnlinkError instanceof TypeError
+      && scopedUnlinkError.message === 'invalid RunDirectoryScope'
+    )
+  ) {
+    addCleanupError(scopedUnlinkError);
   }
   try {
     await target.syncParent();
   } catch (cleanupError) {
-    cleanupErrors.push(cleanupError);
+    addCleanupError(cleanupError);
   }
   try {
     await target.close();
   } catch (cleanupError) {
-    cleanupErrors.push(cleanupError);
+    addCleanupError(cleanupError);
   }
   if (cleanupErrors.length > 0) {
     throw new AggregateError(
@@ -322,7 +348,12 @@ export async function copyRunArtifact(input: {
     return copied;
   } catch (error) {
     if (target !== undefined) {
-      return await rollbackRunArtifact(target, input.artifact.path, error);
+      return await rollbackRunArtifact(
+        input.targetRun,
+        target,
+        input.artifact.path,
+        error,
+      );
     }
     throw error;
   }

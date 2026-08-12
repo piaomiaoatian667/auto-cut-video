@@ -9,8 +9,10 @@ import {
   lstat,
   mkdir,
   open,
+  readdir,
   realpath,
   rename,
+  rmdir,
   unlink,
   type FileHandle,
 } from 'node:fs/promises';
@@ -70,6 +72,7 @@ interface DirectoryIdentity {
 interface ScopeState {
   root: string;
   ancestors: DirectoryIdentity[];
+  listedEntries: Map<string, ScopedDirectoryEntryIdentity>;
 }
 
 export interface RunDirectoryIdentity {
@@ -93,6 +96,17 @@ export type AppDirectoryEntryKind =
   | 'directory'
   | 'symlink'
   | 'other';
+
+export interface ScopedDirectoryEntry {
+  name: string;
+  kind: Exclude<AppDirectoryEntryKind, 'missing'>;
+}
+
+interface ScopedDirectoryEntryIdentity {
+  kind: ScopedDirectoryEntry['kind'];
+  dev: bigint;
+  ino: bigint;
+}
 
 export interface AppDirectoryReadFileAuthority {
   readonly handle: FileHandle;
@@ -119,6 +133,10 @@ export interface AppDirectoryLinkedFileAuthority {
 const workStates = new WeakMap<WorkDirectoryScope, ScopeState>();
 const runStates = new WeakMap<RunDirectoryScope, RunScopeState>();
 const outputStates = new WeakMap<OutputDirectoryScope, ScopeState>();
+const scopedDirectoryEntryIdentities = new WeakMap<
+  ScopedDirectoryEntry,
+  ScopedDirectoryEntryIdentity
+>();
 
 let mintWorkDirectoryScope!: () => WorkDirectoryScope;
 let mintRunDirectoryScope!: () => RunDirectoryScope;
@@ -598,6 +616,7 @@ const createWorkScope = async (
   workStates.set(scope, {
     root: workRoot.path,
     ancestors: [workspace, workContainer, workRoot],
+    listedEntries: new Map(),
   });
   return scope;
 };
@@ -622,6 +641,7 @@ const mintExistingWorkScope = async (
   workStates.set(scope, {
     root: workRoot.path,
     ancestors: [workspace, workContainer, workRoot],
+    listedEntries: new Map(),
   });
   return scope;
 };
@@ -648,6 +668,7 @@ const openExistingWorkScope = async (
   workStates.set(scope, {
     root: workRoot.path,
     ancestors: [workspace, workContainer, workRoot],
+    listedEntries: new Map(),
   });
   return scope;
 };
@@ -688,6 +709,7 @@ const mintRunScope = async (
   runStates.set(scope, {
     root: runRoot.path,
     ancestors: [...workState.ancestors, runsRoot, runRoot],
+    listedEntries: new Map(),
     identity: Object.freeze({
       projectId: validatedProjectId,
       runId: validatedRunId,
@@ -716,6 +738,7 @@ const mintOutputScope = async (
   outputStates.set(scope, {
     root: outputRoot.path,
     ancestors: [workspace, outputContainer, outputRoot],
+    listedEntries: new Map(),
   });
   return scope;
 };
@@ -742,6 +765,7 @@ const openExistingOutputScope = async (
   outputStates.set(scope, {
     root: outputRoot.path,
     ancestors: [workspace, outputContainer, outputRoot],
+    listedEntries: new Map(),
   });
   return scope;
 };
@@ -1272,12 +1296,283 @@ const inspectAnchoredEntry = async (
   }
 };
 
+const openScopedDirectoryAnchor = async (
+  state: ScopeState,
+  relativePath: string,
+): Promise<DirectoryAnchor> => {
+  const segments = parseRelativePath(relativePath, true);
+  await assertScopeStable(state, relativePath);
+  let directory = await openDirectoryAnchor(
+    state.ancestors.at(-1)!,
+    relativePath,
+  );
+  try {
+    for (const segment of segments) {
+      const target = path.join(directory.volumePath, segment);
+      const stats = await lstat(target, {bigint: true});
+      if (stats.isSymbolicLink() || !stats.isDirectory()) {
+        throw securityError(`app-owned list target is not a plain directory: ${relativePath}`);
+      }
+      const identity = identityFromStats(
+        path.join(directory.identity.path, segment),
+        stats,
+      );
+      if (!isWithin(state.root, identity.path)) {
+        throw securityError(`directory escapes app-owned scope: ${relativePath}`);
+      }
+      const child = await openDirectoryAnchor(identity, relativePath);
+      await closeDirectoryAnchor(directory);
+      directory = child;
+    }
+    await assertScopeStable(state, relativePath);
+    await assertDirectoryAnchorStable(directory, relativePath);
+    return directory;
+  } catch (error) {
+    await closeDirectoryAnchor(directory).catch(() => undefined);
+    if (error instanceof AppDirectoryScopeError) throw error;
+    return mapSymlinkError(error, relativePath);
+  }
+};
+
+const listScopedDirectory = async (
+  state: ScopeState,
+  relativePath: string,
+): Promise<ScopedDirectoryEntry[]> => {
+  const directory = await openScopedDirectoryAnchor(state, relativePath);
+  try {
+    await assertDirectoryAnchorStable(directory, relativePath);
+    const names = (await readdir(directory.volumePath)).sort();
+    const entries: ScopedDirectoryEntry[] = [];
+    for (const name of names) {
+      await assertDirectoryAnchorStable(directory, relativePath);
+      const childRelativePath = relativePath === '.' || relativePath === ''
+        ? name
+        : `${relativePath}/${name}`;
+      const entry = await inspectAnchoredEntry(
+        {parent: directory, basename: name},
+        childRelativePath,
+      );
+      if (entry.kind !== 'missing' && entry.stats !== undefined) {
+        const identity: ScopedDirectoryEntryIdentity = {
+          kind: entry.kind,
+          dev: entry.stats.dev,
+          ino: entry.stats.ino,
+        };
+        const scopedEntry = Object.freeze({name, kind: entry.kind});
+        scopedDirectoryEntryIdentities.set(scopedEntry, identity);
+        state.listedEntries.set(childRelativePath, identity);
+        entries.push(scopedEntry);
+      }
+    }
+    await assertScopeStable(state, relativePath);
+    await assertDirectoryAnchorStable(directory, relativePath);
+    return entries;
+  } finally {
+    await closeDirectoryAnchor(directory);
+  }
+};
+
+export const assertScopedDirectoryEntryUnchanged = (
+  expected: ScopedDirectoryEntry,
+  current: ScopedDirectoryEntry,
+  relativePath: string,
+): void => {
+  const expectedIdentity = scopedDirectoryEntryIdentities.get(expected);
+  const currentIdentity = scopedDirectoryEntryIdentities.get(current);
+  if (expectedIdentity === undefined || currentIdentity === undefined) {
+    throw new TypeError('invalid ScopedDirectoryEntry authority');
+  }
+  if (current.kind === 'symlink' || current.kind === 'other') {
+    throw securityError(`cleanup candidate became unsafe: ${relativePath}`);
+  }
+  if (
+    expected.name !== current.name
+    || expectedIdentity.kind !== currentIdentity.kind
+    || expectedIdentity.dev !== currentIdentity.dev
+    || expectedIdentity.ino !== currentIdentity.ino
+  ) {
+    throw authorityError(`cleanup candidate changed after inventory: ${relativePath}`);
+  }
+};
+
+interface AnchoredTreeEntryIdentity {
+  kind: 'file' | 'directory';
+  dev: bigint;
+  ino: bigint;
+}
+
+const anchoredTreeEntryIdentity = (
+  kind: AnchoredTreeEntryIdentity['kind'],
+  stats: BigIntStats,
+): AnchoredTreeEntryIdentity => ({kind, dev: stats.dev, ino: stats.ino});
+
+const revalidateAnchoredTreeEntry = async (
+  state: ScopeState,
+  anchor: ScopedPathAnchor,
+  relativePath: string,
+  expected: AnchoredTreeEntryIdentity,
+): Promise<BigIntStats | null> => {
+  await assertScopedPathAnchorStable(state, anchor, relativePath);
+  const current = await inspectAnchoredEntry(anchor, relativePath);
+  if (current.kind === 'missing') return null;
+  if (current.kind === 'symlink' || current.kind === 'other') {
+    throw securityError(`refusing to remove unsafe app entry: ${relativePath}`);
+  }
+  if (
+    current.stats === undefined
+    || current.kind !== expected.kind
+    || current.stats.dev !== expected.dev
+    || current.stats.ino !== expected.ino
+  ) {
+    throw authorityError(`app-owned tree entry changed before removal: ${relativePath}`);
+  }
+  return current.stats;
+};
+
+const syncRemovedEntryParent = async (
+  state: ScopeState,
+  anchor: ScopedPathAnchor,
+  relativePath: string,
+): Promise<void> => {
+  await assertScopeStable(state, relativePath);
+  await syncHeldDirectoryAnchor(anchor.parent, relativePath);
+};
+
+const removeAnchoredTreeEntry = async (
+  state: ScopeState,
+  anchor: ScopedPathAnchor,
+  relativePath: string,
+  expectedIdentity?: ScopedDirectoryEntryIdentity,
+): Promise<void> => {
+  const initial = await inspectAnchoredEntry(anchor, relativePath);
+  if (initial.kind === 'missing') {
+    await assertScopedPathAnchorStable(state, anchor, relativePath);
+    return;
+  }
+  if (
+    initial.stats === undefined
+    || initial.kind === 'symlink'
+    || initial.kind === 'other'
+  ) {
+    throw securityError(`refusing to remove unsafe app entry: ${relativePath}`);
+  }
+  if (
+    expectedIdentity !== undefined
+    && (
+      initial.kind !== expectedIdentity.kind
+      || initial.stats.dev !== expectedIdentity.dev
+      || initial.stats.ino !== expectedIdentity.ino
+    )
+  ) {
+    throw authorityError(`app-owned tree entry changed after listing: ${relativePath}`);
+  }
+  const expected = anchoredTreeEntryIdentity(initial.kind, initial.stats);
+  if (initial.kind === 'file') {
+    if (await revalidateAnchoredTreeEntry(
+      state,
+      anchor,
+      relativePath,
+      expected,
+    ) === null) return;
+    try {
+      await unlink(path.join(anchor.parent.volumePath, anchor.basename));
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== 'ENOENT') throw error;
+    }
+    await syncRemovedEntryParent(state, anchor, relativePath);
+    return;
+  }
+
+  if (await revalidateAnchoredTreeEntry(
+    state,
+    anchor,
+    relativePath,
+    expected,
+  ) === null) return;
+  const directoryIdentity: DirectoryIdentity = {
+    path: path.join(anchor.parent.identity.path, anchor.basename),
+    dev: expected.dev,
+    ino: expected.ino,
+  };
+  const directory = await openDirectoryAnchor(directoryIdentity, relativePath);
+  try {
+    await assertDirectoryAnchorStable(directory, relativePath);
+    const names = (await readdir(directory.volumePath)).sort();
+    for (const name of names) {
+      await removeAnchoredTreeEntry(
+        state,
+        {parent: directory, basename: name},
+        `${relativePath}/${name}`,
+      );
+    }
+    await assertDirectoryAnchorStable(directory, relativePath);
+    if ((await readdir(directory.volumePath)).length !== 0) {
+      throw authorityError(`app-owned directory changed while removing: ${relativePath}`);
+    }
+    if (await revalidateAnchoredTreeEntry(
+      state,
+      anchor,
+      relativePath,
+      expected,
+    ) === null) return;
+    try {
+      await rmdir(path.join(anchor.parent.volumePath, anchor.basename));
+    } catch (error) {
+      if (!isNodeError(error) || error.code !== 'ENOENT') throw error;
+    }
+    await syncRemovedEntryParent(state, anchor, relativePath);
+  } finally {
+    await closeDirectoryAnchor(directory);
+  }
+};
+
+const removeScopedTree = async (
+  state: ScopeState,
+  relativePath: string,
+): Promise<void> => {
+  const normalizedPath = parseRelativePath(relativePath).join('/');
+  let anchor: ScopedPathAnchor;
+  try {
+    anchor = await openScopedPathAnchor(state, relativePath);
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ENOENT') {
+      state.listedEntries.delete(normalizedPath);
+      return;
+    }
+    throw error;
+  }
+  try {
+    await removeAnchoredTreeEntry(
+      state,
+      anchor,
+      relativePath,
+      state.listedEntries.get(normalizedPath),
+    );
+    state.listedEntries.delete(normalizedPath);
+  } finally {
+    await closeDirectoryAnchor(anchor.parent);
+  }
+};
+
 const unlinkHeldCreatedFile = async (
   identity: RegularFileIdentity,
   handle: FileHandle,
   relativePath: string,
 ): Promise<void> => {
-  const held = await handle.stat({bigint: true});
+  let held: BigIntStats;
+  let handleOpen = true;
+  try {
+    held = await handle.stat({bigint: true});
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== 'EBADF') throw error;
+    handleOpen = false;
+    try {
+      held = await lstat(volumePath(identity.dev, identity.ino), {bigint: true});
+    } catch (identityError) {
+      if (isNodeError(identityError) && identityError.code === 'ENOENT') return;
+      throw identityError;
+    }
+  }
   if (
     !held.isFile()
     || held.dev !== identity.dev
@@ -1290,9 +1585,19 @@ const unlinkHeldCreatedFile = async (
     throw authorityError(`created app-owned file has unexpected hard links: ${relativePath}`);
   }
   await unlink(volumePath(held.dev, held.ino));
-  const removed = await handle.stat({bigint: true});
-  if (removed.nlink !== 0n) {
+  if (handleOpen) {
+    const removed = await handle.stat({bigint: true});
+    if (removed.nlink !== 0n) {
+      throw authorityError(`created app-owned file remains linked after cleanup: ${relativePath}`);
+    }
+    return;
+  }
+  try {
+    await lstat(volumePath(identity.dev, identity.ino), {bigint: true});
     throw authorityError(`created app-owned file remains linked after cleanup: ${relativePath}`);
+  } catch (error) {
+    if (isNodeError(error) && error.code === 'ENOENT') return;
+    throw error;
   }
 };
 
@@ -1886,6 +2191,30 @@ const inspectOutputEntry = async (
   relativePath,
 );
 
+export const listWorkDirectory = async (
+  scope: WorkDirectoryScope,
+  relativePath: string,
+): Promise<ScopedDirectoryEntry[]> => await listScopedDirectory(
+  stateFor(workStates, scope, 'WorkDirectoryScope'),
+  relativePath,
+);
+
+export const listRunDirectory = async (
+  scope: RunDirectoryScope,
+  relativePath: string,
+): Promise<ScopedDirectoryEntry[]> => await listScopedDirectory(
+  stateFor(runStates, scope, 'RunDirectoryScope'),
+  relativePath,
+);
+
+export const listOutputDirectory = async (
+  scope: OutputDirectoryScope,
+  relativePath: string,
+): Promise<ScopedDirectoryEntry[]> => await listScopedDirectory(
+  stateFor(outputStates, scope, 'OutputDirectoryScope'),
+  relativePath,
+);
+
 const unlinkWorkFile = async (
   scope: WorkDirectoryScope,
   relativePath: string,
@@ -1899,6 +2228,30 @@ export const unlinkRunFile = async (
   relativePath: string,
 ): Promise<void> => await unlinkScopedFile(
   stateFor(runStates, scope, 'RunDirectoryScope'),
+  relativePath,
+);
+
+export const removeRunTree = async (
+  scope: RunDirectoryScope,
+  relativePath: string,
+): Promise<void> => await removeScopedTree(
+  stateFor(runStates, scope, 'RunDirectoryScope'),
+  relativePath,
+);
+
+export const removeWorkTree = async (
+  scope: WorkDirectoryScope,
+  relativePath: string,
+): Promise<void> => await removeScopedTree(
+  stateFor(workStates, scope, 'WorkDirectoryScope'),
+  relativePath,
+);
+
+export const removeOutputTree = async (
+  scope: OutputDirectoryScope,
+  relativePath: string,
+): Promise<void> => await removeScopedTree(
+  stateFor(outputStates, scope, 'OutputDirectoryScope'),
   relativePath,
 );
 

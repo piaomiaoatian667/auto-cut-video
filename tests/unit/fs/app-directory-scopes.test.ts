@@ -32,6 +32,9 @@ import {
   createWorkDirectoryScope,
   ensureOutputDirectory,
   ensureRunDirectory,
+  listOutputDirectory,
+  listRunDirectory,
+  listWorkDirectory,
   openExistingOutputFile,
   openExistingRunFile,
   openNewOutputFile,
@@ -39,6 +42,9 @@ import {
   openNewRunFile,
   openNewRunFileForWrite,
   openNewRunReadWriteFile,
+  removeOutputTree,
+  removeRunTree,
+  removeWorkTree,
   unlinkRunFile,
 } from '../../../src/fs/app-directory-scopes';
 import * as appDirectoryScopes from '../../../src/fs/app-directory-scopes';
@@ -1327,5 +1333,90 @@ describe('app-owned directory scopes', () => {
 
   it('uses exclusive no-follow file modes', async () => {
     expect(constants.O_EXCL).toBeGreaterThan(0);
+  });
+
+  it('lists scoped children by name and removes Run subtrees idempotently', async () => {
+    const workspaceRoot = await makeTempDirectory('app-scopes-tree-');
+    const runStore = createRunStore(workspaceRoot);
+    const run = await runStore.createRun('demo', 'run-one');
+    await ensureRunDirectory(run, 'draft/middle');
+    await writeAndClose(await openNewRunFile(run, 'draft/z-last.txt'), 'z');
+    await writeAndClose(await openNewRunFile(run, 'draft/a-first.txt'), 'a');
+
+    await expect(listRunDirectory(run, 'draft')).resolves.toEqual([
+      {name: 'a-first.txt', kind: 'file'},
+      {name: 'middle', kind: 'directory'},
+      {name: 'z-last.txt', kind: 'file'},
+    ]);
+
+    await removeRunTree(run, 'draft');
+    await expect(listRunDirectory(run, '.')).resolves.not.toContainEqual(
+      expect.objectContaining({name: 'draft'}),
+    );
+    await expect(removeRunTree(run, 'draft')).resolves.toBeUndefined();
+    await expect(removeRunTree(run, 'draft/missing/child')).resolves.toBeUndefined();
+  });
+
+  it('lists and removes only the requested Work and Output trees', async () => {
+    const workspaceRoot = await makeTempDirectory('app-scopes-owned-tree-');
+    const runStore = createRunStore(workspaceRoot);
+    await runStore.createRun('demo', 'run-z');
+    await runStore.createRun('demo', 'run-a');
+    const work = await runStore.createWork('demo');
+    const outputStore = createOutputStore(workspaceRoot);
+    await outputStore.createRelease('demo', 'release-z');
+    await outputStore.createRelease('demo', 'release-a');
+    const output = await outputStore.openProject('demo');
+
+    await expect(listWorkDirectory(work, 'runs')).resolves.toEqual([
+      {name: 'run-a', kind: 'directory'},
+      {name: 'run-z', kind: 'directory'},
+    ]);
+    await expect(listOutputDirectory(output, 'releases')).resolves.toEqual([
+      {name: 'release-a', kind: 'directory'},
+      {name: 'release-z', kind: 'directory'},
+    ]);
+
+    await removeWorkTree(work, 'runs/run-z');
+    await removeOutputTree(output, 'releases/release-z');
+    await expect(listWorkDirectory(work, 'runs')).resolves.toEqual([
+      {name: 'run-a', kind: 'directory'},
+    ]);
+    await expect(listOutputDirectory(output, 'releases')).resolves.toEqual([
+      {name: 'release-a', kind: 'directory'},
+    ]);
+  });
+
+  it('rejects root removal and fails closed on symlink children', async () => {
+    const workspaceRoot = await makeTempDirectory('app-scopes-tree-symlink-');
+    const outsideRoot = await makeTempDirectory('app-scopes-tree-outside-');
+    const outsideFile = path.join(outsideRoot, 'source.txt');
+    await writeFile(outsideFile, 'source');
+    const outputStore = createOutputStore(workspaceRoot);
+    const output = await outputStore.createRelease('demo', 'run-old');
+    const linkedPath = path.join(
+      workspaceRoot,
+      'output',
+      'demo',
+      'releases',
+      'run-old',
+      'partial.txt',
+    );
+    await writeAndClose(
+      await openNewOutputFile(output, 'releases/run-old/partial.txt'),
+      'partial',
+    );
+    await listOutputDirectory(output, 'releases/run-old');
+    await rm(linkedPath);
+    await symlink(outsideFile, linkedPath);
+
+    await expect(removeOutputTree(output, '.')).rejects.toMatchObject({
+      code: 'APP_PATH_OUTSIDE_SCOPE',
+    });
+    await expect(removeOutputTree(output, 'releases/run-old')).rejects.toMatchObject({
+      code: 'APP_PATH_OUTSIDE_SCOPE',
+    });
+    await expect(readFile(outsideFile, 'utf8')).resolves.toBe('source');
+    expect((await lstat(linkedPath)).isSymbolicLink()).toBe(true);
   });
 });

@@ -10,6 +10,10 @@ import {
   type PipelineArtifact,
 } from './artifacts';
 import {
+  cleanupFailedStage as sharedCleanupFailedStage,
+  type FailedStageCleanupInput,
+} from './cleanup';
+import {
   ExecutionPlanError,
   revalidateExecutionPlan,
   type ExecutionPlan,
@@ -52,6 +56,8 @@ import {
   normalizePipelineError,
 } from './runtime-errors';
 
+export type {FailedStageCleanupInput} from './cleanup';
+
 export interface PipelineRunResult {
   projectId: string;
   runId?: string;
@@ -80,15 +86,6 @@ export interface RunnerDependencies {
   cleanupFailedStage?: (input: FailedStageCleanupInput) => Promise<void>;
   createRunId(): string;
   now(): string;
-}
-
-export interface FailedStageCleanupInput {
-  projectId: string;
-  runId?: string;
-  stageId: StageId;
-  runDirectory?: RunDirectoryScope;
-  outputDirectory?: OutputDirectoryScope;
-  partialArtifacts: readonly PipelinePartialArtifact[];
 }
 
 interface RunnerSourceRun {
@@ -202,10 +199,6 @@ const STAGE_POSITIONS = new Map(
 
 const preservesCommittedEvidence = (error: unknown): boolean =>
   error instanceof PipelinePointerOutcomeError || isStageReportOutcomeError(error);
-
-const NOOP_FAILED_STAGE_CLEANUP = async (
-  _input: FailedStageCleanupInput,
-): Promise<void> => undefined;
 
 const throwIfPipelineCancelled = (
   signal: AbortSignal,
@@ -380,7 +373,7 @@ const recoverActiveStageFailure = async (
   }
 
   try {
-    await (dependencies.cleanupFailedStage ?? NOOP_FAILED_STAGE_CLEANUP)({
+    await (dependencies.cleanupFailedStage ?? sharedCleanupFailedStage)({
       projectId: active.plan.projectId,
       ...(active.context.runId === undefined ? {} : {runId: active.context.runId}),
       stageId: active.stage.id,
