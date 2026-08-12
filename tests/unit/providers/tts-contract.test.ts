@@ -1,9 +1,15 @@
+import {createHash} from 'node:crypto';
 import {mkdir, readFile} from 'node:fs/promises';
 import path from 'node:path';
 import {afterEach, describe, expect, it} from 'vitest';
 import {loadProject} from '../../../src/domain/load-project';
 import {createRunStore, openExistingRunFile} from '../../../src/fs/app-directory-scopes';
-import {FileTtsProvider, MockTtsProvider, type TtsProvider} from '../../../src/providers/tts';
+import {
+  createTtsProvider,
+  FileTtsProvider,
+  MockTtsProvider,
+  type TtsProvider,
+} from '../../../src/providers/tts';
 import {ProcessExecutionError} from '../../../src/process/process-error';
 import {createTempProject, type TempProject} from '../../helpers/temp-project';
 import {createTestMusic} from '../../helpers/media-fixtures';
@@ -30,6 +36,8 @@ const outputBytes = async (runDirectory: Awaited<ReturnType<typeof makeScopes>>[
     await handle.close();
   }
 };
+
+const hashBytes = (bytes: Buffer): string => createHash('sha256').update(bytes).digest('hex');
 
 const contract = (name: string, createProvider: (scopes: Awaited<ReturnType<typeof makeScopes>>) => TtsProvider, input: (scopes: Awaited<ReturnType<typeof makeScopes>>) => Promise<{sourceAudioPath?: string}>) => {
   describe(name, () => {
@@ -96,6 +104,60 @@ contract(
   },
 );
 
+describe('MockTtsProvider input waveform', () => {
+  it('records semantic invocations and produces stable input-distinct audio', async () => {
+    const scopes = await makeScopes();
+    const invocations: Array<{
+      segmentId: string;
+      text: string;
+      voice: string;
+      rate: number;
+    }> = [];
+    const provider = new MockTtsProvider({
+      runDirectory: scopes.runDirectory,
+      onInvocation: (input) => {
+        invocations.push({
+          segmentId: input.segmentId,
+          text: input.text,
+          voice: input.voice,
+          rate: input.rate,
+        });
+      },
+    });
+    const input = {
+      segmentId: 'intro',
+      text: '第一句',
+      voice: 'fixture',
+      rate: 180,
+    };
+
+    await provider.synthesize({
+      ...input,
+      outputPath: 'audio/segments/stable-a.wav',
+    }, new AbortController().signal);
+    await provider.synthesize({
+      ...input,
+      outputPath: 'audio/segments/stable-b.wav',
+    }, new AbortController().signal);
+    await provider.synthesize({
+      ...input,
+      text: '第二句',
+      outputPath: 'audio/segments/changed.wav',
+    }, new AbortController().signal);
+
+    const stableA = hashBytes(await outputBytes(scopes.runDirectory, 'audio/segments/stable-a.wav'));
+    const stableB = hashBytes(await outputBytes(scopes.runDirectory, 'audio/segments/stable-b.wav'));
+    const changed = hashBytes(await outputBytes(scopes.runDirectory, 'audio/segments/changed.wav'));
+    expect(stableA).toBe(stableB);
+    expect(changed).not.toBe(stableA);
+    expect(invocations).toEqual([
+      input,
+      input,
+      {...input, text: '第二句'},
+    ]);
+  });
+});
+
 describe('FileTtsProvider source handling', () => {
   it('requires sourceAudioPath', async () => {
     const scopes = await makeScopes();
@@ -133,5 +195,30 @@ describe('FileTtsProvider source handling', () => {
     }, new AbortController().signal);
 
     expect(await readFile(sourcePath)).toEqual(before);
+  });
+
+  it('does not emit mock invocation hooks', async () => {
+    const scopes = await makeScopes();
+    const sourcePath = path.join(scopes.projectRoot, 'assets/source/voice.wav');
+    await mkdir(path.dirname(sourcePath), {recursive: true});
+    await createTestMusic(sourcePath, 1);
+    const invocations: string[] = [];
+    const provider = createTtsProvider({
+      provider: 'file',
+      projectDirectory: scopes.projectDirectory,
+      runDirectory: scopes.runDirectory,
+      onMockInvocation: (input) => { invocations.push(input.segmentId); },
+    });
+
+    await provider.synthesize({
+      segmentId: 'intro',
+      text: '你好',
+      voice: 'fixture',
+      rate: 180,
+      outputPath: 'audio/segments/file.wav',
+      sourceAudioPath: 'assets/source/voice.wav',
+    }, new AbortController().signal);
+
+    expect(invocations).toEqual([]);
   });
 });

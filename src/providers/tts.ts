@@ -1,4 +1,5 @@
 import {stat} from 'node:fs/promises';
+import {createHash} from 'node:crypto';
 import path from 'node:path';
 import {
   ensureRunDirectory,
@@ -26,6 +27,15 @@ export interface TtsResult {
   outputPath: string;
   providerFingerprint: string;
 }
+
+export interface MockTtsInvocation {
+  segmentId: string;
+  text: string;
+  voice: string;
+  rate: number;
+}
+
+export type MockTtsInvocationHook = (input: Readonly<MockTtsInvocation>) => void;
 
 export interface TtsProvider {
   readonly id: TtsProviderId;
@@ -58,7 +68,10 @@ export async function fingerprintTtsProvider(
     const say = {mtimeMs: sayStats.mtimeMs, size: sayStats.size};
     return fingerprintValue({provider, algorithm: 'macos-say-v1', say});
   }
-  return fingerprintValue({provider, algorithm: `${provider}-tts-v1`});
+  return fingerprintValue({
+    provider,
+    algorithm: provider === 'mock' ? 'mock-tts-v2' : 'file-tts-v1',
+  });
 }
 
 interface RunOutputProviderOptions {
@@ -69,6 +82,10 @@ interface RunOutputProviderOptions {
 
 interface FileProviderOptions extends RunOutputProviderOptions {
   projectDirectory: ProjectDirectoryScope;
+}
+
+interface MockProviderOptions extends RunOutputProviderOptions {
+  onInvocation?: MockTtsInvocationHook;
 }
 
 const ensureParentDirectory = async (
@@ -131,11 +148,13 @@ export class MockTtsProvider implements TtsProvider {
   readonly #runDirectory: RunDirectoryScope;
   readonly #ffmpegExecutable: string;
   readonly #runner: TtsProcessRunner;
+  readonly #onInvocation: MockTtsInvocationHook | undefined;
 
-  constructor(options: RunOutputProviderOptions) {
+  constructor(options: MockProviderOptions) {
     this.#runDirectory = options.runDirectory;
     this.#ffmpegExecutable = options.ffmpegExecutable ?? FFMPEG_EXECUTABLE;
     this.#runner = options.runProcess ?? runProcess;
+    this.#onInvocation = options.onInvocation;
   }
 
   async capabilities(): Promise<{languages: string[]; voices: string[]}> {
@@ -147,6 +166,19 @@ export class MockTtsProvider implements TtsProvider {
   }
 
   async synthesize(input: TtsInput, signal: AbortSignal): Promise<TtsResult> {
+    const invocation = {
+      segmentId: input.segmentId,
+      text: input.text,
+      voice: input.voice,
+      rate: input.rate,
+    };
+    this.#onInvocation?.(invocation);
+    const digest = createHash('sha256')
+      .update(JSON.stringify(invocation))
+      .digest();
+    const primaryFrequency = 220 + (digest.readUInt16BE(0) % 661);
+    const secondaryFrequency = 880 + (digest.readUInt16BE(2) % 881);
+    const phase = ((digest.readUInt16BE(4) % 6284) / 1000).toFixed(3);
     await normalizeToOutput({
       runDirectory: this.#runDirectory,
       outputPath: input.outputPath,
@@ -155,7 +187,12 @@ export class MockTtsProvider implements TtsProvider {
       signal,
       inputArgs: [
         '-f', 'lavfi',
-        '-i', 'sine=frequency=440:sample_rate=48000:duration=1',
+        '-i', [
+          'aevalsrc=',
+          `0.12*sin(2*PI*${primaryFrequency}*t)`,
+          `+0.08*sin(2*PI*${secondaryFrequency}*t+${phase})`,
+          ':sample_rate=48000:duration=1',
+        ].join(''),
       ],
     });
     return {outputPath: input.outputPath, providerFingerprint: await this.fingerprint()};
@@ -277,10 +314,16 @@ export function createTtsProvider(input: {
   runDirectory: RunDirectoryScope;
   ffmpegExecutable?: string;
   runProcess?: TtsProcessRunner;
+  onMockInvocation?: MockTtsInvocationHook;
 }): TtsProvider {
   switch (input.provider) {
     case 'mock':
-      return new MockTtsProvider(input);
+      return new MockTtsProvider({
+        ...input,
+        ...(input.onMockInvocation === undefined
+          ? {}
+          : {onInvocation: input.onMockInvocation}),
+      });
     case 'file':
       return new FileTtsProvider(input);
     case 'macos-say':

@@ -32,6 +32,10 @@ import {
   MVP_STAGES,
 } from '../pipeline/stage-registry';
 import {createStageReportStore} from '../pipeline/stage-report';
+import {
+  createTtsProvider,
+  type MockTtsInvocationHook,
+} from '../providers/tts';
 import {runCleanCommand} from './commands/clean';
 import {
   executePipelineCommand,
@@ -389,6 +393,7 @@ export interface SystemVideoctlOptions {
   environment?: NodeJS.ProcessEnv;
   stdout?: OutputWriter;
   stderr?: OutputWriter;
+  onMockTtsInvocation?: MockTtsInvocationHook;
 }
 
 export const createSystemVideoctlDependencies = (
@@ -396,6 +401,7 @@ export const createSystemVideoctlDependencies = (
 ): VideoctlDependencies => {
   const workspaceRoot = options.workspaceRoot ?? process.cwd();
   const environment = options.environment ?? process.env;
+  const onMockTtsInvocation = options.onMockTtsInvocation;
   const sourceCatalogDependencies = options.sourceCatalog
     ?? createSystemSourceCatalogDependencies();
   const registry = createMvpStageRegistry({
@@ -405,6 +411,16 @@ export const createSystemVideoctlDependencies = (
     ...(environment.FFPROBE_PATH === undefined
       ? {}
       : {ffprobeExecutable: environment.FFPROBE_PATH}),
+    ...(onMockTtsInvocation === undefined
+      ? {}
+      : {
+        narration: {
+          createTtsProvider: (input) => createTtsProvider({
+            ...input,
+            onMockInvocation: onMockTtsInvocation,
+          }),
+        },
+      }),
   });
   const runStore = createRunStore(workspaceRoot);
   const outputStore = createOutputStore(workspaceRoot);

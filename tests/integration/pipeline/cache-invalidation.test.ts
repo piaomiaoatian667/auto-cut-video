@@ -50,7 +50,7 @@ import {createTempProject} from '../../helpers/temp-project';
 const NOW = '2026-08-11T16:00:00.000Z';
 const PROVIDER_FINGERPRINT = fingerprintValue({
   provider: 'mock',
-  algorithm: 'mock-tts-v1',
+  algorithm: 'mock-tts-v2',
 });
 const SOURCE_HASH = fingerprintValue({source: 'cache-invalidation'});
 

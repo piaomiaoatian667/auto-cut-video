@@ -22,7 +22,7 @@ import type {StageId} from '../run-store';
 export const STAGE_ALGORITHM_VERSIONS = {
   preflight: 'preflight-stage-v1',
   ingest: 'ingest-stage-v1',
-  narration: 'narration-stage-v1',
+  narration: 'narration-stage-v2',
   compile: 'compile-stage-v1',
   draft: 'draft-stage-v1',
   review: 'review-stage-v1',

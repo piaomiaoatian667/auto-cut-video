@@ -553,7 +553,7 @@ describe('MVP_STAGES', () => {
     expect(STAGE_ALGORITHM_VERSIONS).toEqual({
       preflight: 'preflight-stage-v1',
       ingest: 'ingest-stage-v1',
-      narration: 'narration-stage-v1',
+      narration: 'narration-stage-v2',
       compile: 'compile-stage-v1',
       draft: 'draft-stage-v1',
       review: 'review-stage-v1',
@@ -749,7 +749,7 @@ describe('adapter fingerprints', () => {
       fingerprintTtsProvider: async () => hash('provider'),
     }).fingerprint(context));
     expect(await createNarrationStage({
-      algorithmVersion: 'narration-stage-v2',
+      algorithmVersion: 'narration-stage-v3',
       fingerprintTtsProvider: async () => hash('provider'),
     }).fingerprint(context)).not.toBe(await createNarrationStage({
       fingerprintTtsProvider: async () => hash('provider'),

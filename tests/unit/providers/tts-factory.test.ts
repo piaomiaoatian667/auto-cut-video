@@ -63,7 +63,7 @@ describe('fingerprintTtsProvider', () => {
         expect(stat).not.toHaveBeenCalled();
         expect(fingerprint).toBe(fingerprintValue({
           provider,
-          algorithm: `${provider}-tts-v1`,
+          algorithm: provider === 'mock' ? 'mock-tts-v2' : 'file-tts-v1',
         }));
       }
     },

@@ -141,13 +141,19 @@ describe('buildNarration', () => {
 
   it('invalidates only the changed segment cache key', async () => {
     const project = await makeProject();
-    await buildNarration({...project, provider: new RecordingProvider(project.runDirectory)});
+    const first = await buildNarration({
+      ...project,
+      provider: new RecordingProvider(project.runDirectory),
+    });
     project.script.segments[1] = {...project.script.segments[1]!, normalizedText: '改过的第二句', text: '改过的第二句'};
     const provider = new RecordingProvider(project.runDirectory);
 
-    await buildNarration({...project, provider});
+    const second = await buildNarration({...project, provider});
 
     expect(provider.calls.map((call) => call.segmentId)).toEqual(['segment-2']);
+    expect(second.segments[0]!.audioHash).toBe(first.segments[0]!.audioHash);
+    expect(second.segments[1]!.audioHash).not.toBe(first.segments[1]!.audioHash);
+    expect(second.master.audioHash).not.toBe(first.master.audioHash);
   });
 
   it('rejects a segment longer than 7000ms', async () => {

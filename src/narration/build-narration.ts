@@ -136,45 +136,113 @@ const probeRunAudioDurationMs = async (
   }
 };
 
-const createSyntheticMaster = async ({
+const materializeNarrationSegment = async ({
   runDirectory,
+  sourcePath,
   outputPath,
   durationMs,
+  pauseAfterMs,
   ffmpegExecutable,
   runner,
   signal,
 }: {
   runDirectory: RunDirectoryScope;
+  sourcePath: string;
   outputPath: string;
   durationMs: number;
+  pauseAfterMs: number;
   ffmpegExecutable: string;
   runner: NarrationProcessRunner;
   signal?: AbortSignal;
 }): Promise<void> => {
   if (await runFileExists(runDirectory, outputPath)) return;
   await ensureParentDirectory(runDirectory, outputPath);
+  const sourceHandle = await openExistingRunFile(runDirectory, sourcePath);
   const outputHandle = await openNewRunReadWriteFile(runDirectory, outputPath);
   try {
+    const totalDurationSeconds = ((durationMs + pauseAfterMs) / 1000).toFixed(3);
+    const pauseSeconds = (pauseAfterMs / 1000).toFixed(3);
     await runner(ffmpegExecutable, [
       '-v', 'error',
       '-y',
-      '-f', 'lavfi',
-      '-i', `anullsrc=channel_layout=mono:sample_rate=48000:duration=${(durationMs / 1000).toFixed(3)}`,
+      '-i', '/dev/fd/3',
       '-map', '0:a:0',
+      '-af', [
+        `apad=pad_dur=${pauseSeconds}`,
+        `atrim=end=${totalDurationSeconds}`,
+        'aresample=48000',
+        'pan=mono|c0=c0',
+      ].join(','),
       '-c:a', 'pcm_s16le',
       '-ar', '48000',
       '-ac', '1',
       '-flags:a', '+bitexact',
       '-map_metadata', '-1',
       '-f', 'wav',
-      '/dev/fd/3',
+      '/dev/fd/4',
     ], {
       ...(signal === undefined ? {} : {signal}),
-      extraStdioFds: [outputHandle.fd],
+      extraStdioFds: [sourceHandle.fd, outputHandle.fd],
     });
     await outputHandle.sync();
   } finally {
-    await outputHandle.close();
+    await Promise.allSettled([sourceHandle.close(), outputHandle.close()]);
+  }
+};
+
+const createNarrationMaster = async ({
+  runDirectory,
+  segmentPaths,
+  outputPath,
+  ffmpegExecutable,
+  runner,
+  signal,
+}: {
+  runDirectory: RunDirectoryScope;
+  segmentPaths: readonly string[];
+  outputPath: string;
+  ffmpegExecutable: string;
+  runner: NarrationProcessRunner;
+  signal?: AbortSignal;
+}): Promise<void> => {
+  if (await runFileExists(runDirectory, outputPath)) return;
+  await ensureParentDirectory(runDirectory, outputPath);
+  const inputHandles: FileHandle[] = [];
+  let outputHandle: FileHandle | undefined;
+  try {
+    for (const segmentPath of segmentPaths) {
+      inputHandles.push(await openExistingRunFile(runDirectory, segmentPath));
+    }
+    outputHandle = await openNewRunReadWriteFile(runDirectory, outputPath);
+    const inputArgs = inputHandles.flatMap((_handle, index) => [
+      '-i', `/dev/fd/${index + 3}`,
+    ]);
+    const filterGraph = inputHandles.length === 1
+      ? '[0:a:0]anull[out]'
+      : `${inputHandles.map((_handle, index) => `[${index}:a:0]`).join('')}concat=n=${inputHandles.length}:v=0:a=1[out]`;
+    await runner(ffmpegExecutable, [
+      '-v', 'error',
+      '-y',
+      ...inputArgs,
+      '-filter_complex', filterGraph,
+      '-map', '[out]',
+      '-c:a', 'pcm_s16le',
+      '-ar', '48000',
+      '-ac', '1',
+      '-flags:a', '+bitexact',
+      '-map_metadata', '-1',
+      '-f', 'wav',
+      `/dev/fd/${inputHandles.length + 3}`,
+    ], {
+      ...(signal === undefined ? {} : {signal}),
+      extraStdioFds: [...inputHandles.map((handle) => handle.fd), outputHandle.fd],
+    });
+    await outputHandle.sync();
+  } finally {
+    await Promise.allSettled([
+      ...inputHandles.map(async (handle) => await handle.close()),
+      ...(outputHandle === undefined ? [] : [outputHandle.close()]),
+    ]);
   }
 };
 
@@ -233,10 +301,12 @@ export const buildNarration = async (input: BuildNarrationInput): Promise<Narrat
 
     const segmentPath = `audio/segments/${String(index + 1).padStart(4, '0')}-${safeSegmentId(segment.id)}-${inputHashHex.slice(0, 12)}.wav`;
     if (!(await runFileExists(input.runDirectory, segmentPath))) {
-      await createSyntheticMaster({
+      await materializeNarrationSegment({
         runDirectory: input.runDirectory,
+        sourcePath: cachePath,
         outputPath: segmentPath,
-        durationMs: durationMs + segment.pauseAfterMs,
+        durationMs,
+        pauseAfterMs: segment.pauseAfterMs,
         ffmpegExecutable,
         runner,
         ...(input.signal === undefined ? {} : {signal: input.signal}),
@@ -264,10 +334,10 @@ export const buildNarration = async (input: BuildNarrationInput): Promise<Narrat
     segments,
   });
   input.onPartialArtifact?.(masterPath);
-  await createSyntheticMaster({
+  await createNarrationMaster({
     runDirectory: input.runDirectory,
+    segmentPaths: segments.map((segment) => segment.audioPath),
     outputPath: masterPath,
-    durationMs: cursorMs,
     ffmpegExecutable,
     runner,
     ...(input.signal === undefined ? {} : {signal: input.signal}),

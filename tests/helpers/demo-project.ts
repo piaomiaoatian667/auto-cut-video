@@ -44,6 +44,44 @@ export interface DemoProjectFixture {
   cleanup(): Promise<void>;
 }
 
+export interface TopLevelMp4Box {
+  type: string;
+  offset: number;
+  size: number;
+}
+
+export function parseTopLevelMp4Boxes(bytes: Buffer): TopLevelMp4Box[] {
+  const boxes: TopLevelMp4Box[] = [];
+  let offset = 0;
+  while (offset < bytes.byteLength) {
+    const remaining = bytes.byteLength - offset;
+    if (remaining < 8) throw new Error('truncated MP4 box header');
+    const size32 = bytes.readUInt32BE(offset);
+    const type = bytes.toString('ascii', offset + 4, offset + 8);
+    let headerSize = 8;
+    let size = size32;
+    if (size32 === 1) {
+      if (remaining < 16) throw new Error('truncated extended MP4 box header');
+      const extendedSize = bytes.readBigUInt64BE(offset + 8);
+      if (extendedSize > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error(`MP4 box too large: ${type}`);
+      }
+      headerSize = 16;
+      size = Number(extendedSize);
+    } else if (size32 === 0) {
+      size = remaining;
+    }
+    if (size < headerSize || size > remaining) {
+      throw new Error(`invalid MP4 box size for ${type}`);
+    }
+    boxes.push({type, offset, size});
+    const nextOffset = offset + size;
+    if (nextOffset <= offset) throw new Error(`invalid MP4 box progress for ${type}`);
+    offset = nextOffset;
+  }
+  return boxes;
+}
+
 export async function hashDemoSources(sourceRoot: string): Promise<DemoSourceHashes> {
   return Object.fromEntries(await Promise.all(SOURCE_FILES.map(async (fileName) => [
     fileName,

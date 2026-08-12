@@ -20,6 +20,7 @@ import {
   createRecordedToolchain,
   findRemotionBrowser,
   hashDemoSources,
+  parseTopLevelMp4Boxes,
   type DemoProjectFixture,
 } from '../../helpers/demo-project';
 
@@ -108,6 +109,43 @@ const readReports = async (
   }))) as Record<string, StageReport>;
 };
 
+const mp4Box = (type: string, payloadBytes = 0): Buffer => {
+  const box = Buffer.alloc(8 + payloadBytes);
+  box.writeUInt32BE(box.byteLength, 0);
+  box.write(type, 4, 4, 'ascii');
+  return box;
+};
+
+const extendedMp4Box = (type: string, payloadBytes = 0): Buffer => {
+  const box = Buffer.alloc(16 + payloadBytes);
+  box.writeUInt32BE(1, 0);
+  box.write(type, 4, 4, 'ascii');
+  box.writeBigUInt64BE(BigInt(box.byteLength), 8);
+  return box;
+};
+
+describe('Demo MP4 box parser', () => {
+  it('parses all top-level size forms and rejects invalid bounds', () => {
+    const sizeZero = Buffer.alloc(12);
+    sizeZero.writeUInt32BE(0, 0);
+    sizeZero.write('free', 4, 4, 'ascii');
+    expect(parseTopLevelMp4Boxes(Buffer.concat([
+      mp4Box('ftyp', 4),
+      extendedMp4Box('moov', 4),
+      sizeZero,
+    ]))).toEqual([
+      {type: 'ftyp', offset: 0, size: 12},
+      {type: 'moov', offset: 12, size: 20},
+      {type: 'free', offset: 32, size: 12},
+    ]);
+
+    const invalid = Buffer.alloc(8);
+    invalid.writeUInt32BE(4, 0);
+    invalid.write('mdat', 4, 4, 'ascii');
+    expect(() => parseTopLevelMp4Boxes(invalid)).toThrow(/invalid MP4 box size/u);
+  });
+});
+
 describe('Demo pipeline E2E', () => {
   it('plans, drafts, reviews, resumes, and publishes the demo', async () => {
     const fixture = await copyDemoProject();
@@ -138,6 +176,10 @@ describe('Demo pipeline E2E', () => {
     expect(planned.json).toMatchObject({projectId: 'demo', preset: 'release'});
     expect(await listTree(path.join(fixture.workspaceRoot, '.work'))).toEqual([]);
     expect(await listTree(path.join(fixture.workspaceRoot, 'output'))).toEqual([]);
+    expect(await tools.readCalls('ffmpeg')).toEqual([]);
+    expect(await tools.readCalls('ffprobe')).toEqual([]);
+    expect(await tools.readCalls('qt-faststart')).toEqual([]);
+    expect(await browser.readCalls()).toEqual([]);
 
     const assets = await runCli<PipelineRunResult>([
       'pipeline', 'demo', '--preset', 'assets', '--resume', '--json',
@@ -255,10 +297,12 @@ describe('Demo pipeline E2E', () => {
       '-',
     ])).resolves.toMatchObject({exitCode: 0});
     const finalBytes = await readFile(finalPath);
-    expect(finalBytes.indexOf(Buffer.from('moov'))).toBeGreaterThanOrEqual(0);
-    expect(finalBytes.indexOf(Buffer.from('mdat'))).toBeGreaterThanOrEqual(0);
-    expect(finalBytes.indexOf(Buffer.from('moov')))
-      .toBeLessThan(finalBytes.indexOf(Buffer.from('mdat')));
+    const topLevelBoxes = parseTopLevelMp4Boxes(finalBytes);
+    const moovIndex = topLevelBoxes.findIndex((box) => box.type === 'moov');
+    const mdatIndex = topLevelBoxes.findIndex((box) => box.type === 'mdat');
+    expect(moovIndex).toBeGreaterThanOrEqual(0);
+    expect(mdatIndex).toBeGreaterThanOrEqual(0);
+    expect(moovIndex).toBeLessThan(mdatIndex);
 
     await Promise.all([
       'subtitles.srt',

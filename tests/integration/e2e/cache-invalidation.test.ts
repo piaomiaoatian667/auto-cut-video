@@ -23,7 +23,6 @@ import {
 } from '../../helpers/demo-project';
 
 const E2E_TIMEOUT = 180_000;
-const MOCK_TTS_COMMAND = 'sine=frequency=440:sample_rate=48000:duration=1';
 const FINGERPRINT_STAGES = ['narration', 'compile', 'draft'] as const;
 const fixtures: DemoProjectFixture[] = [];
 
@@ -43,6 +42,12 @@ const outputBuffer = (): {writer: OutputWriter; chunks: string[]} => {
 const createCli = (
   workspaceRoot: string,
   environment: NodeJS.ProcessEnv,
+  onMockTtsInvocation: (input: {
+    segmentId: string;
+    text: string;
+    voice: string;
+    rate: number;
+  }) => void,
 ) => {
   const stdout = outputBuffer();
   const stderr = outputBuffer();
@@ -51,6 +56,7 @@ const createCli = (
     environment,
     stdout: stdout.writer,
     stderr: stderr.writer,
+    onMockTtsInvocation,
   });
   return async (argv: readonly string[]) => {
     stdout.chunks.length = 0;
@@ -114,9 +120,6 @@ const hashFile = async (filePath: string): Promise<string> => {
   return `sha256:${createHash('sha256').update(await readFile(filePath)).digest('hex')}`;
 };
 
-const mockTtsCallCount = (calls: readonly string[]): number =>
-  calls.filter((call) => call.includes(MOCK_TTS_COMMAND)).length;
-
 describe('Demo cache invalidation E2E', () => {
   it('reuses one narration segment and invalidates only its downstream pipeline', async () => {
     const fixture = await copyDemoProject();
@@ -138,7 +141,17 @@ describe('Demo cache invalidation E2E', () => {
       REMOTION_CHROME_MODE: browser.chromeMode,
       REMOTION_OPENGL_RENDERER: 'angle',
     };
-    const runCli = createCli(fixture.workspaceRoot, environment);
+    const mockTtsInvocations: Array<{
+      segmentId: string;
+      text: string;
+      voice: string;
+      rate: number;
+    }> = [];
+    const runCli = createCli(
+      fixture.workspaceRoot,
+      environment,
+      (input) => { mockTtsInvocations.push({...input}); },
+    );
 
     const firstDraft = await runCli([
       'pipeline', 'demo', '--preset', 'draft', '--json',
@@ -152,7 +165,11 @@ describe('Demo cache invalidation E2E', () => {
       FINGERPRINT_STAGES,
     );
     const firstManifest = await readNarrationManifest(fixture.workspaceRoot, firstRunId);
-    expect(mockTtsCallCount(await tools.readCalls('ffmpeg'))).toBe(2);
+    const firstDraftReport = await readDraftReport(fixture.workspaceRoot, firstRunId);
+    expect(mockTtsInvocations).toEqual([
+      {segmentId: 'intro', text: '本地流程开始。', voice: 'fixture', rate: 180},
+      {segmentId: 'publish', text: '审核通过后发布。', voice: 'fixture', rate: 180},
+    ]);
 
     const scriptPath = path.join(fixture.projectRoot, 'script.json');
     const script = JSON.parse(await readFile(scriptPath, 'utf8')) as Script;
@@ -168,7 +185,7 @@ describe('Demo cache invalidation E2E', () => {
     };
     await writeFile(scriptPath, `${JSON.stringify(changedScript, null, 2)}\n`, 'utf8');
 
-    const ttsCallsBeforeSecondDraft = mockTtsCallCount(await tools.readCalls('ffmpeg'));
+    const ttsInvocationsBeforeSecondDraft = mockTtsInvocations.length;
     const secondDraft = await runCli([
       'pipeline', 'demo', '--preset', 'draft', '--json',
     ]);
@@ -188,6 +205,9 @@ describe('Demo cache invalidation E2E', () => {
     const secondManifest = await readNarrationManifest(fixture.workspaceRoot, secondRunId);
     expect(secondManifest.segments[0]!.inputHash).toBe(firstManifest.segments[0]!.inputHash);
     expect(secondManifest.segments[1]!.inputHash).not.toBe(firstManifest.segments[1]!.inputHash);
+    expect(secondManifest.segments[0]!.audioHash).toBe(firstManifest.segments[0]!.audioHash);
+    expect(secondManifest.segments[1]!.audioHash).not.toBe(firstManifest.segments[1]!.audioHash);
+    expect(secondManifest.master.audioHash).not.toBe(firstManifest.master.audioHash);
 
     const firstSegmentOldCache = cachePath(
       fixture.workspaceRoot,
@@ -199,29 +219,63 @@ describe('Demo cache invalidation E2E', () => {
       secondRunId,
       secondManifest.segments[0]!.inputHash,
     );
-    expect(await hashFile(firstSegmentNewCache)).toBe(await hashFile(firstSegmentOldCache));
+    const firstSegmentOldCacheHash = await hashFile(firstSegmentOldCache);
+    const firstSegmentNewCacheHash = await hashFile(firstSegmentNewCache);
+    expect(firstSegmentNewCacheHash).toBe(firstSegmentOldCacheHash);
     expect((await stat(firstSegmentNewCache)).ino).not.toBe((await stat(firstSegmentOldCache)).ino);
+    const firstSegmentOldArtifact = path.join(
+      runRoot(fixture.workspaceRoot, firstRunId),
+      firstManifest.segments[0]!.audioPath,
+    );
+    const firstSegmentNewArtifact = path.join(
+      runRoot(fixture.workspaceRoot, secondRunId),
+      secondManifest.segments[0]!.audioPath,
+    );
+    const firstSegmentOldArtifactHash = await hashFile(firstSegmentOldArtifact);
+    const firstSegmentNewArtifactHash = await hashFile(firstSegmentNewArtifact);
+    expect(firstSegmentNewArtifactHash).toBe(firstSegmentOldArtifactHash);
+    expect((await stat(firstSegmentNewArtifact)).ino)
+      .not.toBe((await stat(firstSegmentOldArtifact)).ino);
+    const secondSegmentOldCache = cachePath(
+      fixture.workspaceRoot,
+      firstRunId,
+      firstManifest.segments[1]!.inputHash,
+    );
+    const secondSegmentNewCache = cachePath(
+      fixture.workspaceRoot,
+      secondRunId,
+      secondManifest.segments[1]!.inputHash,
+    );
+    const secondSegmentOldCacheHash = await hashFile(secondSegmentOldCache);
+    const secondSegmentNewCacheHash = await hashFile(secondSegmentNewCache);
+    expect(secondSegmentNewCacheHash).not.toBe(secondSegmentOldCacheHash);
     await expect(access(cachePath(
       fixture.workspaceRoot,
       secondRunId,
       firstManifest.segments[1]!.inputHash,
     ))).rejects.toMatchObject({code: 'ENOENT'});
-    expect(
-      mockTtsCallCount(await tools.readCalls('ffmpeg')) - ttsCallsBeforeSecondDraft,
-    ).toBe(1);
+    expect(mockTtsInvocations.slice(ttsInvocationsBeforeSecondDraft)).toEqual([
+      {segmentId: 'publish', text: '审核确认后立即发布。', voice: 'fixture', rate: 180},
+    ]);
     for (const stageId of FINGERPRINT_STAGES) {
       expect(secondReports[stageId]!.fingerprint)
         .not.toBe(firstReports[stageId]!.fingerprint);
     }
 
     const secondDraftReport = await readDraftReport(fixture.workspaceRoot, secondRunId);
+    expect(secondDraftReport.outputs.audio.filterGraph.sha256)
+      .toBe(firstDraftReport.outputs.audio.filterGraph.sha256);
+    expect(secondDraftReport.outputs.audio.mixedAudio.sha256)
+      .not.toBe(firstDraftReport.outputs.audio.mixedAudio.sha256);
+    expect(secondDraftReport.outputs.audioMixFingerprint)
+      .toBe(firstDraftReport.outputs.audioMixFingerprint);
     const audioPaths = [
       secondDraftReport.outputs.audio.filterGraph.path,
       secondDraftReport.outputs.audio.mixedAudio.path,
     ];
     const audioHashesBeforeRelease = await Promise.all(audioPaths.map(async (relativePath) =>
       await hashFile(path.join(runRoot(fixture.workspaceRoot, secondRunId), relativePath))));
-    const ttsCallsBeforeRelease = mockTtsCallCount(await tools.readCalls('ffmpeg'));
+    const ttsInvocationsBeforeRelease = mockTtsInvocations.length;
 
     const reviewGate = await runCli([
       'pipeline', 'demo', '--preset', 'release', '--resume', '--json',
@@ -246,7 +300,7 @@ describe('Demo cache invalidation E2E', () => {
     expect(await Promise.all(audioPaths.map(async (relativePath) =>
       await hashFile(path.join(runRoot(fixture.workspaceRoot, secondRunId), relativePath)))))
       .toEqual(audioHashesBeforeRelease);
-    expect(mockTtsCallCount(await tools.readCalls('ffmpeg'))).toBe(ttsCallsBeforeRelease);
+    expect(mockTtsInvocations).toHaveLength(ttsInvocationsBeforeRelease);
     const validationReport = ReleaseValidationReportSchema.parse(JSON.parse(await readFile(path.join(
       fixture.workspaceRoot,
       'output',
