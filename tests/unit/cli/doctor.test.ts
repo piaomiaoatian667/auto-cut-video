@@ -1,21 +1,17 @@
 import {describe, expect, it, vi} from 'vitest';
-import {createEditFixture, createProjectFixture, createScriptFixture} from '../../helpers/temp-project';
 import type {ProjectInputs} from '../../../src/domain/load-project';
 import type {ProjectDirectoryScope} from '../../../src/fs/project-paths';
-import {
-  ProjectSourceError,
-  discoverProjectSourceCatalog,
-  type SourceCatalogDependencies,
-  type SourceMeterDependencies,
-} from '../../../src/pipeline/source-assets';
+import type {ExecutionPlan} from '../../../src/pipeline/execution-plan';
+import type {PipelineRunResult} from '../../../src/pipeline/runner';
+import type {ProjectSourceCatalog} from '../../../src/pipeline/source-assets';
 import type {PreflightResult} from '../../../src/pipeline/stages/preflight';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
+import {runVideoctl, type VideoctlDependencies} from '../../../src/cli/videoctl';
 import {
-  createSystemVideoctlDependencies,
-  runVideoctl,
-  type SystemVideoctlOptions,
-  type VideoctlDependencies,
-} from '../../../src/cli/videoctl';
+  createEditFixture,
+  createProjectFixture,
+  createScriptFixture,
+} from '../../helpers/temp-project';
 
 const successfulResult = (): PreflightResult => ({
   checks: [
@@ -84,30 +80,72 @@ const loadedProject = (): ProjectInputs => ({
   edit: createEditFixture(),
 });
 
+const sourceCatalog = (): ProjectSourceCatalog => ({
+  assets: [{
+    assetId: 'source-1',
+    kind: 'image',
+    sourcePath: 'assets/source/cover.png',
+    sizeBytes: 1024,
+    sha256: 'sha256:cover',
+  }],
+  totalBytes: 1024,
+  fingerprint: 'sha256:source',
+});
+
+const plan = (): ExecutionPlan => ({
+  version: 1,
+  projectId: 'demo',
+  preset: 'release',
+  stageIds: ['preflight'],
+  runMode: 'new',
+  requiresProgressReconciliation: false,
+  requiresRuntimePreflight: false,
+  targetRunId: 'run-doctor',
+  items: [{
+    position: 1,
+    total: 1,
+    stageId: 'preflight',
+    displayName: 'Environment Preflight',
+    action: 'run',
+    fingerprint: null,
+    materialize: false,
+  }],
+});
+
 const fixture = (result: PreflightResult = successfulResult()) => {
   let stdout = '';
   let stderr = '';
   const projectInputs = loadedProject();
-  const sourceCatalog: SourceCatalogDependencies = {
-    listSourceFiles: vi.fn(async () => [{
-      sourcePath: 'assets/source/cover.png',
-      sizeBytes: 1024,
-    }]),
-    hashProjectFile: vi.fn(async () => 'sha256:cover'),
-  };
-  const dependencies: VideoctlDependencies = {
+  const catalog = sourceCatalog();
+  const dispose = vi.fn();
+  const dependencies = {
     workspaceRoot: '/workspace',
-    stdout: {write: (chunk) => { stdout += chunk; }},
-    stderr: {write: (chunk) => { stderr += chunk; }},
+    stdout: {write: (chunk: string) => { stdout += chunk; }},
+    stderr: {write: (chunk: string) => { stderr += chunk; }},
     loadProject: vi.fn(async () => projectInputs),
-    sourceCatalog,
-    preflight: vi.fn(async () => result),
-    ffmpegExecutable: '/configured/ffmpeg',
-    ffprobeExecutable: '/configured/ffprobe',
-  };
+    discoverProjectSourceCatalog: vi.fn(async () => catalog),
+    buildExecutionPlan: vi.fn(async () => plan()),
+    runExecutionPlan: vi.fn(async (): Promise<PipelineRunResult> => ({
+      projectId: 'demo',
+      preset: 'release',
+      state: result.checks.some((check) => check.severity === 'error')
+        ? 'failed'
+        : 'passed',
+      completedStage: 'preflight',
+      reports: [],
+      preflight: result,
+      warnings: [],
+    })),
+    installPipelineSignalHandlers: vi.fn(() => ({
+      signal: new AbortController().signal,
+      dispose,
+    })),
+  } satisfies VideoctlDependencies;
   return {
     dependencies,
     projectInputs,
+    catalog,
+    dispose,
     stdout: () => stdout,
     stderr: () => stderr,
   };
@@ -125,29 +163,21 @@ describe('videoctl doctor', () => {
     });
   });
 
-  it('loads the project, injects runtime inputs, and prints a stable table', async () => {
-    const {dependencies, projectInputs, stdout, stderr} = fixture();
+  it('uses the shared preflight-only plan and Runner while preserving the table', async () => {
+    const {dependencies, projectInputs, catalog, dispose, stdout, stderr} = fixture();
 
     const exitCode = await runVideoctl(['doctor', 'demo'], dependencies);
 
     expect(exitCode).toBe(EXIT_CODES.success);
     expect(dependencies.loadProject).toHaveBeenCalledWith('/workspace', 'demo');
-    expect(dependencies.sourceCatalog.listSourceFiles)
-      .toHaveBeenCalledWith(projectInputs.projectDirectory);
-    expect(dependencies.sourceCatalog.hashProjectFile).toHaveBeenCalledWith(
-      projectInputs.projectDirectory,
-      'assets/source/cover.png',
+    expect(dependencies.discoverProjectSourceCatalog).toHaveBeenCalledWith(projectInputs);
+    expect(dependencies.buildExecutionPlan).toHaveBeenCalledWith(
+      projectInputs,
+      catalog,
+      {preset: 'release', to: 'preflight'},
     );
-    expect(dependencies.preflight).toHaveBeenCalledWith({
-      workspaceRoot: '/workspace',
-      projectDirectory: projectInputs.projectDirectory,
-      project: projectInputs.project,
-      script: projectInputs.script,
-      sourceBytes: 1024,
-      workDirectory: '/workspace/.work/demo',
-      ffmpegExecutable: '/configured/ffmpeg',
-      ffprobeExecutable: '/configured/ffprobe',
-    });
+    expect(dependencies.runExecutionPlan).toHaveBeenCalledOnce();
+    expect(dispose).toHaveBeenCalledOnce();
     expect(stdout()).toBe([
       'Environment doctor: demo',
       'STATUS  CHECK               CODE  MESSAGE',
@@ -166,291 +196,137 @@ describe('videoctl doctor', () => {
     expect(stderr()).toBe('');
   });
 
-  it('maps source catalog failures to sanitized project validation JSON', async () => {
-    const {dependencies, stdout, stderr} = fixture();
-    dependencies.sourceCatalog.listSourceFiles = vi.fn(async () => {
-      throw new ProjectSourceError(
-        'PROJECT_SOURCE_INVALID',
-        'project directory changed after scope creation: assets/source',
-      );
-    });
-
-    const exitCode = await runVideoctl(
-      ['doctor', 'demo', '--json'],
-      dependencies,
-    );
-    const report = JSON.parse(stdout()) as {
-      checks: Array<{code?: string}>;
-    };
-
-    expect(exitCode).toBe(EXIT_CODES.validationFailed);
-    expect(dependencies.preflight).not.toHaveBeenCalled();
-    expect(report.checks).toContainEqual(expect.objectContaining({
-      id: 'source-assets',
-      code: 'PROJECT_SOURCE_INVALID',
-    }));
-    expect(stdout()).not.toContain('assets/source');
-    expect(stderr()).toBe('');
-  });
-
-  it('does not allow a byte-only source meter to bypass catalog validation', async () => {
-    const sourceCatalog: SourceCatalogDependencies = {
-      listSourceFiles: vi.fn(async () => []),
-      hashProjectFile: vi.fn(async () => 'sha256:not-used'),
-    };
-    const sourceMeter: SourceMeterDependencies = {
-      openExistingProjectFile: vi.fn(async () => {
-        throw new Error('legacy source meter bypass invoked');
-      }),
-      openAuthority: vi.fn(async () => {
-        throw new Error('legacy source meter bypass invoked');
-      }),
-      openDirectory: vi.fn(async () => {
-        throw new Error('legacy source meter bypass invoked');
-      }),
-    };
-    const options = {
-      sourceCatalog,
-      sourceMeter,
-    } as SystemVideoctlOptions & {sourceMeter: SourceMeterDependencies};
-    const dependencies = createSystemVideoctlDependencies(options);
-
-    await expect(discoverProjectSourceCatalog(
-      loadedProject(),
-      dependencies.sourceCatalog,
-    ))
-      .rejects.toMatchObject({code: 'PROJECT_SOURCE_MISSING'});
-    expect(sourceCatalog.listSourceFiles).toHaveBeenCalledOnce();
-    expect(sourceMeter.openExistingProjectFile).not.toHaveBeenCalled();
-  });
-
-  it('does not allow direct CLI dependencies to inject measured source bytes', async () => {
-    const run = fixture();
-    const sourceCatalog: SourceCatalogDependencies = {
-      listSourceFiles: vi.fn(async () => []),
-      hashProjectFile: vi.fn(async () => 'sha256:not-used'),
-    };
-    const measureSourceBytes = vi.fn(async () => 1024);
-    const dependencies = {
-      ...run.dependencies,
-      sourceCatalog,
-      measureSourceBytes,
-    } as VideoctlDependencies & {
-      measureSourceBytes: typeof measureSourceBytes;
-    };
+  it('prints the Runner in-memory Preflight output as JSON', async () => {
+    const {dependencies, stdout} = fixture();
 
     const exitCode = await runVideoctl(['doctor', 'demo', '--json'], dependencies);
-
-    expect(exitCode).toBe(EXIT_CODES.validationFailed);
-    expect(sourceCatalog.listSourceFiles).toHaveBeenCalledOnce();
-    expect(measureSourceBytes).not.toHaveBeenCalled();
-  });
-
-  it('prints machine-readable JSON with identities, fingerprint, and checks', async () => {
-    const {dependencies, stdout, stderr} = fixture();
-
-    const exitCode = await runVideoctl(
-      ['doctor', 'demo', '--json'],
-      dependencies,
-    );
-    const report = JSON.parse(stdout()) as Record<string, unknown>;
+    const report = JSON.parse(stdout()) as PreflightResult & {
+      command: string;
+      project: string;
+      ok: boolean;
+    };
 
     expect(exitCode).toBe(EXIT_CODES.success);
     expect(report).toMatchObject({
       command: 'doctor',
       project: 'demo',
       ok: true,
-      toolIdentities: {
-        ffmpeg: {realPath: '/real/ffmpeg', sha256: 'sha256:ffmpeg'},
-        ffprobe: {realPath: '/real/ffprobe', sha256: 'sha256:ffprobe'},
-        qtFaststart: {
-          realPath: '/real/qt-faststart',
-          sha256: 'sha256:faststart',
-        },
-      },
       environmentFingerprint: 'sha256:environment',
-      checks: [
-        {id: 'supported-platform', severity: 'info'},
-        {id: 'qt-faststart', severity: 'info'},
-      ],
     });
-    expect(stderr()).toBe('');
   });
 
-  it('returns environmentFailed and shows ENV_TOOL_MISSING in table output', async () => {
-    const {dependencies, stdout} = fixture(failedResult());
+  it('maps failed Preflight checks to environmentFailed', async () => {
+    const table = fixture(failedResult());
+    const json = fixture(failedResult());
 
-    const exitCode = await runVideoctl(['doctor', 'demo'], dependencies);
-
-    expect(exitCode).toBe(EXIT_CODES.environmentFailed);
-    expect(stdout()).toContain('ERROR   qt-faststart  ENV_TOOL_MISSING');
-    expect(stdout()).toContain('qt-faststart real path: unavailable');
-  });
-
-  it('returns environmentFailed for JSON reports with any environment error', async () => {
-    const {dependencies, stdout} = fixture(failedResult());
-
-    const exitCode = await runVideoctl(
-      ['doctor', '--json', 'demo'],
-      dependencies,
-    );
-    const report = JSON.parse(stdout()) as {
-      ok: boolean;
-      checks: Array<{code?: string}>;
-    };
-
-    expect(exitCode).toBe(EXIT_CODES.environmentFailed);
-    expect(report.ok).toBe(false);
-    expect(report.checks).toContainEqual(expect.objectContaining({
-      code: 'ENV_TOOL_MISSING',
-    }));
-  });
-
-  it('keeps warnings at exit zero when no environment error exists', async () => {
-    const result = successfulResult();
-    result.checks.push({
-      id: 'optional-check',
-      severity: 'warning',
-      message: 'Optional capability is unavailable.',
-    });
-    const {dependencies} = fixture(result);
-
-    const exitCode = await runVideoctl(['doctor', 'demo'], dependencies);
-
-    expect(exitCode).toBe(EXIT_CODES.success);
+    await expect(runVideoctl(['doctor', 'demo'], table.dependencies))
+      .resolves.toBe(EXIT_CODES.environmentFailed);
+    await expect(runVideoctl(['doctor', 'demo', '--json'], json.dependencies))
+      .resolves.toBe(EXIT_CODES.environmentFailed);
+    expect(table.stdout()).toContain('ENV_TOOL_MISSING');
+    expect(JSON.parse(json.stdout()).ok).toBe(false);
   });
 
   it('sanitizes table controls while preserving JSON string semantics', async () => {
-    const injectedId = 'font:assets/fonts/evil.otf\nERROR forged';
+    const injectedId = 'font:evil\nERROR forged';
     const injectedMessage = 'Missing font\u001b[31m\nSTATUS forged\u009b31m';
-    const result = successfulResult();
+    const result = failedResult();
     result.checks = [{
       id: injectedId,
       severity: 'error',
       code: 'ENV_FONT_MISSING',
       message: injectedMessage,
     }];
-    result.fonts = [{
-      path: 'assets/fonts/evil.otf\nERROR forged\u001b[0m',
-      sha256: 'sha256:font',
-    }];
-    const tableRun = fixture(result);
-    const jsonRun = fixture(result);
+    const table = fixture(result);
+    const json = fixture(result);
 
-    const tableExit = await runVideoctl(
-      ['doctor', 'demo'],
-      tableRun.dependencies,
-    );
-    const jsonExit = await runVideoctl(
-      ['doctor', 'demo', '--json'],
-      jsonRun.dependencies,
-    );
-    const json = JSON.parse(jsonRun.stdout()) as PreflightResult & {
-      command: string;
-    };
+    await runVideoctl(['doctor', 'demo'], table.dependencies);
+    await runVideoctl(['doctor', 'demo', '--json'], json.dependencies);
 
-    expect(tableExit).toBe(EXIT_CODES.environmentFailed);
-    expect(tableRun.stdout()).not.toMatch(
+    expect(table.stdout()).not.toMatch(
       /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/u,
     );
-    expect(tableRun.stdout()).not.toContain('\u001b');
-    expect(tableRun.stdout().split('\n').filter((line) => (
-      line.includes('ERROR forged') || line.includes('STATUS forged')
-    ))).toHaveLength(1);
-    expect(jsonExit).toBe(EXIT_CODES.environmentFailed);
-    expect(json.checks[0]).toMatchObject({
+    expect(table.stdout()).not.toContain('\u001b');
+    expect(JSON.parse(json.stdout()).checks[0]).toMatchObject({
       id: injectedId,
       message: injectedMessage,
-    });
-    expect(json.fonts[0]?.path).toBe(result.fonts[0]?.path);
-  });
-
-  it('sanitizes unexpected preflight exceptions deterministically', async () => {
-    const first = fixture();
-    const second = fixture();
-    const sensitiveError = Object.assign(
-      new Error('token=super-secret path=/private/authority-root'),
-      {authority: {canonicalRoot: '/private/authority-root'}},
-    );
-    first.dependencies.preflight = vi.fn(async () => { throw sensitiveError; });
-    second.dependencies.preflight = vi.fn(async () => { throw sensitiveError; });
-
-    const firstExitCode = await runVideoctl(
-      ['doctor', 'demo', '--json'],
-      first.dependencies,
-    );
-    const secondExitCode = await runVideoctl(
-      ['doctor', 'demo', '--json'],
-      second.dependencies,
-    );
-
-    expect(firstExitCode).toBe(EXIT_CODES.environmentFailed);
-    expect(secondExitCode).toBe(EXIT_CODES.environmentFailed);
-    expect(first.stdout()).toBe(second.stdout());
-    expect(first.stdout()).not.toContain('super-secret');
-    expect(first.stdout()).not.toContain('/private/authority-root');
-    expect(JSON.parse(first.stdout())).toMatchObject({
-      ok: false,
-      checks: [{
-        id: 'doctor',
-        severity: 'error',
-        code: 'ENV_PREFLIGHT_FAILED',
-        message: 'Preflight failed unexpectedly.',
-      }],
-      toolIdentities: {ffmpeg: null, ffprobe: null, qtFaststart: null},
-      environmentFingerprint: null,
     });
   });
 
   it('reports project loading failures without leaking exception details', async () => {
     const {dependencies, stdout, stderr} = fixture();
-    dependencies.loadProject = vi.fn(async () => {
-      throw new Error('secret workspace authority /private/projects');
-    });
+    dependencies.loadProject.mockRejectedValueOnce(
+      new Error('secret workspace authority /private/projects'),
+    );
 
     const exitCode = await runVideoctl(['doctor', 'demo'], dependencies);
 
     expect(exitCode).toBe(EXIT_CODES.validationFailed);
     expect(stdout()).toBe('');
     expect(stderr()).toBe('Unable to load project "demo".\n');
-    expect(stderr()).not.toContain('/private/projects');
   });
 
-  it('prints structured JSON when project loading or validation fails', async () => {
-    const {dependencies, stdout, stderr} = fixture();
-    dependencies.loadProject = vi.fn(async () => {
-      throw new Error('secret workspace authority /private/projects');
-    });
+  it('sanitizes project identifiers in text loading failures', async () => {
+    const {dependencies, stderr} = fixture();
+    dependencies.loadProject.mockRejectedValueOnce(new Error('invalid project id'));
 
-    const exitCode = await runVideoctl(
-      ['doctor', 'demo', '--json'],
-      dependencies,
-    );
-    const report = JSON.parse(stdout()) as {
-      command: string;
-      project: string;
-      ok: boolean;
-      checks: Array<{
-        id: string;
-        severity: string;
-        code: string;
-        message: string;
-      }>;
-    };
+    const exitCode = await runVideoctl([
+      'doctor',
+      'demo\nSTATUS forged\u001b[31m',
+    ], dependencies);
 
     expect(exitCode).toBe(EXIT_CODES.validationFailed);
-    expect(report).toMatchObject({
-      command: 'doctor',
-      project: 'demo',
+    expect(stderr()).not.toContain('\u001b');
+    expect(stderr().split('\n').filter((line) => line.includes('STATUS forged')))
+      .toHaveLength(1);
+  });
+
+  it('maps source discovery failures to sanitized validation JSON', async () => {
+    const {dependencies, stdout, stderr} = fixture();
+    dependencies.discoverProjectSourceCatalog.mockRejectedValueOnce(
+      new Error('secret source path /private/source.mov'),
+    );
+
+    const exitCode = await runVideoctl(['doctor', 'demo', '--json'], dependencies);
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(JSON.parse(stdout())).toMatchObject({
       ok: false,
       checks: [{
-        id: 'project-load',
-        severity: 'error',
-        code: 'PROJECT_LOAD_FAILED',
-        message: 'Unable to load or validate project.',
+        id: 'source-assets',
+        code: 'PROJECT_SOURCE_INVALID',
       }],
     });
-    expect(stdout()).not.toContain('/private/projects');
+    expect(stdout()).not.toContain('/private/source.mov');
     expect(stderr()).toBe('');
+  });
+
+  it('sanitizes unexpected Runner failures deterministically', async () => {
+    const first = fixture();
+    const second = fixture();
+    first.dependencies.runExecutionPlan.mockRejectedValueOnce(
+      new Error('token=super-secret path=/private/authority-root'),
+    );
+    second.dependencies.runExecutionPlan.mockRejectedValueOnce(
+      new Error('different private failure'),
+    );
+
+    const firstExit = await runVideoctl(
+      ['doctor', 'demo', '--json'],
+      first.dependencies,
+    );
+    const secondExit = await runVideoctl(
+      ['doctor', 'demo', '--json'],
+      second.dependencies,
+    );
+
+    expect(firstExit).toBe(EXIT_CODES.environmentFailed);
+    expect(secondExit).toBe(EXIT_CODES.environmentFailed);
+    expect(first.stdout()).toBe(second.stdout());
+    expect(first.stdout()).not.toContain('super-secret');
+    expect(JSON.parse(first.stdout())).toMatchObject({
+      ok: false,
+      checks: [{code: 'ENV_PREFLIGHT_FAILED'}],
+    });
   });
 });

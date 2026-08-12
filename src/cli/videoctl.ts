@@ -1,84 +1,80 @@
 import {pathToFileURL} from 'node:url';
-import path from 'node:path';
-import {Command, CommanderError} from 'commander';
+import {Command, CommanderError, Option} from 'commander';
+import {loadProject} from '../domain/load-project';
 import {
-  loadProject,
-  type ProjectInputs,
-} from '../domain/load-project';
+  buildCleanupPlan,
+  executeCleanupPlan,
+} from '../pipeline/cleanup';
+import {
+  buildExecutionPlan,
+  type ExecutionPlanRequest,
+} from '../pipeline/execution-plan';
+import {acquireProjectLock} from '../pipeline/project-lock';
+import {
+  createOutputStore,
+  createRunStore,
+  type PipelinePreset,
+  type StageId,
+} from '../pipeline/run-store';
+import {
+  createRunId,
+  runExecutionPlan,
+} from '../pipeline/runner';
+import {installPipelineSignalHandlers} from '../pipeline/signals';
 import {
   createSystemSourceCatalogDependencies,
   discoverProjectSourceCatalog,
   type SourceCatalogDependencies,
 } from '../pipeline/source-assets';
+import {MVP_STAGES} from '../pipeline/stage-registry';
+import {createStageReportStore} from '../pipeline/stage-report';
+import {runCleanCommand} from './commands/clean';
 import {
-  createSystemPreflightDependencies,
-  runPreflight,
-  type PreflightInput,
-  type PreflightResult,
-} from '../pipeline/stages/preflight';
-import {aggregateChecks} from '../pipeline/gate';
+  executePipelineCommand,
+  runPipelineCommand,
+  type PipelineCommandDependencies,
+  type PipelineCommandOptions,
+} from './commands/pipeline';
+import {runReportCommand, type ReportCommandOptions} from './commands/report';
+import {runReviewCommand, type ReviewCommandOptions} from './commands/review';
 import {EXIT_CODES} from './exit-codes';
 import {
   formatDoctorFailure,
   formatDoctorJson,
   formatDoctorTable,
+  sanitizeTerminalText,
 } from './output';
-import {runReviewCommand, type ReviewCommandOptions} from './commands/review';
 
 export interface OutputWriter {
   write(chunk: string): unknown;
 }
 
-export interface VideoctlDependencies {
-  workspaceRoot: string;
-  stdout: OutputWriter;
-  stderr: OutputWriter;
-  loadProject(workspaceRoot: string, projectId: string): Promise<ProjectInputs>;
-  sourceCatalog: SourceCatalogDependencies;
-  preflight(input: PreflightInput): Promise<PreflightResult>;
-  ffmpegExecutable?: string;
-  ffprobeExecutable?: string;
+export interface VideoctlDependencies extends PipelineCommandDependencies {
+  buildCleanupPlan?: typeof buildCleanupPlan;
+  executeCleanupPlan?: typeof executeCleanupPlan;
 }
 
 interface DoctorOptions {
   json?: boolean;
 }
 
-const doctorInput = (
-  project: ProjectInputs,
-  sourceBytes: number,
-  dependencies: VideoctlDependencies,
-): PreflightInput => ({
-  workspaceRoot: project.workspaceRoot,
-  projectDirectory: project.projectDirectory,
-  project: project.project,
-  script: project.script,
-  sourceBytes,
-  workDirectory: path.join(
-    project.workspaceRoot,
-    '.work',
-    project.project.id,
-  ),
-  ...(dependencies.ffmpegExecutable === undefined
-    ? {}
-    : {ffmpegExecutable: dependencies.ffmpegExecutable}),
-  ...(dependencies.ffprobeExecutable === undefined
-    ? {}
-    : {ffprobeExecutable: dependencies.ffprobeExecutable}),
-});
-
 const runDoctor = async (
   projectId: string,
   options: DoctorOptions,
   dependencies: VideoctlDependencies,
 ): Promise<number> => {
-  let project: ProjectInputs;
-  try {
-    project = await dependencies.loadProject(
-      dependencies.workspaceRoot,
-      projectId,
-    );
-  } catch {
+  const outcome = await executePipelineCommand(
+    projectId,
+    {preset: 'release', to: 'preflight'},
+    dependencies,
+  );
+  if (outcome.kind === 'result' && outcome.result.preflight !== undefined) {
+    dependencies.stdout.write(options.json === true
+      ? formatDoctorJson(projectId, outcome.result.preflight)
+      : formatDoctorTable(projectId, outcome.result.preflight));
+    return outcome.exitCode;
+  }
+  if (outcome.kind === 'failure' && outcome.failure.code === 'PROJECT_LOAD_FAILED') {
     if (options.json === true) {
       dependencies.stdout.write(formatDoctorFailure(projectId, true, {
         id: 'project-load',
@@ -86,17 +82,16 @@ const runDoctor = async (
         message: 'Unable to load or validate project.',
       }));
     } else {
-      dependencies.stderr.write(`Unable to load project "${projectId}".\n`);
+      dependencies.stderr.write(
+        `Unable to load project "${sanitizeTerminalText(projectId)}".\n`,
+      );
     }
-    return EXIT_CODES.validationFailed;
+    return outcome.exitCode;
   }
-
-  let sourceBytes: number;
-  try {
-    sourceBytes = (
-      await discoverProjectSourceCatalog(project, dependencies.sourceCatalog)
-    ).totalBytes;
-  } catch {
+  if (
+    outcome.kind === 'failure'
+    && outcome.failure.code === 'PROJECT_SOURCE_INVALID'
+  ) {
     dependencies.stdout.write(formatDoctorFailure(
       projectId,
       options.json === true,
@@ -106,26 +101,23 @@ const runDoctor = async (
         message: 'Project source assets could not be measured safely.',
       },
     ));
-    return EXIT_CODES.validationFailed;
+    return outcome.exitCode;
   }
-
-  try {
-    const result = await dependencies.preflight(doctorInput(
-      project,
-      sourceBytes,
-      dependencies,
-    ));
-    dependencies.stdout.write(options.json === true
-      ? formatDoctorJson(projectId, result)
-      : formatDoctorTable(projectId, result));
-    return aggregateChecks(result.checks) === 'failed'
-      ? EXIT_CODES.environmentFailed
-      : EXIT_CODES.success;
-  } catch {
-    dependencies.stdout.write(formatDoctorFailure(projectId, options.json === true));
-    return EXIT_CODES.environmentFailed;
-  }
+  dependencies.stdout.write(formatDoctorFailure(projectId, options.json === true));
+  return outcome.kind === 'failure'
+    ? outcome.exitCode
+    : EXIT_CODES.environmentFailed;
 };
+
+const pipelineOptions = (options: PipelineCommandOptions): PipelineCommandOptions => ({
+  ...(options.preset === undefined ? {} : {preset: options.preset}),
+  ...(options.plan === undefined ? {} : {plan: options.plan}),
+  ...(options.from === undefined ? {} : {from: options.from}),
+  ...(options.to === undefined ? {} : {to: options.to}),
+  ...(options.resume === undefined ? {} : {resume: options.resume}),
+  ...(options.force === undefined ? {} : {force: options.force}),
+  ...(options.json === undefined ? {} : {json: options.json}),
+});
 
 export async function runVideoctl(
   argv: readonly string[],
@@ -140,6 +132,7 @@ export async function runVideoctl(
       writeOut: (value) => { dependencies.stdout.write(value); },
       writeErr: (value) => { dependencies.stderr.write(value); },
     });
+
   command
     .command('doctor')
     .description('Check the local video pipeline environment')
@@ -149,14 +142,101 @@ export async function runVideoctl(
       exitCode = await runDoctor(project, options, dependencies);
     });
   command
+    .command('ingest')
+    .description('Ingest project source assets')
+    .argument('<project>')
+    .option('--json', 'print machine-readable JSON')
+    .action(async (project: string, options: {json?: boolean}) => {
+      exitCode = await runPipelineCommand(project, {
+        preset: 'assets',
+        to: 'ingest',
+        ...(options.json === undefined ? {} : {json: options.json}),
+      }, dependencies);
+    });
+  command
+    .command('run')
+    .description('Run the one-path draft pipeline')
+    .argument('<project>')
+    .addOption(new Option('--to <stage>').choices(['narration']).makeOptionMandatory())
+    .option('--json', 'print machine-readable JSON')
+    .action(async (project: string, options: {to: 'narration'; json?: boolean}) => {
+      exitCode = await runPipelineCommand(project, {
+        preset: 'draft',
+        to: options.to,
+        ...(options.json === undefined ? {} : {json: options.json}),
+      }, dependencies);
+    });
+  command
+    .command('compile')
+    .description('Compile project media')
+    .argument('<project>')
+    .option('--json', 'print machine-readable JSON')
+    .action(async (project: string, options: {json?: boolean}) => {
+      exitCode = await runPipelineCommand(project, {
+        preset: 'draft',
+        to: 'compile',
+        ...(options.json === undefined ? {} : {json: options.json}),
+      }, dependencies);
+    });
+  command
+    .command('pipeline')
+    .description('Plan or execute a pipeline range')
+    .argument('<project>')
+    .addOption(new Option('--preset <preset>').choices(['assets', 'draft', 'release']))
+    .option('--plan', 'print the execution plan without running')
+    .option('--from <stage>', 'start at a stable Stage ID')
+    .option('--to <stage>', 'stop at a stable Stage ID')
+    .option('--resume', 'resume the current Run')
+    .option('--force <stage>', 'force a Stage inside the selected range')
+    .option('--json', 'print machine-readable JSON')
+    .action(async (project: string, options: PipelineCommandOptions) => {
+      exitCode = await runPipelineCommand(
+        project,
+        pipelineOptions(options),
+        dependencies,
+      );
+    });
+  command
     .command('review')
-    .description('Approve the current draft review for a project')
+    .description('Approve or reject the current draft review')
     .argument('<project>')
     .option('--approve', 'approve the current draft')
-    .requiredOption('--reason <text>', 'approval reason')
-    .option('--reviewer <name>', 'reviewer identity')
+    .option('--reject', 'reject the current draft')
+    .requiredOption('--reason <text>', 'review reason')
     .action(async (project: string, options: ReviewCommandOptions) => {
       exitCode = await runReviewCommand(project, options, dependencies);
+    });
+  command
+    .command('release')
+    .description('Run the complete release pipeline')
+    .argument('<project>')
+    .option('--json', 'print machine-readable JSON')
+    .action(async (project: string, options: {json?: boolean}) => {
+      exitCode = await runPipelineCommand(project, {
+        preset: 'release',
+        ...(options.json === undefined ? {} : {json: options.json}),
+      }, dependencies);
+    });
+  command
+    .command('report')
+    .description('Read the current pipeline report')
+    .argument('<project>')
+    .option('--json', 'print machine-readable JSON')
+    .action(async (project: string, options: ReportCommandOptions) => {
+      exitCode = await runReportCommand(project, options, dependencies);
+    });
+  command
+    .command('clean')
+    .description('Remove non-current pipeline Runs and Releases')
+    .argument('<project>')
+    .action(async (project: string) => {
+      exitCode = await runCleanCommand(project, {
+        workspaceRoot: dependencies.workspaceRoot,
+        stdout: dependencies.stdout,
+        stderr: dependencies.stderr,
+        buildCleanupPlan: dependencies.buildCleanupPlan ?? buildCleanupPlan,
+        executeCleanupPlan: dependencies.executeCleanupPlan ?? executeCleanupPlan,
+      });
     });
 
   try {
@@ -180,20 +260,46 @@ export interface SystemVideoctlOptions {
 export const createSystemVideoctlDependencies = (
   options: SystemVideoctlOptions = {},
 ): VideoctlDependencies => {
-  const preflightDependencies = createSystemPreflightDependencies();
-  const sourceCatalog = options.sourceCatalog
+  const workspaceRoot = process.cwd();
+  const sourceCatalogDependencies = options.sourceCatalog
     ?? createSystemSourceCatalogDependencies();
-  const ffmpegExecutable = process.env.FFMPEG_PATH;
-  const ffprobeExecutable = process.env.FFPROBE_PATH;
+  const runStore = createRunStore(workspaceRoot);
+  const outputStore = createOutputStore(workspaceRoot);
+  const reportStore = createStageReportStore();
+  const buildPlan = async (
+    project: Awaited<ReturnType<typeof loadProject>>,
+    sourceCatalog: Awaited<ReturnType<typeof discoverProjectSourceCatalog>>,
+    request: ExecutionPlanRequest,
+  ) => await buildExecutionPlan({
+    project,
+    sourceCatalog,
+    registry: MVP_STAGES,
+    runStore,
+    outputStore,
+    reportStore,
+    createRunId,
+  }, request);
   return {
-    workspaceRoot: process.cwd(),
+    workspaceRoot,
     stdout: process.stdout,
     stderr: process.stderr,
     loadProject,
-    sourceCatalog,
-    preflight: async (input) => runPreflight(input, preflightDependencies),
-    ...(ffmpegExecutable === undefined ? {} : {ffmpegExecutable}),
-    ...(ffprobeExecutable === undefined ? {} : {ffprobeExecutable}),
+    discoverProjectSourceCatalog: async (project) => (
+      await discoverProjectSourceCatalog(project, sourceCatalogDependencies)
+    ),
+    buildExecutionPlan: buildPlan,
+    runExecutionPlan: async (input) => await runExecutionPlan(input, {
+      registry: MVP_STAGES,
+      runStore,
+      outputStore,
+      reportStore,
+      acquireProjectLock,
+      createRunId,
+      now: () => new Date().toISOString(),
+    }),
+    installPipelineSignalHandlers,
+    buildCleanupPlan,
+    executeCleanupPlan,
   };
 };
 
@@ -205,7 +311,7 @@ if (directlyExecuted) {
     process.argv.slice(2),
     createSystemVideoctlDependencies(),
   ).then(
-    (exitCode) => { process.exitCode = exitCode; },
+    (code) => { process.exitCode = code; },
     () => {
       process.stderr.write('videoctl failed unexpectedly.\n');
       process.exitCode = EXIT_CODES.environmentFailed;

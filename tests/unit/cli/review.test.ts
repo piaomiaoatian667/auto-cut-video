@@ -177,11 +177,13 @@ const makeFixture = async () => {
     stdout: {write: (chunk) => { stdout += chunk; }},
     stderr: {write: (chunk) => { stderr += chunk; }},
     loadProject: vi.fn(async () => projectInputs),
-    sourceCatalog: {
-      listSourceFiles: vi.fn(async () => []),
-      hashProjectFile: vi.fn(async () => 'sha256:not-used'),
-    },
-    preflight: vi.fn(async () => { throw new Error('unused'); }),
+    discoverProjectSourceCatalog: vi.fn(async () => { throw new Error('unused'); }),
+    buildExecutionPlan: vi.fn(async () => { throw new Error('unused'); }),
+    runExecutionPlan: vi.fn(async () => { throw new Error('unused'); }),
+    installPipelineSignalHandlers: vi.fn(() => ({
+      signal: new AbortController().signal,
+      dispose: vi.fn(),
+    })),
   };
   return {
     workspaceRoot,
@@ -242,7 +244,7 @@ describe('videoctl review', () => {
     const beforePointer = await createRunStore(fixture.workspaceRoot).readCurrent('demo');
 
     const exitCode = await runVideoctl([
-      'review', 'demo', '--approve', '--reason', 'looks good', '--reviewer', 'tester',
+      'review', 'demo', '--approve', '--reason', 'looks good',
     ], fixture.dependencies);
 
     expect(exitCode).toBe(EXIT_CODES.success);
@@ -253,7 +255,7 @@ describe('videoctl review', () => {
       projectId: 'demo',
       runId: 'run-review',
       status: 'approved',
-      reviewer: 'tester',
+      reviewer: process.env.USER ?? 'unknown',
       reason: 'looks good',
       evidencePaths: ['draft/draft.mp4', 'draft/contact-sheet.jpg', 'draft/frames/frame-000000.jpg'],
     });
@@ -276,7 +278,7 @@ describe('videoctl review', () => {
           projectId: 'demo',
           runId: fixture.runId,
           status: 'approved',
-          reviewer: 'tester',
+          reviewer: process.env.USER ?? 'unknown',
           reason: 'looks good',
         },
       },
@@ -693,17 +695,39 @@ describe('videoctl review', () => {
     expect(fixture.stderr()).toBe('Choose exactly one of --approve or --reject.\n');
   });
 
-  it('returns a stable validation failure for rejection', async () => {
+  it('records a rejection under the project lock and leaves review pending', async () => {
     const fixture = await makeFixture();
 
-    const exitCode = await runReviewCommand(
-      'demo',
-      {reject: true, reason: 'needs changes'},
-      fixture.dependencies,
-    );
+    const exitCode = await runVideoctl([
+      'review', 'demo', '--reject', '--reason', 'needs changes',
+    ], fixture.dependencies);
 
-    expect(exitCode).toBe(EXIT_CODES.validationFailed);
-    expect(fixture.stderr()).toBe('Review rejection is not supported in MVP.\n');
+    expect(exitCode).toBe(EXIT_CODES.success);
+    expect(fixture.stdout()).toBe('Review rejected: run-review\n');
+    expect(fixture.stderr()).toBe('');
+    expect(await readRunJson(
+      fixture.workspaceRoot,
+      fixture.runId,
+      'review.json',
+    )).toMatchObject({
+      version: 1,
+      projectId: 'demo',
+      runId: fixture.runId,
+      status: 'rejected',
+      reviewer: process.env.USER ?? 'unknown',
+      reason: 'needs changes',
+      evidencePaths: fixture.evidence.map((artifact) => artifact.path),
+    });
+    await expect(createRunStore(fixture.workspaceRoot).readCurrentReadonly('demo'))
+      .resolves.toMatchObject({state: 'needs_review'});
+    const runDirectory = await createRunStore(fixture.workspaceRoot)
+      .openExistingRun('demo', fixture.runId);
+    await expect(createStageReportStore().readStage(runDirectory, 'review'))
+      .resolves.toBeNull();
+    await expect(readFile(
+      path.join(fixture.workspaceRoot, '.work', 'demo', 'pipeline.lock'),
+      'utf8',
+    )).rejects.toMatchObject({code: 'ENOENT'});
   });
 
   it('refuses approval unless the current pointer is needs_review', async () => {
@@ -798,7 +822,7 @@ describe('videoctl review', () => {
     await mutateEvidence(fixture);
 
     const exitCode = await runVideoctl([
-      'review', 'demo', '--approve', '--reason', 'looks good', '--reviewer', 'tester',
+      'review', 'demo', '--approve', '--reason', 'looks good',
     ], fixture.dependencies);
 
     expect(exitCode).toBe(EXIT_CODES.validationFailed);
