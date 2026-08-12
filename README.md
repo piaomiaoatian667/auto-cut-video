@@ -39,6 +39,8 @@ export FFPROBE_PATH=/absolute/path/to/ffprobe
 The repository intentionally does not commit `projects/demo/assets/source`. The safest runnable fixture is a temporary workspace created by the existing test helper; it copies the real demo authoring files and pinned font, then generates `camera-a.mp4`, `camera-b.mp4`, `cover.png`, and `music-main.wav` with local FFmpeg. No network access is used.
 
 ```bash
+set -euo pipefail
+
 export AGENT_VIDEO_REPO="$(pwd)"
 export FFMPEG_PATH="${FFMPEG_PATH:-$(command -v ffmpeg)}"
 export FFPROBE_PATH="${FFPROBE_PATH:-$(command -v ffprobe)}"
@@ -75,14 +77,37 @@ videoctl() {
 }
 ```
 
-The `videoctl` shell function above executes the current checkout's real `src/cli/videoctl.ts` while using the temporary directory as its workspace root. It is equivalent to the repository's `pnpm video` script without writing demo sources into the checkout.
+The `videoctl` shell function above executes the current checkout's real `src/cli/videoctl.ts` while using the temporary directory as its workspace root. It is equivalent to the repository's `pnpm video` script without writing demo sources into the checkout. The helper-generated source media exists only inside the OS temporary fixture; it is not an Agent edit of the checkout's `projects/demo/assets/source`.
 
 Remove the temporary fixture through Node's filesystem API when finished:
 
 ```bash
+set -euo pipefail
+
 SMOKE_ROOT="$AGENT_VIDEO_SMOKE_ROOT" node --input-type=module -e '
-  import {rm} from "node:fs/promises";
-  await rm(process.env.SMOKE_ROOT, {recursive: true, force: true});
+  import {lstat, realpath, rm} from "node:fs/promises";
+  import {tmpdir} from "node:os";
+  import path from "node:path";
+
+  const configured = process.env.SMOKE_ROOT;
+  if (!configured) throw new Error("SMOKE_ROOT is required.");
+
+  const [fixtureRoot, temporaryRoot] = await Promise.all([
+    realpath(path.resolve(configured)),
+    realpath(path.resolve(tmpdir())),
+  ]);
+  const fixturePrefix = "agent-video-demo-e2e-";
+  if (
+    path.dirname(fixtureRoot) !== temporaryRoot
+    || !path.basename(fixtureRoot).startsWith(fixturePrefix)
+  ) {
+    throw new Error(`Refusing to remove unsafe fixture path: ${fixtureRoot}`);
+  }
+  if (!(await lstat(fixtureRoot)).isDirectory()) {
+    throw new Error(`Fixture path is not a directory: ${fixtureRoot}`);
+  }
+
+  await rm(fixtureRoot, {recursive: true, force: false});
 '
 unset AGENT_VIDEO_SMOKE_ROOT BROWSER_INFO
 ```
@@ -104,6 +129,8 @@ Only these three JSON files are editable sources of truth:
 | `projects/<project>/edit.json` | Visual EDL, registered overlays, and optional background music. Timeline positions/durations use integer frames; video source trims and BGM offsets use milliseconds. |
 
 Referenced visual and BGM `assetId` values resolve recursively under `projects/<project>/assets/source` by **filename stem after removing only the final extension**. For example, `assetId: "camera-a"` may resolve to `assets/source/camera-a.mp4`. Every referenced stem must match exactly one regular file across the entire source tree; missing stems, duplicate stems such as `camera-a.mp4` plus `archive/camera-a.mov`, symlinks, or files that change during measurement fail validation.
+
+For authored projects, adding, renaming, or deleting source files is a manual project-owner operation. Agents must report the required correction and wait for the owner; `AGENTS.md` prohibits Agents from modifying any `projects/*/assets/source` path.
 
 Manifests, compiled timelines, Stage reports, Run artifacts, drafts, and Releases are generated outputs and must not be hand-edited.
 
@@ -164,7 +191,7 @@ All convenience commands map through the same Execution Plan builder and Runner:
 
 - `--plan` prints the validated plan and exits 0 without locks, directory creation, writes, subprocesses, TTS, FFmpeg/ffprobe, `qt-faststart`, or Remotion. It may read and hash authoring/source inputs plus existing reports and pointers.
 - `--from <stage>` and `--to <stage>` select an inclusive, registry-ordered range inside the chosen Preset. Every omitted prerequisite before `--from` must already exist in the current Run with matching fingerprints and verified artifacts; execution still performs runtime Preflight revalidation.
-- `--resume` reuses the current `runId` only when the persisted Stage sequence, completed prefix, fingerprints, artifacts, and Review identity are compatible. With no compatible current Run, planning creates a new immutable Run.
+- `--resume` reuses the current `runId` only when the persisted Stage sequence, completed prefix, fingerprints, artifacts, and Review identity are compatible. With no compatible current Run, planning selects `runMode: "new"`; the Run is created only when that executable plan runs successfully through Preflight.
 - `--force <stage>` must name a Stage inside the selected range. It invalidates that Stage and every selected downstream Stage while preserving matching reusable predecessors.
 - `--json` writes deterministic machine-readable output to stdout. Text-mode failures are sanitized before stderr output.
 
@@ -236,9 +263,7 @@ Source-video audio is always muted in the MVP: each Remotion `OffthreadVideo` is
 | Code or family | Recovery |
 | --- | --- |
 | `PROJECT_LOAD_FAILED`, `PROJECT_ID_MISMATCH` | Fix strict `project.json`, `script.json`, and `edit.json` schema/cross-file errors; keep the directory name and `project.id` aligned. |
-| `PROJECT_SOURCE_MISSING` | Add the locally provisioned regular source file whose final-extension stem matches the referenced `assetId`. |
-| `PROJECT_SOURCE_AMBIGUOUS` | Rename/remove duplicate stems so the referenced `assetId` resolves to exactly one file across the source tree. |
-| `PROJECT_SOURCE_INVALID` | Remove symlinks/unsafe entries, restore stable regular files, and rerun `doctor`; do not bypass source measurement. |
+| `PROJECT_SOURCE_INVALID` | Public CLI code for every source-discovery validation failure. The project owner must inspect the source condition and act manually: for a missing stem, add the required local regular file; for an ambiguous stem, rename or delete the conflicting file; for an invalid source, check file type, project-relative path, symlinks, and whether the file changed during measurement. Agents report the condition but must not modify source files. |
 | `ENV_PLATFORM_UNSUPPORTED` | Run on Apple Silicon macOS 15+ with the supported Node runtime. |
 | `ENV_TOOL_MISSING`, `ENV_CAPABILITY_MISSING`, `ENV_TOOL_CHANGED` | Restore executable local FFmpeg/ffprobe plus sibling `qt-faststart`, required encoders/filters, then rerun `pnpm video doctor <project> --json`. |
 | `ENV_FONT_MISSING`, `ENV_FONT_INVALID`, `ENV_VOICE_MISSING` | Restore the configured local font or voice/file-TTS inputs; do not fetch them during render. |
@@ -266,12 +291,19 @@ Without `RUN_SYSTEM_TTS_TESTS`, the macOS system-TTS integration is the only int
 After running the temporary fixture setup above, execute the real CLI through the `videoctl` function:
 
 ```bash
+set -euo pipefail
+
 videoctl doctor demo --json
 videoctl pipeline demo --preset release --plan --json
 videoctl pipeline demo --preset assets --resume --json
 videoctl pipeline demo --preset draft --resume --json
+
+set +e
 videoctl pipeline demo --preset release --resume --json
-test "$?" -eq 2
+review_gate_status=$?
+set -e
+test "$review_gate_status" -eq 2
+
 videoctl review demo --approve --reason "acceptance review"
 videoctl pipeline demo --preset release --resume --json
 videoctl report demo --json
