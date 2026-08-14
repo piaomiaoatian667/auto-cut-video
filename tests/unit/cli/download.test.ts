@@ -177,8 +177,15 @@ describe('videoctl download', () => {
     );
 
     expect(exitCode).toBe(EXIT_CODES.success);
-    expect(run.stdout()).toContain('--browser-cookies <browser>');
-    expect(run.stdout()).toContain('--cookie-access-confirmed');
+    const help = run.stdout().replace(/\s+/g, ' ');
+    expect(help).toContain('--browser-cookies <browser>');
+    expect(help).toContain(
+      'exact lowercase chrome for authorized public Douyin only; requires --cookie-access-confirmed',
+    );
+    expect(help).toContain('--cookie-access-confirmed');
+    expect(help).toContain(
+      'required with --browser-cookies; confirms local Chrome cookie access',
+    );
     expect(run.stderr()).toBe('');
   });
 

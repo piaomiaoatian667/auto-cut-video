@@ -22,14 +22,18 @@ and analysis.
 ```sh
 brew install ffmpeg yt-dlp
 pnpm install
-pnpm video download "<authorized-public-video-url>" --rights-confirmed
-pnpm video download "<authorized-public-video-url>" --rights-confirmed --json
+pnpm video download "<AUTHORIZED_PUBLIC_VIDEO_URL>" --rights-confirmed
+pnpm --silent video download "<AUTHORIZED_PUBLIC_VIDEO_URL>" \
+  --rights-confirmed \
+  --json
 ```
 
 The download command accepts one HTTPS video URL. Use
 `--output <directory>` to select a workspace-relative archive root; the default
-is `downloads`. Use `--json` for a single machine-readable result document.
-These commands use anonymous mode, which remains the default.
+is `downloads`. For machine-parseable stdout, use the
+`pnpm --silent video ... --json` form shown above. `--silent` suppresses pnpm's
+script banner and wrapper noise, while the CLI itself emits exactly one JSON
+document. These commands use anonymous mode, which remains the default.
 
 The downloader ignores ambient `yt-dlp` configuration, forces an empty proxy,
 and disables geo-bypass. These controls keep the operation explicit and do not
@@ -37,12 +41,12 @@ provide region or access-control circumvention.
 
 ## Cookie-assisted Douyin flow
 
-Use this non-interactive flow only for a public Douyin video that you are
-authorized to access, for local learning and analysis:
+Use this non-interactive flow only for a public Douyin video that you own or are
+explicitly authorized to save or download, for local learning and analysis:
 
 ```sh
 pnpm video download \
-  "https://www.douyin.com/jingxuan?modal_id=7654841525762919726" \
+  "<AUTHORIZED_DOUYIN_VIDEO_URL>" \
   --rights-confirmed \
   --browser-cookies chrome \
   --cookie-access-confirmed
@@ -53,11 +57,16 @@ exact lowercase value `chrome`, and Cookie mode is Douyin-only. The command
 does not prompt for missing confirmation or automatically retry an anonymous
 request with browser access.
 
-`yt-dlp` reads the local Chrome cookie store directly. The application does not
-export, store, or print Cookie values; the receipt's `browserCookies` audit
-field records only `"used": true` and `"source": "chrome"`. On macOS, the
-operating system may request Keychain or local Chrome cookie access. Denial
-fails safely, with no fallback or prompting loop.
+The application accepts no cookie-file or browser-profile syntax. It passes the
+exact `--cookies-from-browser chrome` selection to `yt-dlp`, exports no cookie
+material, and does not retain or print Cookie values. The receipt's
+`browserCookies` audit field records only `"used": true` and `"source":
+"chrome"`.
+
+`yt-dlp` controls Chrome profile discovery, temporary browser-database handling
+or copying, and operating-system decryption or Keychain access. Do not add
+profile syntax or guess profiles. On macOS, access denial fails safely, with no
+fallback or prompting loop.
 
 ## Archive layout
 

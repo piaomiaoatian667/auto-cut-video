@@ -536,8 +536,14 @@ export async function runVideoctl(
     .argument('<url>')
     .option('--rights-confirmed', 'confirm permission to save this public video')
     .option('--output <directory>', 'workspace-relative archive directory', 'downloads')
-    .option('--browser-cookies <browser>', 'read browser cookies; supported value: chrome')
-    .option('--cookie-access-confirmed', 'confirm access to the local Chrome cookie store')
+    .option(
+      '--browser-cookies <browser>',
+      'exact lowercase chrome for authorized public Douyin only; requires --cookie-access-confirmed',
+    )
+    .option(
+      '--cookie-access-confirmed',
+      'required with --browser-cookies; confirms local Chrome cookie access',
+    )
     .option('--json', 'print machine-readable JSON')
     .action(async (url: string, options: DownloadCommandOptions) => {
       exitCode = await runDownloadCommand(url, options, dependencies);
