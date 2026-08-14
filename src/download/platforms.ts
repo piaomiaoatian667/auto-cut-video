@@ -68,10 +68,12 @@ export const parseDownloadUrl = (source: string): ValidatedDownloadUrl => {
     throw new DownloadError('DOWNLOAD_HOST_UNSUPPORTED', 'The video host is not supported.');
   }
   if (platform === 'douyin' && parsed.pathname === '/jingxuan') {
-    const modalMatch = strictDouyinModalQuery.exec(parsed.search);
+    const rawQueryStart = source.indexOf('?');
+    const rawQuery = rawQueryStart === -1 ? '' : source.slice(rawQueryStart);
+    const modalMatch = strictDouyinModalQuery.exec(rawQuery);
     const modalId = modalMatch?.[1];
     if (
-      parsed.href.includes('#')
+      source.includes('#')
       || modalId === undefined
       || modalId === '.'
       || modalId === '..'

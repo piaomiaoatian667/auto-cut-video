@@ -119,6 +119,17 @@ describe('download platforms', () => {
   });
 
   it.each([
+    ['tab in parameter name', 'https://www.douyin.com/jingxuan?modal_\tid=abc'],
+    ['newline in parameter name', 'https://www.douyin.com/jingxuan?modal_\nid=abc'],
+    ['carriage return in parameter name', 'https://www.douyin.com/jingxuan?modal_\rid=abc'],
+    ['tab in modal ID', 'https://www.douyin.com/jingxuan?modal_id=a\tbc'],
+    ['newline in modal ID', 'https://www.douyin.com/jingxuan?modal_id=a\nbc'],
+    ['carriage return in modal ID', 'https://www.douyin.com/jingxuan?modal_id=a\rbc'],
+  ])('rejects raw control characters: %s', (_caseName, source) => {
+    expectDownloadError(() => parseDownloadUrl(source), 'DOWNLOAD_URL_INVALID');
+  });
+
+  it.each([
     ['Youtube', 'youtube'],
     ['youtube:tab', 'youtube'],
     ['BiliBiliBangumi', 'bilibili'],
