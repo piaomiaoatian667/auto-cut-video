@@ -12,7 +12,10 @@ import {
   type StagedArchive,
   type ValidatedArchiveRoot,
 } from './archive';
-import type {BrowserCookieSource} from './browser-cookies';
+import {
+  validateBrowserCookieRequest,
+  type BrowserCookieSource,
+} from './browser-cookies';
 import {DownloadError} from './errors';
 import {
   assertExtractorMatches,
@@ -27,6 +30,12 @@ import {
 
 const EXTRACTOR_MISMATCH_MESSAGE =
   'The resolved video platform did not match the requested platform.';
+const RESTRICTED_AVAILABILITY = new Set([
+  'private',
+  'premium_only',
+  'subscriber_only',
+  'needs_auth',
+]);
 
 export interface DownloadInput {
   workspaceRoot: string;
@@ -34,9 +43,17 @@ export interface DownloadInput {
   outputRoot: string;
   rightsConfirmed: boolean;
   browserCookieSource?: BrowserCookieSource;
-  cookieAccessConfirmed?: boolean;
+  cookieAccessConfirmed: boolean;
   signal?: AbortSignal;
 }
+
+type AnonymousDownloadInput = Omit<
+  DownloadInput,
+  'browserCookieSource' | 'cookieAccessConfirmed'
+> & {
+  browserCookieSource?: never;
+  cookieAccessConfirmed?: never;
+};
 
 export type DownloadResult = DownloadedArchive | ExistingArchive;
 
@@ -67,9 +84,13 @@ export interface DownloadDependencies {
 }
 
 export const downloadVideo = async (
-  input: DownloadInput,
+  receivedInput: DownloadInput | AnonymousDownloadInput,
   dependencies: DownloadDependencies,
 ): Promise<DownloadResult> => {
+  const input: DownloadInput = receivedInput.cookieAccessConfirmed === undefined
+    ? {...receivedInput, cookieAccessConfirmed: false}
+    : receivedInput;
+
   if (!input.rightsConfirmed) {
     throw new DownloadError(
       'DOWNLOAD_RIGHTS_NOT_CONFIRMED',
@@ -78,6 +99,18 @@ export const downloadVideo = async (
   }
 
   const requested = parseDownloadUrl(input.url);
+  const browserCookieSource = validateBrowserCookieRequest(
+    input.browserCookieSource,
+    input.cookieAccessConfirmed,
+    requested.platform,
+  );
+  const operationOptions =
+    browserCookieSource === undefined && input.signal === undefined
+      ? undefined
+      : Object.freeze({
+          ...(browserCookieSource === undefined ? {} : {browserCookieSource}),
+          ...(input.signal === undefined ? {} : {signal: input.signal}),
+        });
   const root = await dependencies.archive.validateRoot(
     input.workspaceRoot,
     input.outputRoot,
@@ -85,11 +118,18 @@ export const downloadVideo = async (
   const tools = input.signal === undefined
     ? await dependencies.client.checkTools()
     : await dependencies.client.checkTools(input.signal);
-  const operationOptions = input.signal === undefined
-    ? undefined
-    : Object.freeze({signal: input.signal});
   const probe = await dependencies.client.probe(requested.url, operationOptions);
   assertExtractorMatches(requested.platform, probe.extractor);
+  if (
+    probe.availability !== null &&
+    probe.availability !== undefined &&
+    RESTRICTED_AVAILABILITY.has(probe.availability)
+  ) {
+    throw new DownloadError(
+      'DOWNLOAD_CONTENT_RESTRICTED',
+      'The requested video is not available as authorized public content.',
+    );
+  }
 
   let canonical: ReturnType<typeof parseDownloadUrl>;
   try {
@@ -142,6 +182,7 @@ export const downloadVideo = async (
       canonicalUrl: canonical.url,
       downloadedAt: dependencies.now(),
       tools,
+      ...(browserCookieSource === undefined ? {} : {browserCookieSource}),
     });
   } catch (error) {
     try {

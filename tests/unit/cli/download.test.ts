@@ -296,6 +296,20 @@ describe('videoctl download', () => {
     {code: 'DOWNLOAD_URL_INVALID', message: 'The video URL is invalid.'},
     {code: 'DOWNLOAD_HOST_UNSUPPORTED', message: 'The video host is not supported.'},
     {code: 'DOWNLOAD_OUTPUT_INVALID', message: 'The output directory is invalid.'},
+    {
+      code: 'DOWNLOAD_COOKIE_OPTIONS_INVALID',
+      message:
+        'Chrome cookie access requires both browser selection and explicit confirmation.',
+    },
+    {
+      code: 'DOWNLOAD_COOKIE_HOST_UNSUPPORTED',
+      message: 'Browser cookie access is supported only for Douyin downloads.',
+    },
+    {
+      code: 'DOWNLOAD_CONTENT_RESTRICTED',
+      message:
+        'The requested video is not available as authorized public content.',
+    },
   ])('maps $code to invalid input', async ({code, message}) => {
     const run = fixture(async () => { throw new DownloadError(code, message); });
 

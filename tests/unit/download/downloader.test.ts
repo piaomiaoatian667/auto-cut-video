@@ -107,6 +107,7 @@ const INPUT: DownloadInput = {
   url: 'https://YOUTU.BE:443/video-123#tracking',
   outputRoot: 'downloads',
   rightsConfirmed: true,
+  cookieAccessConfirmed: false,
 };
 
 interface HarnessOptions {
@@ -306,6 +307,138 @@ describe('downloadVideo', () => {
     expect(harness.validateRoot).not.toHaveBeenCalled();
     expect(harness.checkTools).not.toHaveBeenCalled();
     expect(harness.probe).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{browserCookieSource: 'chrome' as const, cookieAccessConfirmed: false},
+      'DOWNLOAD_COOKIE_OPTIONS_INVALID'],
+    [{cookieAccessConfirmed: true}, 'DOWNLOAD_COOKIE_OPTIONS_INVALID'],
+  ] as const)('rejects mismatched Cookie acknowledgement before archive access', async (
+    overrides,
+    code,
+  ) => {
+    const harness = makeHarness();
+    const error = await captureRejection(downloadVideo({
+      ...INPUT,
+      url: 'https://www.douyin.com/video/7654841525762919726',
+      ...overrides,
+    }, harness.dependencies));
+
+    expect(error).toMatchObject({code});
+    expect(harness.calls).toEqual([]);
+  });
+
+  it('rejects Chrome Cookie mode for non-Douyin before archive access', async () => {
+    const harness = makeHarness();
+    const error = await captureRejection(downloadVideo({
+      ...INPUT,
+      browserCookieSource: 'chrome',
+      cookieAccessConfirmed: true,
+    }, harness.dependencies));
+
+    expect(error).toMatchObject({code: 'DOWNLOAD_COOKIE_HOST_UNSUPPORTED'});
+    expect(harness.calls).toEqual([]);
+  });
+
+  it.each(['private', 'premium_only', 'subscriber_only', 'needs_auth'])(
+    'rejects restricted availability %s before staging',
+    async (availability) => {
+      const harness = makeHarness({
+        probe: {
+          id: '7654841525762919726',
+          title: 'Restricted fixture',
+          canonicalUrl: 'https://www.douyin.com/video/7654841525762919726',
+          extractor: 'Douyin',
+          availability,
+        },
+      });
+
+      const error = await captureRejection(downloadVideo({
+        ...INPUT,
+        url: 'https://www.douyin.com/jingxuan?modal_id=7654841525762919726',
+        browserCookieSource: 'chrome',
+        cookieAccessConfirmed: true,
+      }, harness.dependencies));
+
+      expect(error).toMatchObject({
+        code: 'DOWNLOAD_CONTENT_RESTRICTED',
+        message:
+          'The requested video is not available as authorized public content.',
+      });
+      expect(harness.calls).toEqual(['validateRoot', 'checkTools', 'probe']);
+      expect(harness.prepare).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not retry an anonymous probe with browser cookies', async () => {
+    const probeFailure = new DownloadError(
+      'DOWNLOAD_PROBE_FAILED',
+      'Video metadata could not be extracted.',
+    );
+    const harness = makeHarness({probePromise: Promise.reject(probeFailure)});
+    const anonymousInput = {
+      ...INPUT,
+      url: 'https://youtu.be/video-123',
+    };
+
+    const error = await captureRejection(downloadVideo(
+      anonymousInput,
+      harness.dependencies,
+    ));
+
+    expect(error).toBe(probeFailure);
+    expect(harness.probe).toHaveBeenCalledTimes(1);
+    expect(harness.probe).toHaveBeenCalledWith(anonymousInput.url, undefined);
+    expect(harness.download).not.toHaveBeenCalled();
+  });
+
+  it('uses one Chrome Cookie mode for probe, download, and receipt finalization', async () => {
+    const douyinStaged: StagedArchive = {
+      ...STAGED,
+      platform: 'douyin',
+      videoId: '7654841525762919726',
+      finalDirectory: '/workspace/downloads/douyin/7654841525762919726',
+      relativeDirectory: 'downloads/douyin/7654841525762919726',
+    };
+    const harness = makeHarness({
+      probe: {
+        id: '7654841525762919726',
+        title: 'Public Douyin fixture',
+        canonicalUrl: 'https://www.douyin.com/video/7654841525762919726',
+        extractor: 'Douyin',
+      },
+      preparation: douyinStaged,
+    });
+
+    await downloadVideo({
+      ...INPUT,
+      url: 'https://www.douyin.com/jingxuan?modal_id=7654841525762919726',
+      browserCookieSource: 'chrome',
+      cookieAccessConfirmed: true,
+    }, harness.dependencies);
+
+    expect(harness.probe).toHaveBeenCalledWith(
+      'https://www.douyin.com/video/7654841525762919726',
+      {browserCookieSource: 'chrome'},
+    );
+    expect(harness.download).toHaveBeenCalledWith(
+      'https://www.douyin.com/video/7654841525762919726',
+      AUTHORITY_FD,
+      {browserCookieSource: 'chrome'},
+    );
+    const probeOperationOptions = harness.probe.mock.calls[0]?.[1];
+    const downloadOperationOptions = harness.download.mock.calls[0]?.[2];
+    expect(downloadOperationOptions).toBe(probeOperationOptions);
+    expect(Object.isFrozen(probeOperationOptions)).toBe(true);
+    expect(harness.finalize).toHaveBeenCalledWith(douyinStaged, {
+      platform: 'douyin',
+      videoId: '7654841525762919726',
+      title: 'Public Douyin fixture',
+      canonicalUrl: 'https://www.douyin.com/video/7654841525762919726',
+      downloadedAt: NOW,
+      tools: TOOLS,
+      browserCookieSource: 'chrome',
+    });
   });
 
   it('returns a verified existing archive without download or cleanup', async () => {
