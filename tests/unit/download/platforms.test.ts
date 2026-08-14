@@ -69,6 +69,25 @@ describe('download platforms', () => {
     expectDownloadError(() => parseDownloadUrl(source), code);
   });
 
+  it.each([
+    ['tab immediately before query', 'https://www.douyin.com/jingxuan\t?modal_id=abc'],
+    ['newline immediately before query', 'https://www.douyin.com/jingxuan\n?modal_id=abc'],
+    ['carriage return immediately before query', 'https://www.douyin.com/jingxuan\r?modal_id=abc'],
+    ['tab in host', 'https://www.douyin.\tcom/jingxuan?modal_id=abc'],
+    ['newline in host', 'https://www.douyin.\ncom/jingxuan?modal_id=abc'],
+    ['carriage return in host', 'https://www.douyin.\rcom/jingxuan?modal_id=abc'],
+    ['tab in path', 'https://www.douyin.com/jing\txuan?modal_id=abc'],
+    ['newline in path', 'https://www.douyin.com/jing\nxuan?modal_id=abc'],
+    ['carriage return in path', 'https://www.douyin.com/jing\rxuan?modal_id=abc'],
+  ])('rejects raw URL control characters: %s', (_caseName, source) => {
+    const error = expectDownloadError(
+      () => parseDownloadUrl(source),
+      'DOWNLOAD_URL_INVALID',
+    );
+    expect(error.message).toBe('The video URL is invalid.');
+    expect(error.cause).toBeUndefined();
+  });
+
   it('does not retain the raw source when URL parsing fails', () => {
     const marker = 'download-secret-marker';
     const error = expectDownloadError(

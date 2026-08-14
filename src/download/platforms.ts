@@ -30,6 +30,7 @@ const extractorPrefixes: ReadonlyArray<{
 ];
 
 const strictDouyinModalQuery = /^\?modal_id=([A-Za-z0-9._-]{1,512})$/u;
+const rawUrlControlCharacters = /[\t\n\r]/u;
 
 const matches = (hostname: string, suffix: string): boolean =>
   hostname === suffix || hostname.endsWith(`.${suffix}`);
@@ -48,6 +49,9 @@ export interface ValidatedDownloadUrl {
 }
 
 export const parseDownloadUrl = (source: string): ValidatedDownloadUrl => {
+  if (rawUrlControlCharacters.test(source)) {
+    throw new DownloadError('DOWNLOAD_URL_INVALID', 'The video URL is invalid.');
+  }
   let parsed: URL;
   try {
     parsed = new URL(source);

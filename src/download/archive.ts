@@ -28,6 +28,7 @@ import {
   type DownloadReceipt,
 } from './receipt-schema';
 import {
+  parseYtDlpInfo,
   SafeYtDlpMetadataSchema,
   type DownloadToolVersions,
   type SafeYtDlpMetadata,
@@ -85,6 +86,27 @@ const SAFE_METADATA_WORKER_LINES = [
   '    extractor: parsed.extractor,',
   '    ...(hasExtractorKey ? {extractor_key: parsed.extractor_key} : {}),',
   '    _type: "video",',
+  '  };',
+  '};',
+] as const;
+const LEGACY_METADATA_WORKER_LINES = [
+  'const projectLegacyMetadata = (parsed) => {',
+  '  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {',
+  '    throw new Error();',
+  '  }',
+  '  return {',
+  '    id: parsed.id,',
+  '    title: parsed.title,',
+  '    webpage_url: parsed.webpage_url,',
+  '    extractor: parsed.extractor,',
+  '    ...(parsed.extractor_key === undefined',
+  '      ? {} : {extractor_key: parsed.extractor_key}),',
+  '    ...(parsed._type === undefined ? {} : {_type: parsed._type}),',
+  '    ...(parsed.is_live === undefined ? {} : {is_live: parsed.is_live}),',
+  '    ...(parsed.live_status === undefined',
+  '      ? {} : {live_status: parsed.live_status}),',
+  '    ...(parsed.availability === undefined',
+  '      ? {} : {availability: parsed.availability}),',
   '  };',
   '};',
 ] as const;
@@ -426,7 +448,7 @@ const EXISTING_ARCHIVE_WORKER_SCRIPT = [
   '} = require("node:fs");',
   'const O_NOFOLLOW_ANY = 0x20000000;',
   'const readBuffer = Buffer.allocUnsafe(64 * 1024);',
-  ...SAFE_METADATA_WORKER_LINES,
+  ...LEGACY_METADATA_WORKER_LINES,
   'const sortedNames = () => readdirSync(".")',
   '  .sort((left, right) => left.localeCompare(right));',
   'const namesMatch = (actual, expected) =>',
@@ -528,11 +550,11 @@ const EXISTING_ARCHIVE_WORKER_SCRIPT = [
   '          !entryStillMatches(file.path, opened.stats)) {',
   '        throw new Error();',
   '      }',
-      '      if (metadataChunks !== null) {',
-      '        const parsed = JSON.parse(',
-      '          Buffer.concat(metadataChunks, file.bytes).toString("utf8"),',
-      '        );',
-      '        metadata = projectSafeMetadata(parsed);',
+  '      if (metadataChunks !== null) {',
+  '        const parsed = JSON.parse(',
+  '          Buffer.concat(metadataChunks, file.bytes).toString("utf8"),',
+  '        );',
+  '        metadata = projectLegacyMetadata(parsed);',
   '      }',
   '    } finally {',
   '      closeSync(opened.descriptor);',
@@ -1412,10 +1434,10 @@ const readExistingArchive = async (
     if (receipt.platform !== platform || receipt.videoId !== videoId) {
       throw new Error();
     }
-    const metadata = SafeYtDlpMetadataSchema.parse(parsedInspection.metadata);
+    const metadata = parseYtDlpInfo(parsedInspection.metadata);
     if (metadata.id !== receipt.videoId) throw new Error();
     assertExtractorMatches(receipt.platform, metadata.extractor);
-    const metadataCanonical = parseDownloadUrl(metadata.webpage_url);
+    const metadataCanonical = parseDownloadUrl(metadata.canonicalUrl);
     const receiptCanonical = parseDownloadUrl(receipt.canonicalUrl);
     if (
       metadataCanonical.platform !== receipt.platform ||

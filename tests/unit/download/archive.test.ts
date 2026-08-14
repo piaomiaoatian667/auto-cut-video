@@ -1906,48 +1906,91 @@ describe('prepareArchive duplicate verification', () => {
     expect(duplicate.receipt).toEqual(result.receipt);
   });
 
-  it('rejects oversized existing metadata with unexpected fields unchanged', async () => {
+  it('reuses a sealed legacy version 1 archive with extra metadata unchanged', async () => {
     const published = await publishArchive();
     const description = 'x'.repeat(PROCESS_OUTPUT_LIMIT_BYTES + 128 * 1024);
-    const oversized = await rewritePublishedMetadata(published, {description});
-
-    expect(Buffer.byteLength(oversized.metadataSource))
-      .toBeGreaterThan(PROCESS_OUTPUT_LIMIT_BYTES);
-    await expectDownloadError(
-      prepareArchive(published.root, 'youtube', 'abc'),
-      'DOWNLOAD_DESTINATION_CONFLICT',
-      DESTINATION_CONFLICT_MESSAGE,
-    );
-    expect(await readFile(
-      path.join(published.finalDirectory, 'video.info.json'),
-      'utf8',
-    )).toBe(oversized.metadataSource);
-    expect(await readFile(
-      path.join(published.finalDirectory, 'receipt.json'),
-      'utf8',
-    )).toBe(oversized.receiptSource);
-
-    const mismatched = await rewritePublishedMetadata(published, {
+    const legacy = await rewritePublishedMetadata(published, {
       description,
-      id: 'other',
+      format: 'legacy-format',
+      cookies: 'cookie-value-marker',
+      url: 'signed-url-marker',
+      filepath: '/private/profile-marker',
+      http_headers: {Authorization: 'header-marker'},
     });
-    const entriesBefore = sortNames(await readdir(published.finalDirectory));
-
-    await expectDownloadError(
-      prepareArchive(published.root, 'youtube', 'abc'),
-      'DOWNLOAD_DESTINATION_CONFLICT',
-      DESTINATION_CONFLICT_MESSAGE,
+    const expectedReceipt = DownloadReceiptSchema.parse(
+      JSON.parse(legacy.receiptSource),
     );
 
-    expect(sortNames(await readdir(published.finalDirectory))).toEqual(entriesBefore);
+    expect(Buffer.byteLength(legacy.metadataSource))
+      .toBeGreaterThan(PROCESS_OUTPUT_LIMIT_BYTES);
+    const duplicate = await prepareArchive(published.root, 'youtube', 'abc');
+
+    expect(duplicate).toMatchObject({
+      status: 'already-present',
+      platform: 'youtube',
+      videoId: 'abc',
+      receipt: expectedReceipt,
+    });
+    expect(JSON.stringify(duplicate)).not.toMatch(
+      /cookie-value-marker|signed-url-marker|profile-marker|header-marker/u,
+    );
     expect(await readFile(
       path.join(published.finalDirectory, 'video.info.json'),
       'utf8',
-    )).toBe(mismatched.metadataSource);
+    )).toBe(legacy.metadataSource);
     expect(await readFile(
       path.join(published.finalDirectory, 'receipt.json'),
       'utf8',
-    )).toBe(mismatched.receiptSource);
+    )).toBe(legacy.receiptSource);
+  });
+
+  it('reuses a sealed legacy version 2 archive with extra metadata unchanged', async () => {
+    const workspaceRoot = await createWorkspace();
+    const {root, prepared} = await prepareStaging(
+      workspaceRoot,
+      'downloads',
+      DOUYIN_VIDEO_ID,
+      'douyin',
+    );
+    await writeStagedFiles(prepared);
+    const result = await finalize(prepared, {browserCookieSource: 'chrome'});
+    const published: PublishedArchive = {
+      workspaceRoot,
+      root,
+      result,
+      finalDirectory: path.join(root.absolutePath, 'douyin', DOUYIN_VIDEO_ID),
+    };
+    const legacy = await rewritePublishedMetadata(published, {
+      availability: 'public',
+      description: 'legacy Douyin description',
+      cookies: 'cookie-value-marker',
+      url: 'signed-url-marker',
+      filepath: '/private/profile-marker',
+      http_headers: {Authorization: 'header-marker'},
+    });
+    const expectedReceipt = DownloadReceiptSchema.parse(
+      JSON.parse(legacy.receiptSource),
+    );
+
+    const duplicate = await prepareArchive(root, 'douyin', DOUYIN_VIDEO_ID);
+
+    expect(duplicate).toMatchObject({
+      status: 'already-present',
+      platform: 'douyin',
+      videoId: DOUYIN_VIDEO_ID,
+      receipt: expectedReceipt,
+    });
+    expect(JSON.stringify(duplicate)).not.toMatch(
+      /cookie-value-marker|signed-url-marker|profile-marker|header-marker/u,
+    );
+    expect(await readFile(
+      path.join(published.finalDirectory, 'video.info.json'),
+      'utf8',
+    )).toBe(legacy.metadataSource);
+    expect(await readFile(
+      path.join(published.finalDirectory, 'receipt.json'),
+      'utf8',
+    )).toBe(legacy.receiptSource);
   });
 
   it('accepts a valid archive with ordinary safe modes and no immutable flags', async () => {
@@ -2037,7 +2080,6 @@ describe('prepareArchive duplicate verification', () => {
     ['identifier mismatch', {id: 'other'}],
     ['extractor mismatch', {extractor: 'vimeo'}],
     ['canonical mismatch', {webpage_url: 'https://youtu.be/different'}],
-    ['unexpected extra field', {cookies: 'cookie-value-marker'}],
   ])('rejects fully rehashed forged existing metadata: %s', async (
     _caseName,
     replacement,
