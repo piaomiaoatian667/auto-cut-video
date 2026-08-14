@@ -2,6 +2,10 @@ import {EventEmitter} from 'node:events';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
 import {
+  runDownloadCommand,
+  type DownloadCommandOptions,
+} from '../../../src/cli/commands/download';
+import {
   createSystemVideoctlDependencies,
   runWithDownloadSignalHandlers,
   runVideoctl,
@@ -294,6 +298,76 @@ describe('videoctl download', () => {
       + 'Confirm that you are permitted to save this public video.\n',
     );
     expect(run.stdout()).toBe('');
+  });
+
+  it.each([
+    ['string', 'false'],
+    ['number', 1],
+    ['object', {confirmed: true}],
+    ['null', null],
+    ['array', [true]],
+  ])('rejects a runtime %s rights value before download', async (
+    _caseName,
+    rightsConfirmed,
+  ) => {
+    const run = fixture();
+    const expected = {
+      command: 'download',
+      ok: false,
+      code: 'DOWNLOAD_RIGHTS_NOT_CONFIRMED',
+      message: 'Confirm that you are permitted to save this public video.',
+    };
+
+    const exitCode = await runDownloadCommand(
+      inputUrl,
+      {
+        rightsConfirmed,
+        cookieAccessConfirmed: false,
+        json: true,
+      } as unknown as DownloadCommandOptions,
+      run.dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(run.download).not.toHaveBeenCalled();
+    expect(run.stdout()).toBe(`${JSON.stringify(expected, null, 2)}\n`);
+    expect(run.stderr()).toBe('');
+  });
+
+  it.each([
+    ['string', 'false'],
+    ['number', 1],
+    ['object', {confirmed: true}],
+    ['null', null],
+    ['array', [true]],
+  ])('rejects a runtime %s cookie confirmation before download', async (
+    _caseName,
+    cookieAccessConfirmed,
+  ) => {
+    const run = fixture();
+    const expected = {
+      command: 'download',
+      ok: false,
+      code: 'DOWNLOAD_COOKIE_OPTIONS_INVALID',
+      message:
+        'Chrome cookie access requires both browser selection and explicit confirmation.',
+    };
+
+    const exitCode = await runDownloadCommand(
+      jingxuanUrl,
+      {
+        rightsConfirmed: true,
+        browserCookies: 'chrome',
+        cookieAccessConfirmed,
+        json: true,
+      } as unknown as DownloadCommandOptions,
+      run.dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(run.download).not.toHaveBeenCalled();
+    expect(run.stdout()).toBe(`${JSON.stringify(expected, null, 2)}\n`);
+    expect(run.stderr()).toBe('');
   });
 
   it.each<{

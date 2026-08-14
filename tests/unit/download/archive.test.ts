@@ -41,6 +41,7 @@ import {
   DownloadReceiptSchema,
   type DownloadReceipt,
 } from '../../../src/download/receipt-schema';
+import type {DownloadPlatform} from '../../../src/download/platforms';
 import {
   PROCESS_OUTPUT_LIMIT_BYTES,
   runProcess,
@@ -51,6 +52,7 @@ const ARCHIVE_INVALID_MESSAGE = 'The downloaded archive contents are invalid.';
 const DESTINATION_CONFLICT_MESSAGE =
   'The download destination conflicts with an existing archive.';
 const FINALIZE_FAILED_MESSAGE = 'The download archive could not be finalized.';
+const DOUYIN_VIDEO_ID = '7654841525762919726';
 
 const temporaryDirectories: string[] = [];
 const execFileAsync = promisify(execFile);
@@ -132,12 +134,31 @@ const prepareStaging = async (
   workspaceRoot: string,
   outputRoot = 'downloads',
   videoId = 'abc',
+  platform: DownloadPlatform = 'youtube',
 ): Promise<{root: ValidatedArchiveRoot; prepared: StagedArchive}> => {
   const root = await validateArchiveRoot(workspaceRoot, outputRoot);
-  const prepared = await prepareArchive(root, 'youtube', videoId);
+  const prepared = await prepareArchive(root, platform, videoId);
   if (prepared.status !== 'staging') throw new Error('Expected staging archive.');
   return {root, prepared};
 };
+
+const canonicalUrlFor = (
+  platform: DownloadPlatform,
+  videoId: string,
+): string => platform === 'douyin'
+  ? `https://www.douyin.com/video/${videoId}`
+  : `https://youtu.be/${videoId}`;
+
+const extractorFor = (platform: DownloadPlatform): string =>
+  platform === 'douyin' ? 'Douyin' : 'youtube';
+
+const safeMetadataFor = (prepared: StagedArchive) => ({
+  id: prepared.videoId,
+  title: 'Example',
+  webpage_url: canonicalUrlFor(prepared.platform, prepared.videoId),
+  extractor: extractorFor(prepared.platform),
+  _type: 'video' as const,
+});
 
 interface StagedFilesOptions {
   videoId?: string;
@@ -153,7 +174,7 @@ const writeStagedFiles = async (
   options: StagedFilesOptions = {},
 ): Promise<void> => {
   const videoId = options.videoId ?? prepared.videoId;
-  const extractor = options.extractor ?? 'youtube';
+  const extractor = options.extractor ?? extractorFor(prepared.platform);
   const mediaName = options.mediaName ?? 'video.webm';
 
   if (options.thumbnailName !== undefined) {
@@ -174,8 +195,9 @@ const writeStagedFiles = async (
     JSON.stringify({
       id: videoId,
       title: 'Example',
-      webpage_url: `https://youtu.be/${videoId}`,
+      webpage_url: canonicalUrlFor(prepared.platform, videoId),
       extractor,
+      _type: 'video',
       ...options.metadata,
     }),
   );
@@ -185,10 +207,10 @@ const finalize = (
   prepared: StagedArchive,
   overrides: Partial<FinalizeArchiveInput> = {},
 ): Promise<DownloadedArchive> => finalizeArchive(prepared, {
-  platform: 'youtube',
+  platform: prepared.platform,
   videoId: prepared.videoId,
   title: 'Example',
-  canonicalUrl: `https://youtu.be/${prepared.videoId}`,
+  canonicalUrl: canonicalUrlFor(prepared.platform, prepared.videoId),
   downloadedAt: new Date('2026-08-12T00:00:00.000Z'),
   tools: {
     ytDlpVersion: '2026.07.04',
@@ -587,6 +609,7 @@ describe('staging download authority', () => {
     await rename(prepared.stagingDirectory, relocatedOwnedDirectory);
     await symlink(outsideRoot, prepared.stagingDirectory);
     try {
+      await authority.writeMetadata(safeMetadataFor(prepared));
       await runProcess('/usr/bin/osascript', [
         '-l',
         'JavaScript',
@@ -619,7 +642,15 @@ describe('staging download authority', () => {
         path.join(relocatedOwnedDirectory, 'authority.txt'),
         'utf8',
       )).toBe('owned inode');
+      expect(JSON.parse(await readFile(
+        path.join(relocatedOwnedDirectory, 'video.info.json'),
+        'utf8',
+      ))).toEqual(safeMetadataFor(prepared));
+      expect((await lstat(
+        path.join(relocatedOwnedDirectory, 'video.info.json'),
+      )).mode & 0o777).toBe(0o600);
       await expectMissing(path.join(outsideRoot, 'authority.txt'));
+      await expectMissing(path.join(outsideRoot, 'video.info.json'));
       expect((await lstat(prepared.stagingDirectory)).isSymbolicLink()).toBe(true);
     } finally {
       await authority.close();
@@ -630,6 +661,50 @@ describe('staging download authority', () => {
     await cleanupArchive(prepared);
     await expectMissing(prepared.stagingDirectory);
     await expectMissing(path.join(outsideRoot, 'authority.txt'));
+  });
+
+  it('rejects a pre-existing regular metadata file without overwriting it', async () => {
+    const workspaceRoot = await createWorkspace();
+    const {prepared} = await prepareStaging(workspaceRoot);
+    const metadataPath = path.join(prepared.stagingDirectory, 'video.info.json');
+    await writeFile(metadataPath, 'pre-existing regular file');
+    const authority = await openStagingDownloadAuthority(prepared);
+
+    try {
+      await expectDownloadError(
+        authority.writeMetadata(safeMetadataFor(prepared)),
+        'DOWNLOAD_FINALIZE_FAILED',
+        FINALIZE_FAILED_MESSAGE,
+      );
+      expect(await readFile(metadataPath, 'utf8')).toBe('pre-existing regular file');
+    } finally {
+      await authority.close();
+      await cleanupArchive(prepared);
+    }
+  });
+
+  it('rejects a pre-existing metadata symlink without following it', async () => {
+    const workspaceRoot = await createWorkspace();
+    const outsideRoot = await createWorkspace();
+    const {prepared} = await prepareStaging(workspaceRoot);
+    const outsideTarget = path.join(outsideRoot, 'outside-metadata.json');
+    const metadataPath = path.join(prepared.stagingDirectory, 'video.info.json');
+    await writeFile(outsideTarget, 'outside marker');
+    await symlink(outsideTarget, metadataPath);
+    const authority = await openStagingDownloadAuthority(prepared);
+
+    try {
+      await expectDownloadError(
+        authority.writeMetadata(safeMetadataFor(prepared)),
+        'DOWNLOAD_FINALIZE_FAILED',
+        FINALIZE_FAILED_MESSAGE,
+      );
+      expect((await lstat(metadataPath)).isSymbolicLink()).toBe(true);
+      expect(await readFile(outsideTarget, 'utf8')).toBe('outside marker');
+    } finally {
+      await authority.close();
+      await cleanupArchive(prepared);
+    }
   });
 });
 
@@ -713,15 +788,41 @@ describe('finalizeArchive', () => {
 
   it('records Chrome cookie use in a strict version 2 receipt', async () => {
     const workspaceRoot = await createWorkspace();
-    const {prepared} = await prepareStaging(workspaceRoot);
+    const {prepared} = await prepareStaging(
+      workspaceRoot,
+      'downloads',
+      DOUYIN_VIDEO_ID,
+      'douyin',
+    );
     await writeStagedFiles(prepared);
 
     const result = await finalize(prepared, {browserCookieSource: 'chrome'});
 
     expect(result.receipt).toMatchObject({
       version: 2,
+      platform: 'douyin',
+      videoId: DOUYIN_VIDEO_ID,
+      canonicalUrl: `https://www.douyin.com/video/${DOUYIN_VIDEO_ID}`,
       browserCookies: {used: true, source: 'chrome'},
     });
+  });
+
+  it('rejects direct Chrome cookie finalization for a non-Douyin archive', async () => {
+    const workspaceRoot = await createWorkspace();
+    const {prepared} = await prepareStaging(workspaceRoot);
+    await writeStagedFiles(prepared);
+
+    await expectDownloadError(
+      finalize(prepared, {browserCookieSource: 'chrome'}),
+      'DOWNLOAD_ARCHIVE_INVALID',
+      ARCHIVE_INVALID_MESSAGE,
+    );
+
+    await expectMissing(prepared.finalDirectory);
+    expect(sortNames(await readdir(prepared.stagingDirectory))).toEqual(sortNames([
+      'video.info.json',
+      'video.webm',
+    ]));
   });
 
   it.each([
@@ -788,6 +889,7 @@ describe('finalizeArchive', () => {
     ['active live metadata', {is_live: true}],
     ['upcoming live metadata', {live_status: 'is_upcoming'}],
     ['post-live processing metadata', {live_status: 'post_live'}],
+    ['metadata with an unexpected cookie field', {cookies: 'cookie-value-marker'}],
   ])('rejects %s before publication', async (_caseName, metadata) => {
     const workspaceRoot = await createWorkspace();
     const {prepared} = await prepareStaging(workspaceRoot);
@@ -1780,14 +1882,21 @@ describe('prepareArchive duplicate verification', () => {
 
   it('returns a sealed version 2 receipt unchanged', async () => {
     const workspaceRoot = await createWorkspace();
-    const {root, prepared} = await prepareStaging(workspaceRoot);
+    const {root, prepared} = await prepareStaging(
+      workspaceRoot,
+      'downloads',
+      DOUYIN_VIDEO_ID,
+      'douyin',
+    );
     await writeStagedFiles(prepared);
     const result = await finalize(prepared, {browserCookieSource: 'chrome'});
 
-    const duplicate = await prepareArchive(root, 'youtube', 'abc');
+    const duplicate = await prepareArchive(root, 'douyin', DOUYIN_VIDEO_ID);
 
     expect(result.receipt).toMatchObject({
       version: 2,
+      platform: 'douyin',
+      videoId: DOUYIN_VIDEO_ID,
       browserCookies: {used: true, source: 'chrome'},
     });
     expect(duplicate.status).toBe('already-present');
@@ -1797,20 +1906,26 @@ describe('prepareArchive duplicate verification', () => {
     expect(duplicate.receipt).toEqual(result.receipt);
   });
 
-  it('projects oversized existing metadata before returning it from the worker', async () => {
+  it('rejects oversized existing metadata with unexpected fields unchanged', async () => {
     const published = await publishArchive();
     const description = 'x'.repeat(PROCESS_OUTPUT_LIMIT_BYTES + 128 * 1024);
     const oversized = await rewritePublishedMetadata(published, {description});
-    const expectedReceipt = DownloadReceiptSchema.parse(
-      JSON.parse(oversized.receiptSource),
-    );
 
     expect(Buffer.byteLength(oversized.metadataSource))
       .toBeGreaterThan(PROCESS_OUTPUT_LIMIT_BYTES);
-    await expect(prepareArchive(published.root, 'youtube', 'abc')).resolves.toMatchObject({
-      status: 'already-present',
-      receipt: expectedReceipt,
-    });
+    await expectDownloadError(
+      prepareArchive(published.root, 'youtube', 'abc'),
+      'DOWNLOAD_DESTINATION_CONFLICT',
+      DESTINATION_CONFLICT_MESSAGE,
+    );
+    expect(await readFile(
+      path.join(published.finalDirectory, 'video.info.json'),
+      'utf8',
+    )).toBe(oversized.metadataSource);
+    expect(await readFile(
+      path.join(published.finalDirectory, 'receipt.json'),
+      'utf8',
+    )).toBe(oversized.receiptSource);
 
     const mismatched = await rewritePublishedMetadata(published, {
       description,
@@ -1922,6 +2037,7 @@ describe('prepareArchive duplicate verification', () => {
     ['identifier mismatch', {id: 'other'}],
     ['extractor mismatch', {extractor: 'vimeo'}],
     ['canonical mismatch', {webpage_url: 'https://youtu.be/different'}],
+    ['unexpected extra field', {cookies: 'cookie-value-marker'}],
   ])('rejects fully rehashed forged existing metadata: %s', async (
     _caseName,
     replacement,

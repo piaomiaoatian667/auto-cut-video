@@ -540,8 +540,6 @@ describe('yt-dlp download', () => {
       '--max-downloads',
       '1',
       '--no-progress',
-      '--write-info-json',
-      '--clean-info-json',
       '--write-thumbnail',
       '--write-subs',
       '--write-auto-subs',
@@ -555,6 +553,8 @@ describe('yt-dlp download', () => {
 
     expect(ytDlpArgs.at(-1)).toBe(url);
     expect(ytDlpArgs).not.toContain('--ffmpeg-location');
+    expect(ytDlpArgs).not.toContain('--write-info-json');
+    expect(ytDlpArgs).not.toContain('--clean-info-json');
     expectFixedNetworkIsolation(ytDlpArgs);
   });
 
@@ -571,7 +571,8 @@ describe('yt-dlp download', () => {
     );
 
     const wrapperArgs = runProcess.mock.calls[0]?.[1] ?? [];
-    expect(wrapperArgs.slice(6, 15)).toEqual([
+    const ytDlpArgs = wrapperArgs.slice(6);
+    expect(ytDlpArgs).toEqual([
       '--ignore-config',
       '--proxy',
       '',
@@ -581,7 +582,18 @@ describe('yt-dlp download', () => {
       '1',
       '--cookies-from-browser',
       'chrome',
+      '--no-progress',
+      '--write-thumbnail',
+      '--write-subs',
+      '--write-auto-subs',
+      '--sub-langs',
+      'zh.*,en.*',
+      '--output',
+      'video.%(ext)s',
+      canonicalDouyinUrl,
     ]);
+    expect(ytDlpArgs).not.toContain('--write-info-json');
+    expect(ytDlpArgs).not.toContain('--clean-info-json');
   });
 
   it('adds only an explicitly configured ffmpeg location before the URL', async () => {
@@ -615,8 +627,6 @@ describe('yt-dlp download', () => {
       '--max-downloads',
       '1',
       '--no-progress',
-      '--write-info-json',
-      '--clean-info-json',
       '--write-thumbnail',
       '--write-subs',
       '--write-auto-subs',
@@ -629,6 +639,8 @@ describe('yt-dlp download', () => {
       url,
     ]);
     expect(options).toEqual({extraStdioFds: [42]});
+    expect(ytDlpArgs).not.toContain('--write-info-json');
+    expect(ytDlpArgs).not.toContain('--clean-info-json');
     expectFixedNetworkIsolation(ytDlpArgs);
   });
 

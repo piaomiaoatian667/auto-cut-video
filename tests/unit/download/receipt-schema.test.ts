@@ -81,6 +81,14 @@ const makeReceipt = (
   ...(browserCookies === undefined ? {} : {browserCookies}),
 });
 
+const makeDouyinReceipt = (): ReceiptFixture => ({
+  ...makeReceipt(),
+  platform: 'douyin',
+  videoId: '7654841525762919726',
+  title: 'Public Douyin fixture',
+  canonicalUrl: 'https://www.douyin.com/video/7654841525762919726',
+});
+
 const expectInvalid = (receipt: unknown): void => {
   expect(DownloadReceiptSchema.safeParse(receipt).success).toBe(false);
 };
@@ -128,7 +136,7 @@ describe('download receipt schema', () => {
 
   it('parses a valid strict version 2 cookie audit receipt unchanged', () => {
     const receipt = {
-      ...makeReceipt(),
+      ...makeDouyinReceipt(),
       version: 2,
       browserCookies: {used: true, source: 'chrome'},
     };
@@ -136,20 +144,28 @@ describe('download receipt schema', () => {
     expect(DownloadReceiptSchema.parse(receipt)).toEqual(receipt);
   });
 
+  it('rejects a version 2 cookie receipt for YouTube', () => {
+    expectInvalid({
+      ...makeReceipt(),
+      version: 2,
+      browserCookies: {used: true, source: 'chrome'},
+    });
+  });
+
   it('rejects cookie audit fields on version 1', () => {
     expectInvalid(makeReceipt({used: true, source: 'chrome'}));
   });
 
   it.each([
-    ['omitted browserCookies', {...makeReceipt(), version: 2}],
+    ['omitted browserCookies', {...makeDouyinReceipt(), version: 2}],
     [
       'undefined browserCookies',
-      {...makeReceipt(), version: 2, browserCookies: undefined},
+      {...makeDouyinReceipt(), version: 2, browserCookies: undefined},
     ],
     [
       'unused Chrome cookies',
       {
-        ...makeReceipt(),
+        ...makeDouyinReceipt(),
         version: 2,
         browserCookies: {used: false, source: 'chrome'},
       },
@@ -157,7 +173,7 @@ describe('download receipt schema', () => {
     [
       'unsupported cookie source',
       {
-        ...makeReceipt(),
+        ...makeDouyinReceipt(),
         version: 2,
         browserCookies: {used: true, source: 'firefox'},
       },
@@ -165,7 +181,7 @@ describe('download receipt schema', () => {
     [
       'unexpected cookie profile',
       {
-        ...makeReceipt(),
+        ...makeDouyinReceipt(),
         version: 2,
         browserCookies: {used: true, source: 'chrome', profile: 'Default'},
       },

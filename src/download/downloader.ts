@@ -24,6 +24,7 @@ import {
 } from './platforms';
 import {
   createYtDlpClient,
+  type SafeYtDlpMetadata,
   type YtDlpClient,
   type YtDlpClientOptions,
 } from './yt-dlp';
@@ -79,7 +80,7 @@ export const downloadVideo = async (
   input: DownloadInput,
   dependencies: DownloadDependencies,
 ): Promise<DownloadResult> => {
-  if (!input.rightsConfirmed) {
+  if (input.rightsConfirmed !== true) {
     throw new DownloadError(
       'DOWNLOAD_RIGHTS_NOT_CONFIRMED',
       'Confirm that you are permitted to save this public video.',
@@ -134,6 +135,16 @@ export const downloadVideo = async (
       EXTRACTOR_MISMATCH_MESSAGE,
     );
   }
+  const safeMetadata: SafeYtDlpMetadata = {
+    id: probe.id,
+    title: probe.title,
+    webpage_url: canonical.url,
+    extractor: probe.extractor,
+    ...(probe.extractorKey === undefined
+      ? {}
+      : {extractor_key: probe.extractorKey}),
+    _type: 'video',
+  };
 
   const prepared = await dependencies.archive.prepare(
     root,
@@ -146,22 +157,23 @@ export const downloadVideo = async (
     const authority = await dependencies.archive.openStagingDownloadAuthority(
       prepared,
     );
-    let downloadFailure: unknown;
+    let authorityOperationFailure: unknown;
     try {
       await dependencies.client.download(
         requested.url,
         authority.fd,
         operationOptions,
       );
+      await authority.writeMetadata(safeMetadata);
     } catch (error) {
-      downloadFailure = error;
+      authorityOperationFailure = error;
     }
     try {
       await authority.close();
     } catch (error) {
-      if (downloadFailure === undefined) throw error;
+      if (authorityOperationFailure === undefined) throw error;
     }
-    if (downloadFailure !== undefined) throw downloadFailure;
+    if (authorityOperationFailure !== undefined) throw authorityOperationFailure;
 
     return await dependencies.archive.finalize(prepared, {
       platform: requested.platform,

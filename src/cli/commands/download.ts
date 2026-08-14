@@ -4,6 +4,7 @@ import type {
 } from '../../download/downloader';
 import {parseBrowserCookieSource} from '../../download/browser-cookies';
 import {
+  DownloadError,
   isDownloadError,
   type DownloadErrorCode,
 } from '../../download/errors';
@@ -42,6 +43,23 @@ const INVALID_INPUT_CODES = new Set<DownloadErrorCode>([
 
 const UNEXPECTED_ERROR_CODE: DownloadErrorCode = 'DOWNLOAD_PROCESS_FAILED';
 const UNEXPECTED_ERROR_MESSAGE = 'The download operation failed unexpectedly.';
+const RIGHTS_NOT_CONFIRMED_MESSAGE =
+  'Confirm that you are permitted to save this public video.';
+const COOKIE_OPTIONS_MESSAGE =
+  'Chrome cookie access requires both browser selection and explicit confirmation.';
+
+const parseOptionalBooleanFlag = (
+  value: unknown,
+  code: Extract<
+    DownloadErrorCode,
+    'DOWNLOAD_RIGHTS_NOT_CONFIRMED' | 'DOWNLOAD_COOKIE_OPTIONS_INVALID'
+  >,
+  message: string,
+): boolean => {
+  if (value === undefined) return false;
+  if (typeof value === 'boolean') return value;
+  throw new DownloadError(code, message);
+};
 
 const exitCodeForDownloadError = (code: DownloadErrorCode): number => {
   if (INVALID_INPUT_CODES.has(code)) return EXIT_CODES.validationFailed;
@@ -70,6 +88,16 @@ export const runDownloadCommand = async (
 ): Promise<number> => {
   const json = options.json === true;
   try {
+    const rightsConfirmed = parseOptionalBooleanFlag(
+      options.rightsConfirmed,
+      'DOWNLOAD_RIGHTS_NOT_CONFIRMED',
+      RIGHTS_NOT_CONFIRMED_MESSAGE,
+    );
+    const cookieAccessConfirmed = parseOptionalBooleanFlag(
+      options.cookieAccessConfirmed,
+      'DOWNLOAD_COOKIE_OPTIONS_INVALID',
+      COOKIE_OPTIONS_MESSAGE,
+    );
     const browserCookieSource = parseBrowserCookieSource(
       options.browserCookies,
     );
@@ -77,9 +105,9 @@ export const runDownloadCommand = async (
       workspaceRoot: dependencies.workspaceRoot,
       url,
       outputRoot: options.output ?? 'downloads',
-      rightsConfirmed: Boolean(options.rightsConfirmed),
+      rightsConfirmed,
       ...(browserCookieSource === undefined ? {} : {browserCookieSource}),
-      cookieAccessConfirmed: Boolean(options.cookieAccessConfirmed),
+      cookieAccessConfirmed,
       ...(dependencies.downloadSignal === undefined
         ? {}
         : {signal: dependencies.downloadSignal}),

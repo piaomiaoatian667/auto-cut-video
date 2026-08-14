@@ -27,7 +27,11 @@ import {
   type DownloadArchiveFile,
   type DownloadReceipt,
 } from './receipt-schema';
-import {parseYtDlpInfo, type DownloadToolVersions} from './yt-dlp';
+import {
+  SafeYtDlpMetadataSchema,
+  type DownloadToolVersions,
+  type SafeYtDlpMetadata,
+} from './yt-dlp';
 
 const OUTPUT_INVALID_MESSAGE = 'The download output path is invalid.';
 const ARCHIVE_INVALID_MESSAGE = 'The downloaded archive contents are invalid.';
@@ -48,11 +52,88 @@ const STAGING_OWNERSHIP_MARKER_OPEN_FLAGS = (
   fsConstants.O_WRONLY |
   DARWIN_O_NOFOLLOW_ANY
 );
+const SAFE_METADATA_WORKER_LINES = [
+  'const projectSafeMetadata = (parsed) => {',
+  '  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {',
+  '    throw new Error();',
+  '  }',
+  '  const hasExtractorKey = Object.prototype.hasOwnProperty.call(',
+  '    parsed, "extractor_key",',
+  '  );',
+  '  const expectedKeys = ["_type", "extractor", "id", "title", "webpage_url"];',
+  '  if (hasExtractorKey) expectedKeys.push("extractor_key");',
+  '  expectedKeys.sort();',
+  '  const actualKeys = Object.keys(parsed).sort();',
+  '  if (actualKeys.length !== expectedKeys.length ||',
+  '      actualKeys.some((key, index) => key !== expectedKeys[index])) {',
+  '    throw new Error();',
+  '  }',
+  '  if (typeof parsed.id !== "string" || parsed.id.length === 0 ||',
+  '      typeof parsed.title !== "string" || parsed.title.length === 0 ||',
+  '      typeof parsed.webpage_url !== "string" || parsed.webpage_url.length === 0 ||',
+  '      typeof parsed.extractor !== "string" || parsed.extractor.length === 0 ||',
+  '      parsed._type !== "video" ||',
+  '      (hasExtractorKey &&',
+  '        (typeof parsed.extractor_key !== "string" ||',
+  '          parsed.extractor_key.length === 0))) {',
+  '    throw new Error();',
+  '  }',
+  '  return {',
+  '    id: parsed.id,',
+  '    title: parsed.title,',
+  '    webpage_url: parsed.webpage_url,',
+  '    extractor: parsed.extractor,',
+  '    ...(hasExtractorKey ? {extractor_key: parsed.extractor_key} : {}),',
+  '    _type: "video",',
+  '  };',
+  '};',
+] as const;
+const STAGING_METADATA_WRITER_SCRIPT = [
+  'const {',
+  '  constants, closeSync, fchmodSync, fstatSync, fsyncSync, openSync,',
+  '  unlinkSync, writeSync,',
+  '} = require("node:fs");',
+  'const O_NOFOLLOW_ANY = 0x20000000;',
+  'const filename = "video.info.json";',
+  'const contents = Buffer.from(process.argv[1], "base64");',
+  'let descriptor;',
+  'let created = false;',
+  'try {',
+  '  descriptor = openSync(',
+  '    filename,',
+  '    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL |',
+  '      O_NOFOLLOW_ANY,',
+  '    0o600,',
+  '  );',
+  '  created = true;',
+  '  if (!fstatSync(descriptor).isFile()) throw new Error();',
+  '  let writtenBytes = 0;',
+  '  while (writtenBytes < contents.length) {',
+  '    writtenBytes += writeSync(',
+  '      descriptor, contents, writtenBytes, contents.length - writtenBytes,',
+  '    );',
+  '  }',
+  '  fchmodSync(descriptor, 0o600);',
+  '  fsyncSync(descriptor);',
+  '  closeSync(descriptor);',
+  '  descriptor = undefined;',
+  '  process.stdout.write("written");',
+  '} catch {',
+  '  if (descriptor !== undefined) {',
+  '    try { closeSync(descriptor); } catch {}',
+  '  }',
+  '  if (created) {',
+  '    try { unlinkSync(filename); } catch {}',
+  '  }',
+  '  process.exitCode = 1;',
+  '}',
+].join('\n');
 const STAGED_INSPECTION_WORKER_SCRIPT = [
   'const {createHash} = require("node:crypto");',
   'const {constants, closeSync, fstatSync, lstatSync, openSync, readSync, readdirSync} = require("node:fs");',
   'const O_NOFOLLOW_ANY = 0x20000000;',
   'const readBuffer = Buffer.allocUnsafe(64 * 1024);',
+  ...SAFE_METADATA_WORKER_LINES,
   'try {',
   '  const files = [];',
   '  let metadata;',
@@ -94,20 +175,9 @@ const STAGED_INSPECTION_WORKER_SCRIPT = [
   '        bytes: stats.size,',
   '        sha256: `sha256:${hash.digest("hex")}`,',
   '      });',
-  '      if (metadataChunks !== null) {',
-  '        const parsed = JSON.parse(Buffer.concat(metadataChunks).toString("utf8"));',
-  '        metadata = {',
-  '          id: parsed.id,',
-  '          title: parsed.title,',
-  '          webpage_url: parsed.webpage_url,',
-  '          extractor: parsed.extractor,',
-  '          ...(parsed.extractor_key === undefined',
-  '            ? {} : {extractor_key: parsed.extractor_key}),',
-  '          ...(parsed._type === undefined ? {} : {_type: parsed._type}),',
-  '          ...(parsed.is_live === undefined ? {} : {is_live: parsed.is_live}),',
-  '          ...(parsed.live_status === undefined',
-  '            ? {} : {live_status: parsed.live_status}),',
-  '        };',
+      '      if (metadataChunks !== null) {',
+      '        const parsed = JSON.parse(Buffer.concat(metadataChunks).toString("utf8"));',
+      '        metadata = projectSafeMetadata(parsed);',
   '      }',
   '    } finally {',
   '      closeSync(descriptor);',
@@ -356,6 +426,7 @@ const EXISTING_ARCHIVE_WORKER_SCRIPT = [
   '} = require("node:fs");',
   'const O_NOFOLLOW_ANY = 0x20000000;',
   'const readBuffer = Buffer.allocUnsafe(64 * 1024);',
+  ...SAFE_METADATA_WORKER_LINES,
   'const sortedNames = () => readdirSync(".")',
   '  .sort((left, right) => left.localeCompare(right));',
   'const namesMatch = (actual, expected) =>',
@@ -457,22 +528,11 @@ const EXISTING_ARCHIVE_WORKER_SCRIPT = [
   '          !entryStillMatches(file.path, opened.stats)) {',
   '        throw new Error();',
   '      }',
-  '      if (metadataChunks !== null) {',
-  '        const parsed = JSON.parse(',
-  '          Buffer.concat(metadataChunks, file.bytes).toString("utf8"),',
-  '        );',
-  '        metadata = {',
-  '          id: parsed.id,',
-  '          title: parsed.title,',
-  '          webpage_url: parsed.webpage_url,',
-  '          extractor: parsed.extractor,',
-  '          ...(parsed.extractor_key === undefined',
-  '            ? {} : {extractor_key: parsed.extractor_key}),',
-  '          ...(parsed._type === undefined ? {} : {_type: parsed._type}),',
-  '          ...(parsed.is_live === undefined ? {} : {is_live: parsed.is_live}),',
-  '          ...(parsed.live_status === undefined',
-  '            ? {} : {live_status: parsed.live_status}),',
-  '        };',
+      '      if (metadataChunks !== null) {',
+      '        const parsed = JSON.parse(',
+      '          Buffer.concat(metadataChunks, file.bytes).toString("utf8"),',
+      '        );',
+      '        metadata = projectSafeMetadata(parsed);',
   '      }',
   '    } finally {',
   '      closeSync(opened.descriptor);',
@@ -659,6 +719,14 @@ const DARWIN_ARCHIVE_HELPER_SCRIPT = [
   '    ? argv[argv.length - 1] : argv[1];',
   '  if (typeof identityExecutable !== "string" || identityExecutable.length === 0) {',
   '    return "error";',
+  '  }',
+  '  if (operation === "write-metadata") {',
+  '    if (!descriptorMatches(3, argv[4], argv[5])) {',
+  '      return "ownership-conflict";',
+  '    }',
+  '    if (Number($.fchdir(3)) !== 0) return "error";',
+  '    const output = taskOutput(argv[1], argv[2], [argv[3]]);',
+  '    return output === "written" ? "written" : "error";',
   '  }',
   '  if (operation === "remove-staging-marker") {',
   '    if (!descriptorMatches(3, argv[5], argv[6]) ||',
@@ -886,6 +954,7 @@ export interface StagedArchive {
 
 export interface StagingDownloadAuthority {
   readonly fd: number;
+  writeMetadata(metadata: SafeYtDlpMetadata): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -1124,6 +1193,7 @@ const validatePreparedPaths = (
   prepared: StagedArchive,
   input: FinalizeArchiveInput,
 ): void => {
+  const runtimeBrowserCookieSource: unknown = input.browserCookieSource;
   const expectedFinalDirectory = path.join(
     prepared.root.absolutePath,
     prepared.platform,
@@ -1141,6 +1211,8 @@ const validatePreparedPaths = (
     prepared.relativeDirectory !== expectedRelativeDirectory ||
     !validVideoId(input.videoId) ||
     !DownloadPlatformSchema.safeParse(input.platform).success ||
+    (runtimeBrowserCookieSource !== undefined &&
+      (runtimeBrowserCookieSource !== 'chrome' || input.platform !== 'douyin')) ||
     !isOwnedStagingDirectory(prepared) ||
     !stagedArchiveOwnership.has(prepared)
   ) {
@@ -1229,10 +1301,10 @@ const buildReceipt = (
       throw new Error();
     }
 
-    const info = parseYtDlpInfo(inspection.metadata);
+    const info = SafeYtDlpMetadataSchema.parse(inspection.metadata);
     if (info.id !== input.videoId) throw new Error();
     assertExtractorMatches(input.platform, info.extractor);
-    const metadataCanonical = parseDownloadUrl(info.canonicalUrl);
+    const metadataCanonical = parseDownloadUrl(info.webpage_url);
     const inputCanonical = parseDownloadUrl(input.canonicalUrl);
     if (
       metadataCanonical.platform !== input.platform ||
@@ -1340,10 +1412,10 @@ const readExistingArchive = async (
     if (receipt.platform !== platform || receipt.videoId !== videoId) {
       throw new Error();
     }
-    const metadata = parseYtDlpInfo(parsedInspection.metadata);
+    const metadata = SafeYtDlpMetadataSchema.parse(parsedInspection.metadata);
     if (metadata.id !== receipt.videoId) throw new Error();
     assertExtractorMatches(receipt.platform, metadata.extractor);
-    const metadataCanonical = parseDownloadUrl(metadata.canonicalUrl);
+    const metadataCanonical = parseDownloadUrl(metadata.webpage_url);
     const receiptCanonical = parseDownloadUrl(receipt.canonicalUrl);
     if (
       metadataCanonical.platform !== receipt.platform ||
@@ -1393,6 +1465,40 @@ const runDarwinArchiveHelper = async (
   });
   if (result.exitCode !== 0 || result.signal !== null) throw new Error();
   return result.stdout.trim();
+};
+
+const writeStagingMetadata = async (
+  handle: FileHandle,
+  identity: DirectoryIdentity,
+  metadata: SafeYtDlpMetadata,
+): Promise<void> => {
+  let contentsBase64: string;
+  try {
+    const safeMetadata = SafeYtDlpMetadataSchema.parse(metadata);
+    contentsBase64 = Buffer.from(
+      `${JSON.stringify(safeMetadata, null, 2)}\n`,
+      'utf8',
+    ).toString('base64');
+  } catch {
+    throw new DownloadError('DOWNLOAD_FINALIZE_FAILED', FINALIZE_FAILED_MESSAGE);
+  }
+
+  let result: string;
+  try {
+    result = await runDarwinArchiveHelper([
+      'write-metadata',
+      process.execPath,
+      STAGING_METADATA_WRITER_SCRIPT,
+      contentsBase64,
+      identity.device,
+      identity.inode,
+    ], [handle]);
+  } catch {
+    throw new DownloadError('DOWNLOAD_FINALIZE_FAILED', FINALIZE_FAILED_MESSAGE);
+  }
+  if (result !== 'written') {
+    throw new DownloadError('DOWNLOAD_FINALIZE_FAILED', FINALIZE_FAILED_MESSAGE);
+  }
 };
 
 const removeStagingOwnershipMarker = async (
@@ -1786,6 +1892,15 @@ export const openStagingDownloadAuthority = async (
   let openAuthority = true;
   return {
     fd: handle.fd,
+    async writeMetadata(metadata: SafeYtDlpMetadata): Promise<void> {
+      if (!openAuthority) {
+        throw new DownloadError(
+          'DOWNLOAD_FINALIZE_FAILED',
+          FINALIZE_FAILED_MESSAGE,
+        );
+      }
+      await writeStagingMetadata(handle, ownership.stagingDirectory, metadata);
+    },
     async close(): Promise<void> {
       if (!openAuthority) return;
       openAuthority = false;

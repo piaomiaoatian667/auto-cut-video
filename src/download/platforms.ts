@@ -29,7 +29,7 @@ const extractorPrefixes: ReadonlyArray<{
   {platform: 'vimeo', prefixes: ['vimeo']},
 ];
 
-const safeDouyinModalId = /^[A-Za-z0-9._-]{1,512}$/u;
+const strictDouyinModalQuery = /^\?modal_id=([A-Za-z0-9._-]{1,512})$/u;
 
 const matches = (hostname: string, suffix: string): boolean =>
   hostname === suffix || hostname.endsWith(`.${suffix}`);
@@ -68,16 +68,13 @@ export const parseDownloadUrl = (source: string): ValidatedDownloadUrl => {
     throw new DownloadError('DOWNLOAD_HOST_UNSUPPORTED', 'The video host is not supported.');
   }
   if (platform === 'douyin' && parsed.pathname === '/jingxuan') {
-    const queryEntries = [...parsed.searchParams.entries()];
-    const modalId = queryEntries[0]?.[1];
+    const modalMatch = strictDouyinModalQuery.exec(parsed.search);
+    const modalId = modalMatch?.[1];
     if (
       parsed.href.includes('#')
-      || queryEntries.length !== 1
-      || queryEntries[0]?.[0] !== 'modal_id'
       || modalId === undefined
       || modalId === '.'
       || modalId === '..'
-      || !safeDouyinModalId.test(modalId)
     ) {
       throw new DownloadError('DOWNLOAD_URL_INVALID', 'The video URL is invalid.');
     }

@@ -46,8 +46,25 @@ const COOKIE_INFO_DOCUMENT = {
   extractor: 'Douyin',
   extractor_key: 'Douyin',
   _type: 'video',
-  availability: 'public',
 };
+const MALICIOUS_PROBE_FIELDS = {
+  availability: 'public',
+  cookies: 'cookie-value-marker',
+  url: 'signed-url-marker',
+  filepath: '/private/profile-marker',
+  http_headers: {Authorization: 'header-marker'},
+};
+const INFO_PROBE_DOCUMENT = {...INFO_DOCUMENT, ...MALICIOUS_PROBE_FIELDS};
+const COOKIE_INFO_PROBE_DOCUMENT = {
+  ...COOKIE_INFO_DOCUMENT,
+  ...MALICIOUS_PROBE_FIELDS,
+};
+const PROBE_SECRET_MARKERS = [
+  'cookie-value-marker',
+  'signed-url-marker',
+  '/private/profile-marker',
+  'header-marker',
+] as const;
 const SUBTITLE_CONTENTS = [
   'WEBVTT',
   '',
@@ -62,6 +79,9 @@ const FAKE_YT_DLP_SCRIPT = [
   '#!/bin/sh',
   'set -eu',
   'for argument in "$@"; do',
+  '  if [ "$argument" = "--write-info-json" ] || [ "$argument" = "--clean-info-json" ]; then',
+  '    exit 73',
+  '  fi',
   '  if [ "$argument" = "--version" ]; then',
   '    printf \'%s\\n\' \'2026.07.04-test\'',
   '    exit 0',
@@ -104,9 +124,9 @@ const FAKE_YT_DLP_SCRIPT = [
   'for argument in "$@"; do',
   '  if [ "$argument" = "--dump-single-json" ]; then',
   '    if [ "$cookie_mode" -eq 1 ]; then',
-  `      printf '%s\\n' '${JSON.stringify(COOKIE_INFO_DOCUMENT)}'`,
+  `      printf '%s\\n' '${JSON.stringify(COOKIE_INFO_PROBE_DOCUMENT)}'`,
   '    else',
-  `      printf '%s\\n' '${JSON.stringify(INFO_DOCUMENT)}'`,
+  `      printf '%s\\n' '${JSON.stringify(INFO_PROBE_DOCUMENT)}'`,
   '    fi',
   '    exit 0',
   '  fi',
@@ -123,11 +143,6 @@ const FAKE_YT_DLP_SCRIPT = [
   '[ -n "$output" ] || exit 65',
   '[ "$output" = "video.%(ext)s" ] || exit 66',
   `printf '%s\\n' '${WEBM_BASE64}' | /usr/bin/base64 -D > video.webm`,
-  'if [ "$cookie_mode" -eq 1 ]; then',
-  `  printf '%s\\n' '${JSON.stringify(COOKIE_INFO_DOCUMENT)}' > video.info.json`,
-  'else',
-  `  printf '%s\\n' '${JSON.stringify(INFO_DOCUMENT)}' > video.info.json`,
-  'fi',
   'cat > video.en.vtt <<\'VTT\'',
   'WEBVTT',
   '',
@@ -193,6 +208,23 @@ const createWorkspace = async (): Promise<string> => {
 const writeExecutable = async (target: string, source: string): Promise<void> => {
   await writeFile(target, source, {mode: 0o700});
   await chmod(target, 0o700);
+};
+
+const expectNoProbeSecretMarkers = (value: unknown): void => {
+  const source = Buffer.isBuffer(value)
+    ? value.toString('utf8')
+    : typeof value === 'string'
+      ? value
+      : JSON.stringify(value);
+  for (const marker of PROBE_SECRET_MARKERS) expect(source).not.toContain(marker);
+};
+
+const expectPublishedFilesContainNoProbeSecrets = async (
+  finalDirectory: string,
+): Promise<void> => {
+  for (const filename of await readdir(finalDirectory)) {
+    expectNoProbeSecretMarkers(await readFile(path.join(finalDirectory, filename)));
+  }
 };
 
 interface FakeYtDlpLocation {
@@ -292,7 +324,7 @@ describe('fake yt-dlp integration harness', () => {
       {directoryName: 'cookie-parent/tools', executableName: 'yt-dlp'},
     );
 
-    expect(JSON.parse(result.stdout)).toEqual(INFO_DOCUMENT);
+    expect(JSON.parse(result.stdout)).toEqual(INFO_PROBE_DOCUMENT);
   });
 
   it('rejects unexpected executable basenames', async () => {
@@ -442,6 +474,8 @@ describe('system download integration', () => {
       );
       const receipt = DownloadReceiptSchema.parse(JSON.parse(receiptSource));
       expect(receipt).toEqual(result.receipt);
+      expectNoProbeSecretMarkers(result);
+      expectNoProbeSecretMarkers(receiptSource);
       expect(receipt.version).toBe(1);
       expect('browserCookies' in receipt).toBe(false);
       expect(receipt).toMatchObject({
@@ -462,10 +496,19 @@ describe('system download integration', () => {
         'video.webp',
       ]);
 
-      expect(JSON.parse(await readFile(
+      const metadata = JSON.parse(await readFile(
         path.join(finalDirectory, 'video.info.json'),
         'utf8',
-      ))).toEqual(INFO_DOCUMENT);
+      )) as unknown;
+      expect(metadata).toEqual(INFO_DOCUMENT);
+      expect(Object.keys(metadata as Record<string, unknown>)).toEqual([
+        'id',
+        'title',
+        'webpage_url',
+        'extractor',
+        'extractor_key',
+        '_type',
+      ]);
       expect(await readFile(
         path.join(finalDirectory, 'video.en.vtt'),
         'utf8',
@@ -481,6 +524,7 @@ describe('system download integration', () => {
       expect(duplicate.receipt).toEqual(receipt);
       expect((await readdir(finalDirectory)).sort()).toEqual([...FINAL_FILENAMES]);
       expect(await readdir(stagingRoot)).toEqual([]);
+      await expectPublishedFilesContainNoProbeSecrets(finalDirectory);
     } finally {
       const socketCalls = [...socketGuard.calls];
       socketGuard.restore();
@@ -541,6 +585,7 @@ describe('system download integration', () => {
         },
       });
       expect(DownloadReceiptSchema.parse(result.receipt)).toEqual(result.receipt);
+      expectNoProbeSecretMarkers(result);
       expect((await readdir(finalDirectory)).sort()).toEqual([...FINAL_FILENAMES]);
 
       const receipt = DownloadReceiptSchema.parse(JSON.parse(
@@ -551,11 +596,21 @@ describe('system download integration', () => {
         version: 2,
         browserCookies: {used: true, source: 'chrome'},
       });
-      expect(JSON.stringify(receipt)).not.toMatch(/cookie_value|profile|database/iu);
-      expect(JSON.parse(await readFile(
+      expectNoProbeSecretMarkers(receipt);
+      const metadata = JSON.parse(await readFile(
         path.join(finalDirectory, 'video.info.json'),
         'utf8',
-      ))).toEqual(COOKIE_INFO_DOCUMENT);
+      )) as unknown;
+      expect(metadata).toEqual(COOKIE_INFO_DOCUMENT);
+      expect(Object.keys(metadata as Record<string, unknown>)).toEqual([
+        'id',
+        'title',
+        'webpage_url',
+        'extractor',
+        'extractor_key',
+        '_type',
+      ]);
+      await expectPublishedFilesContainNoProbeSecrets(finalDirectory);
       expect(socketGuard.calls).toEqual([]);
     } finally {
       socketGuard.restore();

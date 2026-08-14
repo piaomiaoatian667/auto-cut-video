@@ -78,6 +78,17 @@ export const YtDlpInfoSchema = z.object({
   availability: z.string().nullable().optional(),
 }).passthrough();
 
+export const SafeYtDlpMetadataSchema = z.object({
+  id: z.string().min(1),
+  title: z.string().min(1),
+  webpage_url: ParseableUrlSchema,
+  extractor: z.string().min(1),
+  extractor_key: z.string().min(1).optional(),
+  _type: z.literal('video'),
+}).strict();
+
+export type SafeYtDlpMetadata = z.infer<typeof SafeYtDlpMetadataSchema>;
+
 export interface YtDlpProbe {
   id: string;
   title: string;
@@ -223,8 +234,6 @@ export const createYtDlpClient = (
           ...FIXED_YT_DLP_ARGS,
           ...browserCookieArgs(browserCookieSource),
           '--no-progress',
-          '--write-info-json',
-          '--clean-info-json',
           '--write-thumbnail',
           '--write-subs',
           '--write-auto-subs',

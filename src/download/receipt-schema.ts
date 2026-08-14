@@ -154,6 +154,7 @@ const DownloadReceiptV1Schema = z.object({
 const DownloadReceiptV2Schema = z.object({
   version: z.literal(2),
   ...DownloadReceiptCommonShape,
+  platform: z.literal('douyin'),
   browserCookies: z.object({
     used: z.literal(true),
     source: z.literal('chrome'),

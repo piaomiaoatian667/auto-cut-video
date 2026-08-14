@@ -7,6 +7,7 @@ import {
   type ArchivePreparation,
   type DownloadedArchive,
   type ExistingArchive,
+  type StagingDownloadAuthority,
   type StagedArchive,
   type ValidatedArchiveRoot,
 } from '../../../src/download/archive';
@@ -101,6 +102,15 @@ const PROBE: YtDlpProbe = {
   title: 'Example title',
   canonicalUrl: 'https://WWW.YOUTUBE.COM:443/watch?v=video-123#resolved',
   extractor: 'Youtube',
+  extractorKey: 'Youtube',
+};
+const SAFE_METADATA = {
+  id: 'video-123',
+  title: 'Example title',
+  webpage_url: 'https://www.youtube.com/watch?v=video-123',
+  extractor: 'Youtube',
+  extractor_key: 'Youtube',
+  _type: 'video' as const,
 };
 const INPUT: DownloadInput = {
   workspaceRoot: '/workspace',
@@ -116,14 +126,16 @@ interface HarnessOptions {
   checkToolsPromise?: Promise<DownloadToolVersions>;
   probePromise?: Promise<YtDlpProbe>;
   preparationPromise?: Promise<ArchivePreparation>;
-  authorityOpenPromise?: Promise<{fd: number; close(): Promise<void>}>;
+  authorityOpenPromise?: Promise<StagingDownloadAuthority>;
   authorityClosePromise?: Promise<void>;
+  metadataWritePromise?: Promise<void>;
   downloadPromise?: Promise<void>;
   downloadImplementation?: YtDlpClient['download'];
   finalizePromise?: Promise<DownloadedArchive>;
   cleanupPromise?: Promise<void>;
   authorityOpenError?: unknown;
   authorityCloseError?: unknown;
+  metadataWriteError?: unknown;
   downloadError?: unknown;
   finalizeError?: unknown;
   cleanupError?: unknown;
@@ -187,7 +199,18 @@ const makeHarness = (options: HarnessOptions = {}) => {
     }
     if ('authorityCloseError' in options) throw options.authorityCloseError;
   });
-  const authority = {fd: AUTHORITY_FD, close: closeAuthority};
+  const writeMetadata = vi.fn<StagingDownloadAuthority['writeMetadata']>(async () => {
+    calls.push('writeMetadata');
+    if (options.metadataWritePromise !== undefined) {
+      await options.metadataWritePromise;
+    }
+    if ('metadataWriteError' in options) throw options.metadataWriteError;
+  });
+  const authority = {
+    fd: AUTHORITY_FD,
+    writeMetadata,
+    close: closeAuthority,
+  };
   const openStagingDownloadAuthority = vi.fn(async () => {
     calls.push('openAuthority');
     if (options.authorityOpenPromise !== undefined) {
@@ -246,6 +269,7 @@ const makeHarness = (options: HarnessOptions = {}) => {
     prepare,
     authority,
     openStagingDownloadAuthority,
+    writeMetadata,
     closeAuthority,
     download,
     finalize,
@@ -304,6 +328,35 @@ describe('downloadVideo', () => {
     expect(harness.validateRoot).not.toHaveBeenCalled();
     expect(harness.checkTools).not.toHaveBeenCalled();
     expect(harness.probe).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['string', 'true'],
+    ['number', 1],
+    ['object', {confirmed: true}],
+    ['null', null],
+    ['array', [true]],
+  ])('rejects a runtime %s rights value before dependencies', async (
+    _caseName,
+    rightsConfirmed,
+  ) => {
+    const harness = makeHarness();
+    const runtimeInput = {
+      ...INPUT,
+      rightsConfirmed,
+    } as unknown as DownloadInput;
+
+    const error = await captureRejection(downloadVideo(
+      runtimeInput,
+      harness.dependencies,
+    ));
+
+    expect(error).toBeInstanceOf(DownloadError);
+    expect(error).toMatchObject({
+      code: 'DOWNLOAD_RIGHTS_NOT_CONFIRMED',
+      message: RIGHTS_MESSAGE,
+    });
+    expect(harness.calls).toEqual([]);
   });
 
   it('rejects a confirmed invalid URL before validating the archive root', async () => {
@@ -367,10 +420,38 @@ describe('downloadVideo', () => {
       input: {browserCookieSource: 'chrome'},
     },
     {
-      name: 'non-boolean confirmation',
+      name: 'string confirmation',
       input: {
         browserCookieSource: 'chrome',
         cookieAccessConfirmed: 'true',
+      },
+    },
+    {
+      name: 'number confirmation',
+      input: {
+        browserCookieSource: 'chrome',
+        cookieAccessConfirmed: 1,
+      },
+    },
+    {
+      name: 'object confirmation',
+      input: {
+        browserCookieSource: 'chrome',
+        cookieAccessConfirmed: {confirmed: true},
+      },
+    },
+    {
+      name: 'null confirmation',
+      input: {
+        browserCookieSource: 'chrome',
+        cookieAccessConfirmed: null,
+      },
+    },
+    {
+      name: 'array confirmation',
+      input: {
+        browserCookieSource: 'chrome',
+        cookieAccessConfirmed: [true],
       },
     },
   ])('rejects runtime-invalid Cookie request $name before archive access', async ({
@@ -471,7 +552,13 @@ describe('downloadVideo', () => {
         title: 'Public Douyin fixture',
         canonicalUrl: 'https://www.douyin.com/video/7654841525762919726',
         extractor: 'Douyin',
-      },
+        extractorKey: 'Douyin',
+        availability: 'public',
+        cookies: 'cookie-value-marker',
+        url: 'signed-url-marker',
+        filepath: '/private/profile-marker',
+        http_headers: {Authorization: 'header-marker'},
+      } as YtDlpProbe,
       preparation: douyinStaged,
     });
 
@@ -495,6 +582,16 @@ describe('downloadVideo', () => {
     const downloadOperationOptions = harness.download.mock.calls[0]?.[2];
     expect(downloadOperationOptions).toBe(probeOperationOptions);
     expect(Object.isFrozen(probeOperationOptions)).toBe(true);
+    expect(harness.writeMetadata).toHaveBeenCalledWith({
+      id: '7654841525762919726',
+      title: 'Public Douyin fixture',
+      webpage_url: 'https://www.douyin.com/video/7654841525762919726',
+      extractor: 'Douyin',
+      extractor_key: 'Douyin',
+      _type: 'video',
+    });
+    expect(JSON.stringify(harness.writeMetadata.mock.calls[0]?.[0]))
+      .not.toMatch(/cookie-value-marker|signed-url-marker|profile-marker|header-marker/u);
     expect(harness.finalize).toHaveBeenCalledWith(douyinStaged, {
       platform: 'douyin',
       videoId: '7654841525762919726',
@@ -533,6 +630,7 @@ describe('downloadVideo', () => {
       'prepare',
       'openAuthority',
       'download',
+      'writeMetadata',
       'closeAuthority',
       'now',
       'finalize',
@@ -550,6 +648,7 @@ describe('downloadVideo', () => {
       undefined,
     );
     expect(harness.openStagingDownloadAuthority).toHaveBeenCalledWith(STAGED);
+    expect(harness.writeMetadata).toHaveBeenCalledWith(SAFE_METADATA);
     expect(harness.closeAuthority).toHaveBeenCalledTimes(1);
     expect(harness.finalize).toHaveBeenCalledWith(STAGED, {
       platform: 'youtube',
@@ -592,12 +691,14 @@ describe('downloadVideo', () => {
     const probeGate = createDeferred<YtDlpProbe>();
     const preparationGate = createDeferred<ArchivePreparation>();
     const downloadGate = createDeferred<void>();
+    const metadataWriteGate = createDeferred<void>();
     const finalizeGate = createDeferred<DownloadedArchive>();
     const harness = makeHarness({
       checkToolsPromise: toolsGate.promise,
       probePromise: probeGate.promise,
       preparationPromise: preparationGate.promise,
       downloadPromise: downloadGate.promise,
+      metadataWritePromise: metadataWriteGate.promise,
       finalizePromise: finalizeGate.promise,
     });
     const pending = Symbol('pending');
@@ -653,6 +754,21 @@ describe('downloadVideo', () => {
       'prepare',
       'openAuthority',
       'download',
+      'writeMetadata',
+    ]);
+    expect(harness.closeAuthority).not.toHaveBeenCalled();
+    expect(harness.finalize).not.toHaveBeenCalled();
+
+    metadataWriteGate.resolve();
+    await flushMicrotasks();
+    expect(harness.calls).toEqual([
+      'validateRoot',
+      'checkTools',
+      'probe',
+      'prepare',
+      'openAuthority',
+      'download',
+      'writeMetadata',
       'closeAuthority',
       'now',
       'finalize',
@@ -690,8 +806,38 @@ describe('downloadVideo', () => {
     expect(harness.cleanup).toHaveBeenCalledTimes(1);
     expect(harness.cleanup).toHaveBeenCalledWith(STAGED);
     expect(harness.closeAuthority).toHaveBeenCalledTimes(1);
+    expect(harness.writeMetadata).not.toHaveBeenCalled();
     expect(harness.finalize).not.toHaveBeenCalled();
     expect(harness.now).not.toHaveBeenCalled();
+  });
+
+  it('closes and cleans staging when safe metadata writing fails', async () => {
+    const failure = new DownloadError(
+      'DOWNLOAD_FINALIZE_FAILED',
+      'The download archive could not be finalized.',
+    );
+    const harness = makeHarness({
+      metadataWriteError: failure,
+      cleanupError: new Error('cleanup failed'),
+    });
+
+    const error = await captureRejection(downloadVideo(INPUT, harness.dependencies));
+
+    expect(error).toBe(failure);
+    expect(harness.calls).toEqual([
+      'validateRoot',
+      'checkTools',
+      'probe',
+      'prepare',
+      'openAuthority',
+      'download',
+      'writeMetadata',
+      'closeAuthority',
+      'cleanup',
+    ]);
+    expect(harness.closeAuthority).toHaveBeenCalledTimes(1);
+    expect(harness.finalize).not.toHaveBeenCalled();
+    expect(harness.cleanup).toHaveBeenCalledWith(STAGED);
   });
 
   it('waits for asynchronous cleanup before rethrowing a download failure', async () => {
@@ -812,6 +958,7 @@ describe('downloadVideo', () => {
       'prepare',
       'openAuthority',
       'download',
+      'writeMetadata',
       'closeAuthority',
       'now',
       'finalize',
