@@ -10,6 +10,7 @@ import {
   type DownloadProcessRunner,
   type YtDlpClientOptions,
   YtDlpInfoSchema,
+  type YtDlpOperationOptions,
 } from '../../../src/download/yt-dlp';
 import type {ProcessResult} from '../../../src/process/run-process';
 
@@ -158,6 +159,17 @@ describe('yt-dlp metadata validation', () => {
     });
   });
 
+  it('maps optional availability metadata without coercion', () => {
+    expect(parseYtDlpInfo({
+      id: '7654841525762919726',
+      title: 'Public Douyin fixture',
+      webpage_url: 'https://www.douyin.com/video/7654841525762919726',
+      extractor: 'Douyin',
+      _type: 'video',
+      availability: 'public',
+    })).toMatchObject({availability: 'public'});
+  });
+
   it.each([
     ['playlist', {_type: 'playlist'}],
     ['is_live flag', {is_live: true}],
@@ -191,8 +203,10 @@ describe('yt-dlp tool checks', () => {
     const client = createYtDlpClient({runProcess});
 
     await client.checkTools(controller.signal);
-    await client.probe('https://youtu.be/abc', controller.signal);
-    await client.download('https://youtu.be/abc', 45, controller.signal);
+    await client.probe('https://youtu.be/abc', {signal: controller.signal});
+    await client.download('https://youtu.be/abc', 45, {
+      signal: controller.signal,
+    });
 
     expect(runProcess.mock.calls[0]?.[2]).toEqual({signal: controller.signal});
     expect(runProcess.mock.calls[1]?.[2]).toEqual({signal: controller.signal});
@@ -314,6 +328,61 @@ describe('yt-dlp probe', () => {
     const args = runProcess.mock.calls[0]?.[1];
     expect(args).toBeDefined();
     expectFixedNetworkIsolation(args ?? []);
+  });
+
+  it('adds exact Chrome Cookie arguments to a probe', async () => {
+    const canonicalDouyinUrl =
+      'https://www.douyin.com/video/7654841525762919726';
+    const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockResolvedValueOnce(processResult(JSON.stringify({
+        id: '7654841525762919726',
+        title: 'Public Douyin fixture',
+        webpage_url: canonicalDouyinUrl,
+        extractor: 'Douyin',
+        _type: 'video',
+        availability: 'public',
+      })));
+
+    await createYtDlpClient({runProcess}).probe(canonicalDouyinUrl, {
+      browserCookieSource: 'chrome',
+    });
+
+    expect(runProcess).toHaveBeenCalledWith('yt-dlp', [
+      '--ignore-config',
+      '--proxy',
+      '',
+      '--no-geo-bypass',
+      '--no-playlist',
+      '--max-downloads',
+      '1',
+      '--cookies-from-browser',
+      'chrome',
+      '--skip-download',
+      '--dump-single-json',
+      canonicalDouyinUrl,
+    ]);
+  });
+
+  it('snapshots Chrome Cookie options before caller mutation', async () => {
+    const url = 'https://www.douyin.com/video/7654841525762919726';
+    const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockResolvedValueOnce(processResult(JSON.stringify({
+        id: '7654841525762919726',
+        title: 'Public Douyin fixture',
+        webpage_url: url,
+        extractor: 'Douyin',
+        _type: 'video',
+      })));
+    const client = createYtDlpClient({runProcess});
+    const operationOptions: YtDlpOperationOptions = {
+      browserCookieSource: 'chrome',
+    };
+
+    const promise = client.probe(url, operationOptions);
+    delete operationOptions.browserCookieSource;
+    await promise;
+
+    expect(runProcess.mock.calls[0]?.[1]).toContain('chrome');
   });
 
   it('includes extractorKey only when extractor_key is present', async () => {
@@ -487,6 +556,32 @@ describe('yt-dlp download', () => {
     expect(ytDlpArgs.at(-1)).toBe(url);
     expect(ytDlpArgs).not.toContain('--ffmpeg-location');
     expectFixedNetworkIsolation(ytDlpArgs);
+  });
+
+  it('adds exact Chrome Cookie arguments to the FD-bound download', async () => {
+    const canonicalDouyinUrl =
+      'https://www.douyin.com/video/7654841525762919726';
+    const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockResolvedValueOnce(processResult());
+
+    await createYtDlpClient({runProcess}).download(
+      canonicalDouyinUrl,
+      45,
+      {browserCookieSource: 'chrome'},
+    );
+
+    const wrapperArgs = runProcess.mock.calls[0]?.[1] ?? [];
+    expect(wrapperArgs.slice(6, 15)).toEqual([
+      '--ignore-config',
+      '--proxy',
+      '',
+      '--no-geo-bypass',
+      '--no-playlist',
+      '--max-downloads',
+      '1',
+      '--cookies-from-browser',
+      'chrome',
+    ]);
   });
 
   it('adds only an explicitly configured ffmpeg location before the URL', async () => {

@@ -4,6 +4,7 @@ import {
   type ProcessResult,
   type RunProcessOptions,
 } from '../process/run-process';
+import type {BrowserCookieSource} from './browser-cookies';
 import {DownloadError} from './errors';
 
 const TOOL_MISSING_MESSAGE = 'Required download tools are unavailable.';
@@ -23,6 +24,11 @@ const FIXED_YT_DLP_ARGS = [
   '--max-downloads',
   '1',
 ] as const;
+const browserCookieArgs = (
+  source: BrowserCookieSource | undefined,
+): readonly string[] => source === undefined
+  ? []
+  : ['--cookies-from-browser', source];
 const DARWIN_YT_DLP_WRAPPER_SCRIPT = [
   'ObjC.import("Foundation");',
   'ObjC.bindFunction("fchdir", ["int", ["int"]]);',
@@ -69,6 +75,7 @@ export const YtDlpInfoSchema = z.object({
   _type: z.string().optional(),
   is_live: z.boolean().nullable().optional(),
   live_status: z.string().nullable().optional(),
+  availability: z.string().nullable().optional(),
 }).passthrough();
 
 export interface YtDlpProbe {
@@ -77,6 +84,7 @@ export interface YtDlpProbe {
   canonicalUrl: string;
   extractor: string;
   extractorKey?: string;
+  availability?: string | null;
 }
 
 export const parseYtDlpInfo = (value: unknown): YtDlpProbe => {
@@ -99,6 +107,9 @@ export const parseYtDlpInfo = (value: unknown): YtDlpProbe => {
     ...(info.extractor_key === undefined
       ? {}
       : {extractorKey: info.extractor_key}),
+    ...(info.availability === undefined
+      ? {}
+      : {availability: info.availability}),
   };
 };
 
@@ -107,13 +118,18 @@ export interface DownloadToolVersions {
   ffmpegVersion: string;
 }
 
+export interface YtDlpOperationOptions {
+  browserCookieSource?: BrowserCookieSource;
+  signal?: AbortSignal;
+}
+
 export interface YtDlpClient {
   checkTools(signal?: AbortSignal): Promise<DownloadToolVersions>;
-  probe(url: string, signal?: AbortSignal): Promise<YtDlpProbe>;
+  probe(url: string, options?: YtDlpOperationOptions): Promise<YtDlpProbe>;
   download(
     url: string,
     stagingDirectoryFd: number,
-    signal?: AbortSignal,
+    options?: YtDlpOperationOptions,
   ): Promise<void>;
 }
 
@@ -169,10 +185,16 @@ export const createYtDlpClient = (
       }
     },
 
-    async probe(url: string, signal?: AbortSignal): Promise<YtDlpProbe> {
+    async probe(
+      url: string,
+      options?: YtDlpOperationOptions,
+    ): Promise<YtDlpProbe> {
+      const browserCookieSource = options?.browserCookieSource;
+      const signal = options?.signal;
       try {
         const result = await runWithSignal(ytDlpExecutable, [
           ...FIXED_YT_DLP_ARGS,
+          ...browserCookieArgs(browserCookieSource),
           '--skip-download',
           '--dump-single-json',
           url,
@@ -186,8 +208,10 @@ export const createYtDlpClient = (
     async download(
       url: string,
       stagingDirectoryFd: number,
-      signal?: AbortSignal,
+      options?: YtDlpOperationOptions,
     ): Promise<void> {
+      const browserCookieSource = options?.browserCookieSource;
+      const signal = options?.signal;
       try {
         await runner('/usr/bin/osascript', [
           '-l',
@@ -197,6 +221,7 @@ export const createYtDlpClient = (
           '--',
           ytDlpExecutable,
           ...FIXED_YT_DLP_ARGS,
+          ...browserCookieArgs(browserCookieSource),
           '--no-progress',
           '--write-info-json',
           '--clean-info-json',

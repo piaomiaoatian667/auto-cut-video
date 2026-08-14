@@ -341,11 +341,15 @@ describe('downloadVideo', () => {
     ]);
     expect(harness.validateRoot).toHaveBeenCalledWith('/workspace', 'downloads');
     expect(harness.checkTools).toHaveBeenCalledWith();
-    expect(harness.probe).toHaveBeenCalledWith('https://youtu.be/video-123');
+    expect(harness.probe).toHaveBeenCalledWith(
+      'https://youtu.be/video-123',
+      undefined,
+    );
     expect(harness.prepare).toHaveBeenCalledWith(ROOT, 'youtube', 'video-123');
     expect(harness.download).toHaveBeenCalledWith(
       'https://youtu.be/video-123',
       AUTHORITY_FD,
+      undefined,
     );
     expect(harness.openStagingDownloadAuthority).toHaveBeenCalledWith(STAGED);
     expect(harness.closeAuthority).toHaveBeenCalledTimes(1);
@@ -372,13 +376,17 @@ describe('downloadVideo', () => {
     expect(harness.checkTools).toHaveBeenCalledWith(controller.signal);
     expect(harness.probe).toHaveBeenCalledWith(
       'https://youtu.be/video-123',
-      controller.signal,
+      {signal: controller.signal},
     );
     expect(harness.download).toHaveBeenCalledWith(
       'https://youtu.be/video-123',
       AUTHORITY_FD,
-      controller.signal,
+      {signal: controller.signal},
     );
+    const probeOperationOptions = harness.probe.mock.calls[0]?.[1];
+    const downloadOperationOptions = harness.download.mock.calls[0]?.[2];
+    expect(downloadOperationOptions).toBe(probeOperationOptions);
+    expect(Object.isFrozen(probeOperationOptions)).toBe(true);
   });
 
   it('awaits each asynchronous stage before starting the next stage', async () => {
@@ -538,8 +546,13 @@ describe('downloadVideo', () => {
     const harness = makeHarness({
       authorityClosePromise: closeGate.promise,
       cleanupPromise: cleanupGate.promise,
-      downloadImplementation: async (_url, _fd, signal) => await new Promise(
+      downloadImplementation: async (
+        _url,
+        _fd,
+        operationOptions,
+      ) => await new Promise(
         (_resolve, reject) => {
+          const signal = operationOptions?.signal;
           if (signal === undefined) {
             reject(new Error('missing operation signal'));
             return;

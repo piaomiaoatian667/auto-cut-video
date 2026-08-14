@@ -85,9 +85,10 @@ export const downloadVideo = async (
   const tools = input.signal === undefined
     ? await dependencies.client.checkTools()
     : await dependencies.client.checkTools(input.signal);
-  const probe = input.signal === undefined
-    ? await dependencies.client.probe(requested.url)
-    : await dependencies.client.probe(requested.url, input.signal);
+  const operationOptions = input.signal === undefined
+    ? undefined
+    : Object.freeze({signal: input.signal});
+  const probe = await dependencies.client.probe(requested.url, operationOptions);
   assertExtractorMatches(requested.platform, probe.extractor);
 
   let canonical: ReturnType<typeof parseDownloadUrl>;
@@ -119,15 +120,11 @@ export const downloadVideo = async (
     );
     let downloadFailure: unknown;
     try {
-      if (input.signal === undefined) {
-        await dependencies.client.download(requested.url, authority.fd);
-      } else {
-        await dependencies.client.download(
-          requested.url,
-          authority.fd,
-          input.signal,
-        );
-      }
+      await dependencies.client.download(
+        requested.url,
+        authority.fd,
+        operationOptions,
+      );
     } catch (error) {
       downloadFailure = error;
     }
