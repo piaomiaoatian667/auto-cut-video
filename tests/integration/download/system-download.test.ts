@@ -67,22 +67,39 @@ const FAKE_YT_DLP_SCRIPT = [
   '    exit 0',
   '  fi',
   'done',
-  'case "$0" in',
-  '  *cookie*) cookie_mode=1 ;;',
-  '  *) cookie_mode=0 ;;',
+  'executable_name=${0##*/}',
+  'case "$executable_name" in',
+  '  yt-dlp-cookie) cookie_mode=1 ;;',
+  '  yt-dlp) cookie_mode=0 ;;',
+  '  *) exit 72 ;;',
   'esac',
   'cookie_source=',
-  'previous=',
+  'cookie_pair_count=0',
+  'expecting_cookie_source=0',
   'for argument in "$@"; do',
-  '  if [ "$previous" = "--cookies-from-browser" ]; then',
+  '  case "$argument" in',
+  '    --cookies-from-browser=*) exit 69 ;;',
+  '  esac',
+  '  if [ "$expecting_cookie_source" -eq 1 ]; then',
+  '    case "$argument" in',
+  '      -*) exit 70 ;;',
+  '    esac',
   '    cookie_source=$argument',
+  '    cookie_pair_count=$((cookie_pair_count + 1))',
+  '    expecting_cookie_source=0',
+  '    continue',
   '  fi',
-  '  previous=$argument',
+  '  if [ "$argument" = "--cookies-from-browser" ]; then',
+  '    [ "$cookie_pair_count" -eq 0 ] || exit 71',
+  '    expecting_cookie_source=1',
+  '  fi',
   'done',
+  '[ "$expecting_cookie_source" -eq 0 ] || exit 70',
   'if [ "$cookie_mode" -eq 1 ]; then',
+  '  [ "$cookie_pair_count" -eq 1 ] || exit 67',
   '  [ "$cookie_source" = "chrome" ] || exit 67',
   'else',
-  '  [ -z "$cookie_source" ] || exit 68',
+  '  [ "$cookie_pair_count" -eq 0 ] || exit 68',
   'fi',
   'for argument in "$@"; do',
   '  if [ "$argument" = "--dump-single-json" ]; then',
@@ -131,7 +148,7 @@ const FAKE_FFMPEG_SCRIPT = [
   'exit 64',
   '',
 ].join('\n');
-const NETWORK_COMMAND = /(?:^|\n)\s*(?:curl|wget|nc|ssh)\b/mu;
+const NETWORK_COMMAND = /(?:^|\n)\s*(?:\S*\/)?(?:curl|wget|nc|ssh)\b/mu;
 
 const temporaryDirectories: string[] = [];
 const execFileAsync = promisify(execFile);
@@ -177,6 +194,31 @@ const writeExecutable = async (target: string, source: string): Promise<void> =>
   await writeFile(target, source, {mode: 0o700});
   await chmod(target, 0o700);
 };
+
+interface FakeYtDlpLocation {
+  directoryName?: string;
+  executableName?: string;
+}
+
+const createFakeYtDlpExecutable = async ({
+  directoryName = 'tools',
+  executableName = 'yt-dlp',
+}: FakeYtDlpLocation = {}): Promise<string> => {
+  const workspaceRoot = await createWorkspace();
+  const executableDirectory = path.join(workspaceRoot, directoryName);
+  const executable = path.join(executableDirectory, executableName);
+  await mkdir(executableDirectory, {recursive: true});
+  await writeExecutable(executable, FAKE_YT_DLP_SCRIPT);
+  return executable;
+};
+
+const runFakeYtDlp = async (
+  arguments_: readonly string[],
+  location: FakeYtDlpLocation = {},
+) => execFileAsync(
+  await createFakeYtDlpExecutable(location),
+  [...arguments_],
+);
 
 interface NetworkSocketGuard {
   calls: readonly string[];
@@ -228,6 +270,115 @@ const installNetworkSocketGuard = (): NetworkSocketGuard => {
     },
   };
 };
+
+describe('fake yt-dlp integration harness', () => {
+  it('is valid POSIX shell', async () => {
+    const executable = await createFakeYtDlpExecutable();
+
+    await expect(execFileAsync('/bin/sh', ['-n', executable])).resolves.toMatchObject({
+      stderr: '',
+    });
+  });
+
+  it('detects bare and path-qualified network commands', () => {
+    expect('curl https://example.test').toMatch(NETWORK_COMMAND);
+    expect('/usr/bin/curl https://example.test').toMatch(NETWORK_COMMAND);
+    expect('  ./wget https://example.test').toMatch(NETWORK_COMMAND);
+  });
+
+  it('keeps an anonymous basename anonymous under a cookie-named parent path', async () => {
+    const result = await runFakeYtDlp(
+      ['--dump-single-json', CANONICAL_URL],
+      {directoryName: 'cookie-parent/tools', executableName: 'yt-dlp'},
+    );
+
+    expect(JSON.parse(result.stdout)).toEqual(INFO_DOCUMENT);
+  });
+
+  it('rejects unexpected executable basenames', async () => {
+    await expect(runFakeYtDlp(
+      ['--dump-single-json', CANONICAL_URL],
+      {executableName: 'yt-dlp-other'},
+    )).rejects.toMatchObject({code: 72});
+  });
+
+  it.each([
+    {
+      name: 'equals syntax in Cookie mode',
+      executableName: 'yt-dlp-cookie',
+      arguments: ['--cookies-from-browser=chrome', '--dump-single-json', CANONICAL_URL],
+      exitCode: 69,
+    },
+    {
+      name: 'empty equals syntax in anonymous mode',
+      executableName: 'yt-dlp',
+      arguments: ['--cookies-from-browser=', '--dump-single-json', CANONICAL_URL],
+      exitCode: 69,
+    },
+    {
+      name: 'a bare flag with no value',
+      executableName: 'yt-dlp',
+      arguments: ['--cookies-from-browser'],
+      exitCode: 70,
+    },
+    {
+      name: 'an option used as the source value',
+      executableName: 'yt-dlp-cookie',
+      arguments: ['--cookies-from-browser', '--dump-single-json', CANONICAL_URL],
+      exitCode: 70,
+    },
+    {
+      name: 'duplicate Cookie pairs',
+      executableName: 'yt-dlp-cookie',
+      arguments: [
+        '--cookies-from-browser',
+        'chrome',
+        '--cookies-from-browser',
+        'chrome',
+        '--dump-single-json',
+        CANONICAL_URL,
+      ],
+      exitCode: 71,
+    },
+    {
+      name: 'a valid pair followed by another bare flag',
+      executableName: 'yt-dlp-cookie',
+      arguments: [
+        '--cookies-from-browser',
+        'chrome',
+        '--dump-single-json',
+        CANONICAL_URL,
+        '--cookies-from-browser',
+      ],
+      exitCode: 71,
+    },
+    {
+      name: 'a Cookie pair in anonymous mode',
+      executableName: 'yt-dlp',
+      arguments: [
+        '--cookies-from-browser',
+        'chrome',
+        '--dump-single-json',
+        CANONICAL_URL,
+      ],
+      exitCode: 68,
+    },
+    {
+      name: 'a non-Chrome source in Cookie mode',
+      executableName: 'yt-dlp-cookie',
+      arguments: [
+        '--cookies-from-browser',
+        'firefox',
+        '--dump-single-json',
+        CANONICAL_URL,
+      ],
+      exitCode: 67,
+    },
+  ])('rejects $name', async ({executableName, arguments: arguments_, exitCode}) => {
+    await expect(runFakeYtDlp(arguments_, {executableName}))
+      .rejects.toMatchObject({code: exitCode});
+  });
+});
 
 describe('system download integration', () => {
   it('archives one video with fake local tools and no Node network sockets', async () => {
