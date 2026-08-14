@@ -1,7 +1,7 @@
 # Chrome Cookie-Assisted Public Video Download Design
 
 **Date:** 2026-08-14
-**Status:** Approved in conversation; awaiting written-spec review
+**Status:** Approved and implemented
 **Branch:** `codex/download-chrome-cookies`
 
 ## Summary
@@ -53,10 +53,12 @@ Anonymous behavior remains unchanged:
 pnpm video download "<public-video-url>" --rights-confirmed
 ```
 
-Cookie-assisted Douyin behavior requires all three acknowledgements:
+Cookie-assisted Douyin behavior requires this exact non-interactive flow and all
+three acknowledgements:
 
 ```bash
-pnpm video download "<public-douyin-url>" \
+pnpm video download \
+  "https://www.douyin.com/jingxuan?modal_id=7654841525762919726" \
   --rights-confirmed \
   --browser-cookies chrome \
   --cookie-access-confirmed
@@ -165,8 +167,13 @@ authentication, proxy, playlist, output, post-processing, or other behavior.
 The empty proxy and disabled geo-bypass controls remain mandatory.
 
 The application does not open, copy, parse, decrypt, export, or persist the
-Chrome cookie database itself. It delegates the explicitly authorized read to
-the local `yt-dlp` process. No cookie file is created by the application.
+Chrome cookie database itself. It delegates the explicitly authorized direct
+read of the local Chrome cookie store to `yt-dlp`. The application creates no
+cookie file and does not export, store, or print Cookie values.
+
+On macOS, the operating system may request Keychain or local Chrome cookie
+access. Denial fails safely as a controlled tool failure, with no fallback to a
+different access mode, no automatic retry, and no application prompting loop.
 
 Cookie values and Chrome paths must never enter application errors. Tool
 failures continue to be replaced by controlled `DownloadError` values without
