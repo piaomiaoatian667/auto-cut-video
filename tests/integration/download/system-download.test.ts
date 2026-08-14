@@ -39,6 +39,15 @@ const INFO_DOCUMENT = {
   extractor_key: 'Youtube',
   _type: 'video',
 };
+const COOKIE_INFO_DOCUMENT = {
+  id: '7654841525762919726',
+  title: 'Cookie-assisted Douyin fixture',
+  webpage_url: 'https://www.douyin.com/video/7654841525762919726',
+  extractor: 'Douyin',
+  extractor_key: 'Douyin',
+  _type: 'video',
+  availability: 'public',
+};
 const SUBTITLE_CONTENTS = [
   'WEBVTT',
   '',
@@ -57,8 +66,31 @@ const FAKE_YT_DLP_SCRIPT = [
   '    printf \'%s\\n\' \'2026.07.04-test\'',
   '    exit 0',
   '  fi',
+  'done',
+  'case "$0" in',
+  '  *cookie*) cookie_mode=1 ;;',
+  '  *) cookie_mode=0 ;;',
+  'esac',
+  'cookie_source=',
+  'previous=',
+  'for argument in "$@"; do',
+  '  if [ "$previous" = "--cookies-from-browser" ]; then',
+  '    cookie_source=$argument',
+  '  fi',
+  '  previous=$argument',
+  'done',
+  'if [ "$cookie_mode" -eq 1 ]; then',
+  '  [ "$cookie_source" = "chrome" ] || exit 67',
+  'else',
+  '  [ -z "$cookie_source" ] || exit 68',
+  'fi',
+  'for argument in "$@"; do',
   '  if [ "$argument" = "--dump-single-json" ]; then',
-  `    printf '%s\\n' '${JSON.stringify(INFO_DOCUMENT)}'`,
+  '    if [ "$cookie_mode" -eq 1 ]; then',
+  `      printf '%s\\n' '${JSON.stringify(COOKIE_INFO_DOCUMENT)}'`,
+  '    else',
+  `      printf '%s\\n' '${JSON.stringify(INFO_DOCUMENT)}'`,
+  '    fi',
   '    exit 0',
   '  fi',
   'done',
@@ -74,7 +106,11 @@ const FAKE_YT_DLP_SCRIPT = [
   '[ -n "$output" ] || exit 65',
   '[ "$output" = "video.%(ext)s" ] || exit 66',
   `printf '%s\\n' '${WEBM_BASE64}' | /usr/bin/base64 -D > video.webm`,
-  `printf '%s\\n' '${JSON.stringify(INFO_DOCUMENT)}' > video.info.json`,
+  'if [ "$cookie_mode" -eq 1 ]; then',
+  `  printf '%s\\n' '${JSON.stringify(COOKIE_INFO_DOCUMENT)}' > video.info.json`,
+  'else',
+  `  printf '%s\\n' '${JSON.stringify(INFO_DOCUMENT)}' > video.info.json`,
+  'fi',
   'cat > video.en.vtt <<\'VTT\'',
   'WEBVTT',
   '',
@@ -228,6 +264,8 @@ describe('system download integration', () => {
       if (result.status !== 'downloaded') {
         throw new Error('Expected a newly downloaded archive.');
       }
+      expect(result.receipt.version).toBe(1);
+      expect('browserCookies' in result.receipt).toBe(false);
 
       const finalDirectory = path.join(
         workspaceRoot,
@@ -253,6 +291,8 @@ describe('system download integration', () => {
       );
       const receipt = DownloadReceiptSchema.parse(JSON.parse(receiptSource));
       expect(receipt).toEqual(result.receipt);
+      expect(receipt.version).toBe(1);
+      expect('browserCookies' in receipt).toBe(false);
       expect(receipt).toMatchObject({
         downloadedAt: FIXED_DOWNLOAD_TIME.toISOString(),
         platform: 'youtube',
@@ -294,6 +334,80 @@ describe('system download integration', () => {
       const socketCalls = [...socketGuard.calls];
       socketGuard.restore();
       expect(socketCalls).toEqual([]);
+    }
+  });
+
+  it('archives one normalized Douyin video with explicit Chrome Cookie mode', async () => {
+    const socketGuard = installNetworkSocketGuard();
+    try {
+      expect(FAKE_YT_DLP_SCRIPT).not.toMatch(NETWORK_COMMAND);
+      expect(FAKE_FFMPEG_SCRIPT).not.toMatch(NETWORK_COMMAND);
+
+      const workspaceRoot = await createWorkspace();
+      const toolsDirectory = path.join(workspaceRoot, 'tools');
+      const ytDlpExecutable = path.join(toolsDirectory, 'yt-dlp-cookie');
+      const ffmpegExecutable = path.join(toolsDirectory, 'ffmpeg');
+      await mkdir(toolsDirectory);
+      await Promise.all([
+        writeExecutable(ytDlpExecutable, FAKE_YT_DLP_SCRIPT),
+        writeExecutable(ffmpegExecutable, FAKE_FFMPEG_SCRIPT),
+      ]);
+
+      const dependencies = createSystemDownloadDependencies({
+        ytDlpExecutable,
+        ffmpegExecutable,
+      });
+      dependencies.now = () => new Date(FIXED_DOWNLOAD_TIME);
+
+      const result = await downloadVideo({
+        workspaceRoot,
+        url: 'https://www.douyin.com/jingxuan?modal_id=7654841525762919726',
+        outputRoot: 'downloads',
+        rightsConfirmed: true,
+        browserCookieSource: 'chrome',
+        cookieAccessConfirmed: true,
+      }, dependencies);
+
+      expect(result.status).toBe('downloaded');
+      if (result.status !== 'downloaded') {
+        throw new Error('Expected a newly downloaded Cookie-assisted archive.');
+      }
+
+      const finalDirectory = path.join(
+        workspaceRoot,
+        'downloads',
+        'douyin',
+        '7654841525762919726',
+      );
+      expect(result).toMatchObject({
+        status: 'downloaded',
+        platform: 'douyin',
+        videoId: '7654841525762919726',
+        receipt: {
+          version: 2,
+          canonicalUrl: 'https://www.douyin.com/video/7654841525762919726',
+          browserCookies: {used: true, source: 'chrome'},
+        },
+      });
+      expect(DownloadReceiptSchema.parse(result.receipt)).toEqual(result.receipt);
+      expect((await readdir(finalDirectory)).sort()).toEqual([...FINAL_FILENAMES]);
+
+      const receipt = DownloadReceiptSchema.parse(JSON.parse(
+        await readFile(path.join(finalDirectory, 'receipt.json'), 'utf8'),
+      ));
+      expect(receipt).toEqual(result.receipt);
+      expect(receipt).toMatchObject({
+        version: 2,
+        browserCookies: {used: true, source: 'chrome'},
+      });
+      expect(JSON.stringify(receipt)).not.toMatch(/cookie_value|profile|database/iu);
+      expect(JSON.parse(await readFile(
+        path.join(finalDirectory, 'video.info.json'),
+        'utf8',
+      ))).toEqual(COOKIE_INFO_DOCUMENT);
+      expect(socketGuard.calls).toEqual([]);
+    } finally {
+      socketGuard.restore();
     }
   });
 });
