@@ -221,6 +221,7 @@ describe('system download integration', () => {
         url: CANONICAL_URL,
         outputRoot: 'downloads',
         rightsConfirmed: true,
+        cookieAccessConfirmed: false,
       } as const;
       const result = await downloadVideo(input, dependencies);
       expect(result.status).toBe('downloaded');

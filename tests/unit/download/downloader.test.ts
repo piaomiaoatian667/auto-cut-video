@@ -1,4 +1,4 @@
-import {describe, expect, it, vi} from 'vitest';
+import {describe, expect, expectTypeOf, it, vi} from 'vitest';
 import {
   cleanupArchive,
   finalizeArchive,
@@ -274,6 +274,11 @@ const processResult = (stdout: string): ProcessResult => ({
 });
 
 describe('downloadVideo', () => {
+  it('requires the explicit DownloadInput cookie access contract', () => {
+    expectTypeOf<Parameters<typeof downloadVideo>[0]>()
+      .toEqualTypeOf<DownloadInput>();
+  });
+
   it('rejects unconfirmed rights before URL parsing or dependencies', async () => {
     const harness = makeHarness();
     const error = await captureRejection(downloadVideo({

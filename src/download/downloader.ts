@@ -47,14 +47,6 @@ export interface DownloadInput {
   signal?: AbortSignal;
 }
 
-type AnonymousDownloadInput = Omit<
-  DownloadInput,
-  'browserCookieSource' | 'cookieAccessConfirmed'
-> & {
-  browserCookieSource?: never;
-  cookieAccessConfirmed?: never;
-};
-
 export type DownloadResult = DownloadedArchive | ExistingArchive;
 
 export interface DownloadArchiveDependencies {
@@ -84,13 +76,9 @@ export interface DownloadDependencies {
 }
 
 export const downloadVideo = async (
-  receivedInput: DownloadInput | AnonymousDownloadInput,
+  input: DownloadInput,
   dependencies: DownloadDependencies,
 ): Promise<DownloadResult> => {
-  const input: DownloadInput = receivedInput.cookieAccessConfirmed === undefined
-    ? {...receivedInput, cookieAccessConfirmed: false}
-    : receivedInput;
-
   if (!input.rightsConfirmed) {
     throw new DownloadError(
       'DOWNLOAD_RIGHTS_NOT_CONFIRMED',
