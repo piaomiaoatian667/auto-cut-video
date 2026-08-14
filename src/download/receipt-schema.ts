@@ -129,8 +129,7 @@ export const DownloadArchiveFileSchema = z.object({
 
 export type DownloadArchiveFile = z.infer<typeof DownloadArchiveFileSchema>;
 
-export const DownloadReceiptSchema = z.object({
-  version: z.literal(1),
+const DownloadReceiptCommonShape = {
   status: z.literal('downloaded'),
   platform: DownloadPlatformSchema,
   videoId: VideoIdSchema,
@@ -145,7 +144,30 @@ export const DownloadReceiptSchema = z.object({
     ffmpegVersion: z.string().min(1),
   }).strict(),
   files: z.array(DownloadArchiveFileSchema).min(2),
-}).strict().superRefine((receipt, context) => {
+};
+
+const DownloadReceiptV1Schema = z.object({
+  version: z.literal(1),
+  ...DownloadReceiptCommonShape,
+}).strict();
+
+const DownloadReceiptV2Schema = z.object({
+  version: z.literal(2),
+  ...DownloadReceiptCommonShape,
+  browserCookies: z.object({
+    used: z.literal(true),
+    source: z.literal('chrome'),
+  }).strict(),
+}).strict();
+
+type DownloadReceiptVariant =
+  | z.infer<typeof DownloadReceiptV1Schema>
+  | z.infer<typeof DownloadReceiptV2Schema>;
+
+const validateDownloadReceipt = (
+  receipt: DownloadReceiptVariant,
+  context: z.core.$RefinementCtx<DownloadReceiptVariant>,
+): void => {
   try {
     if (parseDownloadUrl(receipt.canonicalUrl).platform !== receipt.platform) {
       throw new Error();
@@ -208,6 +230,11 @@ export const DownloadReceiptSchema = z.object({
       path: ['files'],
     });
   }
-});
+};
+
+export const DownloadReceiptSchema = z.discriminatedUnion('version', [
+  DownloadReceiptV1Schema,
+  DownloadReceiptV2Schema,
+]).superRefine(validateDownloadReceipt);
 
 export type DownloadReceipt = z.infer<typeof DownloadReceiptSchema>;

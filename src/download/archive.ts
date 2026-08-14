@@ -13,6 +13,7 @@ import {
 } from 'node:fs/promises';
 import path from 'node:path';
 import {runProcess} from '../process/run-process';
+import type {BrowserCookieSource} from './browser-cookies';
 import {DownloadError} from './errors';
 import {
   assertExtractorMatches,
@@ -907,6 +908,7 @@ export interface FinalizeArchiveInput {
   canonicalUrl: string;
   downloadedAt: Date;
   tools: DownloadToolVersions;
+  browserCookieSource?: BrowserCookieSource;
 }
 
 export interface DownloadedArchive {
@@ -1249,20 +1251,28 @@ const buildReceipt = (
         sha256: file.sha256,
       }));
 
-    const receipt = DownloadReceiptSchema.parse({
-      version: 1,
-      status: 'downloaded',
+    const commonReceipt = {
+      status: 'downloaded' as const,
       platform: input.platform,
       videoId: input.videoId,
       title: input.title,
       canonicalUrl: inputCanonical.url,
       downloadedAt: input.downloadedAt.toISOString(),
-      purpose: 'learning-analysis',
-      rightsConfirmed: true,
-      transcoded: false,
+      purpose: 'learning-analysis' as const,
+      rightsConfirmed: true as const,
+      transcoded: false as const,
       tools: input.tools,
       files,
-    });
+    };
+    const receipt = DownloadReceiptSchema.parse(
+      input.browserCookieSource === undefined
+        ? {version: 1, ...commonReceipt}
+        : {
+            version: 2,
+            ...commonReceipt,
+            browserCookies: {used: true, source: input.browserCookieSource},
+          },
+    );
     return {receipt, mediaFilename: mediaFiles[0]?.name ?? ''};
   } catch {
     throw new DownloadError('DOWNLOAD_ARCHIVE_INVALID', ARCHIVE_INVALID_MESSAGE);

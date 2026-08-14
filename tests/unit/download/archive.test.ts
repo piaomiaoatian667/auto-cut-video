@@ -658,6 +658,8 @@ describe('finalizeArchive', () => {
       mediaPath: `${expectedDirectory}/video.webm`,
       receiptPath: `${expectedDirectory}/receipt.json`,
     });
+    expect(result.receipt.version).toBe(1);
+    expect('browserCookies' in result.receipt).toBe(false);
     expect((await lstat(finalDirectory)).isDirectory()).toBe(true);
     await expectMissing(prepared.stagingDirectory);
 
@@ -707,6 +709,19 @@ describe('finalizeArchive', () => {
     ]));
     expect((await readdir(finalDirectory)).some((name) =>
       name.includes('receipt-') || name.endsWith('.tmp'))).toBe(false);
+  });
+
+  it('records Chrome cookie use in a strict version 2 receipt', async () => {
+    const workspaceRoot = await createWorkspace();
+    const {prepared} = await prepareStaging(workspaceRoot);
+    await writeStagedFiles(prepared);
+
+    const result = await finalize(prepared, {browserCookieSource: 'chrome'});
+
+    expect(result.receipt).toMatchObject({
+      version: 2,
+      browserCookies: {used: true, source: 'chrome'},
+    });
   });
 
   it.each([
@@ -1761,6 +1776,25 @@ describe('prepareArchive duplicate verification', () => {
     });
     expect(await readdir(path.join(published.root.absolutePath, '.staging')))
       .toEqual([]);
+  });
+
+  it('returns a sealed version 2 receipt unchanged', async () => {
+    const workspaceRoot = await createWorkspace();
+    const {root, prepared} = await prepareStaging(workspaceRoot);
+    await writeStagedFiles(prepared);
+    const result = await finalize(prepared, {browserCookieSource: 'chrome'});
+
+    const duplicate = await prepareArchive(root, 'youtube', 'abc');
+
+    expect(result.receipt).toMatchObject({
+      version: 2,
+      browserCookies: {used: true, source: 'chrome'},
+    });
+    expect(duplicate.status).toBe('already-present');
+    if (duplicate.status !== 'already-present') {
+      throw new Error('Expected an existing archive.');
+    }
+    expect(duplicate.receipt).toEqual(result.receipt);
   });
 
   it('projects oversized existing metadata before returning it from the worker', async () => {

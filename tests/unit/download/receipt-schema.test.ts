@@ -31,6 +31,10 @@ interface ReceiptFixture {
     ffmpegVersion: string;
   };
   files: ArchiveFileFixture[];
+  browserCookies?: {
+    used: boolean;
+    source: string;
+  };
 }
 
 const sha256 = (character: string): string =>
@@ -56,7 +60,9 @@ const mediaFile = (
   ...overrides,
 });
 
-const makeReceipt = (): ReceiptFixture => ({
+const makeReceipt = (
+  browserCookies?: ReceiptFixture['browserCookies'],
+): ReceiptFixture => ({
   version: 1,
   status: 'downloaded',
   platform: 'youtube',
@@ -72,6 +78,7 @@ const makeReceipt = (): ReceiptFixture => ({
     ffmpegVersion: '7.1.1',
   },
   files: [metadataFile(), mediaFile()],
+  ...(browserCookies === undefined ? {} : {browserCookies}),
 });
 
 const expectInvalid = (receipt: unknown): void => {
@@ -117,6 +124,54 @@ describe('download receipt schema', () => {
 
     expect(parsed).toEqual(receipt);
     expectTypeOf(parsed.files).toEqualTypeOf<DownloadArchiveFile[]>();
+  });
+
+  it('parses a valid strict version 2 cookie audit receipt unchanged', () => {
+    const receipt = {
+      ...makeReceipt(),
+      version: 2,
+      browserCookies: {used: true, source: 'chrome'},
+    };
+
+    expect(DownloadReceiptSchema.parse(receipt)).toEqual(receipt);
+  });
+
+  it('rejects cookie audit fields on version 1', () => {
+    expectInvalid(makeReceipt({used: true, source: 'chrome'}));
+  });
+
+  it.each([
+    ['omitted browserCookies', {...makeReceipt(), version: 2}],
+    [
+      'undefined browserCookies',
+      {...makeReceipt(), version: 2, browserCookies: undefined},
+    ],
+    [
+      'unused Chrome cookies',
+      {
+        ...makeReceipt(),
+        version: 2,
+        browserCookies: {used: false, source: 'chrome'},
+      },
+    ],
+    [
+      'unsupported cookie source',
+      {
+        ...makeReceipt(),
+        version: 2,
+        browserCookies: {used: true, source: 'firefox'},
+      },
+    ],
+    [
+      'unexpected cookie profile',
+      {
+        ...makeReceipt(),
+        version: 2,
+        browserCookies: {used: true, source: 'chrome', profile: 'Default'},
+      },
+    ],
+  ])('rejects version 2 receipt with %s', (_caseName, receipt) => {
+    expectInvalid(receipt);
   });
 
   it('rejects an unexpected top-level key', () => {
