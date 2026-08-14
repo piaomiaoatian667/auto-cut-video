@@ -83,6 +83,7 @@ const makeFixture = async () => {
     loadProject: vi.fn(async () => projectInputs),
     measureSourceBytes: vi.fn(async () => 0),
     preflight: vi.fn(async () => { throw new Error('unused'); }),
+    download: vi.fn(async () => { throw new Error('unused'); }),
   };
   return {workspaceRoot, runId, dependencies, stdout: () => stdout, stderr: () => stderr};
 };

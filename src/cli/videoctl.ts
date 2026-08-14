@@ -8,6 +8,14 @@ import {
   type ProjectInputs,
 } from '../domain/load-project';
 import {
+  createSystemDownloadDependencies,
+  downloadVideo,
+  type DownloadDependencies,
+  type DownloadInput,
+  type DownloadResult,
+} from '../download/downloader';
+import type {YtDlpClientOptions} from '../download/yt-dlp';
+import {
   openExistingProjectFile,
   type ProjectDirectoryScope,
 } from '../fs/project-paths';
@@ -20,10 +28,17 @@ import {
 import {aggregateChecks} from '../pipeline/gate';
 import {EXIT_CODES} from './exit-codes';
 import {
+  formatDownloadFailure,
+} from './download-output';
+import {
   formatDoctorFailure,
   formatDoctorJson,
   formatDoctorTable,
 } from './output';
+import {
+  runDownloadCommand,
+  type DownloadCommandOptions,
+} from './commands/download';
 import {runReviewCommand, type ReviewCommandOptions} from './commands/review';
 
 export interface OutputWriter {
@@ -37,6 +52,8 @@ export interface VideoctlDependencies {
   loadProject(workspaceRoot: string, projectId: string): Promise<ProjectInputs>;
   measureSourceBytes(project: ProjectInputs): Promise<number>;
   preflight(input: PreflightInput): Promise<PreflightResult>;
+  download(input: DownloadInput): Promise<DownloadResult>;
+  downloadSignal?: AbortSignal;
   ffmpegExecutable?: string;
   ffprobeExecutable?: string;
 }
@@ -44,6 +61,17 @@ export interface VideoctlDependencies {
 interface DoctorOptions {
   json?: boolean;
 }
+
+const DOWNLOAD_PARSE_FAILURE_MESSAGE = 'The download command input is invalid.';
+
+const targetsDownload = (argv: readonly string[]): boolean =>
+  argv[0] === 'download';
+
+const requestsDownloadJson = (argv: readonly string[]): boolean =>
+  targetsDownload(argv)
+  && argv.slice(1).some((value) => (
+    value === '--json' || value.startsWith('--json=')
+  ));
 
 export interface SourceMeterStat {
   dev: bigint;
@@ -482,13 +510,17 @@ export async function runVideoctl(
   dependencies: VideoctlDependencies,
 ): Promise<number> {
   let exitCode: number = EXIT_CODES.success;
+  const downloadRequested = targetsDownload(argv);
+  const downloadJsonRequested = requestsDownloadJson(argv);
   const command = new Command();
   command
     .name('videoctl')
     .exitOverride()
     .configureOutput({
       writeOut: (value) => { dependencies.stdout.write(value); },
-      writeErr: (value) => { dependencies.stderr.write(value); },
+      writeErr: (value) => {
+        if (!downloadRequested) dependencies.stderr.write(value);
+      },
     });
   command
     .command('doctor')
@@ -497,6 +529,16 @@ export async function runVideoctl(
     .option('--json', 'print machine-readable JSON')
     .action(async (project: string, options: DoctorOptions) => {
       exitCode = await runDoctor(project, options, dependencies);
+    });
+  command
+    .command('download')
+    .description('Archive one authorized public video without editing it')
+    .argument('<url>')
+    .option('--rights-confirmed', 'confirm permission to save this public video')
+    .option('--output <directory>', 'workspace-relative archive directory', 'downloads')
+    .option('--json', 'print machine-readable JSON')
+    .action(async (url: string, options: DownloadCommandOptions) => {
+      exitCode = await runDownloadCommand(url, options, dependencies);
     });
   command
     .command('review')
@@ -519,12 +561,28 @@ export async function runVideoctl(
     ) {
       return EXIT_CODES.success;
     }
+    if (error instanceof CommanderError && downloadRequested) {
+      const output = formatDownloadFailure(
+        'DOWNLOAD_URL_INVALID',
+        DOWNLOAD_PARSE_FAILURE_MESSAGE,
+        downloadJsonRequested,
+      );
+      if (downloadJsonRequested) {
+        dependencies.stdout.write(output);
+      } else {
+        dependencies.stderr.write(output);
+      }
+    }
     return EXIT_CODES.validationFailed;
   }
 }
 
 export interface SystemVideoctlOptions {
   sourceMeter?: SourceMeterDependencies;
+  signal?: AbortSignal;
+  createDownloadDependencies?: (
+    options: YtDlpClientOptions,
+  ) => DownloadDependencies;
 }
 
 export interface SystemSourceMeterFileHandle {
@@ -586,8 +644,16 @@ export const createSystemVideoctlDependencies = (
   const preflightDependencies = createSystemPreflightDependencies();
   const sourceMeter = options.sourceMeter
     ?? createSystemSourceMeterDependencies();
+  const createDownloadDependencies = options.createDownloadDependencies
+    ?? createSystemDownloadDependencies;
+  const downloadSignal = options.signal;
+  const ytDlpExecutable = process.env.YT_DLP_PATH;
   const ffmpegExecutable = process.env.FFMPEG_PATH;
   const ffprobeExecutable = process.env.FFPROBE_PATH;
+  const downloadDependencies = createDownloadDependencies({
+    ...(ytDlpExecutable === undefined ? {} : {ytDlpExecutable}),
+    ...(ffmpegExecutable === undefined ? {} : {ffmpegExecutable}),
+  });
   return {
     workspaceRoot: process.cwd(),
     stdout: process.stdout,
@@ -598,19 +664,52 @@ export const createSystemVideoctlDependencies = (
       sourceMeter,
     ),
     preflight: async (input) => runPreflight(input, preflightDependencies),
+    download: async (input) => await downloadVideo(input, downloadDependencies),
+    ...(downloadSignal === undefined ? {} : {downloadSignal}),
     ...(ffmpegExecutable === undefined ? {} : {ffmpegExecutable}),
     ...(ffprobeExecutable === undefined ? {} : {ffprobeExecutable}),
   };
+};
+
+export interface DownloadSignalHost {
+  on(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
+  removeListener(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
+}
+
+export const runWithDownloadSignalHandlers = async <Result>(
+  signalHost: DownloadSignalHost,
+  operation: (signal: AbortSignal) => Promise<Result>,
+): Promise<Result> => {
+  const controller = new AbortController();
+  const removeListeners = (): void => {
+    signalHost.removeListener('SIGINT', cancel);
+    signalHost.removeListener('SIGTERM', cancel);
+  };
+  const cancel = (): void => {
+    if (controller.signal.aborted) return;
+    controller.abort(new Error('The download operation was cancelled.'));
+  };
+  signalHost.on('SIGINT', cancel);
+  signalHost.on('SIGTERM', cancel);
+  try {
+    return await operation(controller.signal);
+  } finally {
+    removeListeners();
+  }
 };
 
 const directlyExecuted = process.argv[1] !== undefined
   && pathToFileURL(process.argv[1]).href === import.meta.url;
 
 if (directlyExecuted) {
-  void runVideoctl(
-    process.argv.slice(2),
-    createSystemVideoctlDependencies(),
-  ).then(
+  const argv = process.argv.slice(2);
+  const operation = targetsDownload(argv)
+    ? runWithDownloadSignalHandlers(process, async (signal) => await runVideoctl(
+        argv,
+        createSystemVideoctlDependencies({signal}),
+      ))
+    : runVideoctl(argv, createSystemVideoctlDependencies());
+  void operation.then(
     (exitCode) => { process.exitCode = exitCode; },
     () => {
       process.stderr.write('videoctl failed unexpectedly.\n');

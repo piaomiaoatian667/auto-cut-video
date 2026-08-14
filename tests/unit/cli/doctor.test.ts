@@ -86,6 +86,7 @@ const fixture = (result: PreflightResult = successfulResult()) => {
     loadProject: vi.fn(async () => projectInputs),
     measureSourceBytes: vi.fn(async () => 1024),
     preflight: vi.fn(async () => result),
+    download: vi.fn(async () => { throw new Error('unused'); }),
     ffmpegExecutable: '/configured/ffmpeg',
     ffprobeExecutable: '/configured/ffprobe',
   };
@@ -104,6 +105,7 @@ describe('videoctl doctor', () => {
       needsReview: 2,
       validationFailed: 3,
       environmentFailed: 4,
+      operationFailed: 5,
       cancelled: 130,
     });
   });

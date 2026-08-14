@@ -3,5 +3,6 @@ export const EXIT_CODES = {
   needsReview: 2,
   validationFailed: 3,
   environmentFailed: 4,
+  operationFailed: 5,
   cancelled: 130,
 } as const;
