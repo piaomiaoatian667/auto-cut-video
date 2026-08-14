@@ -2,6 +2,7 @@ import {describe, expect, it} from 'vitest';
 import {
   parseBrowserCookieSource,
   validateBrowserCookieRequest,
+  type BrowserCookieSource,
 } from '../../../src/download/browser-cookies';
 import {isDownloadError} from '../../../src/download/errors';
 
@@ -14,6 +15,7 @@ const expectDownloadError = (
   operation: () => unknown,
   code: 'DOWNLOAD_COOKIE_OPTIONS_INVALID' | 'DOWNLOAD_COOKIE_HOST_UNSUPPORTED',
   message: string,
+  forbidden?: string,
 ): void => {
   try {
     operation();
@@ -23,6 +25,14 @@ const expectDownloadError = (
     if (!isDownloadError(error)) throw error;
     expect(error).toMatchObject({code, message, name: 'DownloadError'});
     expect(error.cause).toBeUndefined();
+    if (forbidden !== undefined) {
+      expect([
+        error.name,
+        error.code,
+        error.message,
+        String(error.cause),
+      ].join('\n')).not.toContain(forbidden);
+    }
   }
 };
 
@@ -58,6 +68,38 @@ describe('browser cookie request validation', () => {
   it('allows explicitly confirmed Chrome access for Douyin', () => {
     expect(validateBrowserCookieRequest('chrome', true, 'douyin'))
       .toBe('chrome');
+  });
+
+  it('rejects an arbitrary runtime browser source without retaining it', () => {
+    const marker = 'firefox:profile-marker';
+
+    expectDownloadError(
+      () => validateBrowserCookieRequest(
+        marker as unknown as BrowserCookieSource,
+        true,
+        'douyin',
+      ),
+      'DOWNLOAD_COOKIE_OPTIONS_INVALID',
+      COOKIE_OPTIONS_MESSAGE,
+      marker,
+    );
+  });
+
+  it.each([
+    ['omitted', undefined],
+    ['null', null],
+    ['string', 'true'],
+    ['number', 1],
+  ])('rejects a runtime %s confirmation value', (_name, confirmed) => {
+    expectDownloadError(
+      () => validateBrowserCookieRequest(
+        'chrome',
+        confirmed as unknown as boolean,
+        'douyin',
+      ),
+      'DOWNLOAD_COOKIE_OPTIONS_INVALID',
+      COOKIE_OPTIONS_MESSAGE,
+    );
   });
 
   it.each([

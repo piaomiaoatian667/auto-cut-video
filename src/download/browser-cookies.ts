@@ -24,6 +24,17 @@ export const validateBrowserCookieRequest = (
   cookieAccessConfirmed: boolean,
   platform: DownloadPlatform,
 ): BrowserCookieSource | undefined => {
+  const runtimeSource: unknown = source;
+  const runtimeConfirmation: unknown = cookieAccessConfirmed;
+  if (
+    (runtimeSource !== undefined && runtimeSource !== 'chrome') ||
+    typeof runtimeConfirmation !== 'boolean'
+  ) {
+    throw new DownloadError(
+      'DOWNLOAD_COOKIE_OPTIONS_INVALID',
+      COOKIE_OPTIONS_MESSAGE,
+    );
+  }
   if ((source === undefined) === cookieAccessConfirmed) {
     throw new DownloadError(
       'DOWNLOAD_COOKIE_OPTIONS_INVALID',

@@ -1,4 +1,4 @@
-import {describe, expect, expectTypeOf, it, vi} from 'vitest';
+import {describe, expect, it, vi} from 'vitest';
 import {
   cleanupArchive,
   finalizeArchive,
@@ -275,8 +275,16 @@ const processResult = (stdout: string): ProcessResult => ({
 
 describe('downloadVideo', () => {
   it('requires the explicit DownloadInput cookie access contract', () => {
-    expectTypeOf<Parameters<typeof downloadVideo>[0]>()
-      .toEqualTypeOf<DownloadInput>();
+    const inputWithoutCookieAccessState = {
+      workspaceRoot: INPUT.workspaceRoot,
+      url: INPUT.url,
+      outputRoot: INPUT.outputRoot,
+      rightsConfirmed: INPUT.rightsConfirmed,
+    };
+    // @ts-expect-error cookieAccessConfirmed is required.
+    const typedInput: DownloadInput = inputWithoutCookieAccessState;
+
+    expect(typedInput).toBe(inputWithoutCookieAccessState);
   });
 
   it('rejects unconfirmed rights before URL parsing or dependencies', async () => {
@@ -342,6 +350,58 @@ describe('downloadVideo', () => {
     }, harness.dependencies));
 
     expect(error).toMatchObject({code: 'DOWNLOAD_COOKIE_HOST_UNSUPPORTED'});
+    expect(harness.calls).toEqual([]);
+  });
+
+  it.each([
+    {
+      name: 'arbitrary source',
+      input: {
+        browserCookieSource: 'firefox:profile-marker',
+        cookieAccessConfirmed: true,
+      },
+      forbidden: 'firefox:profile-marker',
+    },
+    {
+      name: 'omitted confirmation',
+      input: {browserCookieSource: 'chrome'},
+    },
+    {
+      name: 'non-boolean confirmation',
+      input: {
+        browserCookieSource: 'chrome',
+        cookieAccessConfirmed: 'true',
+      },
+    },
+  ])('rejects runtime-invalid Cookie request $name before archive access', async ({
+    input,
+    forbidden,
+  }) => {
+    const harness = makeHarness();
+    const runtimeInput = {
+      workspaceRoot: INPUT.workspaceRoot,
+      url: 'https://www.douyin.com/video/7654841525762919726',
+      outputRoot: INPUT.outputRoot,
+      rightsConfirmed: true,
+      ...input,
+    } as unknown as DownloadInput;
+
+    const error = await captureRejection(downloadVideo(
+      runtimeInput,
+      harness.dependencies,
+    ));
+
+    expect(error).toBeInstanceOf(DownloadError);
+    if (!(error instanceof DownloadError)) throw error;
+    expect(error).toMatchObject({
+      code: 'DOWNLOAD_COOKIE_OPTIONS_INVALID',
+      message:
+        'Chrome cookie access requires both browser selection and explicit confirmation.',
+    });
+    expect(error.cause).toBeUndefined();
+    if (forbidden !== undefined) {
+      expect(String(error)).not.toContain(forbidden);
+    }
     expect(harness.calls).toEqual([]);
   });
 
