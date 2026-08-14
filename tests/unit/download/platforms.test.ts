@@ -92,6 +92,28 @@ describe('download platforms', () => {
       .toBe('https://youtu.be/abc?x=1');
   });
 
+  it('normalizes one strict Douyin Jingxuan modal URL', () => {
+    expect(parseDownloadUrl(
+      'https://www.douyin.com/jingxuan?modal_id=7654841525762919726',
+    )).toEqual({
+      url: 'https://www.douyin.com/video/7654841525762919726',
+      hostname: 'www.douyin.com',
+      platform: 'douyin',
+    });
+  });
+
+  it.each([
+    'https://www.douyin.com/jingxuan',
+    'https://www.douyin.com/jingxuan?modal_id=',
+    'https://www.douyin.com/jingxuan?modal_id=abc&modal_id=def',
+    'https://www.douyin.com/jingxuan?modal_id=abc&tracking=1',
+    'https://www.douyin.com/jingxuan?modal_id=video%2Fid',
+    'https://www.douyin.com/jingxuan?modal_id=..',
+    'https://www.douyin.com/jingxuan?modal_id=abc#tracking',
+  ])('rejects malformed or ambiguous Douyin modal URL %s', (source) => {
+    expectDownloadError(() => parseDownloadUrl(source), 'DOWNLOAD_URL_INVALID');
+  });
+
   it.each([
     ['Youtube', 'youtube'],
     ['youtube:tab', 'youtube'],
