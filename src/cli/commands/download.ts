@@ -2,6 +2,7 @@ import type {
   DownloadInput,
   DownloadResult,
 } from '../../download/downloader';
+import {parseBrowserCookieSource} from '../../download/browser-cookies';
 import {
   isDownloadError,
   type DownloadErrorCode,
@@ -17,6 +18,8 @@ export interface DownloadCommandOptions {
   rightsConfirmed?: boolean;
   output?: string;
   json?: boolean;
+  browserCookies?: string;
+  cookieAccessConfirmed?: boolean;
 }
 
 export interface DownloadCommandDependencies {
@@ -32,6 +35,8 @@ const INVALID_INPUT_CODES = new Set<DownloadErrorCode>([
   'DOWNLOAD_URL_INVALID',
   'DOWNLOAD_HOST_UNSUPPORTED',
   'DOWNLOAD_OUTPUT_INVALID',
+  'DOWNLOAD_COOKIE_OPTIONS_INVALID',
+  'DOWNLOAD_COOKIE_HOST_UNSUPPORTED',
 ]);
 
 const UNEXPECTED_ERROR_CODE: DownloadErrorCode = 'DOWNLOAD_PROCESS_FAILED';
@@ -64,11 +69,16 @@ export const runDownloadCommand = async (
 ): Promise<number> => {
   const json = options.json === true;
   try {
+    const browserCookieSource = parseBrowserCookieSource(
+      options.browserCookies,
+    );
     const result = await dependencies.download({
       workspaceRoot: dependencies.workspaceRoot,
       url,
       outputRoot: options.output ?? 'downloads',
       rightsConfirmed: Boolean(options.rightsConfirmed),
+      ...(browserCookieSource === undefined ? {} : {browserCookieSource}),
+      cookieAccessConfirmed: Boolean(options.cookieAccessConfirmed),
       ...(dependencies.downloadSignal === undefined
         ? {}
         : {signal: dependencies.downloadSignal}),

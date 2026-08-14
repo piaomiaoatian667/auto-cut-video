@@ -18,6 +18,8 @@ import {
 } from '../../../src/download/errors';
 
 const inputUrl = 'https://www.youtube.com/watch?v=abc';
+const jingxuanUrl =
+  'https://www.douyin.com/jingxuan?modal_id=7654841525762919726';
 
 const downloadResult = (
   status: DownloadResult['status'] = 'downloaded',
@@ -77,7 +79,10 @@ describe('videoctl download', () => {
       url: inputUrl,
       outputRoot: 'downloads',
       rightsConfirmed: true,
+      cookieAccessConfirmed: false,
     });
+    expect(run.download.mock.calls[0]?.[0])
+      .not.toHaveProperty('browserCookieSource');
     expect(run.stdout()).toBe([
       'Download complete: youtube/abc',
       'Media: downloads/youtube/abc/video.mp4',
@@ -103,8 +108,78 @@ describe('videoctl download', () => {
       url: inputUrl,
       outputRoot: 'downloads',
       rightsConfirmed: true,
+      cookieAccessConfirmed: false,
       signal: controller.signal,
     });
+    expect(run.download.mock.calls[0]?.[0])
+      .not.toHaveProperty('browserCookieSource');
+  });
+
+  it('forwards explicitly confirmed Chrome cookie access', async () => {
+    const run = fixture();
+
+    const exitCode = await runVideoctl([
+      'download',
+      jingxuanUrl,
+      '--rights-confirmed',
+      '--browser-cookies',
+      'chrome',
+      '--cookie-access-confirmed',
+    ], run.dependencies);
+
+    expect(exitCode).toBe(EXIT_CODES.success);
+    expect(run.download).toHaveBeenCalledWith({
+      workspaceRoot: '/workspace',
+      url: jingxuanUrl,
+      outputRoot: 'downloads',
+      rightsConfirmed: true,
+      browserCookieSource: 'chrome',
+      cookieAccessConfirmed: true,
+    });
+    expect(run.stderr()).toBe('');
+  });
+
+  it('rejects unsupported browser sources without exposing them', async () => {
+    const run = fixture();
+    const unsupportedSource = 'secret-profile-marker';
+    const expected = {
+      command: 'download',
+      ok: false,
+      code: 'DOWNLOAD_COOKIE_OPTIONS_INVALID',
+      message:
+        'Chrome cookie access requires both browser selection and explicit confirmation.',
+    };
+
+    const exitCode = await runVideoctl([
+      'download',
+      jingxuanUrl,
+      '--rights-confirmed',
+      '--browser-cookies',
+      unsupportedSource,
+      '--cookie-access-confirmed',
+      '--json',
+    ], run.dependencies);
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(run.download).not.toHaveBeenCalled();
+    expect(run.stdout()).toBe(`${JSON.stringify(expected, null, 2)}\n`);
+    expect(JSON.parse(run.stdout())).toEqual(expected);
+    expect(run.stdout()).not.toContain(unsupportedSource);
+    expect(run.stderr()).toBe('');
+  });
+
+  it('documents the closed browser cookie options in download help', async () => {
+    const run = fixture();
+
+    const exitCode = await runVideoctl(
+      ['download', '--help'],
+      run.dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.success);
+    expect(run.stdout()).toContain('--browser-cookies <browser>');
+    expect(run.stdout()).toContain('--cookie-access-confirmed');
+    expect(run.stderr()).toBe('');
   });
 
   it('labels an existing archive without claiming a new download', async () => {
@@ -189,7 +264,10 @@ describe('videoctl download', () => {
       url: inputUrl,
       outputRoot: 'archives',
       rightsConfirmed: true,
+      cookieAccessConfirmed: false,
     });
+    expect(run.download.mock.calls[0]?.[0])
+      .not.toHaveProperty('browserCookieSource');
   });
 
   it('maps missing rights confirmation to invalid input', async () => {

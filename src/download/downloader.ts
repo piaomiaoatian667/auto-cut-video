@@ -12,6 +12,7 @@ import {
   type StagedArchive,
   type ValidatedArchiveRoot,
 } from './archive';
+import type {BrowserCookieSource} from './browser-cookies';
 import {DownloadError} from './errors';
 import {
   assertExtractorMatches,
@@ -32,6 +33,8 @@ export interface DownloadInput {
   url: string;
   outputRoot: string;
   rightsConfirmed: boolean;
+  browserCookieSource?: BrowserCookieSource;
+  cookieAccessConfirmed?: boolean;
   signal?: AbortSignal;
 }
 

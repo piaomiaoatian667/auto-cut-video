@@ -536,6 +536,8 @@ export async function runVideoctl(
     .argument('<url>')
     .option('--rights-confirmed', 'confirm permission to save this public video')
     .option('--output <directory>', 'workspace-relative archive directory', 'downloads')
+    .option('--browser-cookies <browser>', 'read browser cookies; supported value: chrome')
+    .option('--cookie-access-confirmed', 'confirm access to the local Chrome cookie store')
     .option('--json', 'print machine-readable JSON')
     .action(async (url: string, options: DownloadCommandOptions) => {
       exitCode = await runDownloadCommand(url, options, dependencies);
