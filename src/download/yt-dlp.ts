@@ -21,7 +21,7 @@ const FIXED_YT_DLP_ARGS = [
   '',
   '--no-geo-bypass',
   '--no-playlist',
-  '--max-downloads',
+  '--playlist-items',
   '1',
 ] as const;
 const browserCookieArgs = (

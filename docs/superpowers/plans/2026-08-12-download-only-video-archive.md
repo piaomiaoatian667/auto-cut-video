@@ -448,7 +448,7 @@ describe('yt-dlp client', () => {
     await expect(client.probe('https://youtu.be/abc')).resolves.toMatchObject({id: 'abc'});
     expect(runProcess.mock.calls[2]?.[1]).toEqual([
       '--ignore-config', '--proxy', '', '--no-geo-bypass',
-      '--no-playlist', '--max-downloads', '1',
+      '--no-playlist', '--playlist-items', '1',
       '--skip-download', '--dump-single-json', 'https://youtu.be/abc',
     ]);
   });
@@ -466,12 +466,14 @@ describe('yt-dlp client', () => {
     const ytDlpArgs = args?.slice(6) ?? [];
     expect(ytDlpArgs.slice(0, 7)).toEqual([
       '--ignore-config', '--proxy', '', '--no-geo-bypass',
-      '--no-playlist', '--max-downloads', '1',
+      '--no-playlist', '--playlist-items', '1',
     ]);
     expect(ytDlpArgs).toEqual(expect.arrayContaining([
-      '--write-info-json', '--clean-info-json', '--write-thumbnail',
+      '--write-thumbnail',
       '--write-subs', '--write-auto-subs', '--sub-langs', 'zh.*,en.*',
     ]));
+    expect(ytDlpArgs).not.toContain('--write-info-json');
+    expect(ytDlpArgs).not.toContain('--clean-info-json');
     expect(ytDlpArgs[ytDlpArgs.indexOf('--output') + 1]).toBe('video.%(ext)s');
     expect(ytDlpArgs.at(-1)).toBe('https://youtu.be/abc');
     expect(options).toEqual({extraStdioFds: [45]});
@@ -568,7 +570,7 @@ Implement `createYtDlpClient(options)` so it:
 ```ts
 [
   '--ignore-config', '--proxy', '', '--no-geo-bypass',
-  '--no-playlist', '--max-downloads', '1',
+  '--no-playlist', '--playlist-items', '1',
   '--skip-download', '--dump-single-json', url,
 ]
 ```
@@ -580,17 +582,18 @@ Implement `createYtDlpClient(options)` so it:
 ```ts
 [
   '--ignore-config', '--proxy', '', '--no-geo-bypass',
-  '--no-playlist', '--max-downloads', '1', '--no-progress',
-  '--write-info-json', '--clean-info-json', '--write-thumbnail',
+  '--no-playlist', '--playlist-items', '1', '--no-progress',
+  '--write-thumbnail',
   '--write-subs', '--write-auto-subs', '--sub-langs', 'zh.*,en.*',
   '--output', 'video.%(ext)s',
 ]
 ```
 
-6. Keeps `--proxy` and `''` as separate argv elements so the empty value explicitly disables ambient or user-configured proxy inheritance, and keeps `--no-geo-bypass` to disable `yt-dlp`'s default geographic/X-Forwarded-For bypass behavior. These mandatory disabling flags do not enable circumvention; no user-supplied proxy value or positive geo-bypass/bypass option is accepted.
-7. Adds `--ffmpeg-location <configured path>` only when `ffmpegExecutable` was explicitly provided.
-8. Passes the same optional signal to probe and download, alongside the borrowed staging FD for download.
-9. Maps download process failures to `DOWNLOAD_PROCESS_FAILED` without exposing child stderr.
+6. Writes the validated safe probe metadata through `authority.writeMetadata` after the media download; does not pass `--write-info-json` or `--clean-info-json` to `yt-dlp`.
+7. Keeps `--proxy` and `''` as separate argv elements so the empty value explicitly disables ambient or user-configured proxy inheritance, and keeps `--no-geo-bypass` to disable `yt-dlp`'s default geographic/X-Forwarded-For bypass behavior. These mandatory disabling flags do not enable circumvention; no user-supplied proxy value or positive geo-bypass/bypass option is accepted.
+8. Adds `--ffmpeg-location <configured path>` only when `ffmpegExecutable` was explicitly provided.
+9. Passes the same optional signal to probe and download, alongside the borrowed staging FD for download.
+10. Maps download process failures to `DOWNLOAD_PROCESS_FAILED` without exposing child stderr.
 
 - [ ] **Step 4: Verify Task 3**
 

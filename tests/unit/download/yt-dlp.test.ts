@@ -319,7 +319,7 @@ describe('yt-dlp probe', () => {
       '',
       '--no-geo-bypass',
       '--no-playlist',
-      '--max-downloads',
+      '--playlist-items',
       '1',
       '--skip-download',
       '--dump-single-json',
@@ -327,6 +327,7 @@ describe('yt-dlp probe', () => {
     ]);
     const args = runProcess.mock.calls[0]?.[1];
     expect(args).toBeDefined();
+    expect(args).not.toContain('--max-downloads');
     expectFixedNetworkIsolation(args ?? []);
   });
 
@@ -353,7 +354,7 @@ describe('yt-dlp probe', () => {
       '',
       '--no-geo-bypass',
       '--no-playlist',
-      '--max-downloads',
+      '--playlist-items',
       '1',
       '--cookies-from-browser',
       'chrome',
@@ -537,7 +538,7 @@ describe('yt-dlp download', () => {
       '',
       '--no-geo-bypass',
       '--no-playlist',
-      '--max-downloads',
+      '--playlist-items',
       '1',
       '--no-progress',
       '--write-thumbnail',
@@ -555,6 +556,7 @@ describe('yt-dlp download', () => {
     expect(ytDlpArgs).not.toContain('--ffmpeg-location');
     expect(ytDlpArgs).not.toContain('--write-info-json');
     expect(ytDlpArgs).not.toContain('--clean-info-json');
+    expect(ytDlpArgs).not.toContain('--max-downloads');
     expectFixedNetworkIsolation(ytDlpArgs);
   });
 
@@ -578,7 +580,7 @@ describe('yt-dlp download', () => {
       '',
       '--no-geo-bypass',
       '--no-playlist',
-      '--max-downloads',
+      '--playlist-items',
       '1',
       '--cookies-from-browser',
       'chrome',
@@ -594,6 +596,7 @@ describe('yt-dlp download', () => {
     ]);
     expect(ytDlpArgs).not.toContain('--write-info-json');
     expect(ytDlpArgs).not.toContain('--clean-info-json');
+    expect(ytDlpArgs).not.toContain('--max-downloads');
   });
 
   it('adds only an explicitly configured ffmpeg location before the URL', async () => {
@@ -624,7 +627,7 @@ describe('yt-dlp download', () => {
       '',
       '--no-geo-bypass',
       '--no-playlist',
-      '--max-downloads',
+      '--playlist-items',
       '1',
       '--no-progress',
       '--write-thumbnail',
@@ -641,6 +644,7 @@ describe('yt-dlp download', () => {
     expect(options).toEqual({extraStdioFds: [42]});
     expect(ytDlpArgs).not.toContain('--write-info-json');
     expect(ytDlpArgs).not.toContain('--clean-info-json');
+    expect(ytDlpArgs).not.toContain('--max-downloads');
     expectFixedNetworkIsolation(ytDlpArgs);
   });
 

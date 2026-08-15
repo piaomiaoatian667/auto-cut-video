@@ -483,7 +483,7 @@ it('adds exact Chrome Cookie arguments to a probe', async () => {
 
   expect(runProcess).toHaveBeenCalledWith('yt-dlp', [
     '--ignore-config', '--proxy', '', '--no-geo-bypass',
-    '--no-playlist', '--max-downloads', '1',
+    '--no-playlist', '--playlist-items', '1',
     '--cookies-from-browser', 'chrome',
     '--skip-download', '--dump-single-json',
     'https://www.douyin.com/video/7654841525762919726',
@@ -507,7 +507,7 @@ it('adds exact Chrome Cookie arguments to the FD-bound download', async () => {
   const wrapperArgs = runProcess.mock.calls[0]?.[1] ?? [];
   expect(wrapperArgs.slice(6, 15)).toEqual([
     '--ignore-config', '--proxy', '', '--no-geo-bypass',
-    '--no-playlist', '--max-downloads', '1',
+    '--no-playlist', '--playlist-items', '1',
     '--cookies-from-browser', 'chrome',
   ]);
 });

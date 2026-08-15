@@ -173,13 +173,17 @@ The existing mandatory arguments remain in force for both invocations:
 <empty string>
 --no-geo-bypass
 --no-playlist
---max-downloads
+--playlist-items
 1
 ```
 
 `--ignore-config` prevents user `yt-dlp` configuration from silently adding
 authentication, proxy, playlist, output, post-processing, or other behavior.
-The empty proxy and disabled geo-bypass controls remain mandatory.
+The empty proxy and disabled geo-bypass controls remain mandatory. The URL is
+processed with `--no-playlist` and capped with `--playlist-items 1`.
+`--max-downloads 1` is intentionally omitted because `yt-dlp 2026.06.09`
+reports that limit as cancellation status `101` after successfully processing
+the first item, including metadata-only probes.
 
 The application accepts no cookie-file or browser-profile syntax. It passes only
 the exact `--cookies-from-browser chrome` selection to `yt-dlp`, exports no
@@ -299,8 +303,9 @@ Chrome/keychain access failures during a probe remain
 - No user-supplied browser-profile or keyring syntax reaches `yt-dlp`.
 - No raw URL, query parameter, cookie, credential, browser path, signed media
   URL, or child argument list reaches terminal or JSON errors.
-- No proxy inheritance, user proxy, positive geo-bypass, playlist, batch,
-  remux, recode, or transcoding option is introduced.
+- No proxy inheritance, user proxy, positive geo-bypass, playlist- or
+  batch-enabling, remux, recode, or transcoding option is introduced;
+  `--playlist-items 1` only caps collection-shaped extractor results.
 - Cookie mode uses the same descriptor-bound staging directory, archive
   verification, atomic publish, duplicate handling, cancellation, and cleanup
   mechanisms as anonymous mode.

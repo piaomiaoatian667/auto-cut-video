@@ -146,7 +146,7 @@ Additional validation rules:
 - fragments are ignored;
 - the initial URL must not resolve through a generic unsupported host;
 - short-link hosts are accepted only when explicitly listed above;
-- playlist, channel, feed, profile, and batch probe results are rejected; `--no-playlist` remains a fixed defense-in-depth argument and the command never enumerates collections;
+- playlist, channel, feed, profile, and batch probe results are rejected; `--no-playlist` remains a fixed defense-in-depth argument, `--playlist-items 1` caps any collection-shaped extractor result to its first item, and the shared metadata validator then rejects non-video `_type` values;
 - active, upcoming, and post-live-in-progress metadata is rejected, while `live_status: was_live` is accepted after the replay is public and complete;
 - after metadata probing, the returned extractor and normalized canonical URL must map to the same supported platform family as the initial host.
 
@@ -179,7 +179,7 @@ Every metadata-probe and media-download `yt-dlp` invocation must include:
 --proxy ''
 --no-geo-bypass
 --no-playlist
---max-downloads 1
+--playlist-items 1
 ```
 
 This prevents a user-level configuration file from silently enabling cookies, authentication, playlists, output templates, proxies, post-processing, or other behavior outside this design. `--proxy ''` is passed as two argv elements, `--proxy` and the empty string, to explicitly disable ambient or user-configured proxy inheritance. `--no-geo-bypass` disables `yt-dlp`'s default geographic/X-Forwarded-For bypass behavior; neither flag enables circumvention.
@@ -212,7 +212,7 @@ yt-dlp
   --proxy ''
   --no-geo-bypass
   --no-playlist
-  --max-downloads 1
+  --playlist-items 1
   --skip-download
   --dump-single-json
   <url>
@@ -267,10 +267,8 @@ Run the fixed Darwin wrapper with arguments equivalent to:
   --proxy ''
   --no-geo-bypass
   --no-playlist
-  --max-downloads 1
+  --playlist-items 1
   --no-progress
-  --write-info-json
-  --clean-info-json
   --write-thumbnail
   --write-subs
   --write-auto-subs
@@ -279,7 +277,7 @@ Run the fixed Darwin wrapper with arguments equivalent to:
   <url>
 ```
 
-The wrapper calls `fchdir(3)` and launches the argument array through `NSTask`; it does not construct a shell command. Pass the operation `AbortSignal` and `extraStdioFds: [stagingDirectoryFd]` to the process runner. Close the staging authority after the download settles and before finalization starts, including cancellation and failure paths.
+The wrapper calls `fchdir(3)` and launches the argument array through `NSTask`; it does not construct a shell command. Pass the operation `AbortSignal` and `extraStdioFds: [stagingDirectoryFd]` to the process runner. After the media download succeeds, write the validated safe probe metadata through `authority.writeMetadata`; do not ask `yt-dlp` to persist its raw info JSON. Close the staging authority after the download settles and before finalization starts, including cancellation and failure paths.
 
 The final implementation may add quiet or structured-printing flags, but it must not add authentication, positive bypass-enabling, recoding, or arbitrary post-processing flags.
 
@@ -547,7 +545,7 @@ Cleaned information JSON is still local-only data. It may be much larger than th
 
 ### Tool argument tests
 
-- every probe and download includes `--ignore-config`, `--proxy ''`, `--no-geo-bypass`, `--no-playlist`, and `--max-downloads 1`;
+- every probe and download includes `--ignore-config`, `--proxy ''`, `--no-geo-bypass`, `--no-playlist`, and `--playlist-items 1`;
 - `--proxy` is immediately followed by an empty-string argv value, and `--no-geo-bypass` is present;
 - probe includes `--skip-download` and `--dump-single-json`;
 - shared metadata validation rejects explicit non-video `_type`, `is_live: true`, and `live_status` values `is_live`, `is_upcoming`, and `post_live`, while accepting `was_live`;
