@@ -430,8 +430,8 @@ describe('system download integration', () => {
       ]);
 
       const dependencies = createSystemDownloadDependencies({
-        ytDlpExecutable,
-        ffmpegExecutable,
+        ytDlpOverride: ytDlpExecutable,
+        ffmpegOverride: ffmpegExecutable,
       });
       dependencies.now = () => new Date(FIXED_DOWNLOAD_TIME);
 
@@ -549,8 +549,8 @@ describe('system download integration', () => {
       ]);
 
       const dependencies = createSystemDownloadDependencies({
-        ytDlpExecutable,
-        ffmpegExecutable,
+        ytDlpOverride: ytDlpExecutable,
+        ffmpegOverride: ffmpegExecutable,
       });
       dependencies.now = () => new Date(FIXED_DOWNLOAD_TIME);
 

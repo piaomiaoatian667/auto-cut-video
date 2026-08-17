@@ -15,6 +15,7 @@ import {
   type DownloadDependencies,
   type DownloadInput,
   type DownloadResult,
+  type SystemDownloadOptions,
 } from '../../../src/download/downloader';
 import {
   DownloadError,
@@ -656,7 +657,9 @@ describe('videoctl download', () => {
     vi.stubEnv('YT_DLP_PATH', '/configured/yt-dlp');
     vi.stubEnv('FFMPEG_PATH', '/configured/ffmpeg');
     const downloadDependencies = {} as DownloadDependencies;
-    const createDownloadDependencies = vi.fn(() => downloadDependencies);
+    const createDownloadDependencies = vi.fn(
+      (_options: SystemDownloadOptions) => downloadDependencies,
+    );
 
     const controller = new AbortController();
     const changedController = new AbortController();
@@ -671,8 +674,8 @@ describe('videoctl download', () => {
 
     expect(createDownloadDependencies).toHaveBeenCalledOnce();
     expect(createDownloadDependencies).toHaveBeenCalledWith({
-      ytDlpExecutable: '/configured/yt-dlp',
-      ffmpegExecutable: '/configured/ffmpeg',
+      ytDlpOverride: '/configured/yt-dlp',
+      ffmpegOverride: '/configured/ffmpeg',
     });
     expect(dependencies.ffmpegExecutable).toBe('/configured/ffmpeg');
     expect(dependencies.downloadSignal).toBe(controller.signal);

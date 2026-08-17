@@ -13,10 +13,10 @@ import {
   type DownloadDependencies,
   type DownloadInput,
   type DownloadResult,
+  type SystemDownloadOptions,
 } from '../download/downloader';
 import {installDownloaderToolchain} from '../download/toolchain/installer';
 import type {SetupDownloaderResult} from '../download/toolchain/types';
-import type {YtDlpClientOptions} from '../download/yt-dlp';
 import {
   openExistingProjectFile,
   type ProjectDirectoryScope,
@@ -657,7 +657,7 @@ export interface SystemVideoctlOptions {
   sourceMeter?: SourceMeterDependencies;
   signal?: AbortSignal;
   createDownloadDependencies?: (
-    options: YtDlpClientOptions,
+    options: SystemDownloadOptions,
   ) => DownloadDependencies;
 }
 
@@ -723,12 +723,12 @@ export const createSystemVideoctlDependencies = (
   const createDownloadDependencies = options.createDownloadDependencies
     ?? createSystemDownloadDependencies;
   const signal = options.signal;
-  const ytDlpExecutable = process.env.YT_DLP_PATH;
-  const ffmpegExecutable = process.env.FFMPEG_PATH;
+  const ytDlpOverride = process.env.YT_DLP_PATH;
+  const ffmpegOverride = process.env.FFMPEG_PATH;
   const ffprobeExecutable = process.env.FFPROBE_PATH;
   const downloadDependencies = createDownloadDependencies({
-    ...(ytDlpExecutable === undefined ? {} : {ytDlpExecutable}),
-    ...(ffmpegExecutable === undefined ? {} : {ffmpegExecutable}),
+    ...(ytDlpOverride === undefined ? {} : {ytDlpOverride}),
+    ...(ffmpegOverride === undefined ? {} : {ffmpegOverride}),
   });
   return {
     workspaceRoot: process.cwd(),
@@ -743,13 +743,13 @@ export const createSystemVideoctlDependencies = (
     download: async (input) => await downloadVideo(input, downloadDependencies),
     setupDownloader: async (operationSignal = signal) =>
       await installDownloaderToolchain({
-        ...(ffmpegExecutable === undefined ? {} : {
-          ffmpegOverride: ffmpegExecutable,
+        ...(ffmpegOverride === undefined ? {} : {
+          ffmpegOverride,
         }),
         ...(operationSignal === undefined ? {} : {signal: operationSignal}),
       }),
     ...(signal === undefined ? {} : {signal, downloadSignal: signal}),
-    ...(ffmpegExecutable === undefined ? {} : {ffmpegExecutable}),
+    ...(ffmpegOverride === undefined ? {} : {ffmpegExecutable: ffmpegOverride}),
     ...(ffprobeExecutable === undefined ? {} : {ffprobeExecutable}),
   };
 };
