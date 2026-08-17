@@ -31,9 +31,15 @@ describe('managed downloader toolchain paths', () => {
     });
   });
 
-  it.each(['Users/tester', '/'])(
-    'rejects invalid home directory %j without echoing it',
-    (homeDirectory) => {
+  it.each([
+    ['relative path', 'Users/tester'],
+    ['filesystem root', '/'],
+    ['canonical root through parent segments', '/tmp/..'],
+    ['canonical root through nested parent segments', '/Users/tester/../..'],
+    ['canonical root through a dot segment', '/./'],
+  ])(
+    'rejects %s %j without echoing it',
+    (_caseName, homeDirectory) => {
       expect(() => resolveDownloaderToolchainPaths(homeDirectory)).toThrowError(
         expect.objectContaining({
           code: 'DOWNLOAD_TOOLCHAIN_INVALID',

@@ -5,9 +5,10 @@ import type {DownloaderToolchainPaths} from './types';
 export const resolveDownloaderToolchainPaths = (
   homeDirectory: string,
 ): DownloaderToolchainPaths => {
+  const canonicalHomeDirectory = path.resolve(homeDirectory);
   if (
     !path.isAbsolute(homeDirectory) ||
-    path.parse(homeDirectory).root === homeDirectory
+    path.parse(canonicalHomeDirectory).root === canonicalHomeDirectory
   ) {
     throw new DownloadError(
       'DOWNLOAD_TOOLCHAIN_INVALID',
@@ -15,7 +16,7 @@ export const resolveDownloaderToolchainPaths = (
     );
   }
   const cacheRoot = path.resolve(
-    homeDirectory,
+    canonicalHomeDirectory,
     'Library/Caches/auto-cut-video/downloader',
   );
   const versionDirectory = path.join(cacheRoot, '2026.07.04-macos-arm64');

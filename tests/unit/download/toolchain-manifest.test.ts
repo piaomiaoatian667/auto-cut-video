@@ -30,6 +30,27 @@ const validManifest = () => ({
   },
 });
 
+const withYtDlp = (
+  replacement: Partial<ReturnType<typeof validManifest>['ytDlp']>,
+) => {
+  const manifest = validManifest();
+  return {...manifest, ytDlp: {...manifest.ytDlp, ...replacement}};
+};
+
+const withPotPlugin = (
+  replacement: Partial<ReturnType<typeof validManifest>['potPlugin']>,
+) => {
+  const manifest = validManifest();
+  return {...manifest, potPlugin: {...manifest.potPlugin, ...replacement}};
+};
+
+const withPotProvider = (
+  replacement: Partial<ReturnType<typeof validManifest>['potProvider']>,
+) => {
+  const manifest = validManifest();
+  return {...manifest, potProvider: {...manifest.potProvider, ...replacement}};
+};
+
 const expectInvalidManifest = (manifest: unknown): Error => {
   try {
     parseDownloaderToolchainManifest(manifest);
@@ -38,6 +59,7 @@ const expectInvalidManifest = (manifest: unknown): Error => {
       code: 'DOWNLOAD_TOOLCHAIN_INVALID',
       message: INVALID_TOOLCHAIN_MESSAGE,
     });
+    expect(String(error)).toBe(`DownloadError: ${INVALID_TOOLCHAIN_MESSAGE}`);
     if (error instanceof Error) return error;
     throw error;
   }
@@ -46,24 +68,7 @@ const expectInvalidManifest = (manifest: unknown): Error => {
 
 describe('managed downloader toolchain manifest', () => {
   it('pins the exact downloader toolchain identity', () => {
-    expect(DOWNLOADER_TOOLCHAIN_MANIFEST).toMatchObject({
-      schemaVersion: 1,
-      platform: 'darwin-arm64',
-      ytDlp: {
-        version: '2026.07.04',
-        bytes: 38256544,
-        sha256: '498bd0dae17855c599d371d68ec5bafc439a9d8640e838be25c765a9792f261b',
-      },
-      potPlugin: {
-        version: '1.3.1',
-        bytes: 8067,
-        sha256: 'b8ceec7f76143da172aaf5ebeec0c2d218e5680c063b931586bca48567069b38',
-      },
-      potProvider: {
-        version: '1.3.1',
-        commit: '7608dd51ee813b48cf9a6d68c6e42cb197ce10e0',
-      },
-    });
+    expect(DOWNLOADER_TOOLCHAIN_MANIFEST).toEqual(validManifest());
   });
 
   it('builds the exact installed manifest identity', () => {
@@ -90,6 +95,82 @@ describe('managed downloader toolchain manifest', () => {
   it('parses the pinned manifest shape', () => {
     const manifest = validManifest();
     expect(parseDownloaderToolchainManifest(manifest)).toEqual(manifest);
+  });
+
+  it.each([
+    [
+      'yt-dlp URL path',
+      withYtDlp({
+        url: 'https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/private-marker',
+      }),
+    ],
+    [
+      'yt-dlp URL credentials',
+      withYtDlp({
+        url: 'https://private-marker@github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/yt-dlp_macos',
+      }),
+    ],
+    [
+      'yt-dlp URL port',
+      withYtDlp({
+        url: 'https://github.com:8443/yt-dlp/yt-dlp/releases/download/2026.07.04/yt-dlp_macos',
+      }),
+    ],
+    [
+      'yt-dlp URL query',
+      withYtDlp({url: `${validManifest().ytDlp.url}?private-marker=1`}),
+    ],
+    [
+      'yt-dlp URL fragment',
+      withYtDlp({url: `${validManifest().ytDlp.url}#private-marker`}),
+    ],
+    [
+      'allowlisted redirect URL',
+      withYtDlp({
+        url: 'https://release-assets.githubusercontent.com/private-marker',
+      }),
+    ],
+    [
+      'plugin URL path',
+      withPotPlugin({
+        url: 'https://github.com/Brainicism/bgutil-ytdlp-pot-provider/releases/download/1.3.1/private-marker.zip',
+      }),
+    ],
+  ])('rejects a replacement %s without echoing it', (_caseName, manifest) => {
+    const error = expectInvalidManifest(manifest);
+    expect(String(error)).not.toContain('private-marker');
+  });
+
+  it.each([
+    ['yt-dlp version', withYtDlp({version: '2026.07.05'})],
+    ['plugin version', withPotPlugin({version: '1.3.2'})],
+    ['provider version', withPotProvider({version: '1.3.2'})],
+  ])('rejects a replacement %s', (_caseName, manifest) => {
+    expectInvalidManifest(manifest);
+  });
+
+  it.each([
+    ['yt-dlp byte size', withYtDlp({bytes: 38256545})],
+    ['plugin byte size', withPotPlugin({bytes: 8068})],
+  ])('rejects a replacement %s', (_caseName, manifest) => {
+    expectInvalidManifest(manifest);
+  });
+
+  it.each([
+    ['yt-dlp digest', withYtDlp({sha256: 'a'.repeat(64)})],
+    ['plugin digest', withPotPlugin({sha256: 'a'.repeat(64)})],
+  ])('rejects a replacement valid lowercase %s', (_caseName, manifest) => {
+    expectInvalidManifest(manifest);
+  });
+
+  it('rejects a replacement allowlisted provider repository', () => {
+    expectInvalidManifest(withPotProvider({
+      repository: 'https://github.com/Brainicism/private-marker.git',
+    }));
+  });
+
+  it('rejects a replacement valid lowercase provider commit', () => {
+    expectInvalidManifest(withPotProvider({commit: 'a'.repeat(40)}));
   });
 
   it.each([

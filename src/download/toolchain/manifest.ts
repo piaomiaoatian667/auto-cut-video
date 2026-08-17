@@ -11,6 +11,28 @@ const allowedAssetHosts = new Set([
   'objects.githubusercontent.com',
 ]);
 
+const pinnedToolchainIdentity = {
+  schemaVersion: 1,
+  platform: 'darwin-arm64',
+  ytDlp: {
+    version: '2026.07.04',
+    url: 'https://github.com/yt-dlp/yt-dlp/releases/download/2026.07.04/yt-dlp_macos',
+    bytes: 38256544,
+    sha256: '498bd0dae17855c599d371d68ec5bafc439a9d8640e838be25c765a9792f261b',
+  },
+  potPlugin: {
+    version: '1.3.1',
+    url: 'https://github.com/Brainicism/bgutil-ytdlp-pot-provider/releases/download/1.3.1/bgutil-ytdlp-pot-provider.zip',
+    bytes: 8067,
+    sha256: 'b8ceec7f76143da172aaf5ebeec0c2d218e5680c063b931586bca48567069b38',
+  },
+  potProvider: {
+    repository: 'https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git',
+    version: '1.3.1',
+    commit: '7608dd51ee813b48cf9a6d68c6e42cb197ce10e0',
+  },
+} as const;
+
 const allowedAssetUrlSchema = z.string().superRefine((value, context) => {
   let parsed: URL;
   try {
@@ -30,23 +52,56 @@ const allowedAssetUrlSchema = z.string().superRefine((value, context) => {
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/);
 const commitSchema = z.string().regex(/^[0-9a-f]{40}$/);
 
-const assetSchema = z.object({
-  version: z.string().min(1),
-  url: allowedAssetUrlSchema,
-  bytes: z.number().int().positive(),
-  sha256: sha256Schema,
+const pinnedUrlSchema = <const Expected extends string>(expected: Expected) =>
+  allowedAssetUrlSchema
+    .refine((value) => value === expected)
+    .transform(() => expected);
+
+const pinnedSha256Schema = <const Expected extends string>(expected: Expected) =>
+  sha256Schema
+    .refine((value) => value === expected)
+    .transform(() => expected);
+
+const pinnedPositiveIntegerSchema = <const Expected extends number>(
+  expected: Expected,
+) =>
+  z.number()
+    .int()
+    .positive()
+    .refine((value) => value === expected)
+    .transform(() => expected);
+
+const pinnedCommitSchema = <const Expected extends string>(expected: Expected) =>
+  commitSchema
+    .refine((value) => value === expected)
+    .transform(() => expected);
+
+const ytDlpSchema = z.object({
+  version: z.literal(pinnedToolchainIdentity.ytDlp.version),
+  url: pinnedUrlSchema(pinnedToolchainIdentity.ytDlp.url),
+  bytes: pinnedPositiveIntegerSchema(pinnedToolchainIdentity.ytDlp.bytes),
+  sha256: pinnedSha256Schema(pinnedToolchainIdentity.ytDlp.sha256),
+}).strict();
+
+const potPluginSchema = z.object({
+  version: z.literal(pinnedToolchainIdentity.potPlugin.version),
+  url: pinnedUrlSchema(pinnedToolchainIdentity.potPlugin.url),
+  bytes: pinnedPositiveIntegerSchema(pinnedToolchainIdentity.potPlugin.bytes),
+  sha256: pinnedSha256Schema(pinnedToolchainIdentity.potPlugin.sha256),
+}).strict();
+
+const potProviderSchema = z.object({
+  repository: pinnedUrlSchema(pinnedToolchainIdentity.potProvider.repository),
+  version: z.literal(pinnedToolchainIdentity.potProvider.version),
+  commit: pinnedCommitSchema(pinnedToolchainIdentity.potProvider.commit),
 }).strict();
 
 const downloaderToolchainManifestSchema = z.object({
-  schemaVersion: z.literal(1),
-  platform: z.literal('darwin-arm64'),
-  ytDlp: assetSchema,
-  potPlugin: assetSchema,
-  potProvider: z.object({
-    repository: allowedAssetUrlSchema,
-    version: z.string().min(1),
-    commit: commitSchema,
-  }).strict(),
+  schemaVersion: z.literal(pinnedToolchainIdentity.schemaVersion),
+  platform: z.literal(pinnedToolchainIdentity.platform),
+  ytDlp: ytDlpSchema,
+  potPlugin: potPluginSchema,
+  potProvider: potProviderSchema,
 }).strict();
 
 export type DownloaderToolchainManifest = z.infer<
