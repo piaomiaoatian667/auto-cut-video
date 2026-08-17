@@ -77,6 +77,13 @@ const cancellationFor = (
   downloadCancellationFrom(error)
   ?? (signal?.aborted === true ? new DownloadCancellationError() : undefined);
 
+const providerUnavailableFor = (error: unknown): DownloadError | undefined => (
+  error instanceof DownloadError
+  && error.code === 'DOWNLOAD_PO_TOKEN_UNAVAILABLE'
+    ? error
+    : undefined
+);
+
 export interface InstallerDependencies {
   fetch: typeof globalThis.fetch;
   runProcess: DownloadProcessRunner;
@@ -917,6 +924,7 @@ const installDownloaderToolchainTransaction = async (
     return {status: 'installed', version: '2026.07.04'};
   } catch (error) {
     const cancellation = cancellationFor(error, options.signal);
+    const providerUnavailable = providerUnavailableFor(error);
     if (!published && quarantineDirectory !== undefined) {
       try {
         await restoreQuarantine(quarantineDirectory, paths, dependencies);
@@ -928,6 +936,7 @@ const installDownloaderToolchainTransaction = async (
       }
     }
     if (cancellation !== undefined) throw cancellation;
+    if (providerUnavailable !== undefined) throw providerUnavailable;
     throw invalidToolchain();
   } finally {
     let cleanupFailed = false;
@@ -965,6 +974,8 @@ export const installDownloaderToolchain = async (
   } catch (error) {
     const cancellation = cancellationFor(error, options.signal);
     if (cancellation !== undefined) throw cancellation;
+    const providerUnavailable = providerUnavailableFor(error);
+    if (providerUnavailable !== undefined) throw providerUnavailable;
     throw invalidToolchain();
   }
 };

@@ -205,7 +205,7 @@ interface DownloaderToolchainManifest {
         entries: 9715;
         files: 8906;
         symlinks: 809;
-        sha256: '6723ebf44c2cc5bdb02395fac7689615ba164d7ae869bb6e7a6c4f96cc8f2b94';
+        sha256: 'f2606eacd44bbf1a9c071f52a8bffbfc1298c3b3cd58ffa713efb06ffc15ae36';
       };
     };
   };
@@ -243,7 +243,8 @@ version, commit, roots, and counts so an older weaker identity is not accepted.
 12. Run Deno dependency installation from the provider's `server` directory
     using its committed lockfile, `--frozen`, the toolchain-scoped `DENO_DIR`,
     and only the provider-documented `npm:canvas` install-script permission.
-13. Safely remove only
+13. Safely remove only, through descriptor-bound Darwin `openat`/`unlinkat`
+    operations rooted at an already-open provider directory,
     `server/node_modules/.deno/.setup-cache.bin`, whose final eight bytes vary
     across otherwise valid Deno installations.
 14. Verify both canonical provider trees and require the provider `--version`
@@ -272,6 +273,15 @@ is SHA-256 hashed. Source verification excludes `.git/**` and
 `server/node_modules/**`; dependency verification covers all of
 `server/node_modules`. Symlink targets must be relative and resolve within the
 tree being verified.
+
+Regular files are opened with `O_RDONLY | O_NOFOLLOW`. The verifier compares
+the opened descriptor with the path `lstat` identity (type, UID, mode, device,
+and inode), streams the content hash, then repeats descriptor and path checks,
+including size and modification metadata, before accepting the record. The
+normalized dependency root above was reproduced with Deno 2.5.6 and 2.8.3.
+Deno is intentionally constrained only to major version 2 or newer; if a future
+Deno release produces a different canonical layout, setup fails closed until a
+new strict identity is reviewed and pinned.
 
 All setup subprocesses use a frozen staging-local environment built from zero.
 This includes Git validation and checkout, Deno validation and frozen dependency

@@ -32,7 +32,17 @@ Traversal also requires current-UID ownership, rejects special files and
 escaping or absolute symlinks, and never trusts the installed Git object
 database. After Deno installation, setup safely removes only
 `server/node_modules/.deno/.setup-cache.bin` before verification and
-publication.
+publication using descriptor-bound `openat`/`unlinkat` operations that do not
+follow a replaced parent chain. The pinned dependency identity is 9,715 entries
+(8,906 regular files and 809 symlinks) with SHA-256
+`f2606eacd44bbf1a9c071f52a8bffbfc1298c3b3cd58ffa713efb06ffc15ae36`.
+That normalized root was independently reproduced with Deno 2.5.6 and 2.8.3;
+Deno remains supported as version 2 or newer, and any future layout mismatch
+fails closed instead of being accepted.
+
+The networked pinned-checkout regression is opt-in and remains skipped by the
+default suite: set `RUN_SYSTEM_PROVIDER_INTEGRITY_TESTS=1` when running
+`tests/integration/download/provider-integrity-system.test.ts`.
 
 Every setup subprocess, including Git checks and checkout, Deno validation and
 frozen dependency installation, and staging capability validation, receives a

@@ -6,7 +6,9 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open as openFile,
   readFile,
+  rename,
   rm,
   symlink,
   unlink,
@@ -178,6 +180,28 @@ const nodeModulesIdentityWithLink = (
   };
 };
 
+const sourceIdentityWithReadme = (
+  contents: string,
+): ProviderIntegrityIdentity => {
+  const records = [
+    ['f', 'README.md', '000', sha256(contents)],
+    ['f', 'bin/provider', '100', sha256('#!/bin/sh\nexit 0\n')],
+    [
+      'f',
+      'server/src/generate_once.ts',
+      '000',
+      sha256("export const version = '1.3.1';\n"),
+    ],
+  ].map((fields) => fields.map(serializeField).join('|'));
+  return {
+    source: {
+      entries: 3,
+      sha256: sha256(`${records.join('\n')}\n`),
+    },
+    nodeModules: canonicalIdentity.nodeModules,
+  };
+};
+
 const statsWithUid = (stats: Stats, uid: number): Stats => new Proxy(stats, {
   get(target, property) {
     if (property === 'uid') return uid;
@@ -271,6 +295,102 @@ describe('provider integrity verifier', () => {
     }));
   });
 
+  it('does not follow a file replaced by a symlink between lstat and open', async () => {
+    const fixture = await createProviderFixture();
+    const outsideFile = path.join(fixture.root, 'outside-provider-source');
+    const outsideContents = 'outside private source\n';
+    await writeFile(outsideFile, outsideContents);
+    const outsideStats = await lstat(outsideFile);
+    let replaced = false;
+    let outsideRead = false;
+
+    await expectProviderFailure(verifyFixture(
+      fixture,
+      sourceIdentityWithReadme(outsideContents),
+      {
+        dependencies: {
+          lstat: async (candidate) => {
+            const stats = await lstat(candidate);
+            if (candidate === fixture.sourceFile && !replaced) {
+              replaced = true;
+              await unlink(candidate);
+              await symlink(outsideFile, candidate);
+            }
+            return stats;
+          },
+          open: async (candidate, flags) => {
+            const handle = await openFile(candidate, flags);
+            const openedStats = await handle.stat();
+            outsideRead = openedStats.dev === outsideStats.dev
+              && openedStats.ino === outsideStats.ino;
+            return handle;
+          },
+        },
+      },
+    ));
+    expect(outsideRead).toBe(false);
+    await expect(readFile(outsideFile, 'utf8')).resolves.toBe(outsideContents);
+  });
+
+  it('rejects a different inode opened after the path lstat', async () => {
+    const fixture = await createProviderFixture();
+    const replacement = path.join(fixture.root, 'replacement-provider-source');
+    const replacementContents = 'replacement provider source\n';
+    await writeFile(replacement, replacementContents);
+    let replaced = false;
+
+    await expectProviderFailure(verifyFixture(
+      fixture,
+      sourceIdentityWithReadme(replacementContents),
+      {
+        dependencies: {
+          lstat: async (candidate) => {
+            const stats = await lstat(candidate);
+            if (candidate === fixture.sourceFile && !replaced) {
+              replaced = true;
+              await unlink(candidate);
+              await rename(replacement, candidate);
+            }
+            return stats;
+          },
+        },
+      },
+    ));
+  });
+
+  it('rejects a path replaced with another inode while reading', async () => {
+    const fixture = await createProviderFixture();
+    const replacement = path.join(fixture.root, 'replacement-provider-source');
+    await writeFile(replacement, 'replacement provider source\n');
+    let replaced = false;
+
+    await expectProviderFailure(verifyFixture(fixture, canonicalIdentity, {
+      dependencies: {
+        open: async (candidate, flags) => {
+          const handle = await openFile(candidate, flags);
+          if (candidate !== fixture.sourceFile) return handle;
+          return new Proxy(handle, {
+            get(target, property) {
+              if (property === 'read') {
+                return async (...args: Parameters<typeof target.read>) => {
+                  const result = await target.read(...args);
+                  if (!replaced) {
+                    replaced = true;
+                    await unlink(candidate);
+                    await rename(replacement, candidate);
+                  }
+                  return result;
+                };
+              }
+              const value = Reflect.get(target, property, target);
+              return typeof value === 'function' ? value.bind(target) : value;
+            },
+          });
+        },
+      },
+    }));
+  });
+
   it('maps filesystem errors to the fixed provider error', async () => {
     const fixture = await createProviderFixture();
     const privateMarker = 'private readdir failure';
@@ -318,6 +438,31 @@ describe('provider integrity verifier', () => {
 });
 
 describe('provider installation normalization', () => {
+  it('allows the descriptor-bound unlink primitive to be injected', async () => {
+    const fixture = await createProviderFixture();
+    const setupCache = path.join(
+      fixture.nodeModulesDirectory,
+      '.deno/.setup-cache.bin',
+    );
+    await writeFile(setupCache, 'unstable-cache-bytes');
+    let unlinkCalls = 0;
+
+    await normalizeProviderInstallation({
+      providerDirectory: fixture.providerDirectory,
+      currentUid,
+    }, {
+      unlinkSetupCache: async (options) => {
+        unlinkCalls += 1;
+        expect(options.providerDirectoryHandle.fd).toBeGreaterThan(2);
+        expect(options.directoryIdentities).toHaveLength(3);
+        await unlink(setupCache);
+      },
+    });
+
+    expect(unlinkCalls).toBe(1);
+    await expect(lstat(setupCache)).rejects.toMatchObject({code: 'ENOENT'});
+  });
+
   it('removes only the unstable Deno setup cache before verification', async () => {
     const fixture = await createProviderFixture();
     const setupCache = path.join(
@@ -351,6 +496,62 @@ describe('provider installation normalization', () => {
       providerDirectory: fixture.providerDirectory,
       currentUid,
     }), [outsideDirectory, outsideCache]);
+    await expect(readFile(outsideCache, 'utf8')).resolves.toBe('outside cache');
+  });
+
+  it('rejects a setup-cache parent replaced after validation', async () => {
+    const fixture = await createProviderFixture();
+    const denoDirectory = path.join(fixture.nodeModulesDirectory, '.deno');
+    const setupCache = path.join(denoDirectory, '.setup-cache.bin');
+    const outsideDirectory = path.join(fixture.root, 'outside-deno');
+    const outsideCache = path.join(outsideDirectory, '.setup-cache.bin');
+    await mkdir(outsideDirectory);
+    await writeFile(setupCache, 'inside cache');
+    await writeFile(outsideCache, 'outside cache');
+    let replaced = false;
+
+    await expectProviderFailure(normalizeProviderInstallation({
+      providerDirectory: fixture.providerDirectory,
+      currentUid,
+    }, {
+      lstat: async (candidate) => {
+        const stats = await lstat(candidate);
+        if (candidate === setupCache && !replaced) {
+          replaced = true;
+          await rm(denoDirectory, {recursive: true});
+          await symlink(outsideDirectory, denoDirectory);
+        }
+        return stats;
+      },
+    }), [outsideDirectory, outsideCache]);
+    await expect(readFile(outsideCache, 'utf8')).resolves.toBe('outside cache');
+  });
+
+  it('rejects a setup-cache file replaced after validation', async () => {
+    const fixture = await createProviderFixture();
+    const setupCache = path.join(
+      fixture.nodeModulesDirectory,
+      '.deno/.setup-cache.bin',
+    );
+    const outsideCache = path.join(fixture.root, 'outside-setup-cache');
+    await writeFile(setupCache, 'inside cache');
+    await writeFile(outsideCache, 'outside cache');
+    let replaced = false;
+
+    await expectProviderFailure(normalizeProviderInstallation({
+      providerDirectory: fixture.providerDirectory,
+      currentUid,
+    }, {
+      lstat: async (candidate) => {
+        const stats = await lstat(candidate);
+        if (candidate === setupCache && !replaced) {
+          replaced = true;
+          await unlink(setupCache);
+          await symlink(outsideCache, setupCache);
+        }
+        return stats;
+      },
+    }), [outsideCache]);
     await expect(readFile(outsideCache, 'utf8')).resolves.toBe('outside cache');
   });
 });

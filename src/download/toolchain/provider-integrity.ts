@@ -1,14 +1,14 @@
 import {createHash} from 'node:crypto';
-import type {Stats} from 'node:fs';
+import {constants, type Stats} from 'node:fs';
 import {
   lstat,
   open,
   readdir,
   readlink,
-  unlink,
   type FileHandle,
 } from 'node:fs/promises';
 import path from 'node:path';
+import {runProcess as runSystemProcess} from '../../process/run-process';
 import {
   downloadCancellationFrom,
   throwIfDownloadCancelled,
@@ -22,6 +22,98 @@ const SOURCE_EXCLUDED_DIRECTORIES = new Set([
   '.git',
   'server/node_modules',
 ]);
+const DARWIN_DIRECTORY_AUTHORITY_FLAGS = 0x20100000;
+const DARWIN_FILE_AUTHORITY_FLAGS = 0x20000000;
+const SETUP_CACHE_COMPONENTS = [
+  'server',
+  'node_modules',
+  '.deno',
+] as const;
+const DARWIN_SETUP_CACHE_UNLINK_SCRIPT = [
+  'ObjC.import("Foundation");',
+  'ObjC.bindFunction("openat", ["int", ["int", "char *", "int"]]);',
+  'ObjC.bindFunction("close", ["int", ["int"]]);',
+  'ObjC.bindFunction("unlinkat", ["int", ["int", "char *", "int"]]);',
+  `const DIRECTORY_FLAGS = ${DARWIN_DIRECTORY_AUTHORITY_FLAGS};`,
+  `const FILE_FLAGS = ${DARWIN_FILE_AUTHORITY_FLAGS};`,
+  'function descriptorStats(nodeExecutable, descriptor) {',
+  '  const task = $.NSTask.alloc.init;',
+  '  task.launchPath = nodeExecutable;',
+  '  task.arguments = [',
+  '    "-e",',
+  '    "const s=require(\\"node:fs\\").fstatSync(0);" +',
+  '      "const kind=s.isDirectory()?\\"d\\":s.isFile()?\\"f\\":\\"o\\";" +',
+  '      "process.stdout.write(JSON.stringify({kind,dev:String(s.dev)," +',
+  '      "ino:String(s.ino),mode:String(s.mode),uid:String(s.uid)}));",',
+  '  ];',
+  '  task.standardInput = $.NSFileHandle.alloc',
+  '    .initWithFileDescriptorCloseOnDealloc(descriptor, false);',
+  '  const outputPipe = $.NSPipe.pipe;',
+  '  task.standardOutput = outputPipe;',
+  '  task.standardError = $.NSFileHandle.fileHandleWithNullDevice;',
+  '  task.launch;',
+  '  const outputData = outputPipe.fileHandleForReading.readDataToEndOfFile;',
+  '  task.waitUntilExit;',
+  '  if (Number(task.terminationStatus) !== 0) return null;',
+  '  const output = ObjC.unwrap(',
+  '    $.NSString.alloc.initWithDataEncoding(outputData, 4),',
+  '  );',
+  '  return JSON.parse(output);',
+  '}',
+  'function matches(nodeExecutable, descriptor, expected) {',
+  '  const actual = descriptorStats(nodeExecutable, descriptor);',
+  '  return actual !== null && actual.kind === expected.kind &&',
+  '    actual.dev === expected.dev && actual.ino === expected.ino &&',
+  '    actual.mode === expected.mode && actual.uid === expected.uid;',
+  '}',
+  'function run(argv) {',
+  '  const descriptors = [];',
+  '  try {',
+  '    const nodeExecutable = argv[0];',
+  '    const expected = JSON.parse(argv[1]);',
+  '    const names = ["server", "node_modules", ".deno"];',
+  '    if (!matches(nodeExecutable, 3, expected.root) ||',
+  '        expected.directories.length !== names.length) return "error";',
+  '    let parentDescriptor = 3;',
+  '    for (let index = 0; index < names.length; index += 1) {',
+  '      const descriptor = Number($.openat(',
+  '        parentDescriptor, names[index], DIRECTORY_FLAGS,',
+  '      ));',
+  '      if (descriptor < 0) return "error";',
+  '      descriptors.push(descriptor);',
+  '      if (!matches(nodeExecutable, descriptor, expected.directories[index])) {',
+  '        return "error";',
+  '      }',
+  '      parentDescriptor = descriptor;',
+  '    }',
+  '    const setupCacheDescriptor = Number($.openat(',
+  '      parentDescriptor, ".setup-cache.bin", FILE_FLAGS,',
+  '    ));',
+  '    if (setupCacheDescriptor < 0) return "error";',
+  '    descriptors.push(setupCacheDescriptor);',
+  '    if (!matches(nodeExecutable, setupCacheDescriptor, expected.file)) {',
+  '      return "error";',
+  '    }',
+  '    const confirmationDescriptor = Number($.openat(',
+  '      parentDescriptor, ".setup-cache.bin", FILE_FLAGS,',
+  '    ));',
+  '    if (confirmationDescriptor < 0) return "error";',
+  '    descriptors.push(confirmationDescriptor);',
+  '    if (!matches(nodeExecutable, confirmationDescriptor, expected.file)) {',
+  '      return "error";',
+  '    }',
+  '    return Number($.unlinkat(',
+  '      parentDescriptor, ".setup-cache.bin", 0,',
+  '    )) === 0 ? "removed" : "error";',
+  '  } catch {',
+  '    return "error";',
+  '  } finally {',
+  '    for (let index = descriptors.length - 1; index >= 0; index -= 1) {',
+  '      $.close(descriptors[index]);',
+  '    }',
+  '  }',
+  '}',
+].join('\n');
 
 export interface ProviderTreeIntegrityIdentity {
   entries: number;
@@ -48,20 +140,71 @@ export interface NormalizeProviderInstallationOptions {
   signal?: AbortSignal;
 }
 
+interface ProviderEntryIdentity {
+  kind: 'd' | 'f';
+  dev: string;
+  ino: string;
+  mode: string;
+  uid: string;
+}
+
+export interface UnlinkProviderSetupCacheOptions {
+  providerDirectoryHandle: FileHandle;
+  providerDirectoryIdentity: ProviderEntryIdentity;
+  directoryIdentities: readonly ProviderEntryIdentity[];
+  setupCacheIdentity: ProviderEntryIdentity;
+  signal?: AbortSignal;
+}
+
 export interface ProviderIntegrityDependencies {
   lstat(candidate: string): Promise<Stats>;
-  open(candidate: string, flags: 'r'): Promise<FileHandle>;
+  open(candidate: string, flags: number): Promise<FileHandle>;
   readdir(candidate: string): Promise<string[]>;
   readlink(candidate: string): Promise<string>;
-  unlink(candidate: string): Promise<void>;
+  unlinkSetupCache(options: UnlinkProviderSetupCacheOptions): Promise<void>;
 }
+
+const unlinkSetupCacheAt = async (
+  options: UnlinkProviderSetupCacheOptions,
+): Promise<void> => {
+  if (process.platform !== 'darwin' || process.arch !== 'arm64') {
+    throw invalidProvider();
+  }
+  const result = await runSystemProcess('/usr/bin/osascript', [
+    '-l',
+    'JavaScript',
+    '-e',
+    DARWIN_SETUP_CACHE_UNLINK_SCRIPT,
+    '--',
+    process.execPath,
+    JSON.stringify({
+      root: options.providerDirectoryIdentity,
+      directories: options.directoryIdentities,
+      file: options.setupCacheIdentity,
+    }),
+  ], {
+    extraStdioFds: [options.providerDirectoryHandle.fd],
+    env: Object.freeze({
+      PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
+      FORCE_COLOR: 'false',
+    }),
+    ...(options.signal === undefined ? {} : {signal: options.signal}),
+  });
+  if (
+    result.exitCode !== 0
+    || result.signal !== null
+    || result.stdout.trim() !== 'removed'
+  ) {
+    throw invalidProvider();
+  }
+};
 
 const defaultProviderIntegrityDependencies: ProviderIntegrityDependencies = {
   lstat,
   open: async (candidate, flags) => await open(candidate, flags),
   readdir: async (candidate) => await readdir(candidate),
   readlink: async (candidate) => await readlink(candidate),
-  unlink: async (candidate) => await unlink(candidate),
+  unlinkSetupCache: unlinkSetupCacheAt,
 };
 
 type IntegrityRecord = {
@@ -128,6 +271,33 @@ const requireOwnedEntry = (
   if (stats.uid !== currentUid) throw invalidProvider();
 };
 
+const entryIdentity = (
+  stats: Stats,
+  kind: ProviderEntryIdentity['kind'],
+): ProviderEntryIdentity => ({
+  kind,
+  dev: String(stats.dev),
+  ino: String(stats.ino),
+  mode: String(stats.mode),
+  uid: String(stats.uid),
+});
+
+const sameOwnedDirectory = (
+  expected: Stats,
+  actual: Stats,
+  currentUid: number,
+): boolean => (
+  !expected.isSymbolicLink()
+  && expected.isDirectory()
+  && !actual.isSymbolicLink()
+  && actual.isDirectory()
+  && expected.uid === currentUid
+  && actual.uid === currentUid
+  && actual.mode === expected.mode
+  && actual.dev === expected.dev
+  && actual.ino === expected.ino
+);
+
 const executableMode = (stats: Stats): string =>
   (stats.mode & 0o111).toString(8).padStart(3, '0');
 
@@ -161,14 +331,23 @@ const throwMappedProviderError = (
 
 const hashRegularFile = async (
   candidate: string,
+  pathStats: Stats,
+  currentUid: number,
   signal: AbortSignal | undefined,
   dependencies: ProviderIntegrityDependencies,
 ): Promise<string> => {
   throwIfDownloadCancelled(signal);
-  const handle = await dependencies.open(candidate, 'r');
+  const handle = await dependencies.open(
+    candidate,
+    constants.O_RDONLY | constants.O_NOFOLLOW,
+  );
   const hash = createHash('sha256');
   const buffer = Buffer.allocUnsafe(FILE_READ_BUFFER_BYTES);
   try {
+    const openedStats = await handle.stat();
+    if (!sameRegularFile(pathStats, openedStats, currentUid, false)) {
+      throw invalidProvider();
+    }
     while (true) {
       throwIfDownloadCancelled(signal);
       const {bytesRead} = await handle.read(
@@ -181,11 +360,44 @@ const hashRegularFile = async (
       if (bytesRead === 0) break;
       hash.update(buffer.subarray(0, bytesRead));
     }
+    const finalHandleStats = await handle.stat();
+    const finalPathStats = await dependencies.lstat(candidate);
+    if (
+      !sameRegularFile(openedStats, finalHandleStats, currentUid, true)
+      || !sameRegularFile(openedStats, finalPathStats, currentUid, true)
+    ) {
+      throw invalidProvider();
+    }
   } finally {
     await handle.close();
   }
   return hash.digest('hex');
 };
+
+const sameRegularFile = (
+  expected: Stats,
+  actual: Stats,
+  currentUid: number,
+  requireStableContents: boolean,
+): boolean => (
+  !expected.isSymbolicLink()
+  && expected.isFile()
+  && !actual.isSymbolicLink()
+  && actual.isFile()
+  && expected.uid === currentUid
+  && actual.uid === currentUid
+  && actual.mode === expected.mode
+  && actual.dev === expected.dev
+  && actual.ino === expected.ino
+  && (
+    !requireStableContents
+    || (
+      actual.size === expected.size
+      && actual.mtimeMs === expected.mtimeMs
+      && actual.ctimeMs === expected.ctimeMs
+    )
+  )
+);
 
 const targetStaysWithinRoot = (
   root: string,
@@ -238,7 +450,13 @@ const measureTree = async (
         continue;
       }
       if (stats.isFile() && !stats.isSymbolicLink()) {
-        const payload = await hashRegularFile(candidate, signal, dependencies);
+        const payload = await hashRegularFile(
+          candidate,
+          stats,
+          currentUid,
+          signal,
+          dependencies,
+        );
         records.push({
           relativePath,
           kind: 'f',
@@ -356,49 +574,76 @@ export const normalizeProviderInstallation = async (
       throw invalidProvider();
     }
     const providerDirectory = requireCanonicalRoot(options.providerDirectory);
-    const directoryChain = [
+    const providerDirectoryStats = await dependencies.lstat(providerDirectory);
+    requireOwnedDirectory(providerDirectoryStats, options.currentUid);
+    const providerDirectoryHandle = await dependencies.open(
       providerDirectory,
-      path.join(providerDirectory, 'server'),
-      path.join(providerDirectory, 'server/node_modules'),
-      path.join(providerDirectory, 'server/node_modules/.deno'),
-    ];
-    for (const [index, candidate] of directoryChain.entries()) {
-      throwIfDownloadCancelled(options.signal);
-      let stats: Stats;
-      try {
-        stats = await dependencies.lstat(candidate);
-      } catch (error) {
-        if (
-          index === directoryChain.length - 1
-          && nodeErrorCode(error) === 'ENOENT'
-        ) {
-          return;
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    try {
+      const openedProviderDirectoryStats = await providerDirectoryHandle.stat();
+      if (!sameOwnedDirectory(
+        providerDirectoryStats,
+        openedProviderDirectoryStats,
+        options.currentUid,
+      )) {
+        throw invalidProvider();
+      }
+      const directoryChain = SETUP_CACHE_COMPONENTS.map((_, index) => path.join(
+        providerDirectory,
+        ...SETUP_CACHE_COMPONENTS.slice(0, index + 1),
+      ));
+      const directoryIdentities: ProviderEntryIdentity[] = [];
+      for (const [index, candidate] of directoryChain.entries()) {
+        throwIfDownloadCancelled(options.signal);
+        let stats: Stats;
+        try {
+          stats = await dependencies.lstat(candidate);
+        } catch (error) {
+          if (
+            index === SETUP_CACHE_COMPONENTS.length - 1
+            && nodeErrorCode(error) === 'ENOENT'
+          ) {
+            return;
+          }
+          throw error;
         }
+        requireOwnedDirectory(stats, options.currentUid);
+        directoryIdentities.push(entryIdentity(stats, 'd'));
+      }
+      const setupCache = path.join(
+        providerDirectory,
+        'server/node_modules/.deno/.setup-cache.bin',
+      );
+      let setupCacheStats: Stats;
+      try {
+        setupCacheStats = await dependencies.lstat(setupCache);
+      } catch (error) {
+        if (nodeErrorCode(error) === 'ENOENT') return;
         throw error;
       }
-      requireOwnedDirectory(stats, options.currentUid);
+      if (
+        setupCacheStats.isSymbolicLink()
+        || !setupCacheStats.isFile()
+        || setupCacheStats.uid !== options.currentUid
+      ) {
+        throw invalidProvider();
+      }
+      throwIfDownloadCancelled(options.signal);
+      await dependencies.unlinkSetupCache({
+        providerDirectoryHandle,
+        providerDirectoryIdentity: entryIdentity(
+          openedProviderDirectoryStats,
+          'd',
+        ),
+        directoryIdentities,
+        setupCacheIdentity: entryIdentity(setupCacheStats, 'f'),
+        ...(options.signal === undefined ? {} : {signal: options.signal}),
+      });
+      throwIfDownloadCancelled(options.signal);
+    } finally {
+      await providerDirectoryHandle.close();
     }
-    const setupCache = path.join(
-      providerDirectory,
-      'server/node_modules/.deno/.setup-cache.bin',
-    );
-    let setupCacheStats: Stats;
-    try {
-      setupCacheStats = await dependencies.lstat(setupCache);
-    } catch (error) {
-      if (nodeErrorCode(error) === 'ENOENT') return;
-      throw error;
-    }
-    if (
-      setupCacheStats.isSymbolicLink()
-      || !setupCacheStats.isFile()
-      || setupCacheStats.uid !== options.currentUid
-    ) {
-      throw invalidProvider();
-    }
-    throwIfDownloadCancelled(options.signal);
-    await dependencies.unlink(setupCache);
-    throwIfDownloadCancelled(options.signal);
   } catch (error) {
     throwMappedProviderError(error, options.signal);
   }

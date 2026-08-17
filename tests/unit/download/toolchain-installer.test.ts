@@ -42,6 +42,8 @@ import type {ProcessResult} from '../../../src/process/run-process';
 
 const INVALID_TOOLCHAIN_MESSAGE =
   'The managed downloader failed integrity or capability checks.';
+const INVALID_PROVIDER_MESSAGE =
+  'The YouTube compatibility provider is unavailable.';
 const currentUid = typeof process.getuid === 'function' ? process.getuid() : 501;
 const denoExecutable = '/private/tools/deno';
 const ffmpegExecutable = '/private/tools/ffmpeg';
@@ -147,6 +149,7 @@ const statsWithUid = (stats: Stats, uid: number): Stats => new Proxy(stats, {
 
 interface InstallerFixtureState {
   providerHead: string;
+  providerVersionOutput: string;
   failFrozenInstall: boolean;
   replaceLockDuringGitCheck: boolean;
   foreignOwnedPath?: string;
@@ -207,6 +210,7 @@ const createInstallerFixture = async (): Promise<InstallerFixture> => {
   const stagingDirectories: string[] = [];
   const state: InstallerFixtureState = {
     providerHead: DOWNLOADER_TOOLCHAIN_MANIFEST.potProvider.commit,
+    providerVersionOutput: '1.3.1\n',
     failFrozenInstall: false,
     replaceLockDuringGitCheck: false,
   };
@@ -307,7 +311,7 @@ const createInstallerFixture = async (): Promise<InstallerFixture> => {
         (command === denoExecutable || path.basename(command) === 'deno-isolated')
         && args[0] === 'run'
       ) {
-        return resultFor(command, args, '1.3.1\n');
+        return resultFor(command, args, state.providerVersionOutput);
       }
       if (args.length === 1 && args[0] === '--list-impersonate-targets') {
         return resultFor(command, args, targetsOutput);
@@ -477,6 +481,28 @@ const expectInvalidToolchain = async (
     name: 'DownloadError',
     code: 'DOWNLOAD_TOOLCHAIN_INVALID',
     message: INVALID_TOOLCHAIN_MESSAGE,
+  });
+  expect((caught as Error & {cause?: unknown}).cause).toBeUndefined();
+  for (const marker of privateMarkers) {
+    expect(String(caught)).not.toContain(marker);
+  }
+  return caught as DownloadError;
+};
+
+const expectProviderUnavailable = async (
+  promise: Promise<unknown>,
+  privateMarkers: readonly string[] = [],
+): Promise<DownloadError> => {
+  let caught: unknown;
+  try {
+    await promise;
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toMatchObject({
+    name: 'DownloadError',
+    code: 'DOWNLOAD_PO_TOKEN_UNAVAILABLE',
+    message: INVALID_PROVIDER_MESSAGE,
   });
   expect((caught as Error & {cause?: unknown}).cause).toBeUndefined();
   for (const marker of privateMarkers) {
@@ -1229,6 +1255,51 @@ describe('installDownloaderToolchain', () => {
     )).resolves.toEqual({status: 'installed', version: '2026.07.04'});
 
     expect(setupCachePresentAtVerification).toBe(false);
+  });
+
+  it.each([
+    ['wrong version', '1.3.0\n', '1.3.0'],
+    ['extra line', '1.3.1\nprivate extra output\n', 'private extra output'],
+    ['surrounding whitespace', ' 1.3.1 \n', ' 1.3.1 '],
+  ] as const)('restores and cleans up before reporting provider unavailable for %s', async (
+    _caseName,
+    providerVersionOutput,
+    privateOutputMarker,
+  ) => {
+    const fixture = await createInstallerFixture();
+    const markerPath = await seedInvalidPublishedDirectory(fixture.paths);
+    fixture.state.providerVersionOutput = providerVersionOutput;
+    const quarantineDirectory = path.join(
+      fixture.paths.cacheRoot,
+      '.quarantine-00000000-0000-4000-8000-000000000001',
+    );
+
+    const error = await expectProviderUnavailable(installDownloaderToolchain(
+      {homeDirectory: fixture.homeDirectory},
+      fixture.dependencies,
+    ), [
+      privateOutputMarker,
+      fixture.paths.providerServerDirectory,
+    ]);
+    for (const stagingDirectory of fixture.stagingDirectories) {
+      expect(String(error)).not.toContain(stagingDirectory);
+    }
+
+    expect(await readFile(markerPath, 'utf8')).toBe('private previous installation');
+    expect(await exists(quarantineDirectory)).toBe(false);
+    expect(await Promise.all(fixture.stagingDirectories.map(exists)))
+      .toEqual(fixture.stagingDirectories.map(() => false));
+    expect(await exists(fixture.paths.setupLock)).toBe(false);
+    const stagingDirectory = fixture.stagingDirectories[0];
+    expect(stagingDirectory).toBeDefined();
+    const restoreRename = fixture.operations.indexOf(
+      `rename:${quarantineDirectory}:${fixture.paths.versionDirectory}`,
+    );
+    const stagingRemoval = fixture.operations.indexOf(`rm:${stagingDirectory}`);
+    const lockRemoval = fixture.operations.indexOf(`rm:${fixture.paths.setupLock}`);
+    expect(restoreRename).toBeGreaterThan(-1);
+    expect(stagingRemoval).toBeGreaterThan(restoreRename);
+    expect(lockRemoval).toBeGreaterThan(stagingRemoval);
   });
 
   it.each([
