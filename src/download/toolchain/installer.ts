@@ -46,6 +46,12 @@ const ALLOWED_REDIRECT_HOSTS = new Set([
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const INSTALL_DIRECTORY_PREFIX = '.install-';
 const QUARANTINE_DIRECTORY_PREFIX = '.quarantine-';
+const CACHE_PATH_COMPONENTS = [
+  'Library',
+  'Caches',
+  'auto-cut-video',
+  'downloader',
+] as const;
 
 const invalidToolchain = (): DownloadError => new DownloadError(
   'DOWNLOAD_TOOLCHAIN_INVALID',
@@ -95,7 +101,11 @@ const defaultInstallerDependencies: InstallerDependencies = {
 
 const processOptionsFor = (
   signal: AbortSignal | undefined,
-): RunProcessOptions => signal === undefined ? {} : {signal};
+  environment: Readonly<NodeJS.ProcessEnv>,
+): RunProcessOptions => ({
+  env: environment,
+  ...(signal === undefined ? {} : {signal}),
+});
 
 const nodeErrorCode = (error: unknown): unknown => (
   typeof error === 'object'
@@ -107,6 +117,14 @@ const nodeErrorCode = (error: unknown): unknown => (
 
 const isMissingPathError = (error: unknown): boolean =>
   nodeErrorCode(error) === 'ENOENT';
+
+const isAllowedAssetUrl = (candidate: URL): boolean =>
+  candidate.protocol === 'https:'
+  && ALLOWED_REDIRECT_HOSTS.has(candidate.hostname)
+  && candidate.username.length === 0
+  && candidate.password.length === 0
+  && candidate.port.length === 0
+  && !candidate.href.includes('#');
 
 const isOwnedDirectory = (
   stats: Awaited<ReturnType<InstallerDependencies['lstat']>>,
@@ -155,15 +173,76 @@ const requireGeneratedPath = (
 
 type SetupLock = {release(): Promise<void>};
 
+const cachePathChain = (
+  canonicalHome: string,
+  cacheRoot: string,
+): readonly string[] => {
+  const expectedCacheRoot = path.join(canonicalHome, ...CACHE_PATH_COMPONENTS);
+  if (
+    !path.isAbsolute(canonicalHome)
+    || cacheRoot !== expectedCacheRoot
+    || path.relative(canonicalHome, cacheRoot).startsWith('..')
+  ) {
+    throw invalidToolchain();
+  }
+  return [
+    canonicalHome,
+    ...CACHE_PATH_COMPONENTS.map((_, index) => path.join(
+      canonicalHome,
+      ...CACHE_PATH_COMPONENTS.slice(0, index + 1),
+    )),
+  ];
+};
+
+const validateCachePathAncestors = async (
+  canonicalHome: string,
+  cacheRoot: string,
+  dependencies: InstallerDependencies,
+  allowMissingTail: boolean,
+): Promise<void> => {
+  const chain = cachePathChain(canonicalHome, cacheRoot);
+  const applicationCache = chain.at(-2);
+  const uid = dependencies.currentUid();
+  for (const [index, candidate] of chain.entries()) {
+    let stats: Awaited<ReturnType<InstallerDependencies['lstat']>>;
+    try {
+      stats = await dependencies.lstat(candidate);
+    } catch (error) {
+      if (allowMissingTail && index > 0 && isMissingPathError(error)) return;
+      throw invalidToolchain();
+    }
+    if (!isOwnedDirectory(stats, uid)) throw invalidToolchain();
+    if (
+      (candidate === applicationCache || candidate === cacheRoot)
+      && (stats.mode & 0o022) !== 0
+    ) {
+      throw invalidToolchain();
+    }
+  }
+};
+
 const acquireSetupLock = async (
-  lockPath: string,
+  canonicalHome: string,
+  paths: DownloaderToolchainPaths,
   dependencies: InstallerDependencies,
 ): Promise<SetupLock> => {
-  const cacheRoot = path.dirname(lockPath);
+  const {cacheRoot, setupLock: lockPath} = paths;
   let handle: FileHandle | undefined;
   try {
+    if (path.dirname(lockPath) !== cacheRoot) throw invalidToolchain();
+    await validateCachePathAncestors(
+      canonicalHome,
+      cacheRoot,
+      dependencies,
+      true,
+    );
     await dependencies.mkdir(cacheRoot, {recursive: true, mode: 0o700});
-    await requireOwnedDirectory(cacheRoot, dependencies);
+    await validateCachePathAncestors(
+      canonicalHome,
+      cacheRoot,
+      dependencies,
+      false,
+    );
     handle = await dependencies.open(lockPath, 'wx', 0o600);
     const identity = await handle.stat();
     if (!identity.isFile() || identity.uid !== dependencies.currentUid()) {
@@ -370,6 +449,7 @@ const removeOwnedDirectory = async (
   await requireOwnedDirectory(cacheRoot, dependencies);
   await requireOwnedDirectory(candidate, dependencies);
   await dependencies.rm(candidate, {recursive: true});
+  await syncDirectory(cacheRoot, dependencies);
 };
 
 const restoreQuarantine = async (
@@ -407,10 +487,14 @@ const createStagingLayout = async (
 };
 
 const requireGitAndDeno2 = async (
+  stagingPaths: DownloaderToolchainPaths,
   dependencies: InstallerDependencies,
   signal?: AbortSignal,
 ): Promise<string> => {
-  const processOptions = processOptionsFor(signal);
+  const processOptions = processOptionsFor(
+    signal,
+    buildDownloaderChildEnvironment(stagingPaths),
+  );
   await dependencies.runProcess('git', ['--version'], processOptions);
   const denoExecutable = await dependencies.capabilities.resolveExecutable('deno');
   const result = await dependencies.runProcess(
@@ -435,18 +519,14 @@ const downloadPinnedAsset = async (
   let current = new URL(asset.url);
   let response: Response | undefined;
   for (let redirects = 0; redirects <= 5; redirects += 1) {
-    if (
-      current.protocol !== 'https:'
-      || !ALLOWED_REDIRECT_HOSTS.has(current.hostname)
-    ) {
-      throw invalidToolchain();
-    }
+    if (!isAllowedAssetUrl(current)) throw invalidToolchain();
     response = await dependencies.fetch(current, {
       redirect: 'manual',
       ...(signal === undefined ? {} : {signal}),
     });
     if (!REDIRECT_STATUSES.has(response.status)) break;
     const location = response.headers.get('location');
+    await response.body?.cancel();
     if (location === null) throw invalidToolchain();
     current = new URL(location, current);
     response = undefined;
@@ -480,7 +560,10 @@ const checkoutPinnedProvider = async (
   dependencies: InstallerDependencies,
   signal?: AbortSignal,
 ): Promise<void> => {
-  const processOptions = processOptionsFor(signal);
+  const processOptions = processOptionsFor(
+    signal,
+    buildDownloaderChildEnvironment(paths),
+  );
   await dependencies.runProcess(
     'git',
     ['init', paths.providerDirectory],
@@ -542,6 +625,18 @@ const validateStagedToolchain = async (
   dependencies: InstallerDependencies,
   signal?: AbortSignal,
 ): Promise<void> => {
+  const childEnvironment = buildDownloaderChildEnvironment(stagingPaths);
+  const capabilityDependencies: DownloaderCapabilityDependencies = {
+    ...dependencies.capabilities,
+    runProcess: async (command, args, options = {}) =>
+      await dependencies.capabilities.runProcess(command, args, {
+        ...options,
+        env: buildDownloaderChildEnvironment(
+          stagingPaths,
+          options.env ?? childEnvironment,
+        ),
+      }),
+  };
   await validateDownloaderCapabilities({
     source: 'managed',
     validationMode: 'staging',
@@ -549,7 +644,7 @@ const validateStagedToolchain = async (
     ...(ffmpegOverride === undefined ? {} : {ffmpegOverride}),
     paths: stagingPaths,
     ...(signal === undefined ? {} : {signal}),
-  }, dependencies.capabilities);
+  }, capabilityDependencies);
 };
 
 const writeInstalledManifest = async (
@@ -634,13 +729,13 @@ const installDownloaderToolchainTransaction = async (
   options: InstallDownloaderToolchainOptions,
   dependencies: InstallerDependencies,
 ): Promise<SetupDownloaderResult> => {
-  const paths = resolveDownloaderToolchainPaths(
-    options.homeDirectory ?? homedir(),
-  );
+  const homeDirectory = options.homeDirectory ?? homedir();
+  const canonicalHome = path.resolve(homeDirectory);
+  const paths = resolveDownloaderToolchainPaths(homeDirectory);
   if (process.platform !== 'darwin' || process.arch !== 'arm64') {
     throw invalidToolchain();
   }
-  const lock = await acquireSetupLock(paths.setupLock, dependencies);
+  const lock = await acquireSetupLock(canonicalHome, paths, dependencies);
   let stagingDirectory: string | undefined;
   let quarantineDirectory: string | undefined;
   let published = false;
@@ -652,6 +747,9 @@ const installDownloaderToolchainTransaction = async (
       paths,
       dependencies,
     );
+    if (quarantineDirectory !== undefined) {
+      await syncDirectory(paths.cacheRoot, dependencies);
+    }
     stagingDirectory = await dependencies.mkdtemp(
       path.join(paths.cacheRoot, INSTALL_DIRECTORY_PREFIX),
     );
@@ -665,6 +763,7 @@ const installDownloaderToolchainTransaction = async (
     const stagingPaths = pathsForVersionDirectory(paths, stagingDirectory);
     await createStagingLayout(stagingPaths, dependencies);
     const denoExecutable = await requireGitAndDeno2(
+      stagingPaths,
       dependencies,
       options.signal,
     );
@@ -713,6 +812,7 @@ const installDownloaderToolchainTransaction = async (
     if (!published && quarantineDirectory !== undefined) {
       try {
         await restoreQuarantine(quarantineDirectory, paths, dependencies);
+        await syncDirectory(paths.cacheRoot, dependencies);
         quarantineDirectory = undefined;
       } catch {
         throw invalidToolchain();

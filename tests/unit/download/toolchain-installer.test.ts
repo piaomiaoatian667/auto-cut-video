@@ -447,6 +447,7 @@ afterEach(async () => {
     DOWNLOADER_TOOLCHAIN_MANIFEST.potPlugin as unknown as MutableAsset,
     originalPluginAsset,
   );
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
   await Promise.all(
     temporaryRoots.splice(0).map(async (root) => {
@@ -550,6 +551,36 @@ describe('installDownloaderToolchain', () => {
       .toEqual(fixture.stagingDirectories.map(() => false));
   });
 
+  it('strips mixed-case system proxy variables from every Git and Deno child', async () => {
+    vi.stubEnv('HTTP_PROXY', 'http://private-http-proxy.test');
+    vi.stubEnv('https_proxy', 'http://private-https-proxy.test');
+    vi.stubEnv('ALL_PROXY', 'socks5://private-all-proxy.test');
+    vi.stubEnv('no_proxy', 'private-no-proxy.test');
+    vi.stubEnv('TOOLCHAIN_SAFE_ENV', 'preserved');
+    const fixture = await createInstallerFixture();
+
+    await expect(installDownloaderToolchain(
+      {homeDirectory: fixture.homeDirectory},
+      fixture.dependencies,
+    )).resolves.toEqual({status: 'installed', version: '2026.07.04'});
+
+    const gitAndDenoCalls = fixture.runProcess.mock.calls.filter(([command]) =>
+      command === 'git' || command === denoExecutable
+    );
+    expect(gitAndDenoCalls.length).toBeGreaterThan(0);
+    for (const [, , options] of gitAndDenoCalls) {
+      expect(options?.env).toBeDefined();
+      expect(Object.isFrozen(options?.env)).toBe(true);
+      expect(options?.env?.TOOLCHAIN_SAFE_ENV).toBe('preserved');
+      expect(Object.keys(options?.env ?? {}).filter((key) => [
+        'http_proxy',
+        'https_proxy',
+        'all_proxy',
+        'no_proxy',
+      ].includes(key.toLowerCase()))).toEqual([]);
+    }
+  });
+
   it('reuses a valid published toolchain without fetches or runtime checks', async () => {
     const fixture = await createInstallerFixture();
     await seedValidPublishedToolchain(fixture.paths);
@@ -591,6 +622,70 @@ describe('installDownloaderToolchain', () => {
     expect(await exists(fixture.paths.versionDirectory)).toBe(false);
     expect(await Promise.all(fixture.stagingDirectories.map(exists)))
       .toEqual(fixture.stagingDirectories.map(() => false));
+  });
+
+  it.each([
+    [
+      'credentials',
+      'https://private-user:private-password@release-assets.githubusercontent.com/asset',
+    ],
+    [
+      'a non-default port',
+      'https://release-assets.githubusercontent.com:444/asset',
+    ],
+    [
+      'a fragment',
+      'https://release-assets.githubusercontent.com/asset#private-fragment',
+    ],
+    [
+      'an empty fragment',
+      'https://release-assets.githubusercontent.com/asset#',
+    ],
+  ])('rejects an allowlisted redirect containing %s before following it', async (
+    _caseName,
+    privateRedirect,
+  ) => {
+    const fixture = await createInstallerFixture();
+    fixture.fetch.mockImplementationOnce(async () => new Response('redirect', {
+      status: 302,
+      headers: {location: privateRedirect},
+    }));
+
+    await expectInvalidToolchain(
+      installDownloaderToolchain(
+        {homeDirectory: fixture.homeDirectory},
+        fixture.dependencies,
+      ),
+      [privateRedirect],
+    );
+
+    expect(fixture.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows a signed redirect query and cancels its body before the next hop', async () => {
+    const fixture = await createInstallerFixture();
+    const signedRedirect =
+      'https://release-assets.githubusercontent.com/asset?signature=private-query';
+    const redirectResponse = new Response('redirect body', {
+      status: 302,
+      headers: {location: signedRedirect},
+    });
+    if (redirectResponse.body === null) throw new Error('missing redirect body');
+    const cancel = vi.spyOn(redirectResponse.body, 'cancel');
+    fixture.fetch
+      .mockImplementationOnce(async () => redirectResponse)
+      .mockImplementationOnce(async (input) => {
+        expect(String(input)).toBe(signedRedirect);
+        expect(cancel).toHaveBeenCalledTimes(1);
+        return new Response(ytDlpContents);
+      });
+
+    await expect(installDownloaderToolchain(
+      {homeDirectory: fixture.homeDirectory},
+      fixture.dependencies,
+    )).resolves.toEqual({status: 'installed', version: '2026.07.04'});
+
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -668,6 +763,59 @@ describe('installDownloaderToolchain', () => {
     expect(fixture.mkdtemp).not.toHaveBeenCalled();
   });
 
+  it('rejects an application cache ancestor symlink without touching its target', async () => {
+    const fixture = await createInstallerFixture();
+    const externalDirectory = await makeTemporaryDirectory(
+      path.join(tmpdir(), 'toolchain-cache-symlink-target-'),
+    );
+    temporaryRoots.push(externalDirectory);
+    const cachesDirectory = path.join(fixture.homeDirectory, 'Library/Caches');
+    const applicationCache = path.join(cachesDirectory, 'auto-cut-video');
+    await mkdirDirectory(cachesDirectory, {recursive: true, mode: 0o700});
+    await symlink(externalDirectory, applicationCache);
+
+    await expectInvalidToolchain(
+      installDownloaderToolchain(
+        {homeDirectory: fixture.homeDirectory},
+        fixture.dependencies,
+      ),
+      [applicationCache, externalDirectory],
+    );
+
+    expect(await exists(path.join(externalDirectory, 'downloader'))).toBe(false);
+    expect(fixture.open).not.toHaveBeenCalledWith(
+      fixture.paths.setupLock,
+      'wx',
+      0o600,
+    );
+    expect(fixture.mkdtemp).not.toHaveBeenCalled();
+    expect(fixture.fetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects a group/world-writable application cache before creating the setup lock', async () => {
+    const fixture = await createInstallerFixture();
+    const applicationCache = path.join(
+      fixture.homeDirectory,
+      'Library/Caches/auto-cut-video',
+    );
+    await mkdirDirectory(applicationCache, {recursive: true, mode: 0o700});
+    await chmodFile(applicationCache, 0o777);
+
+    await expectInvalidToolchain(installDownloaderToolchain(
+      {homeDirectory: fixture.homeDirectory},
+      fixture.dependencies,
+    ));
+
+    expect(await exists(fixture.paths.setupLock)).toBe(false);
+    expect(fixture.open).not.toHaveBeenCalledWith(
+      fixture.paths.setupLock,
+      'wx',
+      0o600,
+    );
+    expect(fixture.mkdtemp).not.toHaveBeenCalled();
+    expect(fixture.fetch).not.toHaveBeenCalled();
+  });
+
   it('rejects a symlinked published directory without moving its target', async () => {
     const fixture = await createInstallerFixture();
     const externalDirectory = await makeTemporaryDirectory(
@@ -718,9 +866,18 @@ describe('installDownloaderToolchain', () => {
       fixture.paths.cacheRoot,
       '.quarantine-00000000-0000-4000-8000-000000000001',
     );
+    let namespaceSyncedBeforeStaging = false;
     fixture.mkdtemp.mockImplementationOnce(async () => {
-      expect(await exists(fixture.paths.versionDirectory)).toBe(false);
-      expect(await exists(quarantineDirectory)).toBe(true);
+      const quarantineRename = fixture.operations.indexOf(
+        `rename:${fixture.paths.versionDirectory}:${quarantineDirectory}`,
+      );
+      const cacheSync = fixture.operations.findIndex((operation, index) =>
+        index > quarantineRename && operation === `sync:${fixture.paths.cacheRoot}`
+      );
+      namespaceSyncedBeforeStaging = quarantineRename >= 0
+        && cacheSync > quarantineRename
+        && !await exists(fixture.paths.versionDirectory)
+        && await exists(quarantineDirectory);
       throw new Error('private staging allocation failure');
     });
 
@@ -734,6 +891,7 @@ describe('installDownloaderToolchain', () => {
 
     expect(await readFile(markerPath, 'utf8')).toBe('private previous installation');
     expect(await exists(quarantineDirectory)).toBe(false);
+    expect(namespaceSyncedBeforeStaging).toBe(true);
   });
 
   it('never removes a generated-looking staging directory outside cacheRoot', async () => {
@@ -837,6 +995,14 @@ describe('installDownloaderToolchain', () => {
     expect(await Promise.all(fixture.stagingDirectories.map(exists)))
       .toEqual(fixture.stagingDirectories.map(() => false));
     expect(await exists(fixture.paths.versionDirectory)).toBe(false);
+    const stagingDirectory = fixture.stagingDirectories[0];
+    expect(stagingDirectory).toBeDefined();
+    const stagingRemoval = fixture.operations.indexOf(`rm:${stagingDirectory}`);
+    const cacheSync = fixture.operations.findIndex((operation, index) =>
+      index > stagingRemoval && operation === `sync:${fixture.paths.cacheRoot}`
+    );
+    expect(stagingRemoval).toBeGreaterThan(-1);
+    expect(cacheSync).toBeGreaterThan(stagingRemoval);
   });
 
   it('restores quarantine when installation fails before publication', async () => {
@@ -862,6 +1028,29 @@ describe('installDownloaderToolchain', () => {
         `rename:${fixture.paths.versionDirectory}:${quarantineDirectory}`,
         `rename:${quarantineDirectory}:${fixture.paths.versionDirectory}`,
       ]);
+    const quarantineRename = fixture.operations.indexOf(
+      `rename:${fixture.paths.versionDirectory}:${quarantineDirectory}`,
+    );
+    const quarantineSync = fixture.operations.findIndex((operation, index) =>
+      index > quarantineRename && operation === `sync:${fixture.paths.cacheRoot}`
+    );
+    const restoreRename = fixture.operations.indexOf(
+      `rename:${quarantineDirectory}:${fixture.paths.versionDirectory}`,
+    );
+    const restoreSync = fixture.operations.findIndex((operation, index) =>
+      index > restoreRename && operation === `sync:${fixture.paths.cacheRoot}`
+    );
+    const stagingDirectory = fixture.stagingDirectories[0];
+    expect(stagingDirectory).toBeDefined();
+    const stagingRemoval = fixture.operations.indexOf(`rm:${stagingDirectory}`);
+    const removalSync = fixture.operations.findIndex((operation, index) =>
+      index > stagingRemoval && operation === `sync:${fixture.paths.cacheRoot}`
+    );
+    expect(quarantineSync).toBeGreaterThan(quarantineRename);
+    expect(quarantineSync).toBeLessThan(restoreRename);
+    expect(restoreSync).toBeGreaterThan(restoreRename);
+    expect(restoreSync).toBeLessThan(stagingRemoval);
+    expect(removalSync).toBeGreaterThan(stagingRemoval);
   });
 
   it('atomically replaces quarantine and removes it only after cache sync', async () => {
@@ -886,12 +1075,23 @@ describe('installDownloaderToolchain', () => {
     expect(renameOperations[1]).toMatch(
       new RegExp(`^rename:.+\\.install-.+:${fixture.paths.versionDirectory}$`, 'u'),
     );
-    const cacheSync = fixture.operations.indexOf(`sync:${fixture.paths.cacheRoot}`);
-    const quarantineRemoval = fixture.operations.indexOf(`rm:${quarantineDirectory}`);
-    expect(cacheSync).toBeGreaterThan(
-      fixture.operations.indexOf(renameOperations[1] ?? ''),
+    const quarantineRename = fixture.operations.indexOf(renameOperations[0] ?? '');
+    const quarantineSync = fixture.operations.findIndex((operation, index) =>
+      index > quarantineRename && operation === `sync:${fixture.paths.cacheRoot}`
     );
-    expect(quarantineRemoval).toBeGreaterThan(cacheSync);
+    const publication = fixture.operations.indexOf(renameOperations[1] ?? '');
+    const publicationSync = fixture.operations.findIndex((operation, index) =>
+      index > publication && operation === `sync:${fixture.paths.cacheRoot}`
+    );
+    const quarantineRemoval = fixture.operations.indexOf(`rm:${quarantineDirectory}`);
+    const removalSync = fixture.operations.findIndex((operation, index) =>
+      index > quarantineRemoval && operation === `sync:${fixture.paths.cacheRoot}`
+    );
+    expect(quarantineSync).toBeGreaterThan(quarantineRename);
+    expect(quarantineSync).toBeLessThan(publication);
+    expect(publicationSync).toBeGreaterThan(publication);
+    expect(quarantineRemoval).toBeGreaterThan(publicationSync);
+    expect(removalSync).toBeGreaterThan(quarantineRemoval);
     expect(await exists(quarantineDirectory)).toBe(false);
     expect(await exists(fixture.paths.versionDirectory)).toBe(true);
   });
