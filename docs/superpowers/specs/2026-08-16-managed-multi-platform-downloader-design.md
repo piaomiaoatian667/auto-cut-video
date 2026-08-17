@@ -243,10 +243,15 @@ version, commit, roots, and counts so an older weaker identity is not accepted.
 12. Run Deno dependency installation from the provider's `server` directory
     using its committed lockfile, `--frozen`, the toolchain-scoped `DENO_DIR`,
     and only the provider-documented `npm:canvas` install-script permission.
-13. Safely remove only, through descriptor-bound Darwin `openat`/`unlinkat`
-    operations rooted at an already-open provider directory,
-    `server/node_modules/.deno/.setup-cache.bin`, whose final eight bytes vary
-    across otherwise valid Deno installations.
+13. Normalize `server/node_modules/.deno/.setup-cache.bin`, whose final eight
+    bytes vary across otherwise valid Deno installations, through the
+    already-open provider directory. Open and verify the `.deno` chain with
+    Darwin `openat`, atomically isolate the cache to a random strict basename in
+    that same directory with no-replace, no-follow `renameatx_np`, reopen the
+    quarantine with `O_NOFOLLOW`, and require the original identity before
+    `unlinkat`. On mismatch, do not delete the quarantine; best-effort restore
+    the original name without replacement and fail with the controlled provider
+    error.
 14. Verify both canonical provider trees and require the provider `--version`
     stdout to be the single exact `1.3.1` line, with at most one platform line
     ending.
@@ -278,10 +283,20 @@ The provider root is opened once with `O_DIRECTORY | O_NOFOLLOW` and remains
 the authority for both source and dependency verification. Every child
 directory is likewise opened without following the final component, checked
 against its path `lstat`, and enumerated through `opendir(/dev/fd/<fd>)` so a
-later path rename or symlink replacement cannot redirect enumeration. Before
-and after entry processing, descriptor and original-path stats must retain the
-same directory type, UID, mode, device, inode, size, and modification metadata;
-any detected replacement or mutation fails closed.
+walk reads the opened directory inode rather than reopening that directory by
+its original pathname. Before and after entry processing, descriptor and
+original-path stats must retain the same directory type, UID, mode, device,
+inode, size, and modification metadata; any detected replacement or mutation
+fails closed.
+
+The provider verifier is a local at-rest integrity control. It is designed to
+fail closed for static or persistent tampering, one-way symlink or rename
+substitution, and ordinary concurrent changes observed by the descriptor/path
+checks. It does not claim to resist a malicious same-UID process that
+continuously and precisely swaps same-owned entries into and out of place
+between every syscall. That actor can already directly modify or delete the
+per-user cache and is outside this threat model; the verifier retains all
+before/after identity checks and the one-way substitution regressions.
 
 Regular files are opened with `O_RDONLY | O_NOFOLLOW`. The verifier compares
 the opened descriptor with the path `lstat` identity (type, UID, mode, device,

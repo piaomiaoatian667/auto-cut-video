@@ -3,6 +3,7 @@ import {createHash} from 'node:crypto';
 import type {Stats} from 'node:fs';
 import {
   chmod,
+  type FileHandle,
   lstat,
   mkdir,
   mkdtemp,
@@ -18,7 +19,11 @@ import {
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {promisify} from 'node:util';
-import {afterEach, describe, expect, it} from 'vitest';
+import {afterEach, describe, expect, it, vi} from 'vitest';
+import {
+  DownloadCancellationError,
+} from '../../../src/download/cancellation';
+import {DownloadError} from '../../../src/download/errors';
 import {
   normalizeProviderInstallation,
   verifyProviderIntegrity,
@@ -213,6 +218,78 @@ const statsWithUid = (stats: Stats, uid: number): Stats => new Proxy(stats, {
     return typeof value === 'function' ? value.bind(target) : value;
   },
 });
+
+type ParentAuthorityRole = 'node_modules' | 'provider' | 'server';
+
+const parentAuthorityCloseHarness = (
+  fixture: ProviderFixture,
+  closeFailure: Error,
+  primaryError?: Error,
+): {
+  closeAttempts: ParentAuthorityRole[];
+  cleanup: () => Promise<void>;
+  dependencies: NonNullable<Parameters<typeof verifyProviderIntegrity>[1]>;
+} => {
+  const openCounts = new Map<string, number>();
+  const trackedHandles: Array<{closed: boolean; handle: FileHandle}> = [];
+  const closeAttempts: ParentAuthorityRole[] = [];
+  const serverDirectory = path.join(fixture.providerDirectory, 'server');
+  let nodeModulesDescriptor: number | undefined;
+
+  return {
+    closeAttempts,
+    cleanup: async () => {
+      await Promise.allSettled(trackedHandles.map(async (tracked) => {
+        if (tracked.closed) return;
+        tracked.closed = true;
+        await tracked.handle.close();
+      }));
+    },
+    dependencies: {
+      open: async (candidate, flags) => {
+        const handle = await openFile(candidate, flags);
+        const occurrence = (openCounts.get(candidate) ?? 0) + 1;
+        openCounts.set(candidate, occurrence);
+        const role: ParentAuthorityRole | undefined =
+          candidate === fixture.providerDirectory
+            ? 'provider'
+            : candidate === serverDirectory && occurrence === 2
+              ? 'server'
+              : candidate === fixture.nodeModulesDirectory && occurrence === 2
+                ? 'node_modules'
+                : undefined;
+        if (role === undefined) return handle;
+        if (role === 'node_modules') nodeModulesDescriptor = handle.fd;
+        const tracked = {closed: false, handle};
+        trackedHandles.push(tracked);
+        return new Proxy(handle, {
+          get(target, property) {
+            if (property === 'close') {
+              return async () => {
+                closeAttempts.push(role);
+                if (role === 'node_modules') throw closeFailure;
+                tracked.closed = true;
+                await target.close();
+              };
+            }
+            const value = Reflect.get(target, property, target);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      },
+      opendir: async (candidate) => {
+        if (
+          primaryError !== undefined
+          && nodeModulesDescriptor !== undefined
+          && candidate === `/dev/fd/${nodeModulesDescriptor}`
+        ) {
+          throw primaryError;
+        }
+        return await openDirectory(candidate);
+      },
+    },
+  };
+};
 
 afterEach(async () => {
   await Promise.all(temporaryRoots.splice(0).map(async (root) => {
@@ -532,6 +609,69 @@ describe('provider integrity verifier', () => {
       privateReason,
     );
   });
+
+  it('attempts every parent close and maps a lone close failure', async () => {
+    const fixture = await createProviderFixture();
+    const privateMarker = 'private node_modules close failure';
+    const harness = parentAuthorityCloseHarness(
+      fixture,
+      new Error(privateMarker),
+    );
+
+    try {
+      await expectProviderFailure(verifyFixture(fixture, canonicalIdentity, {
+        dependencies: harness.dependencies,
+      }), [privateMarker]);
+      expect(harness.closeAttempts).toEqual([
+        'node_modules',
+        'server',
+        'provider',
+      ]);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+
+  it.each([
+    [
+      'provider validation error',
+      new DownloadError(
+        'DOWNLOAD_PO_TOKEN_UNAVAILABLE',
+        INVALID_PROVIDER_MESSAGE,
+      ),
+    ],
+    ['cancellation', new DownloadCancellationError()],
+  ])('preserves the original %s when parent close also fails', async (
+    _caseName,
+    primaryError,
+  ) => {
+    const fixture = await createProviderFixture();
+    const harness = parentAuthorityCloseHarness(
+      fixture,
+      new Error('private close failure'),
+      primaryError,
+    );
+    let caught: unknown;
+
+    try {
+      try {
+        await verifyFixture(fixture, canonicalIdentity, {
+          dependencies: harness.dependencies,
+        });
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toBe(primaryError);
+      expect(harness.closeAttempts).toEqual([
+        'node_modules',
+        'server',
+        'provider',
+      ]);
+    } finally {
+      await harness.cleanup();
+    }
+  });
 });
 
 describe('provider installation normalization', () => {
@@ -577,6 +717,88 @@ describe('provider installation normalization', () => {
     await expect(readFile(fixture.moduleFile, 'utf8'))
       .resolves.toBe('export const value = 1;\n');
     await expect(verifyFixture(fixture)).resolves.toBeUndefined();
+  });
+
+  it('does not delete a setup-cache replacement after confirmation', async () => {
+    const fixture = await createProviderFixture();
+    const denoDirectory = path.join(fixture.nodeModulesDirectory, '.deno');
+    const setupCache = path.join(denoDirectory, '.setup-cache.bin');
+    const parkedCache = path.join(denoDirectory, '.setup-cache.bin.original');
+    const replacementCache = path.join(fixture.root, 'replacement-cache.bin');
+    await writeFile(setupCache, 'confirmed cache');
+    await writeFile(replacementCache, 'replacement cache');
+
+    vi.resetModules();
+    vi.doMock('../../../src/process/run-process', async () => {
+      const actual = await vi.importActual<
+        typeof import('../../../src/process/run-process')
+      >('../../../src/process/run-process');
+      return {
+        ...actual,
+        runProcess: async (...args: Parameters<typeof actual.runProcess>) => {
+          if (args[0] !== '/usr/bin/osascript') {
+            return actual.runProcess(...args);
+          }
+          const modifiedArgs = [...args[1]];
+          const scriptIndex = modifiedArgs.indexOf('-e') + 1;
+          const helperScript = modifiedArgs[scriptIndex] ?? '';
+          const quarantineMarker =
+            '    const quarantineResult = Number($.renameatx_np(';
+          const directUnlinkMarker = '    return Number($.unlinkat(';
+          const marker = helperScript.includes(quarantineMarker)
+            ? quarantineMarker
+            : directUnlinkMarker;
+          if (!helperScript.includes(marker)) {
+            throw new Error('Missing setup-cache isolation marker.');
+          }
+          const swapScript = [
+            'const {renameSync} = require("node:fs");',
+            `renameSync(${JSON.stringify(setupCache)}, `
+              + `${JSON.stringify(parkedCache)});`,
+            `renameSync(${JSON.stringify(replacementCache)}, `
+              + `${JSON.stringify(setupCache)});`,
+          ].join('\n');
+          const injection = [
+            '    const raceTask = $.NSTask.alloc.init;',
+            '    raceTask.launchPath = nodeExecutable;',
+            `    raceTask.arguments = ["-e", ${JSON.stringify(swapScript)}];`,
+            '    raceTask.standardOutput = $.NSFileHandle.fileHandleWithNullDevice;',
+            '    raceTask.standardError = $.NSFileHandle.fileHandleWithNullDevice;',
+            '    raceTask.launch;',
+            '    raceTask.waitUntilExit;',
+            '    if (Number(raceTask.terminationStatus) !== 0) return "error";',
+          ].join('\n');
+          modifiedArgs[scriptIndex] = helperScript.replace(
+            marker,
+            `${injection}\n${marker}`,
+          );
+          return actual.runProcess(args[0], modifiedArgs, args[2]);
+        },
+      };
+    });
+
+    try {
+      const racedProviderIntegrity = await import(
+        '../../../src/download/toolchain/provider-integrity'
+      );
+      await expectProviderFailure(
+        racedProviderIntegrity.normalizeProviderInstallation({
+          providerDirectory: fixture.providerDirectory,
+          currentUid,
+        }),
+        [setupCache, parkedCache, replacementCache],
+      );
+    } finally {
+      vi.doUnmock('../../../src/process/run-process');
+      vi.resetModules();
+    }
+
+    await expect(readFile(setupCache, 'utf8')).resolves.toBe(
+      'replacement cache',
+    );
+    await expect(readFile(parkedCache, 'utf8')).resolves.toBe(
+      'confirmed cache',
+    );
   });
 
   it('does not follow a symlinked setup-cache parent', async () => {

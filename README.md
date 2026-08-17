@@ -32,14 +32,19 @@ Traversal also requires current-UID ownership, rejects special files and
 escaping or absolute symlinks, and never trusts the installed Git object
 database. Verification opens the provider root and every child directory with
 `O_DIRECTORY | O_NOFOLLOW`, enumerates each opened inode through its
-`/dev/fd/<fd>` authority, and requires the descriptor and original path to keep
-the same type, UID, mode, device, inode, and stable metadata before and after
-processing. A replaced directory path is therefore rejected without traversing
-the replacement target. After Deno installation, setup safely removes only
-`server/node_modules/.deno/.setup-cache.bin` before verification and
-publication using descriptor-bound `openat`/`unlinkat` operations that do not
-follow a replaced parent chain. The pinned dependency identity is 9,715 entries
-(8,906 regular files and 809 symlinks) with SHA-256
+`/dev/fd/<fd>` authority, and compares descriptor and original-path identity
+before and after processing. Static or persistent tampering, one-way symlink or
+rename substitution, and ordinary concurrent changes detected by those checks
+fail closed. This local at-rest integrity model does not claim to defeat a
+malicious same-UID process that continuously and precisely swaps entries between
+every syscall; such a process can already modify or delete the per-user cache
+directly. After Deno installation, setup isolates only
+`server/node_modules/.deno/.setup-cache.bin` to a random basename within the
+already-open `.deno` directory using no-replace, no-follow `renameatx_np`,
+reopens the quarantine with `O_NOFOLLOW`, verifies the original identity, and
+only then removes that quarantine with `unlinkat`. An identity mismatch is not
+deleted and is restored without replacement when possible. The pinned
+dependency identity is 9,715 entries (8,906 regular files and 809 symlinks) with SHA-256
 `f2606eacd44bbf1a9c071f52a8bffbfc1298c3b3cd58ffa713efb06ffc15ae36`.
 That normalized root was independently reproduced with Deno 2.5.6 and 2.8.3;
 Deno remains supported as version 2 or newer, and any future layout mismatch

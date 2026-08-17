@@ -1,4 +1,4 @@
-import {createHash} from 'node:crypto';
+import {createHash, randomBytes} from 'node:crypto';
 import {constants, type Dir, type Stats} from 'node:fs';
 import {
   lstat,
@@ -33,9 +33,11 @@ const DARWIN_SETUP_CACHE_UNLINK_SCRIPT = [
   'ObjC.import("Foundation");',
   'ObjC.bindFunction("openat", ["int", ["int", "char *", "int"]]);',
   'ObjC.bindFunction("close", ["int", ["int"]]);',
+  'ObjC.bindFunction("renameatx_np", ["int", ["int", "char *", "int", "char *", "uint32"]]);',
   'ObjC.bindFunction("unlinkat", ["int", ["int", "char *", "int"]]);',
   `const DIRECTORY_FLAGS = ${DARWIN_DIRECTORY_AUTHORITY_FLAGS};`,
   `const FILE_FLAGS = ${DARWIN_FILE_AUTHORITY_FLAGS};`,
+  'const RENAME_EXCL_NOFOLLOW_ANY = 20;',
   'function descriptorStats(nodeExecutable, descriptor) {',
   '  const task = $.NSTask.alloc.init;',
   '  task.launchPath = nodeExecutable;',
@@ -66,11 +68,23 @@ const DARWIN_SETUP_CACHE_UNLINK_SCRIPT = [
   '    actual.dev === expected.dev && actual.ino === expected.ino &&',
   '    actual.mode === expected.mode && actual.uid === expected.uid;',
   '}',
+  'function moveNoReplace(directoryDescriptor, sourceName, targetName) {',
+  '  return Number($.renameatx_np(',
+  '    directoryDescriptor, sourceName, directoryDescriptor, targetName,',
+  '    RENAME_EXCL_NOFOLLOW_ANY,',
+  '  )) === 0;',
+  '}',
   'function run(argv) {',
   '  const descriptors = [];',
+  '  let denoDescriptor = -1;',
+  '  let quarantined = false;',
   '  try {',
   '    const nodeExecutable = argv[0];',
   '    const expected = JSON.parse(argv[1]);',
+  '    const quarantineName = argv[2];',
+  '    if (!/^\\.setup-cache\\.bin\\.quarantine-[0-9a-f]{32}$/.test(',
+  '      quarantineName,',
+  '    )) return "error";',
   '    const names = ["server", "node_modules", ".deno"];',
   '    if (!matches(nodeExecutable, 3, expected.root) ||',
   '        expected.directories.length !== names.length) return "error";',
@@ -86,6 +100,7 @@ const DARWIN_SETUP_CACHE_UNLINK_SCRIPT = [
   '      }',
   '      parentDescriptor = descriptor;',
   '    }',
+  '    denoDescriptor = parentDescriptor;',
   '    const setupCacheDescriptor = Number($.openat(',
   '      parentDescriptor, ".setup-cache.bin", FILE_FLAGS,',
   '    ));',
@@ -102,10 +117,42 @@ const DARWIN_SETUP_CACHE_UNLINK_SCRIPT = [
   '    if (!matches(nodeExecutable, confirmationDescriptor, expected.file)) {',
   '      return "error";',
   '    }',
-  '    return Number($.unlinkat(',
-  '      parentDescriptor, ".setup-cache.bin", 0,',
-  '    )) === 0 ? "removed" : "error";',
+  '    const quarantineResult = Number($.renameatx_np(',
+  '      denoDescriptor, ".setup-cache.bin",',
+  '      denoDescriptor, quarantineName, RENAME_EXCL_NOFOLLOW_ANY,',
+  '    ));',
+  '    if (quarantineResult !== 0) return "error";',
+  '    quarantined = true;',
+  '    const quarantineDescriptor = Number($.openat(',
+  '      denoDescriptor, quarantineName, FILE_FLAGS,',
+  '    ));',
+  '    if (quarantineDescriptor < 0) {',
+  '      if (moveNoReplace(',
+  '        denoDescriptor, quarantineName, ".setup-cache.bin",',
+  '      )) quarantined = false;',
+  '      return "error";',
+  '    }',
+  '    descriptors.push(quarantineDescriptor);',
+  '    if (!matches(nodeExecutable, quarantineDescriptor, expected.file)) {',
+  '      if (moveNoReplace(',
+  '        denoDescriptor, quarantineName, ".setup-cache.bin",',
+  '      )) quarantined = false;',
+  '      return "error";',
+  '    }',
+  '    if (Number($.unlinkat(denoDescriptor, quarantineName, 0)) !== 0) {',
+  '      if (moveNoReplace(',
+  '        denoDescriptor, quarantineName, ".setup-cache.bin",',
+  '      )) quarantined = false;',
+  '      return "error";',
+  '    }',
+  '    quarantined = false;',
+  '    return "removed";',
   '  } catch {',
+  '    if (quarantined && denoDescriptor >= 0) {',
+  '      moveNoReplace(',
+  '        denoDescriptor, argv[2], ".setup-cache.bin",',
+  '      );',
+  '    }',
   '    return "error";',
   '  } finally {',
   '    for (let index = descriptors.length - 1; index >= 0; index -= 1) {',
@@ -170,6 +217,8 @@ const unlinkSetupCacheAt = async (
   if (process.platform !== 'darwin' || process.arch !== 'arm64') {
     throw invalidProvider();
   }
+  const quarantineName =
+    `.setup-cache.bin.quarantine-${randomBytes(16).toString('hex')}`;
   const result = await runSystemProcess('/usr/bin/osascript', [
     '-l',
     'JavaScript',
@@ -182,6 +231,7 @@ const unlinkSetupCacheAt = async (
       directories: options.directoryIdentities,
       file: options.setupCacheIdentity,
     }),
+    quarantineName,
   ], {
     extraStdioFds: [options.providerDirectoryHandle.fd],
     env: Object.freeze({
@@ -226,6 +276,10 @@ type DirectoryAuthority = {
   stats: Stats;
 };
 
+type CloseAuthoritiesResult =
+  | {failed: false}
+  | {error: unknown; failed: true};
+
 const invalidProvider = (): DownloadError => new DownloadError(
   'DOWNLOAD_PO_TOKEN_UNAVAILABLE',
   INVALID_PROVIDER_MESSAGE,
@@ -245,6 +299,25 @@ const dependenciesWith = (
   ...defaultProviderIntegrityDependencies,
   ...overrides,
 });
+
+const closeDirectoryAuthorities = async (
+  authorities: readonly (DirectoryAuthority | undefined)[],
+): Promise<CloseAuthoritiesResult> => {
+  let firstError: unknown;
+  let failed = false;
+  for (const authority of authorities) {
+    if (authority === undefined) continue;
+    try {
+      await authority.handle.close();
+    } catch (error) {
+      if (!failed) firstError = error;
+      failed = true;
+    }
+  }
+  return failed
+    ? {error: firstError, failed: true}
+    : {failed: false};
+};
 
 const requireCanonicalRoot = (candidate: string): string => {
   if (
@@ -777,6 +850,8 @@ export const verifyProviderIntegrity = async (
     );
     let serverDirectory: DirectoryAuthority | undefined;
     let nodeModulesRoot: DirectoryAuthority | undefined;
+    let verificationError: unknown;
+    let verificationFailed = false;
     try {
       const source = await measureTree(
         providerRoot,
@@ -843,10 +918,17 @@ export const verifyProviderIntegrity = async (
         options.signal,
         dependencies,
       );
+    } catch (error) {
+      verificationError = error;
+      verificationFailed = true;
     } finally {
-      await nodeModulesRoot?.handle.close();
-      await serverDirectory?.handle.close();
-      await providerRoot.handle.close();
+      const closeResult = await closeDirectoryAuthorities([
+        nodeModulesRoot,
+        serverDirectory,
+        providerRoot,
+      ]);
+      if (verificationFailed) throw verificationError;
+      if (closeResult.failed) throw closeResult.error;
     }
   } catch (error) {
     throwMappedProviderError(error, options.signal);
