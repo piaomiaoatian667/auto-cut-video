@@ -238,6 +238,14 @@ digests, sizes, versions, platform, repository, or commit.
 17. On failure or cancellation, remove only the owned staging directory and, if
     replacement has not published, atomically restore the quarantined version.
 
+All setup subprocesses use a frozen staging-local environment built from zero.
+This includes Git validation and checkout, Deno validation and frozen dependency
+installation, and the complete staging capability validation pass. `HOME` and
+`TMPDIR` point to the staging provider cache, `PATH` keeps only absolute host
+entries followed by the fixed system directories, and Git, Deno, XDG, npm, and
+color settings are fixed. Credentials, proxy variables, SSH agents, runtime or
+dynamic-loader injection, and every other unlisted host variable are excluded.
+
 The application-owned downloader uses these redirect hosts:
 
 - `github.com`;
@@ -256,14 +264,16 @@ The setup command does not accept arbitrary asset URLs or redirect hosts.
 `FFMPEG_PATH` keeps its existing precedence. Otherwise use the system `ffmpeg`
 resolution already implemented by the application.
 
-At resolver entry, capture the current working directory before any asynchronous
-work and resolve both explicit override strings against that one directory.
-Capability validation must reuse those absolute inputs without reading a later
-working directory; direct capability callers may resolve relative inputs once
-before their own first await. Validation, the returned toolchain, metadata
-probes, staged JXA downloads, and `--ffmpeg-location` must all reuse those exact
-absolute strings. Do not call `realpath`; existing symlink validation remains
-unchanged.
+If at least one explicit override is relative, capture the current working
+directory once at resolver entry before any asynchronous work and resolve only
+the relative inputs against that snapshot. Absolute override strings remain
+byte-for-byte unchanged, including `..` segments, and resolving with no relative
+override must not read the working directory. Capability validation must reuse
+those inputs without reading a later working directory; direct capability
+callers may resolve relative inputs once before their own first await.
+Validation, the returned toolchain, metadata probes, staged JXA downloads, and
+`--ffmpeg-location` must all reuse those exact strings. Do not call `realpath`;
+existing symlink validation remains unchanged.
 
 ### 7.5 Capability validation
 

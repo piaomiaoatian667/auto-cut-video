@@ -23,6 +23,14 @@ either `installed` or `already-present`; otherwise it emits a controlled error.
 Ordinary `download` and `doctor-downloader` commands never install or update
 executable code.
 
+Every setup subprocess, including Git checks and checkout, Deno validation and
+frozen dependency installation, and staging capability validation, receives a
+frozen staging-local environment built from zero. Its `HOME` and `TMPDIR` point
+inside staging, its `PATH` contains only absolute host entries plus the fixed
+system directories, and its Git, Deno, and npm settings are fixed; credentials,
+proxies, runtime injection variables, and all other unlisted host values are
+excluded.
+
 ## Install and run
 
 The concrete YouTube and Douyin URLs below are command examples only. Replace

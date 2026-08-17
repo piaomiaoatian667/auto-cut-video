@@ -265,6 +265,98 @@ describe('resolveDownloaderToolchain', () => {
     expect(fixture.resolveExecutable.mock.calls).toEqual([['deno'], ['ffmpeg']]);
   });
 
+  it('preserves absolute override strings without reading cwd', async () => {
+    const fixture = createResolverFixture();
+    const ytDlpOverride = '/private/overrides/linked-bin/../yt-dlp';
+    const ffmpegOverride = '/private/overrides/linked-ffmpeg/../ffmpeg';
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue('/private/unneeded-cwd');
+
+    try {
+      const resolved = await resolveDownloaderToolchain({
+        ytDlpOverride,
+        ffmpegOverride,
+        homeDirectory,
+      }, fixture.dependencies);
+
+      expect(cwd).not.toHaveBeenCalled();
+      expect(resolved).toMatchObject({
+        source: 'override',
+        ytDlpExecutable: ytDlpOverride,
+        ffmpegExecutable: ffmpegOverride,
+        ffmpegExplicit: true,
+      });
+      expect(fixture.runProcess.mock.calls[0]?.[0]).toBe(ytDlpOverride);
+      expect(fixture.runProcess).toHaveBeenCalledWith(
+        ffmpegOverride,
+        ['-version'],
+        expect.objectContaining({env: expect.any(Object)}),
+      );
+    } finally {
+      cwd.mockRestore();
+    }
+  });
+
+  it('does not read cwd when no override is present', async () => {
+    const fixture = createResolverFixture();
+    const cwd = vi.spyOn(process, 'cwd').mockImplementation(() => {
+      throw new Error('private cwd failure');
+    });
+
+    try {
+      const resolved = await resolveDownloaderToolchain(
+        {homeDirectory},
+        fixture.dependencies,
+      );
+
+      expect(cwd).not.toHaveBeenCalled();
+      expect(resolved).toMatchObject({
+        source: 'managed',
+        ytDlpExecutable: paths.ytDlpExecutable,
+      });
+    } finally {
+      cwd.mockRestore();
+    }
+  });
+
+  it('snapshots cwd once for mixed absolute and relative overrides', async () => {
+    const fixture = createResolverFixture();
+    const resolverEntryCwd = '/private/resolver-entry-cwd';
+    const laterCwd = '/private/resolver-later-cwd';
+    const ytDlpOverride = '/private/overrides/linked-bin/../yt-dlp';
+    const ffmpegOverride = 'relative-tools/ffmpeg';
+    const absoluteFfmpegOverride = path.resolve(resolverEntryCwd, ffmpegOverride);
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(resolverEntryCwd);
+    fixture.directoryExists.mockImplementationOnce(async () => {
+      await Promise.resolve();
+      cwd.mockReturnValue(laterCwd);
+      return true;
+    });
+
+    try {
+      const resolved = await resolveDownloaderToolchain({
+        ytDlpOverride,
+        ffmpegOverride,
+        homeDirectory,
+      }, fixture.dependencies);
+
+      expect(cwd).toHaveBeenCalledTimes(1);
+      expect(resolved).toMatchObject({
+        source: 'override',
+        ytDlpExecutable: ytDlpOverride,
+        ffmpegExecutable: absoluteFfmpegOverride,
+        ffmpegExplicit: true,
+      });
+      expect(fixture.runProcess.mock.calls[0]?.[0]).toBe(ytDlpOverride);
+      expect(fixture.runProcess).toHaveBeenCalledWith(
+        absoluteFfmpegOverride,
+        ['-version'],
+        expect.objectContaining({env: expect.any(Object)}),
+      );
+    } finally {
+      cwd.mockRestore();
+    }
+  });
+
   it('snapshots relative overrides before the async directory check changes cwd', async () => {
     const fixture = createResolverFixture();
     const resolverEntryCwd = '/private/resolver-entry-cwd';

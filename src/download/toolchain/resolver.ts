@@ -35,13 +35,21 @@ export const resolveDownloaderToolchain = async (
   dependencies: ResolveDownloaderToolchainDependencies =
     defaultDownloaderCapabilityDependencies,
 ): Promise<ResolvedDownloaderToolchain> => {
-  const resolverCwd = process.cwd();
-  const ytDlpOverride = options.ytDlpOverride === undefined
-    ? undefined
-    : path.resolve(resolverCwd, options.ytDlpOverride);
-  const ffmpegOverride = options.ffmpegOverride === undefined
-    ? undefined
-    : path.resolve(resolverCwd, options.ffmpegOverride);
+  const relativeOverridePresent = (
+    options.ytDlpOverride !== undefined
+    && !path.isAbsolute(options.ytDlpOverride)
+  ) || (
+    options.ffmpegOverride !== undefined
+    && !path.isAbsolute(options.ffmpegOverride)
+  );
+  const resolverCwd = relativeOverridePresent ? process.cwd() : undefined;
+  const resolveOverride = (candidate: string | undefined): string | undefined => {
+    if (candidate === undefined || path.isAbsolute(candidate)) return candidate;
+    if (resolverCwd === undefined) throw invalidToolchain();
+    return path.resolve(resolverCwd, candidate);
+  };
+  const ytDlpOverride = resolveOverride(options.ytDlpOverride);
+  const ffmpegOverride = resolveOverride(options.ffmpegOverride);
   throwIfDownloadCancelled(options.signal);
   if (process.platform !== 'darwin' || process.arch !== 'arm64') {
     throw invalidToolchain();
