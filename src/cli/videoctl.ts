@@ -14,6 +14,8 @@ import {
   type DownloadInput,
   type DownloadResult,
 } from '../download/downloader';
+import {installDownloaderToolchain} from '../download/toolchain/installer';
+import type {SetupDownloaderResult} from '../download/toolchain/types';
 import type {YtDlpClientOptions} from '../download/yt-dlp';
 import {
   openExistingProjectFile,
@@ -30,6 +32,7 @@ import {EXIT_CODES} from './exit-codes';
 import {
   formatDownloadFailure,
 } from './download-output';
+import {formatDownloaderCommandFailure} from './downloader-output';
 import {
   formatDoctorFailure,
   formatDoctorJson,
@@ -40,6 +43,10 @@ import {
   type DownloadCommandOptions,
 } from './commands/download';
 import {runReviewCommand, type ReviewCommandOptions} from './commands/review';
+import {
+  runSetupDownloaderCommand,
+  type SetupDownloaderCommandOptions,
+} from './commands/setup-downloader';
 
 export interface OutputWriter {
   write(chunk: string): unknown;
@@ -53,6 +60,8 @@ export interface VideoctlDependencies {
   measureSourceBytes(project: ProjectInputs): Promise<number>;
   preflight(input: PreflightInput): Promise<PreflightResult>;
   download(input: DownloadInput): Promise<DownloadResult>;
+  setupDownloader?(signal?: AbortSignal): Promise<SetupDownloaderResult>;
+  signal?: AbortSignal;
   downloadSignal?: AbortSignal;
   ffmpegExecutable?: string;
   ffprobeExecutable?: string;
@@ -63,12 +72,28 @@ interface DoctorOptions {
 }
 
 const DOWNLOAD_PARSE_FAILURE_MESSAGE = 'The download command input is invalid.';
+const SETUP_DOWNLOADER_PARSE_FAILURE_MESSAGE =
+  'The setup-downloader command input is invalid.';
 
 const targetsDownload = (argv: readonly string[]): boolean =>
   argv[0] === 'download';
 
+const targetsSetupDownloader = (argv: readonly string[]): boolean =>
+  argv[0] === 'setup-downloader';
+
+const targetsSignalAwareCommand = (argv: readonly string[]): boolean =>
+  targetsDownload(argv)
+  || targetsSetupDownloader(argv)
+  || argv[0] === 'doctor-downloader';
+
 const requestsDownloadJson = (argv: readonly string[]): boolean =>
   targetsDownload(argv)
+  && argv.slice(1).some((value) => (
+    value === '--json' || value.startsWith('--json=')
+  ));
+
+const requestsSetupDownloaderJson = (argv: readonly string[]): boolean =>
+  targetsSetupDownloader(argv)
   && argv.slice(1).some((value) => (
     value === '--json' || value.startsWith('--json=')
   ));
@@ -512,6 +537,8 @@ export async function runVideoctl(
   let exitCode: number = EXIT_CODES.success;
   const downloadRequested = targetsDownload(argv);
   const downloadJsonRequested = requestsDownloadJson(argv);
+  const setupDownloaderRequested = targetsSetupDownloader(argv);
+  const setupDownloaderJsonRequested = requestsSetupDownloaderJson(argv);
   const command = new Command();
   command
     .name('videoctl')
@@ -519,7 +546,9 @@ export async function runVideoctl(
     .configureOutput({
       writeOut: (value) => { dependencies.stdout.write(value); },
       writeErr: (value) => {
-        if (!downloadRequested) dependencies.stderr.write(value);
+        if (!downloadRequested && !setupDownloaderRequested) {
+          dependencies.stderr.write(value);
+        }
       },
     });
   command
@@ -529,6 +558,25 @@ export async function runVideoctl(
     .option('--json', 'print machine-readable JSON')
     .action(async (project: string, options: DoctorOptions) => {
       exitCode = await runDoctor(project, options, dependencies);
+    });
+  command
+    .command('setup-downloader')
+    .description('Install the pinned local downloader toolchain')
+    .option('--json', 'print machine-readable JSON')
+    .action(async (options: SetupDownloaderCommandOptions) => {
+      exitCode = await runSetupDownloaderCommand(options, {
+        stdout: dependencies.stdout,
+        stderr: dependencies.stderr,
+        install: async (signal) => {
+          if (dependencies.setupDownloader === undefined) {
+            throw new Error('The setup downloader dependency is unavailable.');
+          }
+          return await dependencies.setupDownloader(signal);
+        },
+        ...(dependencies.signal === undefined
+          ? {}
+          : {signal: dependencies.signal}),
+      });
     });
   command
     .command('download')
@@ -576,6 +624,19 @@ export async function runVideoctl(
         downloadJsonRequested,
       );
       if (downloadJsonRequested) {
+        dependencies.stdout.write(output);
+      } else {
+        dependencies.stderr.write(output);
+      }
+    }
+    if (error instanceof CommanderError && setupDownloaderRequested) {
+      const output = formatDownloaderCommandFailure(
+        'setup-downloader',
+        'DOWNLOAD_TOOLCHAIN_INVALID',
+        SETUP_DOWNLOADER_PARSE_FAILURE_MESSAGE,
+        setupDownloaderJsonRequested,
+      );
+      if (setupDownloaderJsonRequested) {
         dependencies.stdout.write(output);
       } else {
         dependencies.stderr.write(output);
@@ -654,7 +715,7 @@ export const createSystemVideoctlDependencies = (
     ?? createSystemSourceMeterDependencies();
   const createDownloadDependencies = options.createDownloadDependencies
     ?? createSystemDownloadDependencies;
-  const downloadSignal = options.signal;
+  const signal = options.signal;
   const ytDlpExecutable = process.env.YT_DLP_PATH;
   const ffmpegExecutable = process.env.FFMPEG_PATH;
   const ffprobeExecutable = process.env.FFPROBE_PATH;
@@ -673,19 +734,26 @@ export const createSystemVideoctlDependencies = (
     ),
     preflight: async (input) => runPreflight(input, preflightDependencies),
     download: async (input) => await downloadVideo(input, downloadDependencies),
-    ...(downloadSignal === undefined ? {} : {downloadSignal}),
+    setupDownloader: async (operationSignal = signal) =>
+      await installDownloaderToolchain({
+        ...(ffmpegExecutable === undefined ? {} : {
+          ffmpegOverride: ffmpegExecutable,
+        }),
+        ...(operationSignal === undefined ? {} : {signal: operationSignal}),
+      }),
+    ...(signal === undefined ? {} : {signal, downloadSignal: signal}),
     ...(ffmpegExecutable === undefined ? {} : {ffmpegExecutable}),
     ...(ffprobeExecutable === undefined ? {} : {ffprobeExecutable}),
   };
 };
 
-export interface DownloadSignalHost {
+export interface CommandSignalHost {
   on(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
   removeListener(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
 }
 
-export const runWithDownloadSignalHandlers = async <Result>(
-  signalHost: DownloadSignalHost,
+export const runWithCommandSignalHandlers = async <Result>(
+  signalHost: CommandSignalHost,
   operation: (signal: AbortSignal) => Promise<Result>,
 ): Promise<Result> => {
   const controller = new AbortController();
@@ -706,13 +774,16 @@ export const runWithDownloadSignalHandlers = async <Result>(
   }
 };
 
+export type DownloadSignalHost = CommandSignalHost;
+export const runWithDownloadSignalHandlers = runWithCommandSignalHandlers;
+
 const directlyExecuted = process.argv[1] !== undefined
   && pathToFileURL(process.argv[1]).href === import.meta.url;
 
 if (directlyExecuted) {
   const argv = process.argv.slice(2);
-  const operation = targetsDownload(argv)
-    ? runWithDownloadSignalHandlers(process, async (signal) => await runVideoctl(
+  const operation = targetsSignalAwareCommand(argv)
+    ? runWithCommandSignalHandlers(process, async (signal) => await runVideoctl(
         argv,
         createSystemVideoctlDependencies({signal}),
       ))
