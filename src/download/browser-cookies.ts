@@ -1,12 +1,10 @@
 import {DownloadError} from './errors';
-import type {DownloadPlatform} from './platforms';
+import {DownloadPlatformSchema, type DownloadPlatform} from './platforms';
 
 export type BrowserCookieSource = 'chrome';
 
 const COOKIE_OPTIONS_MESSAGE =
   'Chrome cookie access requires both browser selection and explicit confirmation.';
-const COOKIE_HOST_MESSAGE =
-  'Browser cookie access is supported only for Douyin downloads.';
 
 export const parseBrowserCookieSource = (
   value: string | undefined,
@@ -28,7 +26,8 @@ export const validateBrowserCookieRequest = (
   const runtimeConfirmation: unknown = cookieAccessConfirmed;
   if (
     (runtimeSource !== undefined && runtimeSource !== 'chrome') ||
-    typeof runtimeConfirmation !== 'boolean'
+    typeof runtimeConfirmation !== 'boolean' ||
+    !DownloadPlatformSchema.safeParse(platform).success
   ) {
     throw new DownloadError(
       'DOWNLOAD_COOKIE_OPTIONS_INVALID',
@@ -39,12 +38,6 @@ export const validateBrowserCookieRequest = (
     throw new DownloadError(
       'DOWNLOAD_COOKIE_OPTIONS_INVALID',
       COOKIE_OPTIONS_MESSAGE,
-    );
-  }
-  if (source !== undefined && platform !== 'douyin') {
-    throw new DownloadError(
-      'DOWNLOAD_COOKIE_HOST_UNSUPPORTED',
-      COOKIE_HOST_MESSAGE,
     );
   }
   return source;

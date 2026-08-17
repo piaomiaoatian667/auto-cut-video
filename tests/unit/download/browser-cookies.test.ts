@@ -8,12 +8,10 @@ import {isDownloadError} from '../../../src/download/errors';
 
 const COOKIE_OPTIONS_MESSAGE =
   'Chrome cookie access requires both browser selection and explicit confirmation.';
-const COOKIE_HOST_MESSAGE =
-  'Browser cookie access is supported only for Douyin downloads.';
 
 const expectDownloadError = (
   operation: () => unknown,
-  code: 'DOWNLOAD_COOKIE_OPTIONS_INVALID' | 'DOWNLOAD_COOKIE_HOST_UNSUPPORTED',
+  code: 'DOWNLOAD_COOKIE_OPTIONS_INVALID',
   message: string,
   forbidden?: string,
 ): void => {
@@ -65,10 +63,12 @@ describe('browser cookie request validation', () => {
       .toBeUndefined();
   });
 
-  it('allows explicitly confirmed Chrome access for Douyin', () => {
-    expect(validateBrowserCookieRequest('chrome', true, 'douyin'))
-      .toBe('chrome');
-  });
+  it.each(['youtube', 'bilibili', 'douyin', 'tiktok', 'vimeo'] as const)(
+    'allows separately confirmed Chrome access for %s',
+    (platform) => {
+      expect(validateBrowserCookieRequest('chrome', true, platform)).toBe('chrome');
+    },
+  );
 
   it('rejects an arbitrary runtime browser source without retaining it', () => {
     const marker = 'firefox:profile-marker';
@@ -115,12 +115,4 @@ describe('browser cookie request validation', () => {
       );
     },
   );
-
-  it('rejects browser cookie access for YouTube', () => {
-    expectDownloadError(
-      () => validateBrowserCookieRequest('chrome', true, 'youtube'),
-      'DOWNLOAD_COOKIE_HOST_UNSUPPORTED',
-      COOKIE_HOST_MESSAGE,
-    );
-  });
 });
