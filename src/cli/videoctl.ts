@@ -8,15 +8,21 @@ import {
   type ProjectInputs,
 } from '../domain/load-project';
 import {
+  checkVideoDownload,
   createSystemDownloadDependencies,
   downloadVideo,
+  type DownloadCheckInput,
+  type DownloadCheckResult,
   type DownloadDependencies,
   type DownloadInput,
   type DownloadResult,
   type SystemDownloadOptions,
 } from '../download/downloader';
 import {installDownloaderToolchain} from '../download/toolchain/installer';
-import type {SetupDownloaderResult} from '../download/toolchain/types';
+import type {
+  ResolvedDownloaderToolchain,
+  SetupDownloaderResult,
+} from '../download/toolchain/types';
 import {
   openExistingProjectFile,
   type ProjectDirectoryScope,
@@ -39,6 +45,10 @@ import {
   formatDoctorTable,
 } from './output';
 import {
+  runDoctorDownloaderCommand,
+  type DoctorDownloaderCommandOptions,
+} from './commands/doctor-downloader';
+import {
   runDownloadCommand,
   type DownloadCommandOptions,
 } from './commands/download';
@@ -52,7 +62,7 @@ export interface OutputWriter {
   write(chunk: string): unknown;
 }
 
-export interface VideoctlDependencies {
+export interface CoreVideoctlDependencies {
   workspaceRoot: string;
   stdout: OutputWriter;
   stderr: OutputWriter;
@@ -67,6 +77,32 @@ export interface VideoctlDependencies {
   ffprobeExecutable?: string;
 }
 
+export interface DoctorDownloaderVideoctlDependencies {
+  resolveDownloaderToolchain(
+    signal?: AbortSignal,
+  ): Promise<ResolvedDownloaderToolchain>;
+  checkDownloader(
+    input: DownloadCheckInput,
+    resolveToolchain: () => Promise<ResolvedDownloaderToolchain>,
+  ): Promise<DownloadCheckResult>;
+}
+
+type DoctorDownloaderArgv = readonly [
+  'doctor-downloader',
+  ...string[],
+];
+
+export type VideoctlDependencies<
+  Argv extends readonly string[] = readonly string[],
+> = CoreVideoctlDependencies & (
+  Argv extends DoctorDownloaderArgv
+    ? DoctorDownloaderVideoctlDependencies
+    : object
+);
+
+export type SystemVideoctlDependencies = CoreVideoctlDependencies
+  & DoctorDownloaderVideoctlDependencies;
+
 interface DoctorOptions {
   json?: boolean;
 }
@@ -74,6 +110,8 @@ interface DoctorOptions {
 const DOWNLOAD_PARSE_FAILURE_MESSAGE = 'The download command input is invalid.';
 const SETUP_DOWNLOADER_PARSE_FAILURE_MESSAGE =
   'The setup-downloader command input is invalid.';
+const DOCTOR_DOWNLOADER_PARSE_FAILURE_MESSAGE =
+  'The downloader doctor check input is invalid.';
 
 const targetsDownload = (argv: readonly string[]): boolean =>
   argv[0] === 'download';
@@ -81,10 +119,13 @@ const targetsDownload = (argv: readonly string[]): boolean =>
 const targetsSetupDownloader = (argv: readonly string[]): boolean =>
   argv[0] === 'setup-downloader';
 
+const targetsDoctorDownloader = (argv: readonly string[]): boolean =>
+  argv[0] === 'doctor-downloader';
+
 const targetsSignalAwareCommand = (argv: readonly string[]): boolean =>
   targetsDownload(argv)
   || targetsSetupDownloader(argv)
-  || argv[0] === 'doctor-downloader';
+  || targetsDoctorDownloader(argv);
 
 const tokensBeforeOptionSeparator = (
   argv: readonly string[],
@@ -95,7 +136,7 @@ const tokensBeforeOptionSeparator = (
 
 const requestsCommandJson = (
   argv: readonly string[],
-  command: 'download' | 'setup-downloader',
+  command: 'download' | 'setup-downloader' | 'doctor-downloader',
 ): boolean => {
   const tokens = tokensBeforeOptionSeparator(argv);
   return tokens[0] === command
@@ -109,6 +150,9 @@ const requestsDownloadJson = (argv: readonly string[]): boolean =>
 
 const requestsSetupDownloaderJson = (argv: readonly string[]): boolean =>
   requestsCommandJson(argv, 'setup-downloader');
+
+const requestsDoctorDownloaderJson = (argv: readonly string[]): boolean =>
+  requestsCommandJson(argv, 'doctor-downloader');
 
 export interface SourceMeterStat {
   dev: bigint;
@@ -542,15 +586,19 @@ const runDoctor = async (
   }
 };
 
-export async function runVideoctl(
-  argv: readonly string[],
-  dependencies: VideoctlDependencies,
+export async function runVideoctl<const Argv extends readonly string[]>(
+  argv: Argv,
+  dependencies: VideoctlDependencies<Argv>,
 ): Promise<number> {
   let exitCode: number = EXIT_CODES.success;
   const downloadRequested = targetsDownload(argv);
   const downloadJsonRequested = requestsDownloadJson(argv);
   const setupDownloaderRequested = targetsSetupDownloader(argv);
   const setupDownloaderJsonRequested = requestsSetupDownloaderJson(argv);
+  const doctorDownloaderRequested = targetsDoctorDownloader(argv);
+  const doctorDownloaderJsonRequested = requestsDoctorDownloaderJson(argv);
+  const doctorDependencies = dependencies as CoreVideoctlDependencies
+    & DoctorDownloaderVideoctlDependencies;
   const command = new Command();
   command
     .name('videoctl')
@@ -558,7 +606,11 @@ export async function runVideoctl(
     .configureOutput({
       writeOut: (value) => { dependencies.stdout.write(value); },
       writeErr: (value) => {
-        if (!downloadRequested && !setupDownloaderRequested) {
+        if (
+          !downloadRequested
+          && !setupDownloaderRequested
+          && !doctorDownloaderRequested
+        ) {
           dependencies.stderr.write(value);
         }
       },
@@ -580,6 +632,34 @@ export async function runVideoctl(
         stdout: dependencies.stdout,
         stderr: dependencies.stderr,
         install: async (signal) => await dependencies.setupDownloader(signal),
+        ...(dependencies.signal === undefined
+          ? {}
+          : {signal: dependencies.signal}),
+      });
+    });
+  command
+    .command('doctor-downloader')
+    .description('Check the local downloader and optionally inspect one video')
+    .option(
+      '--check-url <url>',
+      'run one metadata-only authorized platform check',
+    )
+    .option(
+      '--rights-confirmed',
+      'confirm permission to inspect this public video',
+    )
+    .option('--proxy <url>', 'explicit http, https, socks5, or socks5h proxy')
+    .option('--browser-cookies <browser>', 'exact lowercase chrome')
+    .option('--cookie-access-confirmed', 'confirm local Chrome cookie access')
+    .option('--json', 'print machine-readable JSON')
+    .action(async (options: DoctorDownloaderCommandOptions) => {
+      exitCode = await runDoctorDownloaderCommand(options, {
+        stdout: dependencies.stdout,
+        stderr: dependencies.stderr,
+        resolveToolchain: (signal) =>
+          doctorDependencies.resolveDownloaderToolchain(signal),
+        check: (input, resolveToolchain) =>
+          doctorDependencies.checkDownloader(input, resolveToolchain),
         ...(dependencies.signal === undefined
           ? {}
           : {signal: dependencies.signal}),
@@ -644,6 +724,19 @@ export async function runVideoctl(
         setupDownloaderJsonRequested,
       );
       if (setupDownloaderJsonRequested) {
+        dependencies.stdout.write(output);
+      } else {
+        dependencies.stderr.write(output);
+      }
+    }
+    if (error instanceof CommanderError && doctorDownloaderRequested) {
+      const output = formatDownloaderCommandFailure(
+        'doctor-downloader',
+        'DOWNLOAD_URL_INVALID',
+        DOCTOR_DOWNLOADER_PARSE_FAILURE_MESSAGE,
+        doctorDownloaderJsonRequested,
+      );
+      if (doctorDownloaderJsonRequested) {
         dependencies.stdout.write(output);
       } else {
         dependencies.stderr.write(output);
@@ -716,7 +809,7 @@ export const createSystemSourceMeterDependencies = (
 
 export const createSystemVideoctlDependencies = (
   options: SystemVideoctlOptions = {},
-): VideoctlDependencies => {
+): SystemVideoctlDependencies => {
   const preflightDependencies = createSystemPreflightDependencies();
   const sourceMeter = options.sourceMeter
     ?? createSystemSourceMeterDependencies();
@@ -748,6 +841,12 @@ export const createSystemVideoctlDependencies = (
         }),
         ...(operationSignal === undefined ? {} : {signal: operationSignal}),
       }),
+    resolveDownloaderToolchain: (operationSignal = signal) =>
+      downloadDependencies.resolveToolchain(operationSignal),
+    checkDownloader: (input, resolveToolchain) => checkVideoDownload(input, {
+      ...downloadDependencies,
+      resolveToolchain: () => resolveToolchain(),
+    }),
     ...(signal === undefined ? {} : {signal, downloadSignal: signal}),
     ...(ffmpegOverride === undefined ? {} : {ffmpegExecutable: ffmpegOverride}),
     ...(ffprobeExecutable === undefined ? {} : {ffprobeExecutable}),
