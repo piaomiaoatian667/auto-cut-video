@@ -84,7 +84,7 @@ const platformArguments = (
       fixture.paths.pluginDirectory,
       '--no-js-runtimes',
       '--js-runtimes',
-      `deno:${path.join(fixture.toolsDirectory, 'deno')}`,
+      `deno:${fixture.paths.denoWrapperExecutable}`,
       '--no-remote-components',
       '--extractor-args',
       `youtubepot-bgutilscript:server_home=${fixture.paths.providerServerDirectory}`,
@@ -164,6 +164,16 @@ describe('managed multi-platform download integration', () => {
     for (const subprocess of fixture.subprocesses) {
       expect(subprocess.environment).toEqual(expectedEnvironment);
     }
+    expect(fixture.subprocesses.filter((subprocess) =>
+      subprocess.command === path.join(fixture.toolsDirectory, 'deno')
+    )).toEqual([
+      expect.objectContaining({args: ['--version']}),
+    ]);
+    const providerChecks = fixture.subprocesses.filter((subprocess) =>
+      subprocess.command === fixture.paths.denoWrapperExecutable
+    );
+    expect(providerChecks).toHaveLength(1);
+    expect(providerChecks[0]?.args[0]).toBe('run');
     const serializedEnvironments = JSON.stringify(
       fixture.subprocesses.map((subprocess) => subprocess.environment),
     );
@@ -198,6 +208,7 @@ describe('managed multi-platform download integration', () => {
     fixtures.push(fixture);
     const managedCandidates = [
       fixture.paths.ytDlpExecutable,
+      fixture.paths.denoWrapperExecutable,
       fixture.paths.pluginDirectory,
       fixture.paths.pluginArchive,
       fixture.paths.providerDirectory,

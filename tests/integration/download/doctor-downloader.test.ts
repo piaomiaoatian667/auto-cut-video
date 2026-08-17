@@ -26,6 +26,7 @@ import {
   defaultDownloaderCapabilityDependencies,
   type DownloaderCapabilityDependencies,
 } from '../../../src/download/toolchain/capabilities';
+import {DENO_WRAPPER_SOURCE} from '../../../src/download/toolchain/deno-wrapper';
 import {
   DOWNLOADER_TOOLCHAIN_MANIFEST,
   installedManifestForPinnedToolchain,
@@ -65,9 +66,10 @@ const REPORT = {
 const writeExecutable = async (
   candidate: string,
   contents: string,
+  mode = 0o755,
 ): Promise<void> => {
-  await writeFile(candidate, contents);
-  await chmod(candidate, 0o755);
+  await writeFile(candidate, contents, {mode});
+  await chmod(candidate, mode);
 };
 
 const sha256 = async (candidate: string): Promise<string> => createHash('sha256')
@@ -99,8 +101,10 @@ const createPluginArchive = async (
 interface ManagedFixture {
   homeDirectory: string;
   recordPath: string;
+  systemDenoExecutable: string;
   resolveToolchain(signal?: AbortSignal): Promise<ResolvedDownloaderToolchain>;
   createDownloadDependencies(): DownloadDependencies;
+  capabilityCommands: Array<{command: string; args: string[]}>;
   probeEnvironments: Array<Readonly<NodeJS.ProcessEnv> | undefined>;
   probeArgs: string[][];
   actualHashes: Map<string, string>;
@@ -117,6 +121,7 @@ const createManagedFixture = async (): Promise<ManagedFixture> => {
   const denoExecutable = path.join(toolsDirectory, 'deno');
   const ffmpegExecutable = path.join(toolsDirectory, 'ffmpeg');
   const recordPath = path.join(root, 'yt-dlp-phases.txt');
+  vi.stubEnv('PATH', [toolsDirectory, process.env.PATH ?? ''].join(path.delimiter));
 
   await Promise.all([
     mkdir(path.dirname(paths.ytDlpExecutable), {recursive: true}),
@@ -145,10 +150,20 @@ const createManagedFixture = async (): Promise<ManagedFixture> => {
       path.join(paths.providerServerDirectory, 'src/generate_once.ts'),
       'console.log("fixture");\n',
     ),
+    writeExecutable(
+      paths.denoWrapperExecutable,
+      DENO_WRAPPER_SOURCE,
+      0o700,
+    ),
     writeExecutable(denoExecutable, [
       '#!/usr/bin/env node',
       "const args = process.argv.slice(2);",
-      "if (args.includes('--version')) process.stdout.write('deno 2.8.3\\n');",
+      "if (args.length === 1 && args[0] === '--version') {",
+      "  process.stdout.write('deno 2.8.3\\n');",
+      '  process.exit(0);',
+      '}',
+      "if (args[0] === 'run') process.exit(0);",
+      'process.exit(2);',
       '',
     ].join('\n')),
     writeExecutable(ffmpegExecutable, [
@@ -159,8 +174,13 @@ const createManagedFixture = async (): Promise<ManagedFixture> => {
   ]);
 
   const actualHashes = new Map<string, string>();
+  const capabilityCommands: Array<{command: string; args: string[]}> = [];
   const capabilityDependencies: DownloaderCapabilityDependencies = {
     ...defaultDownloaderCapabilityDependencies,
+    runProcess: async (command, args, options) => {
+      capabilityCommands.push({command, args: [...args]});
+      return await runSystemProcess(command, args, options);
+    },
     lstat: async (candidate): Promise<Stats> =>
       await defaultDownloaderCapabilityDependencies.lstat(candidate),
     hashFile: async (candidate) => {
@@ -201,7 +221,9 @@ const createManagedFixture = async (): Promise<ManagedFixture> => {
   return {
     homeDirectory,
     recordPath,
+    systemDenoExecutable: denoExecutable,
     resolveToolchain,
+    capabilityCommands,
     createDownloadDependencies: () => {
       const dependencies = createSystemDownloadDependencies({
         homeDirectory,
@@ -285,6 +307,16 @@ describe('doctor-downloader managed integration', () => {
     expect(fixture.probeEnvironments).toEqual([]);
     expect(fixture.actualHashes.has(fixture.paths.ytDlpExecutable)).toBe(true);
     expect(fixture.actualHashes.has(fixture.paths.pluginArchive)).toBe(true);
+    expect(fixture.capabilityCommands.filter(({command}) =>
+      command === fixture.systemDenoExecutable
+    )).toEqual([
+      expect.objectContaining({args: ['--version']}),
+    ]);
+    const providerChecks = fixture.capabilityCommands.filter(({command}) =>
+      command === fixture.paths.denoWrapperExecutable
+    );
+    expect(providerChecks).toHaveLength(1);
+    expect(providerChecks[0]?.args[0]).toBe('run');
     expect(run.stdout()).not.toContain('Doctor fixture');
     expect(run.stdout()).not.toContain('https://');
     expect(run.stdout()).not.toContain(fixture.homeDirectory);

@@ -33,6 +33,7 @@ import {
   defaultDownloaderCapabilityDependencies,
   type DownloaderCapabilityDependencies,
 } from '../../../src/download/toolchain/capabilities';
+import {DENO_WRAPPER_SOURCE} from '../../../src/download/toolchain/deno-wrapper';
 import {
   DOWNLOADER_TOOLCHAIN_MANIFEST,
   installedManifestForPinnedToolchain,
@@ -179,9 +180,10 @@ const fixtureLayout = (root: string): FixtureLayout => {
 const writeExecutable = async (
   candidate: string,
   contents: string,
+  mode = 0o755,
 ): Promise<void> => {
-  await writeFile(candidate, contents, {mode: 0o755});
-  await chmod(candidate, 0o755);
+  await writeFile(candidate, contents, {mode});
+  await chmod(candidate, mode);
 };
 
 const sha256 = async (candidate: string): Promise<string> => createHash('sha256')
@@ -287,9 +289,20 @@ const initializeManagedCache = async (
       path.join(paths.providerServerDirectory, 'src/generate_once.ts'),
       'console.log("deterministic fixture");\n',
     ),
+    writeExecutable(
+      paths.denoWrapperExecutable,
+      DENO_WRAPPER_SOURCE,
+      0o700,
+    ),
     writeExecutable(layout.denoExecutable, [
       '#!/usr/bin/env node',
-      "process.stdout.write('deno 2.8.3\\n');",
+      'const args = process.argv.slice(2);',
+      "if (args.length === 1 && args[0] === '--version') {",
+      "  process.stdout.write('deno 2.8.3\\n');",
+      '  process.exit(0);',
+      '}',
+      "if (args[0] === 'run') process.exit(0);",
+      'process.exit(2);',
       '',
     ].join('\n')),
     writeExecutable(layout.ffmpegExecutable, [
