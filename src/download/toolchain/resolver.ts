@@ -1,4 +1,3 @@
-import {homedir} from 'node:os';
 import path from 'node:path';
 import {
   downloadCancellationFrom,
@@ -10,6 +9,7 @@ import {
   validateDownloaderCapabilities,
   type DownloaderCapabilityDependencies,
 } from './capabilities';
+import {currentUidHomeDirectory} from './home';
 import {resolveDownloaderToolchainPaths} from './paths';
 import type {ResolvedDownloaderToolchain} from './types';
 
@@ -25,9 +25,14 @@ export interface ResolveDownloaderToolchainOptions {
   signal?: AbortSignal;
 }
 
+export interface ResolveDownloaderToolchainDependencies
+  extends DownloaderCapabilityDependencies {
+  uidHomeDirectory?(): string;
+}
+
 export const resolveDownloaderToolchain = async (
   options: ResolveDownloaderToolchainOptions = {},
-  dependencies: DownloaderCapabilityDependencies =
+  dependencies: ResolveDownloaderToolchainDependencies =
     defaultDownloaderCapabilityDependencies,
 ): Promise<ResolvedDownloaderToolchain> => {
   const resolverCwd = process.cwd();
@@ -42,7 +47,8 @@ export const resolveDownloaderToolchain = async (
     throw invalidToolchain();
   }
   const paths = resolveDownloaderToolchainPaths(
-    options.homeDirectory ?? homedir(),
+    options.homeDirectory
+      ?? (dependencies.uidHomeDirectory ?? currentUidHomeDirectory)(),
   );
   let managedDirectoryExists: boolean;
   try {

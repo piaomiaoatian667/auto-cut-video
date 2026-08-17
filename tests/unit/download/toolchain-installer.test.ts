@@ -502,11 +502,18 @@ afterEach(async () => {
 describe('installDownloaderToolchain', () => {
   it('installs the pinned toolchain and publishes canonical bytes atomically', async () => {
     const fixture = await createInstallerFixture();
+    const uidHomeDirectory = vi.fn(() => '/Users/unused-uid-home');
+    const dependencies = {
+      ...fixture.dependencies,
+      uidHomeDirectory,
+    };
 
     await expect(installDownloaderToolchain(
       {homeDirectory: fixture.homeDirectory},
-      fixture.dependencies,
+      dependencies,
     )).resolves.toEqual({status: 'installed', version: '2026.07.04'});
+
+    expect(uidHomeDirectory).not.toHaveBeenCalled();
 
     expect(await readFile(fixture.paths.installedManifest, 'utf8')).toBe(
       `${JSON.stringify(installedManifestForPinnedToolchain(), null, 2)}\n`,
@@ -605,6 +612,31 @@ describe('installDownloaderToolchain', () => {
     expect(await exists(fixture.paths.setupLock)).toBe(false);
     expect(await Promise.all(fixture.stagingDirectories.map(exists)))
       .toEqual(fixture.stagingDirectories.map(() => false));
+  });
+
+  it('uses an injected UID home for the default managed install path', async () => {
+    const fixture = await createInstallerFixture();
+    const poisonedHome = await makeTemporaryDirectory(
+      path.join(tmpdir(), 'toolchain-poisoned-home-'),
+    );
+    temporaryRoots.push(poisonedHome);
+    vi.stubEnv('HOME', poisonedHome);
+    const uidHomeDirectory = vi.fn(() => fixture.homeDirectory);
+    const dependencies = {
+      ...fixture.dependencies,
+      uidHomeDirectory,
+    };
+
+    await expect(installDownloaderToolchain(
+      {},
+      dependencies,
+    )).resolves.toEqual({status: 'installed', version: '2026.07.04'});
+
+    expect(uidHomeDirectory).toHaveBeenCalledTimes(1);
+    expect(await exists(fixture.paths.ytDlpExecutable)).toBe(true);
+    expect(await exists(
+      resolveDownloaderToolchainPaths(poisonedHome).versionDirectory,
+    )).toBe(false);
   });
 
   it('isolates Deno HOME and npm config while forwarding arguments and exit code', async () => {
@@ -859,6 +891,8 @@ describe('installDownloaderToolchain', () => {
       '/usr/bin',
       '/opt/private-tools/bin',
       '/bin',
+      '/usr/sbin',
+      '/sbin',
     ].join(path.delimiter);
     const installerEnvironment = {
       PATH: expectedPath,

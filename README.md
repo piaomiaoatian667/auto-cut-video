@@ -81,9 +81,11 @@ prompting loop.
 
 Downloader capability checks, probes, and downloads do not copy the host
 environment wholesale. Each child receives a frozen allowlist containing the
-resolved user's real `HOME` for Chrome and Keychain access, only absolute
-deduplicated `PATH` entries (with a system fallback), an absolute `TMPDIR` when
-available, `LANG`, the fixed locale keys `LC_ALL`, `LC_CTYPE`, `LC_COLLATE`,
+current UID's canonical home from the OS user record as `HOME` for Chrome and
+Keychain access, only absolute deduplicated host `PATH` entries followed by the
+deduplicated system directories `/usr/bin`, `/bin`, `/usr/sbin`, and `/sbin`,
+an absolute `TMPDIR` when available, `LANG`, the fixed locale keys `LC_ALL`,
+`LC_CTYPE`, `LC_COLLATE`,
 `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`, and `LC_TIME`, required user and
 macOS session identifiers, and fixed Deno, XDG, and npm settings. Proxy
 variables, cloud or model credentials, SSH agent sockets, Node/Deno injection

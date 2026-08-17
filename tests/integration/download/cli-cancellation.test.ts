@@ -186,6 +186,8 @@ describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
           fixture.toolsDirectory,
           '/usr/bin',
           '/bin',
+          '/usr/sbin',
+          '/sbin',
         ].join(path.delimiter),
         TMPDIR: fixture.temporaryDirectory,
         DENO_DIR: fixture.paths.denoDirectory,

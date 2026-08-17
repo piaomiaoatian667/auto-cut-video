@@ -14,7 +14,6 @@ import {
   writeFile,
   type FileHandle,
 } from 'node:fs/promises';
-import {homedir} from 'node:os';
 import path from 'node:path';
 import {isDeepStrictEqual} from 'node:util';
 import {runProcess as runSystemProcess, type RunProcessOptions} from '../../process/run-process';
@@ -34,6 +33,8 @@ import {
   DENO_WRAPPER_FILENAME,
   DENO_WRAPPER_SOURCE,
 } from './deno-wrapper';
+import {buildToolchainExecutablePath} from './environment';
+import {currentUidHomeDirectory} from './home';
 import {resolveDownloaderToolchainPaths} from './paths';
 import type {
   DownloaderToolchainPaths,
@@ -50,12 +51,6 @@ const ALLOWED_REDIRECT_HOSTS = new Set([
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const INSTALL_DIRECTORY_PREFIX = '.install-';
 const QUARANTINE_DIRECTORY_PREFIX = '.quarantine-';
-const INSTALLER_PATH_FALLBACK = [
-  '/usr/bin',
-  '/bin',
-  '/usr/sbin',
-  '/sbin',
-].join(path.delimiter);
 const CACHE_PATH_COMPONENTS = [
   'Library',
   'Caches',
@@ -83,6 +78,7 @@ export interface InstallerDependencies {
   rm: typeof import('node:fs/promises').rm;
   randomUUID(): string;
   currentUid(): number;
+  uidHomeDirectory?(): string;
 }
 
 export interface InstallDownloaderToolchainOptions {
@@ -107,6 +103,7 @@ const defaultInstallerDependencies: InstallerDependencies = {
   randomUUID: createRandomUUID,
   currentUid: () =>
     typeof process.getuid === 'function' ? process.getuid() : -1,
+  uidHomeDirectory: currentUidHomeDirectory,
 };
 
 const processOptionsFor = (
@@ -121,13 +118,8 @@ const buildInstallerChildEnvironment = (
   paths: DownloaderToolchainPaths,
   source: Readonly<NodeJS.ProcessEnv> = process.env,
 ): Readonly<NodeJS.ProcessEnv> => {
-  const absolutePathEntries = (source.PATH ?? '')
-    .split(path.delimiter)
-    .filter((entry) => path.isAbsolute(entry));
   return Object.freeze({
-    PATH: absolutePathEntries.length === 0
-      ? INSTALLER_PATH_FALLBACK
-      : absolutePathEntries.join(path.delimiter),
+    PATH: buildToolchainExecutablePath(source.PATH),
     HOME: paths.providerCacheDirectory,
     TMPDIR: paths.providerCacheDirectory,
     DENO_DIR: paths.denoDirectory,
@@ -808,7 +800,8 @@ const installDownloaderToolchainTransaction = async (
   options: InstallDownloaderToolchainOptions,
   dependencies: InstallerDependencies,
 ): Promise<SetupDownloaderResult> => {
-  const homeDirectory = options.homeDirectory ?? homedir();
+  const homeDirectory = options.homeDirectory
+    ?? (dependencies.uidHomeDirectory ?? currentUidHomeDirectory)();
   const canonicalHome = path.resolve(homeDirectory);
   const paths = resolveDownloaderToolchainPaths(homeDirectory);
   if (process.platform !== 'darwin' || process.arch !== 'arm64') {

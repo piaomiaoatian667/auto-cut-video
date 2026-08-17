@@ -1,4 +1,5 @@
 import type {Stats} from 'node:fs';
+import {homedir, userInfo} from 'node:os';
 import path from 'node:path';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import type {DownloaderCapabilityDependencies} from '../../../src/download/toolchain/capabilities';
@@ -165,6 +166,7 @@ const expectResolverError = async (
 };
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
 
@@ -192,6 +194,52 @@ describe('resolveDownloaderToolchain', () => {
     expect(`${String(caught)}${JSON.stringify(caught)}`).not.toContain(privateReason);
     expect(fixture.directoryExists).not.toHaveBeenCalled();
     expect(fixture.runProcess).not.toHaveBeenCalled();
+  });
+
+  it('uses the current UID home when HOME poisons os.homedir()', async () => {
+    const fixture = createResolverFixture();
+    fixture.state.directoryPresent = false;
+    const poisonedHome = '/private/poisoned';
+    const uidHomeDirectory = userInfo().homedir;
+    const uidPaths = resolveDownloaderToolchainPaths(uidHomeDirectory);
+    vi.stubEnv('HOME', poisonedHome);
+
+    expect(homedir()).toBe(poisonedHome);
+    await expectResolverError(
+      resolveDownloaderToolchain({}, fixture.dependencies),
+      'DOWNLOAD_TOOLCHAIN_MISSING',
+      MISSING_TOOLCHAIN_MESSAGE,
+      [poisonedHome],
+    );
+
+    expect(fixture.directoryExists).toHaveBeenCalledWith(
+      uidPaths.versionDirectory,
+    );
+  });
+
+  it('uses an injected UID home for default resolver paths', async () => {
+    const fixture = createResolverFixture();
+    fixture.state.directoryPresent = false;
+    const injectedHomeDirectory = '/Users/injected-resolver-home';
+    const injectedPaths = resolveDownloaderToolchainPaths(
+      injectedHomeDirectory,
+    );
+    const uidHomeDirectory = vi.fn(() => injectedHomeDirectory);
+    const dependencies = {
+      ...fixture.dependencies,
+      uidHomeDirectory,
+    };
+
+    await expectResolverError(
+      resolveDownloaderToolchain({}, dependencies),
+      'DOWNLOAD_TOOLCHAIN_MISSING',
+      MISSING_TOOLCHAIN_MESSAGE,
+    );
+
+    expect(uidHomeDirectory).toHaveBeenCalledTimes(1);
+    expect(fixture.directoryExists).toHaveBeenCalledWith(
+      injectedPaths.versionDirectory,
+    );
   });
 
   it('uses an explicit override before the exact managed downloader', async () => {
@@ -260,10 +308,15 @@ describe('resolveDownloaderToolchain', () => {
 
   it('uses only the exact managed cache path when no override is present', async () => {
     const fixture = createResolverFixture();
+    const uidHomeDirectory = vi.fn(() => '/Users/unused-uid-home');
+    const dependencies = {
+      ...fixture.dependencies,
+      uidHomeDirectory,
+    };
 
     const resolved = await resolveDownloaderToolchain(
       {homeDirectory},
-      fixture.dependencies,
+      dependencies,
     );
 
     expect(resolved).toMatchObject({
@@ -274,6 +327,7 @@ describe('resolveDownloaderToolchain', () => {
     expect(fixture.runProcess.mock.calls[0]?.[0]).toBe(paths.ytDlpExecutable);
     expect(fixture.runProcess.mock.calls.some(([command]) => command === 'yt-dlp'))
       .toBe(false);
+    expect(uidHomeDirectory).not.toHaveBeenCalled();
   });
 
   it('requires the managed cache even when an override is explicit', async () => {

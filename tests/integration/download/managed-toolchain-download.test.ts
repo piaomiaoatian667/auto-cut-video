@@ -166,7 +166,13 @@ describe('managed multi-platform download integration', () => {
     expect(run.stderr()).toBe('');
     const expectedValidationEnvironment = {
       HOME: fixture.homeDirectory,
-      PATH: ['/host/path-marker', '/usr/bin'].join(path.delimiter),
+      PATH: [
+        '/host/path-marker',
+        '/usr/bin',
+        '/bin',
+        '/usr/sbin',
+        '/sbin',
+      ].join(path.delimiter),
       TMPDIR: fixture.temporaryDirectory,
       LANG: 'en_US.UTF-8',
       LC_ALL: 'C',
@@ -204,6 +210,8 @@ describe('managed multi-platform download integration', () => {
       expect(operation.environment).toEqual(expectedChildEnvironment);
       expect(Object.isFrozen(operation.environment)).toBe(true);
     }
+    expect(expectedChildEnvironment.PATH.split(path.delimiter))
+      .toContain('/usr/bin');
     expect(fixture.subprocesses.filter((subprocess) =>
       subprocess.command === path.join(fixture.toolsDirectory, 'deno')
     )).toEqual([

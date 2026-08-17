@@ -289,12 +289,15 @@ checks.
 
 Capability checks and runtime downloader processes build a frozen environment
 from an allowlist rather than copying `process.env`. Preserve the canonical
-resolver home as `HOME` so `--cookies-from-browser chrome` can use the real
-Chrome and Keychain context without selecting or exposing a profile path.
+resolver home derived from the current UID's OS user record as `HOME` so
+`--cookies-from-browser chrome` can use the real Chrome and Keychain context
+without selecting or exposing a profile path. Do not derive this default from
+the mutable host `HOME` environment variable.
 
-The allowlist contains only deduplicated absolute `PATH` entries (or
-`/usr/bin:/bin:/usr/sbin:/sbin` when none are usable), an absolute `TMPDIR` when
-present, `LANG`, the fixed locale keys `LC_ALL`, `LC_CTYPE`, `LC_COLLATE`,
+The allowlist contains only deduplicated absolute host `PATH` entries followed
+by the deduplicated system directories `/usr/bin`, `/bin`, `/usr/sbin`, and
+`/sbin`, an absolute `TMPDIR` when present, `LANG`, the fixed locale keys
+`LC_ALL`, `LC_CTYPE`, `LC_COLLATE`,
 `LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`, and `LC_TIME`, `USER`, `LOGNAME`,
 the macOS text-encoding and security session identifiers when present, and the
 fixed Deno, XDG, npm, internal Deno binding, and `FORCE_COLOR=false` values

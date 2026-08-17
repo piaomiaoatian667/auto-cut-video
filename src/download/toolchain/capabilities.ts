@@ -26,6 +26,7 @@ import {
   DENO_EXECUTABLE_ENVIRONMENT_KEY,
   DENO_WRAPPER_SOURCE,
 } from './deno-wrapper';
+import {buildToolchainExecutablePath} from './environment';
 import type {
   DownloaderToolchainPaths,
   DownloaderToolchainSource,
@@ -53,12 +54,6 @@ const EXPECTED_PLUGIN_ENTRIES = [
   'yt_dlp_plugins/extractor/getpot_bgutil_http.py',
   'yt_dlp_plugins/extractor/getpot_bgutil_script.py',
 ] as const;
-const DOWNLOADER_PATH_FALLBACK = [
-  '/usr/bin',
-  '/bin',
-  '/usr/sbin',
-  '/sbin',
-].join(path.delimiter);
 const PASSTHROUGH_ENVIRONMENT_KEYS = new Set([
   'LANG',
   'LC_ALL',
@@ -116,13 +111,8 @@ const buildDownloaderBaseEnvironment = (
   paths: DownloaderToolchainPaths,
   source: Readonly<NodeJS.ProcessEnv> = process.env,
 ): Readonly<NodeJS.ProcessEnv> => {
-  const pathEntries = [...new Set((source.PATH ?? '')
-    .split(path.delimiter)
-    .filter((entry) => path.isAbsolute(entry)))];
   const environment: NodeJS.ProcessEnv = {
-    PATH: pathEntries.length === 0
-      ? DOWNLOADER_PATH_FALLBACK
-      : pathEntries.join(path.delimiter),
+    PATH: buildToolchainExecutablePath(source.PATH),
     HOME: paths.homeDirectory,
     NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
     NPM_CONFIG_USERCONFIG: '/dev/null',

@@ -387,7 +387,12 @@ describe('downloader toolchain capability helpers', () => {
     source.LANG = 'mutated';
 
     expect(environment).toEqual({
-      PATH: ['/usr/bin', '/bin'].join(path.delimiter),
+      PATH: [
+        '/usr/bin',
+        '/bin',
+        '/usr/sbin',
+        '/sbin',
+      ].join(path.delimiter),
       HOME: '/Users/tester',
       TMPDIR: '/private/runtime-tmp',
       LANG: 'en_US.UTF-8',
@@ -417,6 +422,18 @@ describe('downloader toolchain capability helpers', () => {
       key.toLowerCase() === DENO_EXECUTABLE_ENVIRONMENT_KEY.toLowerCase()
     )).toEqual([DENO_EXECUTABLE_ENVIRONMENT_KEY]);
     expect(Object.isFrozen(environment)).toBe(true);
+  });
+
+  it('appends deduplicated system directories after host PATH entries', () => {
+    const environment = buildDownloaderChildEnvironment(
+      paths,
+      denoExecutable,
+      {PATH: '/opt/homebrew/bin'},
+    );
+
+    expect(environment.PATH).toBe(
+      '/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+    );
   });
 
   it('uses the safe PATH fallback and omits a relative TMPDIR', () => {
@@ -591,7 +608,9 @@ describe('validateDownloaderCapabilities', () => {
     const resolved = await validateFixture(fixture);
     vi.stubEnv('PATH', '/private/mutated-path');
 
-    expect(resolved.childEnvironment.PATH).toBe('/private/original-path');
+    expect(resolved.childEnvironment.PATH).toBe(
+      '/private/original-path:/usr/bin:/bin:/usr/sbin:/sbin',
+    );
     expect(resolved.childEnvironment[DENO_EXECUTABLE_ENVIRONMENT_KEY])
       .toBe(denoExecutable);
     expect(Object.keys(resolved.childEnvironment).filter((key) =>
