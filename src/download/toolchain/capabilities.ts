@@ -88,8 +88,10 @@ export const compareYtDlpVersions = (left: string, right: string): number => {
 
 export const pluginEntriesMatch = (stdout: string): boolean => {
   const actual = stdout.split(/\r?\n/u).filter((entry) => entry.length > 0);
+  const actualEntries = new Set(actual);
   return actual.length === EXPECTED_PLUGIN_ENTRIES.length
-    && actual.every((entry, index) => entry === EXPECTED_PLUGIN_ENTRIES[index]);
+    && actualEntries.size === EXPECTED_PLUGIN_ENTRIES.length
+    && EXPECTED_PLUGIN_ENTRIES.every((entry) => actualEntries.has(entry));
 };
 
 export const buildDownloaderChildEnvironment = (

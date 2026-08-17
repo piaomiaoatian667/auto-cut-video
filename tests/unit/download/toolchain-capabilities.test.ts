@@ -39,12 +39,15 @@ const targetsOutput = [
   'Client          OS           Source',
   'Chrome-136      Macos-15     curl_cffi',
 ].join('\n');
-const pluginOutput = [
+const pluginEntries = [
   'yt_dlp_plugins/',
   'yt_dlp_plugins/extractor/',
-  'yt_dlp_plugins/extractor/getpot_bgutil.py',
   'yt_dlp_plugins/extractor/getpot_bgutil_http.py',
   'yt_dlp_plugins/extractor/getpot_bgutil_script.py',
+  'yt_dlp_plugins/extractor/getpot_bgutil.py',
+] as const;
+const pluginOutput = [
+  ...pluginEntries,
   '',
 ].join('\n');
 const paths = resolveDownloaderToolchainPaths('/Users/tester');
@@ -278,16 +281,21 @@ describe('downloader toolchain capability helpers', () => {
     },
   );
 
-  it('matches only the exact ordered plugin entries', () => {
+  it('matches the exact plugin entry set regardless of archive order', () => {
     expect(pluginEntriesMatch(pluginOutput)).toBe(true);
-    expect(pluginEntriesMatch([
-      'yt_dlp_plugins/',
-      'yt_dlp_plugins/extractor/getpot_bgutil.py',
-      'yt_dlp_plugins/extractor/',
-      'yt_dlp_plugins/extractor/getpot_bgutil_http.py',
-      'yt_dlp_plugins/extractor/getpot_bgutil_script.py',
-    ].join('\n'))).toBe(false);
-    expect(pluginEntriesMatch(`${pluginOutput}unexpected.py\n`)).toBe(false);
+    expect(pluginEntriesMatch([...pluginEntries].reverse().join('\n'))).toBe(true);
+  });
+
+  it.each([
+    ['a duplicate', [...pluginEntries, pluginEntries[2]].join('\n')],
+    ['a missing entry', pluginEntries.slice(0, -1).join('\n')],
+    ['an extra entry', [...pluginEntries, 'unexpected.py'].join('\n')],
+    ['an incorrect path', pluginEntries.map((entry) =>
+      entry === 'yt_dlp_plugins/extractor/getpot_bgutil.py'
+        ? 'yt_dlp_plugins/getpot_bgutil.py'
+        : entry).join('\n')],
+  ])('rejects plugin entries with %s', (_case, output) => {
+    expect(pluginEntriesMatch(output)).toBe(false);
   });
 
   it('builds a frozen proxy-free child environment from a snapshot', () => {
