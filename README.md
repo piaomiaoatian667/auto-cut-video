@@ -13,15 +13,22 @@ and analysis.
 - macOS on Apple Silicon (`Darwin/arm64`) only.
 - Node.js `>=22.17.0 <23`.
 - pnpm `10.14.0`.
-- Homebrew `ffmpeg`, Deno, and Git prerequisites.
+- Deno `2+`, FFmpeg, and Git available on `PATH`. The Homebrew command below
+  is one installation example, not a required package source.
 
 `setup-downloader` is the only command that installs the pinned downloader and
 its pinned compatibility components into the per-user application cache. It
-verifies the expected assets and required capabilities, then reports either
-`installed` or `already-present`. Ordinary `download` and
-`doctor-downloader` commands never install or update executable code.
+verifies the expected assets and required capabilities. On success it reports
+either `installed` or `already-present`; otherwise it emits a controlled error.
+Ordinary `download` and `doctor-downloader` commands never install or update
+executable code.
 
 ## Install and run
+
+The concrete YouTube and Douyin URLs below are command examples only. Replace
+them with, or independently confirm, public content that you own or are
+explicitly authorized to archive. Neither these examples nor
+`--rights-confirmed` grants authorization.
 
 ```sh
 brew install ffmpeg deno git
@@ -94,11 +101,17 @@ The final directory contains:
 - `video.<language>.<subtitle-ext>`: subtitle sidecars when available.
 - `video.<thumbnail-ext>`: one thumbnail sidecar when available.
 
-Receipt v3 records only whether a proxy was used and its scheme, whether
+The archive intentionally retains content-identifying fields. Receipt v3 stores
+the canonical URL, title, platform, and video ID, while `video.info.json` stores
+their cleaned downloader equivalents. A canonical URL, such as a TikTok URL
+containing `@handle`, may identify both content and an account.
+
+Receipt v3 also records whether a proxy was used and its scheme, whether
 Chrome-family impersonation was used, whether confirmed Chrome Cookie access
-was used, and the managed or validated override toolchain identity. It does not
-record proxy endpoints or credentials, Cookie values, account identifiers,
-browser profiles, raw downloader arguments, or local cache paths.
+was used, and the managed or validated override toolchain identity. The archive
+does not record additional Cookie-derived account fields, proxy endpoints or
+credentials, Cookie values, browser profiles or paths, raw downloader
+arguments, tokens, or cache or staging paths.
 
 If a valid archive already exists for the resolved platform and video ID, the
 command reports `already-present` and does not redownload or overwrite it. An
@@ -122,15 +135,17 @@ excluded. Completed public replays may be treated as ordinary videos only when
 current metadata no longer marks them active, upcoming, or still processing.
 
 Playlists, channels, login automation, automatic proxy or Cookie escalation,
-geo-bypass, browser automation, editing, clipping, publishing, remuxing,
-recoding, and re-encoding are also excluded. FFmpeg may merge separate audio
-and video streams selected by the fixed downloader profile, but the application
-does not request transcoding.
+geo-bypass, browser automation, editing, clipping, publishing, and
+user-specified remux, recode, re-encode, or transcoding options are also
+excluded. The fixed downloader profile may use FFmpeg to mux or merge separate
+audio and video streams without re-encoding.
 
 Missing setup, invalid capabilities, invalid input, unavailable networks,
 rate limits, platform challenges, Cookie denial, restricted content, and
 archive conflicts fail with controlled public messages and stable JSON error
-codes. Raw third-party diagnostics and sensitive inputs are not printed or
-written to the archive. A failed platform is not retried with a different
-proxy, Cookie mode, browser profile, provider, or content scope, and media is
-not published to the final archive until validation succeeds.
+codes. Controlled failures do not write raw third-party diagnostics or
+credential, session, or network secrets to the archive. Canonical URL, title,
+platform, and video ID remain part of a successful archive as described above.
+A failed platform is not retried with a different proxy, Cookie mode, browser
+profile, provider, or content scope, and media is not published to the final
+archive until validation succeeds.
