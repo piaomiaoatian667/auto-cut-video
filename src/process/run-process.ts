@@ -34,6 +34,8 @@ export interface RunProcessOptions {
   readonly signal?: AbortSignal;
   /** Borrowed parent FDs mapped to child FDs 3 + index; ownership stays with the caller. */
   readonly extraStdioFds?: readonly number[];
+  readonly cwd?: string;
+  readonly env?: Readonly<NodeJS.ProcessEnv>;
 }
 
 interface TerminationReason {
@@ -220,6 +222,8 @@ export async function runProcess(
   const timeoutMs = options.timeoutMs;
   const signal = options.signal;
   const extraStdioFds = [...(options.extraStdioFds ?? [])];
+  const cwd = options.cwd;
+  const env = options.env === undefined ? undefined : {...options.env};
   validateTimeout(timeoutMs);
   validateExtraStdioFds(extraStdioFds);
 
@@ -263,6 +267,8 @@ export async function runProcess(
       shell: false,
       detached: useProcessGroup,
       stdio,
+      ...(cwd === undefined ? {} : {cwd}),
+      ...(env === undefined ? {} : {env}),
     });
   } catch (error) {
     throw new ProcessExecutionError(

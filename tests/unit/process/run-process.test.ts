@@ -1,4 +1,13 @@
-import {access, mkdtemp, open, readFile, rm, writeFile} from 'node:fs/promises';
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  realpath,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
@@ -28,6 +37,14 @@ type _SignalOptionIsReadonly = Assert<IsEqual<
 type _ExtraStdioOptionIsReadonly = Assert<IsEqual<
   Pick<RunProcessOptions, 'extraStdioFds'>,
   Readonly<Pick<RunProcessOptions, 'extraStdioFds'>>
+>>;
+type _CwdOptionIsReadonly = Assert<IsEqual<
+  Pick<RunProcessOptions, 'cwd'>,
+  Readonly<Pick<RunProcessOptions, 'cwd'>>
+>>;
+type _EnvironmentOptionIsReadonly = Assert<IsEqual<
+  Pick<RunProcessOptions, 'env'>,
+  Readonly<Pick<RunProcessOptions, 'env'>>
 >>;
 type Mutable<T> = {-readonly [Key in keyof T]: T[Key]};
 
@@ -124,6 +141,31 @@ const createPidScript = (ignoreSigterm: boolean): string => [
 ].filter(Boolean).join(';');
 
 describe('runProcess', () => {
+  it('passes a closed working directory and environment to a real fixture', async () => {
+    const tempDirectory = await mkdtemp(path.join(tmpdir(), 'run-process-fixture-'));
+    onTestFinished(() => rm(tempDirectory, {recursive: true, force: true}));
+    const canonicalTempDirectory = await realpath(tempDirectory);
+    const workingDirectory = path.join(canonicalTempDirectory, 'working');
+    const fixturePath = path.join(canonicalTempDirectory, 'fixture.mjs');
+    await mkdir(workingDirectory);
+    await writeFile(fixturePath, [
+      'process.stdout.write(JSON.stringify({',
+      '  cwd: process.cwd(),',
+      '  fixtureValue: process.env.FIXTURE_VALUE,',
+      '}));',
+    ].join('\n'));
+
+    const result = await runProcess(process.execPath, [fixturePath], {
+      cwd: workingDirectory,
+      env: {PATH: process.env.PATH, FIXTURE_VALUE: 'closed-value'},
+    });
+
+    expect(JSON.parse(result.stdout)).toEqual({
+      cwd: workingDirectory,
+      fixtureValue: 'closed-value',
+    });
+  });
+
   it('passes arguments without shell interpolation', async () => {
     const tempDirectory = await mkdtemp(path.join(tmpdir(), 'run-process-shell-'));
     onTestFinished(() => rm(tempDirectory, {recursive: true, force: true}));
