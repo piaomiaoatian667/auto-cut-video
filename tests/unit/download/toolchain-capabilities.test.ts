@@ -15,6 +15,7 @@ import {
   DOWNLOADER_TOOLCHAIN_MANIFEST,
   installedManifestForPinnedToolchain,
 } from '../../../src/download/toolchain/manifest';
+import {DENO_EXECUTABLE_ENVIRONMENT_KEY} from '../../../src/download/toolchain/deno-wrapper';
 import {resolveDownloaderToolchainPaths} from '../../../src/download/toolchain/paths';
 import type {DownloaderToolchainPaths} from '../../../src/download/toolchain/types';
 import type {DownloadError, DownloadErrorCode} from '../../../src/download/errors';
@@ -53,13 +54,21 @@ const pluginOutput = [
 const expectedDenoWrapperSource = [
   '#!/bin/sh',
   'set -eu',
+  ': "${AUTO_CUT_VIDEO_DENO_EXECUTABLE:?AUTO_CUT_VIDEO_DENO_EXECUTABLE must be set}"',
+  'case "$AUTO_CUT_VIDEO_DENO_EXECUTABLE" in',
+  '  /*) ;;',
+  '  *) exit 126 ;;',
+  'esac',
+  'if [ "$AUTO_CUT_VIDEO_DENO_EXECUTABLE" = "$0" ]; then',
+  '  exit 126',
+  'fi',
   ': "${XDG_CACHE_HOME:?XDG_CACHE_HOME must be set}"',
   'export HOME="$XDG_CACHE_HOME"',
   'export TMPDIR="$XDG_CACHE_HOME"',
   'export NPM_CONFIG_REGISTRY="https://registry.npmjs.org/"',
   'export NPM_CONFIG_USERCONFIG="/dev/null"',
   'export NPM_CONFIG_GLOBALCONFIG="/dev/null"',
-  'exec deno "$@"',
+  'exec "$AUTO_CUT_VIDEO_DENO_EXECUTABLE" "$@"',
   '',
 ].join('\n');
 const denoWrapperExecutableFor = (
@@ -331,10 +340,17 @@ describe('downloader toolchain capability helpers', () => {
       npm_config_userconfig: `/${privateMarker}/user-npmrc`,
       NpM_CoNfIg_GlObAlCoNfIg: `/${privateMarker}/global-npmrc`,
       npm_config_private_marker: privateMarker,
+      [DENO_EXECUTABLE_ENVIRONMENT_KEY]: `/${privateMarker}/poisoned-deno`,
+      [DENO_EXECUTABLE_ENVIRONMENT_KEY.toLowerCase()]:
+        `relative-${privateMarker}`,
       PRESERVED: 'closed-value',
     };
 
-    const environment = buildDownloaderChildEnvironment(paths, source);
+    const environment = buildDownloaderChildEnvironment(
+      paths,
+      denoExecutable,
+      source,
+    );
     source.PATH = '/mutated';
 
     expect(environment).toMatchObject({
@@ -344,6 +360,7 @@ describe('downloader toolchain capability helpers', () => {
       NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
       NPM_CONFIG_USERCONFIG: '/dev/null',
       NPM_CONFIG_GLOBALCONFIG: '/dev/null',
+      [DENO_EXECUTABLE_ENVIRONMENT_KEY]: denoExecutable,
       DENO_DIR: paths.denoDirectory,
       XDG_CACHE_HOME: paths.providerCacheDirectory,
       DENO_NO_PROMPT: '1',
@@ -360,6 +377,9 @@ describe('downloader toolchain capability helpers', () => {
       'NPM_CONFIG_USERCONFIG',
     ]);
     expect(JSON.stringify(environment)).not.toContain(privateMarker);
+    expect(Object.keys(environment).filter((key) =>
+      key.toLowerCase() === DENO_EXECUTABLE_ENVIRONMENT_KEY.toLowerCase()
+    )).toEqual([DENO_EXECUTABLE_ENVIRONMENT_KEY]);
     expect(Object.isFrozen(environment)).toBe(true);
   });
 
@@ -449,16 +469,24 @@ describe('validateDownloaderCapabilities', () => {
     });
     expect(Object.isFrozen(resolved.childEnvironment)).toBe(true);
     expect(fixture.resolveExecutable.mock.calls).toEqual([['deno'], ['ffmpeg']]);
-    expect(fixture.runProcess.mock.calls.slice(0, 4)).toEqual([
-      [paths.ytDlpExecutable, ['--version'], {env: resolved.childEnvironment}],
-      [paths.ytDlpExecutable, ['--help'], {env: resolved.childEnvironment}],
-      [denoExecutable, ['--version'], {env: resolved.childEnvironment}],
+    const validationEnvironment = fixture.runProcess.mock.calls[0]?.[2]?.env;
+    expect(validationEnvironment).toBeDefined();
+    expect(validationEnvironment).not.toBe(resolved.childEnvironment);
+    expect(Object.isFrozen(validationEnvironment)).toBe(true);
+    expect(validationEnvironment?.[DENO_EXECUTABLE_ENVIRONMENT_KEY])
+      .toBeUndefined();
+    expect(fixture.runProcess.mock.calls.slice(0, 3)).toEqual([
+      [paths.ytDlpExecutable, ['--version'], {env: validationEnvironment}],
+      [paths.ytDlpExecutable, ['--help'], {env: validationEnvironment}],
+      [denoExecutable, ['--version'], {env: validationEnvironment}],
+    ]);
+    expect(fixture.runProcess.mock.calls[3]).toEqual(
       [
         '/usr/bin/unzip',
         ['-Z1', paths.pluginArchive],
         {env: resolved.childEnvironment},
       ],
-    ]);
+    );
     const providerCall = fixture.runProcess.mock.calls[4];
     expect(providerCall).toEqual([
       denoWrapperExecutable,
@@ -485,13 +513,48 @@ describe('validateDownloaderCapabilities', () => {
       ],
       [ffmpegExecutable, ['-version'], {env: resolved.childEnvironment}],
     ]);
-    for (const [, , processOptions] of fixture.runProcess.mock.calls) {
-      expect(processOptions?.env).toBe(resolved.childEnvironment);
+    for (const [index, [, , processOptions]] of
+      fixture.runProcess.mock.calls.entries()) {
+      expect(processOptions?.env).toBe(
+        index < 3 ? validationEnvironment : resolved.childEnvironment,
+      );
       expect(Object.keys(processOptions?.env ?? {}).filter((key) =>
         ['http_proxy', 'https_proxy', 'all_proxy', 'no_proxy']
           .includes(key.toLowerCase())))
         .toEqual([]);
     }
+  });
+
+  it('binds the frozen runtime to the validated absolute Deno executable', async () => {
+    const privateMarker = 'private-deno-runtime-marker';
+    vi.stubEnv('PATH', '/private/original-path');
+    vi.stubEnv(
+      DENO_EXECUTABLE_ENVIRONMENT_KEY,
+      `/private/${privateMarker}/poisoned-deno`,
+    );
+    vi.stubEnv(
+      DENO_EXECUTABLE_ENVIRONMENT_KEY.toLowerCase(),
+      `relative-${privateMarker}`,
+    );
+    const fixture = createCapabilityFixture();
+
+    const resolved = await validateFixture(fixture);
+    vi.stubEnv('PATH', '/private/mutated-path');
+
+    expect(resolved.childEnvironment.PATH).toBe('/private/original-path');
+    expect(resolved.childEnvironment[DENO_EXECUTABLE_ENVIRONMENT_KEY])
+      .toBe(denoExecutable);
+    expect(Object.keys(resolved.childEnvironment).filter((key) =>
+      key.toLowerCase() === DENO_EXECUTABLE_ENVIRONMENT_KEY.toLowerCase()
+    )).toEqual([DENO_EXECUTABLE_ENVIRONMENT_KEY]);
+    expect(JSON.stringify(resolved.childEnvironment)).not.toContain(privateMarker);
+    expect(Object.isFrozen(resolved.childEnvironment)).toBe(true);
+    const providerCall = fixture.runProcess.mock.calls.find(([command, args]) =>
+      command === denoWrapperExecutable && args[0] === 'run'
+    );
+    expect(providerCall?.[2]?.env).toBe(resolved.childEnvironment);
+    expect(providerCall?.[2]?.env?.[DENO_EXECUTABLE_ENVIRONMENT_KEY])
+      .toBe(denoExecutable);
   });
 
   it('forwards one signal with the proxy-free environment to every process', async () => {
@@ -505,9 +568,12 @@ describe('validateDownloaderCapabilities', () => {
     const resolved = await validateFixture(fixture, {signal: controller.signal});
 
     expect(fixture.runProcess).toHaveBeenCalledTimes(7);
-    for (const [, , processOptions] of fixture.runProcess.mock.calls) {
+    const validationEnvironment = fixture.runProcess.mock.calls[0]?.[2]?.env;
+    expect(validationEnvironment).toBeDefined();
+    for (const [index, [, , processOptions]] of
+      fixture.runProcess.mock.calls.entries()) {
       expect(processOptions).toMatchObject({
-        env: resolved.childEnvironment,
+        env: index < 3 ? validationEnvironment : resolved.childEnvironment,
         signal: controller.signal,
       });
       expect(Object.keys(processOptions?.env ?? {}).filter((key) =>

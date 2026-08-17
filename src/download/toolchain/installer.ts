@@ -30,6 +30,7 @@ import {
   installedManifestForPinnedToolchain,
 } from './manifest';
 import {
+  DENO_EXECUTABLE_ENVIRONMENT_KEY,
   DENO_WRAPPER_FILENAME,
   DENO_WRAPPER_SOURCE,
 } from './deno-wrapper';
@@ -697,11 +698,20 @@ const validateStagedToolchain = async (
   const childEnvironment = buildInstallerChildEnvironment(stagingPaths);
   const capabilityDependencies: DownloaderCapabilityDependencies = {
     ...dependencies.capabilities,
-    runProcess: async (command, args, options = {}) =>
-      await dependencies.capabilities.runProcess(command, args, {
+    runProcess: async (command, args, options = {}) => {
+      const systemDenoExecutable =
+        options.env?.[DENO_EXECUTABLE_ENVIRONMENT_KEY];
+      const environment = systemDenoExecutable === undefined
+        ? childEnvironment
+        : Object.freeze({
+            ...childEnvironment,
+            [DENO_EXECUTABLE_ENVIRONMENT_KEY]: systemDenoExecutable,
+          });
+      return await dependencies.capabilities.runProcess(command, args, {
         ...options,
-        env: childEnvironment,
-      }),
+        env: environment,
+      });
+    },
   };
   await validateDownloaderCapabilities({
     source: 'managed',

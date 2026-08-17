@@ -33,6 +33,7 @@ import {
   DOWNLOADER_TOOLCHAIN_MANIFEST,
   installedManifestForPinnedToolchain,
 } from '../../../src/download/toolchain/manifest';
+import {DENO_EXECUTABLE_ENVIRONMENT_KEY} from '../../../src/download/toolchain/deno-wrapper';
 import {resolveDownloaderToolchainPaths} from '../../../src/download/toolchain/paths';
 import type {DownloaderToolchainPaths} from '../../../src/download/toolchain/types';
 import type {DownloadError} from '../../../src/download/errors';
@@ -73,13 +74,21 @@ const providerInstallArguments = [
 const expectedDenoWrapperSource = [
   '#!/bin/sh',
   'set -eu',
+  ': "${AUTO_CUT_VIDEO_DENO_EXECUTABLE:?AUTO_CUT_VIDEO_DENO_EXECUTABLE must be set}"',
+  'case "$AUTO_CUT_VIDEO_DENO_EXECUTABLE" in',
+  '  /*) ;;',
+  '  *) exit 126 ;;',
+  'esac',
+  'if [ "$AUTO_CUT_VIDEO_DENO_EXECUTABLE" = "$0" ]; then',
+  '  exit 126',
+  'fi',
   ': "${XDG_CACHE_HOME:?XDG_CACHE_HOME must be set}"',
   'export HOME="$XDG_CACHE_HOME"',
   'export TMPDIR="$XDG_CACHE_HOME"',
   'export NPM_CONFIG_REGISTRY="https://registry.npmjs.org/"',
   'export NPM_CONFIG_USERCONFIG="/dev/null"',
   'export NPM_CONFIG_GLOBALCONFIG="/dev/null"',
-  'exec deno "$@"',
+  'exec "$AUTO_CUT_VIDEO_DENO_EXECUTABLE" "$@"',
   '',
 ].join('\n');
 const denoWrapperExecutableFor = (
@@ -602,9 +611,15 @@ describe('installDownloaderToolchain', () => {
     const fakeBinDirectory = path.join(fixture.homeDirectory, 'fake-bin');
     const fakeDenoExecutable = path.join(fakeBinDirectory, 'deno');
     const capturePath = path.join(fixture.homeDirectory, 'fake-deno-capture.txt');
+    const maliciousBinDirectory = path.join(fixture.homeDirectory, 'relative-bin');
+    const maliciousCapturePath = path.join(
+      fixture.homeDirectory,
+      'malicious-deno-capture.txt',
+    );
     const runtimeCache = path.join(fixture.homeDirectory, 'runtime-cache');
     const poisonedHome = path.join(fixture.homeDirectory, 'poisoned-home');
     await mkdirDirectory(fakeBinDirectory, {recursive: true, mode: 0o700});
+    await mkdirDirectory(maliciousBinDirectory, {recursive: true, mode: 0o700});
     await mkdirDirectory(runtimeCache, {recursive: true, mode: 0o700});
     await writeFile(fakeDenoExecutable, [
       '#!/bin/sh',
@@ -618,6 +633,13 @@ describe('installDownloaderToolchain', () => {
       '  printf \'ARG=%s\\n\' "$@"',
       '} > "$FAKE_DENO_CAPTURE"',
       'exit 37',
+      '',
+    ].join('\n'), {mode: 0o700});
+    await writeFile(path.join(maliciousBinDirectory, 'deno'), [
+      '#!/bin/sh',
+      'set -eu',
+      'printf \'malicious PATH deno executed\\n\' > "$MALICIOUS_DENO_CAPTURE"',
+      'exit 91',
       '',
     ].join('\n'), {mode: 0o700});
     vi.stubEnv('HOME', poisonedHome);
@@ -637,10 +659,13 @@ describe('installDownloaderToolchain', () => {
         {
           env: {
             ...process.env,
-            PATH: fakeBinDirectory,
+            PATH: ['relative-bin', '/usr/bin', '/bin'].join(path.delimiter),
             XDG_CACHE_HOME: runtimeCache,
+            [DENO_EXECUTABLE_ENVIRONMENT_KEY]: fakeDenoExecutable,
             FAKE_DENO_CAPTURE: capturePath,
+            MALICIOUS_DENO_CAPTURE: maliciousCapturePath,
           },
+          cwd: fixture.homeDirectory,
           stdio: 'ignore',
         },
       );
@@ -659,8 +684,58 @@ describe('installDownloaderToolchain', () => {
       'ARG=--flag=$literal',
       '',
     ].join('\n'));
+    expect(await exists(maliciousCapturePath)).toBe(false);
     expect(process.env.HOME).toBe(parentHome);
   });
+
+  it.each(['relative', 'wrapper'] as const)(
+    'rejects a %s Deno runtime binding before PATH lookup',
+    async (runtimeBinding) => {
+      const fixture = await createInstallerFixture();
+      await installDownloaderToolchain(
+        {homeDirectory: fixture.homeDirectory},
+        fixture.dependencies,
+      );
+      const wrapperExecutable = denoWrapperExecutableFor(fixture.paths);
+      const maliciousBinDirectory = path.join(fixture.homeDirectory, 'relative-bin');
+      const maliciousCapturePath = path.join(
+        fixture.homeDirectory,
+        `malicious-${runtimeBinding}-capture.txt`,
+      );
+      await mkdirDirectory(maliciousBinDirectory, {recursive: true, mode: 0o700});
+      await writeFile(path.join(maliciousBinDirectory, 'deno'), [
+        '#!/bin/sh',
+        'set -eu',
+        'printf \'malicious PATH deno executed\\n\' > "$MALICIOUS_DENO_CAPTURE"',
+        'exit 0',
+        '',
+      ].join('\n'), {mode: 0o700});
+
+      const completion = await new Promise<{
+        code: number | null;
+        signal: NodeJS.Signals | null;
+      }>((resolve, reject) => {
+        const child = spawn(wrapperExecutable, ['--version'], {
+          cwd: fixture.homeDirectory,
+          env: {
+            PATH: ['relative-bin', '/usr/bin', '/bin'].join(path.delimiter),
+            XDG_CACHE_HOME: fixture.paths.providerCacheDirectory,
+            [DENO_EXECUTABLE_ENVIRONMENT_KEY]: runtimeBinding === 'relative'
+              ? 'relative-deno'
+              : wrapperExecutable,
+            MALICIOUS_DENO_CAPTURE: maliciousCapturePath,
+          },
+          stdio: 'ignore',
+        });
+        child.once('error', reject);
+        child.once('exit', (code, signal) => resolve({code, signal}));
+      });
+
+      expect(completion.signal).toBeNull();
+      expect(completion.code).not.toBe(0);
+      expect(await exists(maliciousCapturePath)).toBe(false);
+    },
+  );
 
   it('uses a minimal staging-local environment for every installer subprocess', async () => {
     const sourcePath = [
@@ -706,6 +781,8 @@ describe('installDownloaderToolchain', () => {
       GIT_CONFIG_SYSTEM: '/private/system-gitconfig',
       GIT_TERMINAL_PROMPT: '1',
       GIT_SSH_COMMAND: '/private/host-ssh-command',
+      AUTO_CUT_VIDEO_DENO_EXECUTABLE: '/private/poisoned-system-deno',
+      auto_cut_video_deno_executable: 'relative-poisoned-deno',
       TOOLCHAIN_SAFE_ENV: 'private-unlisted-value',
     };
     const fixture = await createInstallerFixture();
@@ -756,6 +833,10 @@ describe('installDownloaderToolchain', () => {
       NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
       NPM_CONFIG_USERCONFIG: '/dev/null',
       NPM_CONFIG_GLOBALCONFIG: '/dev/null',
+    };
+    const validatedInstallerEnvironment = {
+      ...installerEnvironment,
+      [DENO_EXECUTABLE_ENVIRONMENT_KEY]: denoExecutable,
     };
     const providerInstallCalls = fixture.runProcess.mock.calls.filter(
       ([command, args, options]) => command === denoExecutable
@@ -839,6 +920,9 @@ describe('installDownloaderToolchain', () => {
     expect(providerProbe?.[0]).toBe(stagingDenoWrapperExecutable);
     expect(providerProbe?.[1]).toEqual(providerProbeArguments);
     expect(providerProbe?.[2]?.cwd).toBe(providerServerDirectory);
+    expect(providerProbe?.[2]?.env).toEqual({
+      ...validatedInstallerEnvironment,
+    });
 
     for (const call of fixture.runProcess.mock.calls) {
       const environment = call[2]?.env;
@@ -849,7 +933,8 @@ describe('installDownloaderToolchain', () => {
       expect(environment?.PATH?.split(path.delimiter).every((entry) =>
         path.isAbsolute(entry)
       )).toBe(true);
-      expect(environment).toEqual(installerEnvironment);
+      expect([installerEnvironment, validatedInstallerEnvironment])
+        .toContainEqual(environment);
       for (const [poisonedKey, poisonedValue] of Object.entries(
         poisonedEnvironment,
       )) {

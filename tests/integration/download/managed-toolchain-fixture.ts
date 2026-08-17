@@ -33,7 +33,10 @@ import {
   defaultDownloaderCapabilityDependencies,
   type DownloaderCapabilityDependencies,
 } from '../../../src/download/toolchain/capabilities';
-import {DENO_WRAPPER_SOURCE} from '../../../src/download/toolchain/deno-wrapper';
+import {
+  DENO_EXECUTABLE_ENVIRONMENT_KEY,
+  DENO_WRAPPER_SOURCE,
+} from '../../../src/download/toolchain/deno-wrapper';
 import {
   DOWNLOADER_TOOLCHAIN_MANIFEST,
   installedManifestForPinnedToolchain,
@@ -229,6 +232,7 @@ const fixtureChildEnvironment = (
   TMPDIR: layout.temporaryDirectory,
   DENO_DIR: layout.paths.denoDirectory,
   XDG_CACHE_HOME: layout.paths.providerCacheDirectory,
+  [DENO_EXECUTABLE_ENVIRONMENT_KEY]: layout.denoExecutable,
   DENO_NO_PROMPT: '1',
   DENO_NO_UPDATE_CHECK: '1',
   FORCE_COLOR: 'false',

@@ -15,6 +15,7 @@ import {downloadVideo} from '../../../src/download/downloader';
 import {parseDownloadProxy} from '../../../src/download/network-options';
 import {DownloadReceiptSchema} from '../../../src/download/receipt-schema';
 import type {DownloadPlatform} from '../../../src/download/platforms';
+import {DENO_EXECUTABLE_ENVIRONMENT_KEY} from '../../../src/download/toolchain/deno-wrapper';
 import {
   FAKE_YT_DLP_FIXTURE,
   FIXED_DOWNLOAD_TIME,
@@ -154,6 +155,10 @@ describe('managed multi-platform download integration', () => {
       TMPDIR: path.join(fixture.root, 'tmp'),
       DENO_DIR: fixture.paths.denoDirectory,
       XDG_CACHE_HOME: fixture.paths.providerCacheDirectory,
+      [DENO_EXECUTABLE_ENVIRONMENT_KEY]: path.join(
+        fixture.toolsDirectory,
+        'deno',
+      ),
       DENO_NO_PROMPT: '1',
       DENO_NO_UPDATE_CHECK: '1',
       FORCE_COLOR: 'false',
@@ -510,6 +515,10 @@ describe('managed multi-platform download integration', () => {
       TMPDIR: fixture.temporaryDirectory,
       DENO_DIR: fixture.paths.denoDirectory,
       XDG_CACHE_HOME: fixture.paths.providerCacheDirectory,
+      [DENO_EXECUTABLE_ENVIRONMENT_KEY]: path.join(
+        fixture.toolsDirectory,
+        'deno',
+      ),
       DENO_NO_PROMPT: '1',
       DENO_NO_UPDATE_CHECK: '1',
       FORCE_COLOR: 'false',

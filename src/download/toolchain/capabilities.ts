@@ -22,7 +22,10 @@ import {
   DOWNLOADER_TOOLCHAIN_MANIFEST,
   installedManifestForPinnedToolchain,
 } from './manifest';
-import {DENO_WRAPPER_SOURCE} from './deno-wrapper';
+import {
+  DENO_EXECUTABLE_ENVIRONMENT_KEY,
+  DENO_WRAPPER_SOURCE,
+} from './deno-wrapper';
 import type {
   DownloaderToolchainPaths,
   DownloaderToolchainSource,
@@ -56,6 +59,8 @@ const PROXY_ENVIRONMENT_KEYS = new Set([
   'all_proxy',
   'no_proxy',
 ]);
+const DENO_EXECUTABLE_ENVIRONMENT_KEY_NORMALIZED =
+  DENO_EXECUTABLE_ENVIRONMENT_KEY.toLowerCase();
 
 const invalidToolchain = (): DownloadError => new DownloadError(
   'DOWNLOAD_TOOLCHAIN_INVALID',
@@ -95,7 +100,7 @@ export const pluginEntriesMatch = (stdout: string): boolean => {
     && EXPECTED_PLUGIN_ENTRIES.every((entry) => actualEntries.has(entry));
 };
 
-export const buildDownloaderChildEnvironment = (
+const buildDownloaderBaseEnvironment = (
   paths: DownloaderToolchainPaths,
   source: Readonly<NodeJS.ProcessEnv> = process.env,
 ): Readonly<NodeJS.ProcessEnv> => {
@@ -103,7 +108,8 @@ export const buildDownloaderChildEnvironment = (
     Object.entries(source).filter(([key]) => {
       const normalizedKey = key.toLowerCase();
       return !PROXY_ENVIRONMENT_KEYS.has(normalizedKey)
-        && !normalizedKey.startsWith('npm_config_');
+        && !normalizedKey.startsWith('npm_config_')
+        && normalizedKey !== DENO_EXECUTABLE_ENVIRONMENT_KEY_NORMALIZED;
     }),
   );
   return Object.freeze({
@@ -116,6 +122,18 @@ export const buildDownloaderChildEnvironment = (
     DENO_NO_PROMPT: '1',
     DENO_NO_UPDATE_CHECK: '1',
     FORCE_COLOR: 'false',
+  });
+};
+
+export const buildDownloaderChildEnvironment = (
+  paths: DownloaderToolchainPaths,
+  systemDenoExecutable: string,
+  source: Readonly<NodeJS.ProcessEnv> = process.env,
+): Readonly<NodeJS.ProcessEnv> => {
+  if (!path.isAbsolute(systemDenoExecutable)) throw invalidToolchain();
+  return Object.freeze({
+    ...buildDownloaderBaseEnvironment(paths, source),
+    [DENO_EXECUTABLE_ENVIRONMENT_KEY]: systemDenoExecutable,
   });
 };
 
@@ -351,9 +369,13 @@ export const validateDownloaderCapabilities = async (
     signal,
   } = options;
   throwIfDownloadCancelled(signal);
-  const childEnvironment = buildDownloaderChildEnvironment(paths);
-  const processOptions: RunProcessOptions = {
-    env: childEnvironment,
+  const environmentSource = Object.freeze({...process.env});
+  const validationEnvironment = buildDownloaderBaseEnvironment(
+    paths,
+    environmentSource,
+  );
+  const validationProcessOptions: RunProcessOptions = {
+    env: validationEnvironment,
     ...(signal === undefined ? {} : {signal}),
   };
   const providerHead = path.join(paths.providerDirectory, '.git/HEAD');
@@ -398,12 +420,18 @@ export const validateDownloaderCapabilities = async (
     if (cancellation !== undefined) throw cancellation;
     throw invalidToolchain();
   }
+  if (
+    !path.isAbsolute(systemDenoExecutable)
+    || systemDenoExecutable === paths.denoWrapperExecutable
+  ) {
+    throw invalidToolchain();
+  }
 
   const versionResult = await runChecked(
     dependencies.runProcess,
     ytDlpExecutable,
     ['--version'],
-    processOptions,
+    validationProcessOptions,
   );
   const ytDlpVersion = versionResult.stdout.trim();
   const versionComparison = compareYtDlpVersions(
@@ -421,7 +449,7 @@ export const validateDownloaderCapabilities = async (
     dependencies.runProcess,
     ytDlpExecutable,
     ['--help'],
-    processOptions,
+    validationProcessOptions,
   );
   if (!HELP_MARKERS.every((marker) => helpResult.stdout.includes(marker))) {
     throw invalidToolchain();
@@ -431,9 +459,18 @@ export const validateDownloaderCapabilities = async (
     dependencies.runProcess,
     systemDenoExecutable,
     ['--version'],
-    processOptions,
+    validationProcessOptions,
   );
   if (parseDenoMajor(denoResult.stdout) < 2) throw invalidToolchain();
+  const childEnvironment = buildDownloaderChildEnvironment(
+    paths,
+    systemDenoExecutable,
+    environmentSource,
+  );
+  const processOptions: RunProcessOptions = {
+    env: childEnvironment,
+    ...(signal === undefined ? {} : {signal}),
+  };
 
   const pluginResult = await runChecked(
     dependencies.runProcess,

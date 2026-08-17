@@ -8,6 +8,7 @@ import path from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
 import {fileURLToPath} from 'node:url';
 import {afterEach, describe, expect, it, vi} from 'vitest';
+import {DENO_EXECUTABLE_ENVIRONMENT_KEY} from '../../../src/download/toolchain/deno-wrapper';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
 import {
   FAKE_YT_DLP_FIXTURE,
@@ -138,6 +139,10 @@ describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
         TMPDIR: fixture.temporaryDirectory,
         DENO_DIR: fixture.paths.denoDirectory,
         XDG_CACHE_HOME: fixture.paths.providerCacheDirectory,
+        [DENO_EXECUTABLE_ENVIRONMENT_KEY]: path.join(
+          fixture.toolsDirectory,
+          'deno',
+        ),
         DENO_NO_PROMPT: '1',
         DENO_NO_UPDATE_CHECK: '1',
         FORCE_COLOR: 'false',
@@ -185,6 +190,10 @@ describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
         TMPDIR: fixture.temporaryDirectory,
         DENO_DIR: fixture.paths.denoDirectory,
         XDG_CACHE_HOME: fixture.paths.providerCacheDirectory,
+        [DENO_EXECUTABLE_ENVIRONMENT_KEY]: path.join(
+          fixture.toolsDirectory,
+          'deno',
+        ),
         DENO_NO_PROMPT: '1',
         DENO_NO_UPDATE_CHECK: '1',
         FORCE_COLOR: 'false',
