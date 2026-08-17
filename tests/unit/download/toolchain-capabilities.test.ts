@@ -298,13 +298,19 @@ describe('downloader toolchain capability helpers', () => {
     expect(pluginEntriesMatch(output)).toBe(false);
   });
 
-  it('builds a frozen proxy-free child environment from a snapshot', () => {
+  it('builds a frozen proxy-free npm-isolated child environment from a snapshot', () => {
+    const privateMarker = 'private-npm-marker';
     const source: NodeJS.ProcessEnv = {
       PATH: '/usr/bin',
+      HOME: '/Users/downloader',
       HTTP_PROXY: 'http://private-marker',
       https_proxy: 'http://private-marker',
       All_Proxy: 'socks5://private-marker',
       no_PROXY: 'localhost',
+      NPM_CONFIG_REGISTRY: `https://${privateMarker}.example.test/`,
+      npm_config_userconfig: `/${privateMarker}/user-npmrc`,
+      NpM_CoNfIg_GlObAlCoNfIg: `/${privateMarker}/global-npmrc`,
+      npm_config_private_marker: privateMarker,
       PRESERVED: 'closed-value',
     };
 
@@ -313,7 +319,11 @@ describe('downloader toolchain capability helpers', () => {
 
     expect(environment).toMatchObject({
       PATH: '/usr/bin',
+      HOME: '/Users/downloader',
       PRESERVED: 'closed-value',
+      NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
+      NPM_CONFIG_USERCONFIG: '/dev/null',
+      NPM_CONFIG_GLOBALCONFIG: '/dev/null',
       DENO_DIR: paths.denoDirectory,
       XDG_CACHE_HOME: paths.providerCacheDirectory,
       DENO_NO_PROMPT: '1',
@@ -322,6 +332,14 @@ describe('downloader toolchain capability helpers', () => {
     });
     expect(Object.keys(environment).filter((key) => key.toLowerCase().includes('proxy')))
       .toEqual([]);
+    expect(Object.keys(environment).filter((key) =>
+      key.toLowerCase().startsWith('npm_config_')
+    ).sort()).toEqual([
+      'NPM_CONFIG_GLOBALCONFIG',
+      'NPM_CONFIG_REGISTRY',
+      'NPM_CONFIG_USERCONFIG',
+    ]);
+    expect(JSON.stringify(environment)).not.toContain(privateMarker);
     expect(Object.isFrozen(environment)).toBe(true);
   });
 
@@ -428,7 +446,7 @@ describe('validateDownloaderCapabilities', () => {
         'run',
         '--allow-env',
         `--allow-ffi=${path.join(paths.providerServerDirectory, 'node_modules')}`,
-        `--allow-read=${paths.providerServerDirectory},${path.join(paths.providerServerDirectory, 'node_modules')}`,
+        `--allow-read=${paths.providerServerDirectory},${path.join(paths.providerServerDirectory, 'node_modules')},${paths.providerCacheDirectory}`,
         `--allow-write=${paths.providerCacheDirectory}`,
         path.join(paths.providerServerDirectory, 'src/generate_once.ts'),
         '--version',

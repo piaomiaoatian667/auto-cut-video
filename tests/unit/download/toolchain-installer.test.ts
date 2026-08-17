@@ -650,9 +650,6 @@ describe('installDownloaderToolchain', () => {
       GIT_CONFIG_NOSYSTEM: '1',
       GIT_CONFIG_GLOBAL: '/dev/null',
       GIT_TERMINAL_PROMPT: '0',
-    };
-    const providerEnvironment = {
-      ...installerEnvironment,
       NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
       NPM_CONFIG_USERCONFIG: '/dev/null',
       NPM_CONFIG_GLOBALCONFIG: '/dev/null',
@@ -672,7 +669,7 @@ describe('installDownloaderToolchain', () => {
     expect(providerInstall?.[2]).toMatchObject({
       cwd: providerServerDirectory,
       signal: controller.signal,
-      env: providerEnvironment,
+      env: installerEnvironment,
     });
 
     const expectedGitCalls = [
@@ -723,7 +720,7 @@ describe('installDownloaderToolchain', () => {
       'run',
       '--allow-env',
       `--allow-ffi=${providerModulesDirectory}`,
-      `--allow-read=${providerServerDirectory},${providerModulesDirectory}`,
+      `--allow-read=${providerServerDirectory},${providerModulesDirectory},${providerCacheDirectory}`,
       `--allow-write=${providerCacheDirectory}`,
       path.join(providerServerDirectory, 'src/generate_once.ts'),
       '--version',
@@ -749,9 +746,7 @@ describe('installDownloaderToolchain', () => {
       expect(environment?.PATH?.split(path.delimiter).every((entry) =>
         path.isAbsolute(entry)
       )).toBe(true);
-      expect(environment).toEqual(
-        call === providerInstall ? providerEnvironment : installerEnvironment,
-      );
+      expect(environment).toEqual(installerEnvironment);
       for (const [poisonedKey, poisonedValue] of Object.entries(
         poisonedEnvironment,
       )) {

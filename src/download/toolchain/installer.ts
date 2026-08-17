@@ -133,18 +133,11 @@ const buildInstallerChildEnvironment = (
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: '/dev/null',
     GIT_TERMINAL_PROMPT: '0',
+    NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
+    NPM_CONFIG_USERCONFIG: '/dev/null',
+    NPM_CONFIG_GLOBALCONFIG: '/dev/null',
   });
 };
-
-const buildProviderDependencyEnvironment = (
-  paths: DownloaderToolchainPaths,
-  source: Readonly<NodeJS.ProcessEnv> = process.env,
-): Readonly<NodeJS.ProcessEnv> => Object.freeze({
-  ...buildInstallerChildEnvironment(paths, source),
-  NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
-  NPM_CONFIG_USERCONFIG: '/dev/null',
-  NPM_CONFIG_GLOBALCONFIG: '/dev/null',
-});
 
 const nodeErrorCode = (error: unknown): unknown => (
   typeof error === 'object'
@@ -653,7 +646,7 @@ const installProviderDependencies = async (
     '--frozen',
   ], {
     cwd: stagingPaths.providerServerDirectory,
-    env: buildProviderDependencyEnvironment(stagingPaths),
+    env: buildInstallerChildEnvironment(stagingPaths),
     ...(signal === undefined ? {} : {signal}),
   });
 };

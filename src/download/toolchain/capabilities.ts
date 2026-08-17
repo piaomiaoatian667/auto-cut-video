@@ -99,11 +99,17 @@ export const buildDownloaderChildEnvironment = (
   source: Readonly<NodeJS.ProcessEnv> = process.env,
 ): Readonly<NodeJS.ProcessEnv> => {
   const environment = Object.fromEntries(
-    Object.entries(source).filter(([key]) =>
-      !PROXY_ENVIRONMENT_KEYS.has(key.toLowerCase())),
+    Object.entries(source).filter(([key]) => {
+      const normalizedKey = key.toLowerCase();
+      return !PROXY_ENVIRONMENT_KEYS.has(normalizedKey)
+        && !normalizedKey.startsWith('npm_config_');
+    }),
   );
   return Object.freeze({
     ...environment,
+    NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
+    NPM_CONFIG_USERCONFIG: '/dev/null',
+    NPM_CONFIG_GLOBALCONFIG: '/dev/null',
     DENO_DIR: paths.denoDirectory,
     XDG_CACHE_HOME: paths.providerCacheDirectory,
     DENO_NO_PROMPT: '1',
@@ -428,7 +434,7 @@ export const validateDownloaderCapabilities = async (
     'run',
     '--allow-env',
     `--allow-ffi=${denoPathList(path.join(paths.providerServerDirectory, 'node_modules'))}`,
-    `--allow-read=${denoPathList(paths.providerServerDirectory, path.join(paths.providerServerDirectory, 'node_modules'))}`,
+    `--allow-read=${denoPathList(paths.providerServerDirectory, path.join(paths.providerServerDirectory, 'node_modules'), paths.providerCacheDirectory)}`,
     `--allow-write=${denoPathList(paths.providerCacheDirectory)}`,
     path.join(paths.providerServerDirectory, 'src/generate_once.ts'),
     '--version',
