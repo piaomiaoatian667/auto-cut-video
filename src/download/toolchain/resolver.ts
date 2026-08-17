@@ -1,4 +1,3 @@
-import path from 'node:path';
 import {
   downloadCancellationFrom,
   throwIfDownloadCancelled,
@@ -10,6 +9,7 @@ import {
   type DownloaderCapabilityDependencies,
 } from './capabilities';
 import {currentUidHomeDirectory} from './home';
+import {snapshotOverridePaths} from './override-paths';
 import {resolveDownloaderToolchainPaths} from './paths';
 import type {ResolvedDownloaderToolchain} from './types';
 
@@ -35,21 +35,10 @@ export const resolveDownloaderToolchain = async (
   dependencies: ResolveDownloaderToolchainDependencies =
     defaultDownloaderCapabilityDependencies,
 ): Promise<ResolvedDownloaderToolchain> => {
-  const relativeOverridePresent = (
-    options.ytDlpOverride !== undefined
-    && !path.isAbsolute(options.ytDlpOverride)
-  ) || (
-    options.ffmpegOverride !== undefined
-    && !path.isAbsolute(options.ffmpegOverride)
-  );
-  const resolverCwd = relativeOverridePresent ? process.cwd() : undefined;
-  const resolveOverride = (candidate: string | undefined): string | undefined => {
-    if (candidate === undefined || path.isAbsolute(candidate)) return candidate;
-    if (resolverCwd === undefined) throw invalidToolchain();
-    return path.resolve(resolverCwd, candidate);
-  };
-  const ytDlpOverride = resolveOverride(options.ytDlpOverride);
-  const ffmpegOverride = resolveOverride(options.ffmpegOverride);
+  const {ytDlpOverride, ffmpegOverride} = snapshotOverridePaths({
+    ytDlpOverride: options.ytDlpOverride,
+    ffmpegOverride: options.ffmpegOverride,
+  });
   throwIfDownloadCancelled(options.signal);
   if (process.platform !== 'darwin' || process.arch !== 'arm64') {
     throw invalidToolchain();

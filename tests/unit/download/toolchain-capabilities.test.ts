@@ -772,6 +772,53 @@ describe('validateDownloaderCapabilities', () => {
     );
   });
 
+  it('sanitizes cwd failures while resolving relative capability overrides', async () => {
+    const fixture = createCapabilityFixture();
+    const privateMarker = 'private deleted cwd /private/removed-capability-cwd';
+    const cwd = vi.spyOn(process, 'cwd').mockImplementation(() => {
+      throw Object.assign(new Error(privateMarker), {code: 'ENOENT'});
+    });
+
+    try {
+      await expectControlledError(
+        validateFixture(fixture, {
+          source: 'override',
+          ytDlpExecutable: 'relative-tools/yt-dlp',
+        }),
+        'DOWNLOAD_TOOLCHAIN_INVALID',
+        INVALID_TOOLCHAIN_MESSAGE,
+        [privateMarker, '/private/removed-capability-cwd'],
+      );
+      expect(fixture.lstat).not.toHaveBeenCalled();
+      expect(fixture.runProcess).not.toHaveBeenCalled();
+    } finally {
+      cwd.mockRestore();
+    }
+  });
+
+  it('preserves absolute capability inputs without reading cwd', async () => {
+    const fixture = createCapabilityFixture();
+    const ytDlpExecutable = '/private/overrides/linked-bin/../yt-dlp';
+    const ffmpegOverride = '/private/overrides/linked-ffmpeg/../ffmpeg';
+    const cwd = vi.spyOn(process, 'cwd').mockImplementation(() => {
+      throw new Error('private cwd failure');
+    });
+
+    try {
+      const resolved = await validateFixture(fixture, {
+        source: 'override',
+        ytDlpExecutable,
+        ffmpegOverride,
+      });
+
+      expect(cwd).not.toHaveBeenCalled();
+      expect(resolved.ytDlpExecutable).toBe(ytDlpExecutable);
+      expect(resolved.ffmpegExecutable).toBe(ffmpegOverride);
+    } finally {
+      cwd.mockRestore();
+    }
+  });
+
   it('sanitizes a missing canonicalized relative override path', async () => {
     const fixture = createCapabilityFixture();
     const capabilityCwd = '/private/canonical-cwd-marker';

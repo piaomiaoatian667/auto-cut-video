@@ -22,6 +22,7 @@ import {
   DOWNLOADER_TOOLCHAIN_MANIFEST,
   installedManifestForPinnedToolchain,
 } from './manifest';
+import {snapshotOverridePaths} from './override-paths';
 import {
   DENO_EXECUTABLE_ENVIRONMENT_KEY,
   DENO_WRAPPER_SOURCE,
@@ -373,21 +374,10 @@ export const validateDownloaderCapabilities = async (
   dependencies: DownloaderCapabilityDependencies =
     defaultDownloaderCapabilityDependencies,
 ): Promise<ResolvedDownloaderToolchain> => {
-  const relativeInputPresent = !path.isAbsolute(options.ytDlpExecutable)
-    || (
-      options.ffmpegOverride !== undefined
-      && !path.isAbsolute(options.ffmpegOverride)
-    );
-  const capabilityCwd = relativeInputPresent ? process.cwd() : undefined;
-  const canonicalizeExecutable = (candidate: string): string => {
-    if (path.isAbsolute(candidate)) return candidate;
-    if (capabilityCwd === undefined) throw invalidToolchain();
-    return path.resolve(capabilityCwd, candidate);
-  };
-  const ytDlpExecutable = canonicalizeExecutable(options.ytDlpExecutable);
-  const ffmpegOverride = options.ffmpegOverride === undefined
-    ? undefined
-    : canonicalizeExecutable(options.ffmpegOverride);
+  const {ytDlpExecutable, ffmpegOverride} = snapshotOverridePaths({
+    ytDlpExecutable: options.ytDlpExecutable,
+    ffmpegOverride: options.ffmpegOverride,
+  });
   const {
     source,
     validationMode,

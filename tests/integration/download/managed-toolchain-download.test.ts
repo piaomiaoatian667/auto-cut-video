@@ -204,11 +204,11 @@ describe('managed multi-platform download integration', () => {
         expectedValidationEnvironment,
         expectedChildEnvironment,
       ]).toContainEqual(subprocess.environment);
-      expect(Object.isFrozen(subprocess.environment)).toBe(true);
+      expect(subprocess.environmentWasFrozen).toBe(true);
     }
     for (const operation of fixture.operations) {
       expect(operation.environment).toEqual(expectedChildEnvironment);
-      expect(Object.isFrozen(operation.environment)).toBe(true);
+      expect(operation.environmentWasFrozen).toBe(true);
     }
     expect(expectedChildEnvironment.PATH.split(path.delimiter))
       .toContain('/usr/bin');

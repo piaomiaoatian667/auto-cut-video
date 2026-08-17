@@ -318,6 +318,30 @@ describe('resolveDownloaderToolchain', () => {
     }
   });
 
+  it('sanitizes cwd failures while resolving relative overrides', async () => {
+    const fixture = createResolverFixture();
+    const privateMarker = 'private deleted cwd /private/removed-workspace';
+    const cwd = vi.spyOn(process, 'cwd').mockImplementation(() => {
+      throw Object.assign(new Error(privateMarker), {code: 'ENOENT'});
+    });
+
+    try {
+      await expectResolverError(
+        resolveDownloaderToolchain({
+          ytDlpOverride: 'relative-tools/yt-dlp',
+          homeDirectory,
+        }, fixture.dependencies),
+        'DOWNLOAD_TOOLCHAIN_INVALID',
+        INVALID_TOOLCHAIN_MESSAGE,
+        [privateMarker, '/private/removed-workspace'],
+      );
+      expect(fixture.directoryExists).not.toHaveBeenCalled();
+      expect(fixture.runProcess).not.toHaveBeenCalled();
+    } finally {
+      cwd.mockRestore();
+    }
+  });
+
   it('snapshots cwd once for mixed absolute and relative overrides', async () => {
     const fixture = createResolverFixture();
     const resolverEntryCwd = '/private/resolver-entry-cwd';

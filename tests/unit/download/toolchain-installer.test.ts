@@ -614,6 +614,118 @@ describe('installDownloaderToolchain', () => {
       .toEqual(fixture.stagingDirectories.map(() => false));
   });
 
+  it('snapshots a relative FFmpeg override before the first setup await', async () => {
+    const fixture = await createInstallerFixture();
+    const setupEntryCwd = '/private/setup-entry-cwd';
+    const laterCwd = '/private/setup-later-cwd';
+    const ffmpegOverride = 'relative-tools/ffmpeg';
+    const expectedFfmpegOverride = path.resolve(setupEntryCwd, ffmpegOverride);
+    const laterFfmpegOverride = path.resolve(laterCwd, ffmpegOverride);
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(setupEntryCwd);
+    let firstLstat = true;
+    const lstat = vi.fn(async (candidate: string): Promise<Stats> => {
+      if (firstLstat) {
+        firstLstat = false;
+        await Promise.resolve();
+        cwd.mockReturnValue(laterCwd);
+      }
+      return await fixture.dependencies.lstat(candidate);
+    });
+    const capabilityRunProcess = vi.fn<DownloadProcessRunner>(
+      async (command, args, options) => {
+        if (args.length === 1 && args[0] === '-version') {
+          return resultFor(command, args, 'ffmpeg version 8.1.2\n');
+        }
+        return await fixture.dependencies.capabilities.runProcess(
+          command,
+          args,
+          options,
+        );
+      },
+    );
+    const dependencies = {
+      ...fixture.dependencies,
+      lstat: lstat as unknown as InstallerDependencies['lstat'],
+      capabilities: {
+        ...fixture.dependencies.capabilities,
+        runProcess: capabilityRunProcess,
+      },
+    };
+
+    try {
+      await expect(installDownloaderToolchain({
+        homeDirectory: fixture.homeDirectory,
+        ffmpegOverride,
+      }, dependencies)).resolves.toEqual({
+        status: 'installed',
+        version: '2026.07.04',
+      });
+
+      expect(cwd).toHaveBeenCalledTimes(1);
+      expect(cwd.mock.invocationCallOrder[0]).toBeLessThan(
+        lstat.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+      );
+      expect(capabilityRunProcess).toHaveBeenCalledWith(
+        expectedFfmpegOverride,
+        ['-version'],
+        expect.objectContaining({env: expect.any(Object)}),
+      );
+      expect(capabilityRunProcess).not.toHaveBeenCalledWith(
+        laterFfmpegOverride,
+        ['-version'],
+        expect.anything(),
+      );
+    } finally {
+      cwd.mockRestore();
+    }
+  });
+
+  it('preserves an absolute FFmpeg override without reading cwd', async () => {
+    const fixture = await createInstallerFixture();
+    const ffmpegOverride = '/private/overrides/linked-bin/../ffmpeg';
+    const cwd = vi.spyOn(process, 'cwd').mockImplementation(() => {
+      throw new Error('private cwd failure');
+    });
+    const capabilityRunProcess = vi.fn<DownloadProcessRunner>(
+      async (command, args, options) => {
+        if (command === ffmpegOverride && args[0] === '-version') {
+          return resultFor(command, args, 'ffmpeg version 8.1.2\n');
+        }
+        return await fixture.dependencies.capabilities.runProcess(
+          command,
+          args,
+          options,
+        );
+      },
+    );
+    const dependencies = {
+      ...fixture.dependencies,
+      capabilities: {
+        ...fixture.dependencies.capabilities,
+        runProcess: capabilityRunProcess,
+      },
+    };
+
+    try {
+      await expect(installDownloaderToolchain({
+        homeDirectory: fixture.homeDirectory,
+        ffmpegOverride,
+      }, dependencies)).resolves.toEqual({
+        status: 'installed',
+        version: '2026.07.04',
+      });
+
+      expect(cwd).not.toHaveBeenCalled();
+      expect(capabilityRunProcess).toHaveBeenCalledWith(
+        ffmpegOverride,
+        ['-version'],
+        expect.objectContaining({env: expect.any(Object)}),
+      );
+    } finally {
+      cwd.mockRestore();
+    }
+  });
+
   it('uses an injected UID home for the default managed install path', async () => {
     const fixture = await createInstallerFixture();
     const poisonedHome = await makeTemporaryDirectory(

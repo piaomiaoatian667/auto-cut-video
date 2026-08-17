@@ -35,6 +35,7 @@ import {
 } from './deno-wrapper';
 import {buildToolchainExecutablePath} from './environment';
 import {currentUidHomeDirectory} from './home';
+import {snapshotOverridePaths} from './override-paths';
 import {resolveDownloaderToolchainPaths} from './paths';
 import type {
   DownloaderToolchainPaths,
@@ -800,6 +801,9 @@ const installDownloaderToolchainTransaction = async (
   options: InstallDownloaderToolchainOptions,
   dependencies: InstallerDependencies,
 ): Promise<SetupDownloaderResult> => {
+  const {ffmpegOverride} = snapshotOverridePaths({
+    ffmpegOverride: options.ffmpegOverride,
+  });
   const homeDirectory = options.homeDirectory
     ?? (dependencies.uidHomeDirectory ?? currentUidHomeDirectory)();
   const canonicalHome = path.resolve(homeDirectory);
@@ -863,7 +867,7 @@ const installDownloaderToolchainTransaction = async (
     await validateStagedToolchain(
       stagingPaths,
       denoExecutable,
-      options.ffmpegOverride,
+      ffmpegOverride,
       dependencies,
       options.signal,
     );

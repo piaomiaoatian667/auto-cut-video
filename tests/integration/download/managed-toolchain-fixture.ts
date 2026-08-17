@@ -99,6 +99,7 @@ export interface RecordedYtDlpOperation {
   phase: 'probe' | 'download';
   args: string[];
   environment: Readonly<NodeJS.ProcessEnv> | undefined;
+  environmentWasFrozen: boolean;
   extraStdioFds: readonly number[] | undefined;
 }
 
@@ -106,6 +107,7 @@ export interface RecordedFixtureSubprocess {
   command: string;
   args: string[];
   environment: Readonly<NodeJS.ProcessEnv>;
+  environmentWasFrozen: boolean;
 }
 
 export interface DigestRecord {
@@ -393,13 +395,16 @@ export const createManagedDownloadRuntime = (
     args,
     runOptions = {},
   ) => {
-    const environment = Object.freeze({...runOptions.env});
+    const environmentWasFrozen = runOptions.env !== undefined
+      && Object.isFrozen(runOptions.env);
+    const environment = {...runOptions.env};
     const operation = operationForInvocation(command, args);
     if (operation !== undefined) {
       operations.push({
         phase: operation.phase,
         args: operation.args,
         environment,
+        environmentWasFrozen,
         extraStdioFds: runOptions.extraStdioFds === undefined
           ? undefined
           : [...runOptions.extraStdioFds],
@@ -409,6 +414,7 @@ export const createManagedDownloadRuntime = (
       command,
       args: [...args],
       environment,
+      environmentWasFrozen,
     });
     try {
       return await runSystemProcess(command, args, runOptions);
