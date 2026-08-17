@@ -31,6 +31,10 @@ const fixture = (
     preflight: vi.fn(async () => { throw new Error('unused'); }),
     download: vi.fn(async () => { throw new Error('unused'); }),
     setupDownloader,
+    resolveDownloaderToolchain: vi.fn(async () => {
+      throw new Error('unused');
+    }),
+    checkDownloader: vi.fn(async () => { throw new Error('unused'); }),
     ...(signal === undefined ? {} : {signal}),
   };
   return {

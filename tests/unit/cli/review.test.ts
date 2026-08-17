@@ -85,6 +85,10 @@ const makeFixture = async () => {
     preflight: vi.fn(async () => { throw new Error('unused'); }),
     download: vi.fn(async () => { throw new Error('unused'); }),
     setupDownloader: vi.fn(async () => { throw new Error('unused'); }),
+    resolveDownloaderToolchain: vi.fn(async () => {
+      throw new Error('unused');
+    }),
+    checkDownloader: vi.fn(async () => { throw new Error('unused'); }),
   };
   return {workspaceRoot, runId, dependencies, stdout: () => stdout, stderr: () => stderr};
 };

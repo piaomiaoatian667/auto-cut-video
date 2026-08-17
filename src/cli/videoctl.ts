@@ -62,7 +62,7 @@ export interface OutputWriter {
   write(chunk: string): unknown;
 }
 
-export interface CoreVideoctlDependencies {
+export interface VideoctlDependencies {
   workspaceRoot: string;
   stdout: OutputWriter;
   stderr: OutputWriter;
@@ -71,13 +71,6 @@ export interface CoreVideoctlDependencies {
   preflight(input: PreflightInput): Promise<PreflightResult>;
   download(input: DownloadInput): Promise<DownloadResult>;
   setupDownloader(signal?: AbortSignal): Promise<SetupDownloaderResult>;
-  signal?: AbortSignal;
-  downloadSignal?: AbortSignal;
-  ffmpegExecutable?: string;
-  ffprobeExecutable?: string;
-}
-
-export interface DoctorDownloaderVideoctlDependencies {
   resolveDownloaderToolchain(
     signal?: AbortSignal,
   ): Promise<ResolvedDownloaderToolchain>;
@@ -85,23 +78,11 @@ export interface DoctorDownloaderVideoctlDependencies {
     input: DownloadCheckInput,
     resolveToolchain: () => Promise<ResolvedDownloaderToolchain>,
   ): Promise<DownloadCheckResult>;
+  signal?: AbortSignal;
+  downloadSignal?: AbortSignal;
+  ffmpegExecutable?: string;
+  ffprobeExecutable?: string;
 }
-
-type DoctorDownloaderArgv = readonly [
-  'doctor-downloader',
-  ...string[],
-];
-
-export type VideoctlDependencies<
-  Argv extends readonly string[] = readonly string[],
-> = CoreVideoctlDependencies & (
-  Argv extends DoctorDownloaderArgv
-    ? DoctorDownloaderVideoctlDependencies
-    : object
-);
-
-export type SystemVideoctlDependencies = CoreVideoctlDependencies
-  & DoctorDownloaderVideoctlDependencies;
 
 interface DoctorOptions {
   json?: boolean;
@@ -586,9 +567,9 @@ const runDoctor = async (
   }
 };
 
-export async function runVideoctl<const Argv extends readonly string[]>(
-  argv: Argv,
-  dependencies: VideoctlDependencies<Argv>,
+export async function runVideoctl(
+  argv: readonly string[],
+  dependencies: VideoctlDependencies,
 ): Promise<number> {
   let exitCode: number = EXIT_CODES.success;
   const downloadRequested = targetsDownload(argv);
@@ -597,8 +578,6 @@ export async function runVideoctl<const Argv extends readonly string[]>(
   const setupDownloaderJsonRequested = requestsSetupDownloaderJson(argv);
   const doctorDownloaderRequested = targetsDoctorDownloader(argv);
   const doctorDownloaderJsonRequested = requestsDoctorDownloaderJson(argv);
-  const doctorDependencies = dependencies as CoreVideoctlDependencies
-    & DoctorDownloaderVideoctlDependencies;
   const command = new Command();
   command
     .name('videoctl')
@@ -657,9 +636,9 @@ export async function runVideoctl<const Argv extends readonly string[]>(
         stdout: dependencies.stdout,
         stderr: dependencies.stderr,
         resolveToolchain: (signal) =>
-          doctorDependencies.resolveDownloaderToolchain(signal),
+          dependencies.resolveDownloaderToolchain(signal),
         check: (input, resolveToolchain) =>
-          doctorDependencies.checkDownloader(input, resolveToolchain),
+          dependencies.checkDownloader(input, resolveToolchain),
         ...(dependencies.signal === undefined
           ? {}
           : {signal: dependencies.signal}),
@@ -809,7 +788,7 @@ export const createSystemSourceMeterDependencies = (
 
 export const createSystemVideoctlDependencies = (
   options: SystemVideoctlOptions = {},
-): SystemVideoctlDependencies => {
+): VideoctlDependencies => {
   const preflightDependencies = createSystemPreflightDependencies();
   const sourceMeter = options.sourceMeter
     ?? createSystemSourceMeterDependencies();

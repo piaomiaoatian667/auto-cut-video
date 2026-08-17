@@ -99,7 +99,7 @@ const videoctlFixture = () => {
   const run = commandFixture();
   const download = vi.fn(async () => { throw new Error('unused download'); });
   const setupDownloader = vi.fn(async () => { throw new Error('unused setup'); });
-  const dependencies = {
+  const dependencies: VideoctlDependencies = {
     workspaceRoot: '/workspace',
     stdout: run.dependencies.stdout,
     stderr: run.dependencies.stderr,
@@ -110,7 +110,7 @@ const videoctlFixture = () => {
     setupDownloader,
     resolveDownloaderToolchain: run.resolveToolchain,
     checkDownloader: run.check,
-  } as VideoctlDependencies<readonly ['doctor-downloader', ...string[]]>;
+  };
   return {...run, dependencies, download, setupDownloader};
 };
 

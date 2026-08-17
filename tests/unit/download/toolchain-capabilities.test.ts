@@ -1,6 +1,6 @@
 import type {Stats} from 'node:fs';
 import path from 'node:path';
-import {describe, expect, it, vi} from 'vitest';
+import {afterEach, describe, expect, it, vi} from 'vitest';
 import {
   buildDownloaderChildEnvironment,
   compareYtDlpVersions,
@@ -227,6 +227,10 @@ const validateFixture = (
   ...options,
 }, fixture.dependencies);
 
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 const expectControlledError = async (
   pending: Promise<unknown>,
   code: DownloadErrorCode,
@@ -342,6 +346,10 @@ describe('downloader toolchain capability helpers', () => {
 
 describe('validateDownloaderCapabilities', () => {
   it('validates the exact managed toolchain and local command contract', async () => {
+    vi.stubEnv('HTTP_PROXY', 'http://uppercase-proxy.invalid');
+    vi.stubEnv('Https_Proxy', 'https://mixed-proxy.invalid');
+    vi.stubEnv('ALL_PROXY', 'socks5://uppercase-proxy.invalid');
+    vi.stubEnv('no_PROXY', 'mixed-proxy.invalid');
     const fixture = createCapabilityFixture();
 
     const resolved = await validateFixture(fixture);
@@ -370,10 +378,14 @@ describe('validateDownloaderCapabilities', () => {
     expect(Object.isFrozen(resolved.childEnvironment)).toBe(true);
     expect(fixture.resolveExecutable.mock.calls).toEqual([['deno'], ['ffmpeg']]);
     expect(fixture.runProcess.mock.calls.slice(0, 4)).toEqual([
-      [paths.ytDlpExecutable, ['--version'], {}],
-      [paths.ytDlpExecutable, ['--help'], {}],
-      [denoExecutable, ['--version'], {}],
-      ['/usr/bin/unzip', ['-Z1', paths.pluginArchive], {}],
+      [paths.ytDlpExecutable, ['--version'], {env: resolved.childEnvironment}],
+      [paths.ytDlpExecutable, ['--help'], {env: resolved.childEnvironment}],
+      [denoExecutable, ['--version'], {env: resolved.childEnvironment}],
+      [
+        '/usr/bin/unzip',
+        ['-Z1', paths.pluginArchive],
+        {env: resolved.childEnvironment},
+      ],
     ]);
     const providerCall = fixture.runProcess.mock.calls[4];
     expect(providerCall).toEqual([
@@ -393,9 +405,43 @@ describe('validateDownloaderCapabilities', () => {
       },
     ]);
     expect(fixture.runProcess.mock.calls.slice(5)).toEqual([
-      [paths.ytDlpExecutable, ['--list-impersonate-targets'], {}],
-      [ffmpegExecutable, ['-version'], {}],
+      [
+        paths.ytDlpExecutable,
+        ['--list-impersonate-targets'],
+        {env: resolved.childEnvironment},
+      ],
+      [ffmpegExecutable, ['-version'], {env: resolved.childEnvironment}],
     ]);
+    for (const [, , processOptions] of fixture.runProcess.mock.calls) {
+      expect(processOptions?.env).toBe(resolved.childEnvironment);
+      expect(Object.keys(processOptions?.env ?? {}).filter((key) =>
+        ['http_proxy', 'https_proxy', 'all_proxy', 'no_proxy']
+          .includes(key.toLowerCase())))
+        .toEqual([]);
+    }
+  });
+
+  it('forwards one signal with the proxy-free environment to every process', async () => {
+    vi.stubEnv('http_PROXY', 'http://mixed-proxy.invalid');
+    vi.stubEnv('HTTPS_PROXY', 'https://uppercase-proxy.invalid');
+    vi.stubEnv('All_Proxy', 'socks5://mixed-proxy.invalid');
+    vi.stubEnv('NO_PROXY', 'uppercase-proxy.invalid');
+    const fixture = createCapabilityFixture();
+    const controller = new AbortController();
+
+    const resolved = await validateFixture(fixture, {signal: controller.signal});
+
+    expect(fixture.runProcess).toHaveBeenCalledTimes(7);
+    for (const [, , processOptions] of fixture.runProcess.mock.calls) {
+      expect(processOptions).toMatchObject({
+        env: resolved.childEnvironment,
+        signal: controller.signal,
+      });
+      expect(Object.keys(processOptions?.env ?? {}).filter((key) =>
+        ['http_proxy', 'https_proxy', 'all_proxy', 'no_proxy']
+          .includes(key.toLowerCase())))
+        .toEqual([]);
+    }
   });
 
   it('selects the highest checked-in Chrome-on-macOS preference', async () => {

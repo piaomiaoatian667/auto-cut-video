@@ -302,8 +302,11 @@ export const validateDownloaderCapabilities = async (
     paths,
     signal,
   } = options;
-  const processOptions: RunProcessOptions = signal === undefined ? {} : {signal};
   const childEnvironment = buildDownloaderChildEnvironment(paths);
+  const processOptions: RunProcessOptions = {
+    env: childEnvironment,
+    ...(signal === undefined ? {} : {signal}),
+  };
   const providerHead = path.join(paths.providerDirectory, '.git/HEAD');
 
   await requireOwnedRegularFile(
@@ -411,7 +414,6 @@ export const validateDownloaderCapabilities = async (
   ], {
     ...processOptions,
     cwd: paths.providerServerDirectory,
-    env: childEnvironment,
   });
 
   let targetsResult: ProcessResult;
