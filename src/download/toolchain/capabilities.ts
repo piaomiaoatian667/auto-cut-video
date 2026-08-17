@@ -61,6 +61,13 @@ const DOWNLOADER_PATH_FALLBACK = [
 ].join(path.delimiter);
 const PASSTHROUGH_ENVIRONMENT_KEYS = new Set([
   'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+  'LC_COLLATE',
+  'LC_MESSAGES',
+  'LC_MONETARY',
+  'LC_NUMERIC',
+  'LC_TIME',
   'USER',
   'LOGNAME',
   '__CF_USER_TEXT_ENCODING',
@@ -132,7 +139,7 @@ const buildDownloaderBaseEnvironment = (
   for (const [key, value] of Object.entries(source)) {
     if (
       value !== undefined
-      && (PASSTHROUGH_ENVIRONMENT_KEYS.has(key) || key.startsWith('LC_'))
+      && PASSTHROUGH_ENVIRONMENT_KEYS.has(key)
     ) {
       environment[key] = value;
     }

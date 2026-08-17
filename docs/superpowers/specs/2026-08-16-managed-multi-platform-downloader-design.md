@@ -291,12 +291,14 @@ Chrome and Keychain context without selecting or exposing a profile path.
 
 The allowlist contains only deduplicated absolute `PATH` entries (or
 `/usr/bin:/bin:/usr/sbin:/sbin` when none are usable), an absolute `TMPDIR` when
-present, `LANG`, `LC_*`, `USER`, `LOGNAME`, the macOS text-encoding and security
-session identifiers when present, and the fixed Deno, XDG, npm, internal Deno
-binding, and `FORCE_COLOR=false` values required by the managed toolchain.
-Proxy variables in any casing, credentials and tokens, SSH agent sockets,
-Node/Deno runtime injection variables, dynamic-loader variables, and all other
-unlisted host values are excluded.
+present, `LANG`, the fixed locale keys `LC_ALL`, `LC_CTYPE`, `LC_COLLATE`,
+`LC_MESSAGES`, `LC_MONETARY`, `LC_NUMERIC`, and `LC_TIME`, `USER`, `LOGNAME`,
+the macOS text-encoding and security session identifiers when present, and the
+fixed Deno, XDG, npm, internal Deno binding, and `FORCE_COLOR=false` values
+required by the managed toolchain. Proxy variables in any casing, credentials
+and tokens, SSH agent sockets, Node/Deno runtime injection variables,
+dynamic-loader variables, custom locale-shaped keys, and all other unlisted
+host values are excluded.
 
 ## 8. CLI Contract
 

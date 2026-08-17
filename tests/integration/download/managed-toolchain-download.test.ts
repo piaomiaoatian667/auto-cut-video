@@ -144,6 +144,8 @@ describe('managed multi-platform download integration', () => {
     vi.stubEnv('LC_ALL', 'C');
     vi.stubEnv('LC_CTYPE', 'C.UTF-8');
     vi.stubEnv('LC_MESSAGES', 'en_US.UTF-8');
+    vi.stubEnv('LC_MODEL_TOKEN', 'locale-model-private-marker');
+    vi.stubEnv('LC_SECRET', 'locale-secret-private-marker');
     vi.stubEnv('USER', 'fixture-user');
     vi.stubEnv('LOGNAME', 'fixture-logname');
     vi.stubEnv('__CF_USER_TEXT_ENCODING', '0x1F5:0x0:0x0');
@@ -223,11 +225,15 @@ describe('managed multi-platform download integration', () => {
       'OPENAI_API_KEY',
       'ANTHROPIC_API_KEY',
       'CUSTOM_RUNTIME_MARKER',
+      'LC_MODEL_TOKEN',
+      'LC_SECRET',
       'credential-marker',
       'ssh-agent-marker',
       'openai-credential-marker',
       'anthropic-credential-marker',
       'custom-runtime-marker',
+      'locale-model-private-marker',
+      'locale-secret-private-marker',
       '/host/home-marker',
       'relative-path-marker',
       'host-proxy.invalid',
