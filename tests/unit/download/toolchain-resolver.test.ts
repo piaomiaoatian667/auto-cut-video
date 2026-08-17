@@ -57,6 +57,7 @@ interface ResolverFixture {
 
 const regularFileStats = (): Stats => ({
   uid: currentUid,
+  mode: 0o700,
   isFile: () => true,
   isSymbolicLink: () => false,
 }) as Stats;

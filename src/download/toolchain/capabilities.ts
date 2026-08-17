@@ -196,7 +196,7 @@ const requireOwnedRegularFile = async (
   candidate: string,
   dependencies: DownloaderCapabilityDependencies,
   failure: () => DownloadError,
-): Promise<void> => {
+): Promise<Stats> => {
   try {
     const stats = await dependencies.lstat(candidate);
     if (
@@ -206,6 +206,7 @@ const requireOwnedRegularFile = async (
     ) {
       throw failure();
     }
+    return stats;
   } catch (error) {
     const cancellation = downloadCancellationFrom(error);
     if (cancellation !== undefined) throw cancellation;
@@ -236,11 +237,12 @@ const requireManagedDenoWrapper = async (
   paths: DownloaderToolchainPaths,
   dependencies: DownloaderCapabilityDependencies,
 ): Promise<void> => {
-  await requireOwnedRegularFile(
+  const stats = await requireOwnedRegularFile(
     paths.denoWrapperExecutable,
     dependencies,
     invalidToolchain,
   );
+  if ((stats.mode & 0o777) !== 0o700) throw invalidToolchain();
   try {
     if (
       await dependencies.readFile(paths.denoWrapperExecutable, 'utf8')

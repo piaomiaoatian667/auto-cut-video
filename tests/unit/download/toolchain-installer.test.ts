@@ -912,6 +912,27 @@ describe('installDownloaderToolchain', () => {
     );
   });
 
+  it.each([
+    ['0600', 0o600],
+    ['0777', 0o777],
+  ] as const)('reinstalls when the published Deno wrapper mode drifts to %s', async (
+    _caseName,
+    mode,
+  ) => {
+    const fixture = await createInstallerFixture();
+    await seedValidPublishedToolchain(fixture.paths);
+    const denoWrapperExecutable = denoWrapperExecutableFor(fixture.paths);
+    await chmodFile(denoWrapperExecutable, mode);
+
+    await expect(installDownloaderToolchain(
+      {homeDirectory: fixture.homeDirectory},
+      fixture.dependencies,
+    )).resolves.toEqual({status: 'installed', version: '2026.07.04'});
+
+    expect(fixture.fetch).toHaveBeenCalledTimes(2);
+    expect((await lstatFile(denoWrapperExecutable)).mode & 0o777).toBe(0o700);
+  });
+
   it('rejects a redirect to a non-allowlisted host without following it', async () => {
     const fixture = await createInstallerFixture();
     const privateRedirect = 'https://private.example.test/asset';

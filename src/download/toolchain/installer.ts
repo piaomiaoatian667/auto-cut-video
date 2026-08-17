@@ -388,6 +388,7 @@ const validatePublishedToolchainIntegrity = async (
     !isOwnedDirectory(root, uid)
     || !isOwnedRegularFile(downloader, uid)
     || !isOwnedRegularFile(denoWrapper, uid)
+    || (denoWrapper.mode & 0o777) !== 0o700
     || !isOwnedRegularFile(plugin, uid)
     || !isOwnedRegularFile(providerHeadStats, uid)
     || !isOwnedRegularFile(providerScriptStats, uid)

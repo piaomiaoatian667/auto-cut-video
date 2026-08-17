@@ -100,14 +100,17 @@ interface CapabilityFixture {
 const regularFileStats = (
   uid = currentUid,
   symbolicLink = false,
+  mode = 0o700,
 ): Stats => ({
   uid,
+  mode,
   isFile: () => !symbolicLink,
   isSymbolicLink: () => symbolicLink,
 }) as Stats;
 
 const nonRegularStats = (): Stats => ({
   uid: currentUid,
+  mode: 0o700,
   isFile: () => false,
   isSymbolicLink: () => false,
 }) as Stats;
@@ -656,6 +659,27 @@ describe('validateDownloaderCapabilities', () => {
   ])('rejects a managed Deno wrapper with %s', async (_caseName, wrapperStats) => {
     const fixture = createCapabilityFixture();
     fixture.stats.set(denoWrapperExecutable, wrapperStats);
+
+    await expectControlledError(
+      validateFixture(fixture),
+      'DOWNLOAD_TOOLCHAIN_INVALID',
+      INVALID_TOOLCHAIN_MESSAGE,
+      [denoWrapperExecutable],
+    );
+  });
+
+  it.each([
+    ['0600', 0o600],
+    ['0777', 0o777],
+  ] as const)('rejects a managed Deno wrapper with mode %s', async (
+    _caseName,
+    mode,
+  ) => {
+    const fixture = createCapabilityFixture();
+    fixture.stats.set(
+      denoWrapperExecutable,
+      regularFileStats(currentUid, false, mode),
+    );
 
     await expectControlledError(
       validateFixture(fixture),
