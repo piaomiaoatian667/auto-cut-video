@@ -87,6 +87,7 @@ const fixture = (result: PreflightResult = successfulResult()) => {
     measureSourceBytes: vi.fn(async () => 1024),
     preflight: vi.fn(async () => result),
     download: vi.fn(async () => { throw new Error('unused'); }),
+    setupDownloader: vi.fn(async () => { throw new Error('unused'); }),
     ffmpegExecutable: '/configured/ffmpeg',
     ffprobeExecutable: '/configured/ffprobe',
   };

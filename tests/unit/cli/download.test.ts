@@ -55,6 +55,7 @@ const fixture = (
     measureSourceBytes: vi.fn(async () => { throw new Error('unused'); }),
     preflight: vi.fn(async () => { throw new Error('unused'); }),
     download,
+    setupDownloader: vi.fn(async () => { throw new Error('unused'); }),
   };
   return {
     dependencies,

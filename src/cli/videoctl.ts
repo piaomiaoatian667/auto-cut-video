@@ -60,7 +60,7 @@ export interface VideoctlDependencies {
   measureSourceBytes(project: ProjectInputs): Promise<number>;
   preflight(input: PreflightInput): Promise<PreflightResult>;
   download(input: DownloadInput): Promise<DownloadResult>;
-  setupDownloader?(signal?: AbortSignal): Promise<SetupDownloaderResult>;
+  setupDownloader(signal?: AbortSignal): Promise<SetupDownloaderResult>;
   signal?: AbortSignal;
   downloadSignal?: AbortSignal;
   ffmpegExecutable?: string;
@@ -567,12 +567,7 @@ export async function runVideoctl(
       exitCode = await runSetupDownloaderCommand(options, {
         stdout: dependencies.stdout,
         stderr: dependencies.stderr,
-        install: async (signal) => {
-          if (dependencies.setupDownloader === undefined) {
-            throw new Error('The setup downloader dependency is unavailable.');
-          }
-          return await dependencies.setupDownloader(signal);
-        },
+        install: async (signal) => await dependencies.setupDownloader(signal),
         ...(dependencies.signal === undefined
           ? {}
           : {signal: dependencies.signal}),

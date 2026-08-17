@@ -11,11 +11,6 @@ type SetupDownloaderImplementation = (
   signal?: AbortSignal,
 ) => Promise<SetupDownloaderResult>;
 
-interface SetupVideoctlDependencies extends VideoctlDependencies {
-  signal?: AbortSignal;
-  setupDownloader(signal?: AbortSignal): Promise<SetupDownloaderResult>;
-}
-
 const result = (
   status: SetupDownloaderResult['status'] = 'installed',
 ): SetupDownloaderResult => ({status, version: '2026.07.04'});
@@ -27,7 +22,7 @@ const fixture = (
   let stdout = '';
   let stderr = '';
   const setupDownloader = vi.fn(implementation);
-  const dependencies: SetupVideoctlDependencies = {
+  const dependencies: VideoctlDependencies = {
     workspaceRoot: '/workspace',
     stdout: {write: (chunk) => { stdout += chunk; }},
     stderr: {write: (chunk) => { stderr += chunk; }},
