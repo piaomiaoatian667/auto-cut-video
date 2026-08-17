@@ -1,9 +1,12 @@
 import {describe, expect, it, vi} from 'vitest';
+import {formatDownloadFailure} from '../../../src/cli/download-output';
 import {
   type DownloadError,
   type DownloadErrorCode,
   isDownloadError,
 } from '../../../src/download/errors';
+import {resolvePlatformProfile} from '../../../src/download/platform-profiles';
+import type {ResolvedDownloaderToolchain} from '../../../src/download/toolchain/types';
 import {
   createYtDlpClient,
   parseYtDlpInfo,
@@ -12,39 +15,128 @@ import {
   YtDlpInfoSchema,
   type YtDlpOperationOptions,
 } from '../../../src/download/yt-dlp';
+import {ProcessExecutionError} from '../../../src/process/process-error';
 import type {ProcessResult} from '../../../src/process/run-process';
 
-const TOOL_MISSING_MESSAGE = 'Required download tools are unavailable.';
 const PROBE_FAILED_MESSAGE = 'Video metadata could not be extracted.';
 const PROCESS_FAILED_MESSAGE = 'The video could not be downloaded.';
-const forbiddenConnectionArguments = [
-  '--geo-bypass',
-  '--geo-verification-proxy',
-  '--source-address',
-  '--xff',
+const CLASSIFIED_FAILURES = [
+  [
+    'HTTP Error 429: Too Many Requests',
+    'DOWNLOAD_RATE_LIMITED',
+    'The video platform temporarily rate-limited this session.',
+  ],
+  [
+    'Sign in to confirm you are not a bot',
+    'DOWNLOAD_RATE_LIMITED',
+    'The video platform temporarily rate-limited this session.',
+  ],
+  [
+    'HTTP Error 412: Precondition Failed',
+    'DOWNLOAD_PLATFORM_CHALLENGE',
+    'The video platform rejected the selected public-session request.',
+  ],
+  [
+    'Connection timed out',
+    'DOWNLOAD_NETWORK_UNREACHABLE',
+    'The video platform could not be reached with the selected network settings.',
+  ],
+  [
+    'Impersonate target is unavailable',
+    'DOWNLOAD_IMPERSONATION_UNAVAILABLE',
+    'The required browser compatibility capability is unavailable.',
+  ],
+  [
+    'bgutil script provider unavailable',
+    'DOWNLOAD_PO_TOKEN_UNAVAILABLE',
+    'The YouTube compatibility provider is unavailable.',
+  ],
 ] as const;
-const credentialArgument = /^--(?:(?:.*(?:auth|cookie|netrc|password|username).*)|ap-mso|twofactor|client-certificate(?:-key|-password)?)$/iu;
-const recodeOrRemuxArgument = /^--(?:recode|remux)(?:-|$)/iu;
 
-type SupportedYtDlpClientOption =
-  | 'runProcess'
-  | 'ytDlpExecutable'
-  | 'ffmpegExecutable';
+type SupportedYtDlpClientOption = 'toolchain' | 'runProcess';
 type UnexpectedYtDlpClientOption = Exclude<
   keyof YtDlpClientOptions,
   SupportedYtDlpClientOption
 >;
-const hasNoUserControlledPassthrough:
+const hasOnlyFixedClientOptions:
   [UnexpectedYtDlpClientOption] extends [never] ? true : false = true;
 
-const processResult = (stdout = ''): ProcessResult => ({
-  command: 'tool',
+type SupportedYtDlpOperationOption = 'profile' | 'signal';
+type UnexpectedYtDlpOperationOption = Exclude<
+  keyof YtDlpOperationOptions,
+  SupportedYtDlpOperationOption
+>;
+const hasOnlyFixedOperationOptions:
+  [UnexpectedYtDlpOperationOption] extends [never] ? true : false = true;
+
+const createToolchain = (
+  overrides: Partial<ResolvedDownloaderToolchain> = {},
+): ResolvedDownloaderToolchain => ({
+  source: 'managed',
+  ytDlpExecutable: '/managed/bin/yt-dlp',
+  ffmpegExecutable: '/usr/local/bin/ffmpeg',
+  denoExecutable: '/usr/local/bin/deno',
+  ytDlpVersion: '2026.07.04',
+  ffmpegVersion: '8.1.2',
+  pluginDirectory: '/managed/plugins',
+  pluginArchive: '/managed/plugins/bgutil.zip',
+  providerServerDirectory: '/managed/provider/server',
+  denoDirectory: '/managed/deno',
+  providerCacheDirectory: '/managed/provider-cache',
+  chromeImpersonationTarget: 'Chrome-136:Macos-15',
+  ffmpegExplicit: false,
+  childEnvironment: Object.freeze({
+    PATH: '/usr/bin:/bin',
+    DENO_NO_PROMPT: '1',
+  }),
+  audit: {
+    source: 'managed',
+    ytDlpVersion: '2026.07.04',
+    managedAssetSha256: 'sha256:managed-asset',
+  },
+  ...overrides,
+});
+
+const processResult = (
+  overrides: Partial<ProcessResult> = {},
+): ProcessResult => ({
+  command: '/managed/bin/yt-dlp',
   args: [],
   exitCode: 0,
   signal: null,
-  stdout,
+  stdout: '',
   stderr: '',
   durationMs: 1,
+  ...overrides,
+});
+
+const processFailure = (stderr: string): ProcessExecutionError =>
+  new ProcessExecutionError(
+    'PROCESS_EXIT_NONZERO',
+    'Process exited with status 1',
+    processResult({
+      exitCode: 1,
+      args: ['--secret-argument'],
+      stderr,
+    }),
+  );
+
+const youtubeInfo = (overrides: Record<string, unknown> = {}): string =>
+  JSON.stringify({
+    id: 'abc',
+    title: 'Example',
+    webpage_url: 'https://youtu.be/abc',
+    extractor: 'youtube',
+    _type: 'video',
+    ...overrides,
+  });
+
+const operationOptions = (
+  toolchain: ResolvedDownloaderToolchain,
+  signal?: AbortSignal,
+): YtDlpOperationOptions => ({
+  profile: resolvePlatformProfile({platform: 'youtube', toolchain}),
+  ...(signal === undefined ? {} : {signal}),
 });
 
 const expectDownloadError = async (
@@ -63,111 +155,56 @@ const expectDownloadError = async (
   throw new Error(`Expected ${code}.`);
 };
 
-const expectFixedNetworkIsolation = (args: readonly string[]): void => {
-  expect(args.slice(0, 4)).toEqual([
-    '--ignore-config',
-    '--proxy',
-    '',
-    '--no-geo-bypass',
-  ]);
-  expect(args.filter((argument) => argument === '--proxy')).toHaveLength(1);
-  expect(args[2]).toBe('');
-  expect(args.filter((argument) => argument === '--no-geo-bypass')).toHaveLength(1);
-  for (const forbiddenArgument of forbiddenConnectionArguments) {
-    expect(args).not.toContain(forbiddenArgument);
-  }
-  expect(args.filter((argument) => credentialArgument.test(argument))).toEqual([]);
-  expect(args.filter((argument) => recodeOrRemuxArgument.test(argument))).toEqual([]);
-};
-
 describe('yt-dlp client options', () => {
-  it('does not expose user-controlled yt-dlp argument passthrough', () => {
-    expect(hasNoUserControlledPassthrough).toBe(true);
+  it('exposes only resolved toolchain and fixed profile options', () => {
+    expect(hasOnlyFixedClientOptions).toBe(true);
+    expect(hasOnlyFixedOperationOptions).toBe(true);
   });
 });
 
 describe('yt-dlp metadata schema', () => {
-  it('passes through extra fields without normalizing the source URL', () => {
-    const webpageUrl = 'https://EXAMPLE.com:443/watch?v=ABC';
-
-    expect(YtDlpInfoSchema.parse({
-      id: 'abc',
-      title: 'Example',
-      webpage_url: webpageUrl,
-      extractor: 'youtube',
-      extra: {kept: true},
-    })).toMatchObject({
-      webpage_url: webpageUrl,
-      extra: {kept: true},
-    });
-  });
-
-  it('rejects an unparseable webpage URL', () => {
-    expect(YtDlpInfoSchema.safeParse({
-      id: 'abc',
-      title: 'Example',
-      webpage_url: 'not a URL',
-      extractor: 'youtube',
-    }).success).toBe(false);
-  });
-
-  it('accepts nullable live metadata fields without coercion', () => {
+  it('accepts nullable DRM metadata without coercion', () => {
     expect(YtDlpInfoSchema.parse({
       id: 'abc',
       title: 'Example',
       webpage_url: 'https://youtu.be/abc',
       extractor: 'youtube',
-      is_live: null,
-      live_status: null,
-    })).toMatchObject({
-      is_live: null,
-      live_status: null,
-    });
+      has_drm: null,
+    })).toMatchObject({has_drm: null});
   });
 
-  it.each([
-    ['is_live', {is_live: 'true'}],
-    ['live_status', {live_status: false}],
-  ])('rejects a malformed %s field', (_field, liveMetadata) => {
+  it('rejects malformed DRM metadata', () => {
     expect(YtDlpInfoSchema.safeParse({
       id: 'abc',
       title: 'Example',
       webpage_url: 'https://youtu.be/abc',
       extractor: 'youtube',
-      ...liveMetadata,
+      has_drm: 'true',
     }).success).toBe(false);
   });
 });
 
 describe('yt-dlp metadata validation', () => {
-  it('maps validated video metadata to probe fields', () => {
+  it.each([
+    [true, true],
+    [false, false],
+    [null, false],
+    [undefined, false],
+  ] as const)('maps has_drm %s to hasDrm %s', (hasDrm, expected) => {
     expect(parseYtDlpInfo({
       id: 'abc',
       title: 'Example',
       webpage_url: 'https://youtu.be/abc',
       extractor: 'youtube',
-      extractor_key: 'Youtube',
       _type: 'video',
-      is_live: false,
-      live_status: 'was_live',
+      ...(hasDrm === undefined ? {} : {has_drm: hasDrm}),
     })).toEqual({
       id: 'abc',
       title: 'Example',
       canonicalUrl: 'https://youtu.be/abc',
       extractor: 'youtube',
-      extractorKey: 'Youtube',
+      hasDrm: expected,
     });
-  });
-
-  it('maps optional availability metadata without coercion', () => {
-    expect(parseYtDlpInfo({
-      id: '7654841525762919726',
-      title: 'Public Douyin fixture',
-      webpage_url: 'https://www.douyin.com/video/7654841525762919726',
-      extractor: 'Douyin',
-      _type: 'video',
-      availability: 'public',
-    })).toMatchObject({availability: 'public'});
   });
 
   it.each([
@@ -187,430 +224,250 @@ describe('yt-dlp metadata validation', () => {
   });
 });
 
-describe('yt-dlp tool checks', () => {
-  it('forwards the same operation signal to checks, probe, and download', async () => {
-    const controller = new AbortController();
-    const runProcess = vi.fn<DownloadProcessRunner>()
-      .mockResolvedValueOnce(processResult('yt-dlp test\n'))
-      .mockResolvedValueOnce(processResult('ffmpeg test\n'))
-      .mockResolvedValueOnce(processResult(JSON.stringify({
-        id: 'abc',
-        title: 'Example',
-        webpage_url: 'https://youtu.be/abc',
-        extractor: 'youtube',
-      })))
-      .mockResolvedValueOnce(processResult());
-    const client = createYtDlpClient({runProcess});
-
-    await client.checkTools(controller.signal);
-    await client.probe('https://youtu.be/abc', {signal: controller.signal});
-    await client.download('https://youtu.be/abc', 45, {
-      signal: controller.signal,
-    });
-
-    expect(runProcess.mock.calls[0]?.[2]).toEqual({signal: controller.signal});
-    expect(runProcess.mock.calls[1]?.[2]).toEqual({signal: controller.signal});
-    expect(runProcess.mock.calls[2]?.[2]).toEqual({signal: controller.signal});
-    expect(runProcess.mock.calls[3]?.[2]).toEqual({
-      signal: controller.signal,
-      extraStdioFds: [45],
-    });
-  });
-
-  it('uses default executables and returns first nonempty trimmed lines', async () => {
-    const runProcess = vi.fn<DownloadProcessRunner>()
-      .mockResolvedValueOnce(processResult('\n  2026.07.04  \nignored\n'))
-      .mockResolvedValueOnce(processResult('\r\n ffmpeg version 8.0 \r\nbuild details\n'));
-
-    await expect(createYtDlpClient({runProcess}).checkTools()).resolves.toEqual({
-      ytDlpVersion: '2026.07.04',
-      ffmpegVersion: 'ffmpeg version 8.0',
-    });
-    expect(runProcess.mock.calls).toEqual([
-      ['yt-dlp', ['--version']],
-      ['ffmpeg', ['-version']],
-    ]);
-  });
-
-  it('uses configured executable selections', async () => {
-    const runProcess = vi.fn<DownloadProcessRunner>()
-      .mockResolvedValueOnce(processResult('yt-dlp custom\n'))
-      .mockResolvedValueOnce(processResult('ffmpeg custom\n'));
-
-    await createYtDlpClient({
-      runProcess,
-      ytDlpExecutable: '/tools/custom-yt-dlp',
-      ffmpegExecutable: '/tools/custom-ffmpeg',
-    }).checkTools();
-
-    expect(runProcess.mock.calls).toEqual([
-      ['/tools/custom-yt-dlp', ['--version']],
-      ['/tools/custom-ffmpeg', ['-version']],
-    ]);
-  });
-
-  it.each([
-    ['yt-dlp', ['\n \t\n']],
-    ['ffmpeg', ['2026.07.04\n', '\r\n  \n']],
-  ] as const)('maps empty %s version output to DOWNLOAD_TOOL_MISSING', async (
-    _tool,
-    outputs,
-  ) => {
+describe('yt-dlp resolved toolchain', () => {
+  it('returns snapshotted resolved versions without ambient tool lookup', async () => {
+    const toolchain = createToolchain();
     const runProcess = vi.fn<DownloadProcessRunner>();
-    for (const stdout of outputs) {
-      runProcess.mockResolvedValueOnce(processResult(stdout));
-    }
+    const client = createYtDlpClient({toolchain, runProcess});
 
-    const error = await expectDownloadError(
-      createYtDlpClient({runProcess}).checkTools(),
-      'DOWNLOAD_TOOL_MISSING',
-      TOOL_MISSING_MESSAGE,
-    );
+    toolchain.ytDlpVersion = 'mutated';
+    toolchain.ffmpegVersion = 'mutated';
 
-    expect(error.cause).toBeUndefined();
-  });
-
-  it('sanitizes tool process failures', async () => {
-    const secret = 'tool-secret-marker';
-    const processFailure = Object.assign(
-      new Error(`spawn failed at /private/${secret}`),
-      {stderr: secret, stdout: secret},
-    );
-    const runProcess = vi.fn<DownloadProcessRunner>()
-      .mockRejectedValueOnce(processFailure);
-
-    const error = await expectDownloadError(
-      createYtDlpClient({runProcess}).checkTools(),
-      'DOWNLOAD_TOOL_MISSING',
-      TOOL_MISSING_MESSAGE,
-    );
-
-    expect(error).not.toBe(processFailure);
-    expect(error.cause).toBeUndefined();
-    expect(String(error)).not.toContain(secret);
+    await expect(client.checkTools()).resolves.toEqual({
+      ytDlpVersion: '2026.07.04',
+      ffmpegVersion: '8.1.2',
+    });
+    expect(runProcess).not.toHaveBeenCalled();
   });
 });
 
 describe('yt-dlp probe', () => {
-  it('uses isolated safety arguments with the URL last and maps video fields', async () => {
+  it('uses the profile common arguments exactly before fixed probe flags', async () => {
+    const toolchain = createToolchain();
+    const options = operationOptions(toolchain);
     const url = 'https://youtu.be/requested';
-    const canonicalUrl = 'https://EXAMPLE.com:443/watch?v=ABC';
     const runProcess = vi.fn<DownloadProcessRunner>()
-      .mockResolvedValueOnce(processResult(JSON.stringify({
-        id: 'abc',
-        title: 'Example',
-        webpage_url: canonicalUrl,
-        extractor: 'youtube',
-        _type: 'video',
-      })));
+      .mockResolvedValueOnce(processResult({
+        stdout: youtubeInfo({webpage_url: 'https://youtu.be/canonical'}),
+      }));
 
-    const probe = await createYtDlpClient({runProcess}).probe(url);
+    const probe = await createYtDlpClient({toolchain, runProcess})
+      .probe(url, options);
 
     expect(probe).toEqual({
       id: 'abc',
       title: 'Example',
-      canonicalUrl,
+      canonicalUrl: 'https://youtu.be/canonical',
       extractor: 'youtube',
+      hasDrm: false,
     });
-    expect(Object.hasOwn(probe, 'extractorKey')).toBe(false);
-    expect(runProcess).toHaveBeenCalledWith('yt-dlp', [
-      '--ignore-config',
-      '--proxy',
-      '',
-      '--no-geo-bypass',
-      '--no-playlist',
-      '--playlist-items',
-      '1',
-      '--skip-download',
-      '--dump-single-json',
-      url,
-    ]);
-    const args = runProcess.mock.calls[0]?.[1];
-    expect(args).toBeDefined();
-    expect(args).not.toContain('--max-downloads');
-    expectFixedNetworkIsolation(args ?? []);
-  });
-
-  it('adds exact Chrome Cookie arguments to a probe', async () => {
-    const canonicalDouyinUrl =
-      'https://www.douyin.com/video/7654841525762919726';
-    const runProcess = vi.fn<DownloadProcessRunner>()
-      .mockResolvedValueOnce(processResult(JSON.stringify({
-        id: '7654841525762919726',
-        title: 'Public Douyin fixture',
-        webpage_url: canonicalDouyinUrl,
-        extractor: 'Douyin',
-        _type: 'video',
-        availability: 'public',
-      })));
-
-    await createYtDlpClient({runProcess}).probe(canonicalDouyinUrl, {
-      browserCookieSource: 'chrome',
-    });
-
-    expect(runProcess).toHaveBeenCalledWith('yt-dlp', [
-      '--ignore-config',
-      '--proxy',
-      '',
-      '--no-geo-bypass',
-      '--no-playlist',
-      '--playlist-items',
-      '1',
-      '--cookies-from-browser',
-      'chrome',
-      '--skip-download',
-      '--dump-single-json',
-      canonicalDouyinUrl,
-    ]);
-  });
-
-  it('snapshots Chrome Cookie options before caller mutation', async () => {
-    const url = 'https://www.douyin.com/video/7654841525762919726';
-    const runProcess = vi.fn<DownloadProcessRunner>()
-      .mockResolvedValueOnce(processResult(JSON.stringify({
-        id: '7654841525762919726',
-        title: 'Public Douyin fixture',
-        webpage_url: url,
-        extractor: 'Douyin',
-        _type: 'video',
-      })));
-    const client = createYtDlpClient({runProcess});
-    const operationOptions: YtDlpOperationOptions = {
-      browserCookieSource: 'chrome',
-    };
-
-    const promise = client.probe(url, operationOptions);
-    delete operationOptions.browserCookieSource;
-    await promise;
-
-    expect(runProcess.mock.calls[0]?.[1]).toContain('chrome');
-  });
-
-  it('includes extractorKey only when extractor_key is present', async () => {
-    const runProcess = vi.fn<DownloadProcessRunner>()
-      .mockResolvedValueOnce(processResult(JSON.stringify({
-        id: 'abc',
-        title: 'Example',
-        webpage_url: 'https://youtu.be/abc',
-        extractor: 'youtube',
-        extractor_key: 'Youtube',
-      })));
-
-    await expect(createYtDlpClient({runProcess}).probe('https://youtu.be/abc'))
-      .resolves.toEqual({
-        id: 'abc',
-        title: 'Example',
-        canonicalUrl: 'https://youtu.be/abc',
-        extractor: 'youtube',
-        extractorKey: 'Youtube',
-      });
-  });
-
-  it.each([
-    ['is_live flag', {is_live: true}],
-    ['active live status', {is_live: false, live_status: 'is_live'}],
-    ['upcoming live status', {is_live: false, live_status: 'is_upcoming'}],
-    ['post-live processing status', {is_live: false, live_status: 'post_live'}],
-  ])('maps %s to DOWNLOAD_PROBE_FAILED', async (_caseName, liveMetadata) => {
-    const runProcess = vi.fn<DownloadProcessRunner>()
-      .mockResolvedValueOnce(processResult(JSON.stringify({
-        id: 'abc',
-        title: 'Example',
-        webpage_url: 'https://youtu.be/abc',
-        extractor: 'youtube',
-        ...liveMetadata,
-      })));
-
-    const error = await expectDownloadError(
-      createYtDlpClient({runProcess}).probe('https://youtu.be/abc'),
-      'DOWNLOAD_PROBE_FAILED',
-      PROBE_FAILED_MESSAGE,
+    expect(runProcess).toHaveBeenCalledWith(
+      toolchain.ytDlpExecutable,
+      [
+        ...options.profile.commonArgs,
+        '--skip-download',
+        '--dump-single-json',
+        url,
+      ],
+      {env: toolchain.childEnvironment},
     );
-
-    expect(error.cause).toBeUndefined();
   });
 
-  it('accepts a completed archived replay marked was_live', async () => {
+  it('passes the resolved child environment and operation signal', async () => {
+    const toolchain = createToolchain();
+    const controller = new AbortController();
+    const options = operationOptions(toolchain, controller.signal);
     const runProcess = vi.fn<DownloadProcessRunner>()
-      .mockResolvedValueOnce(processResult(JSON.stringify({
-        id: 'abc',
-        title: 'Archived replay',
-        webpage_url: 'https://youtu.be/abc',
-        extractor: 'youtube',
-        is_live: false,
-        live_status: 'was_live',
-      })));
+      .mockResolvedValueOnce(processResult({stdout: youtubeInfo()}));
 
-    await expect(createYtDlpClient({runProcess}).probe('https://youtu.be/abc'))
-      .resolves.toEqual({
-        id: 'abc',
-        title: 'Archived replay',
-        canonicalUrl: 'https://youtu.be/abc',
-        extractor: 'youtube',
-      });
+    await createYtDlpClient({toolchain, runProcess})
+      .probe('https://youtu.be/abc', options);
+
+    expect(runProcess.mock.calls[0]?.[2]).toEqual({
+      signal: controller.signal,
+      env: toolchain.childEnvironment,
+    });
   });
 
-  it.each([
-    ['invalid JSON', '{not-json'],
-    ['missing required fields', JSON.stringify({
-      id: 'abc',
-      webpage_url: 'https://youtu.be/abc',
-      extractor: 'youtube',
-    })],
-    ['invalid canonical URL', JSON.stringify({
+  it('returns only safe probe fields and excludes raw signed metadata', async () => {
+    const markers = [
+      'format-secret-marker',
+      'signed-url-secret-marker',
+      'cookie-secret-marker',
+      'visitor-data-secret-marker',
+    ];
+    const toolchain = createToolchain();
+    const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockResolvedValueOnce(processResult({
+        stdout: youtubeInfo({
+          has_drm: true,
+          formats: [{format_id: markers[0], url: `https://cdn/?sig=${markers[1]}`}],
+          http_headers: {Cookie: markers[2]},
+          visitor_data: markers[3],
+        }),
+      }));
+
+    const probe = await createYtDlpClient({toolchain, runProcess}).probe(
+      'https://youtu.be/abc',
+      operationOptions(toolchain),
+    );
+    const serialized = JSON.stringify(probe);
+
+    expect(probe).toEqual({
       id: 'abc',
       title: 'Example',
-      webpage_url: 'not a URL',
+      canonicalUrl: 'https://youtu.be/abc',
       extractor: 'youtube',
-    })],
-    ['playlist result', JSON.stringify({
-      id: 'abc',
-      title: 'Example',
-      webpage_url: 'https://youtu.be/abc',
-      extractor: 'youtube',
-      _type: 'playlist',
-    })],
-  ])('maps %s to DOWNLOAD_PROBE_FAILED', async (_caseName, stdout) => {
-    const runProcess = vi.fn<DownloadProcessRunner>()
-      .mockResolvedValueOnce(processResult(stdout));
-
-    const error = await expectDownloadError(
-      createYtDlpClient({runProcess}).probe('https://youtu.be/abc'),
-      'DOWNLOAD_PROBE_FAILED',
-      PROBE_FAILED_MESSAGE,
-    );
-
-    expect(error.cause).toBeUndefined();
+      hasDrm: true,
+    });
+    for (const marker of markers) expect(serialized).not.toContain(marker);
+    expect(serialized).not.toContain('formats');
+    expect(serialized).not.toContain('http_headers');
+    expect(serialized).not.toContain('Cookie');
   });
 
-  it('sanitizes probe process failures and does not retain the raw URL', async () => {
-    const marker = 'probe-secret-marker';
-    const url = `https://youtu.be/abc?token=${marker}`;
-    const processFailure = Object.assign(
-      new Error(`probe failed for ${url}`),
-      {command: '/private/yt-dlp', stderr: marker},
-    );
-    const runProcess = vi.fn<DownloadProcessRunner>()
-      .mockRejectedValueOnce(processFailure);
+  it.each(CLASSIFIED_FAILURES)(
+    'classifies process stderr %s as %s',
+    async (stderr, code, message) => {
+      const toolchain = createToolchain();
+      const failure = processFailure(stderr);
+      const runProcess = vi.fn<DownloadProcessRunner>()
+        .mockRejectedValueOnce(failure);
 
-    const error = await expectDownloadError(
-      createYtDlpClient({runProcess}).probe(url),
+      const error = await expectDownloadError(
+        createYtDlpClient({toolchain, runProcess}).probe(
+          'https://youtu.be/abc',
+          operationOptions(toolchain),
+        ),
+        code,
+        message,
+      );
+
+      expect(error).not.toBe(failure);
+      expect(error.cause).toBeUndefined();
+    },
+  );
+
+  it('matches only the bounded stderr tail', async () => {
+    const toolchain = createToolchain();
+    const stderr = [
+      'HTTP Error 429: Too Many Requests',
+      'x'.repeat(64 * 1024),
+      'Connection timed out',
+    ].join('\n');
+    const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockRejectedValueOnce(processFailure(stderr));
+
+    await expectDownloadError(
+      createYtDlpClient({toolchain, runProcess}).probe(
+        'https://youtu.be/abc',
+        operationOptions(toolchain),
+      ),
+      'DOWNLOAD_NETWORK_UNREACHABLE',
+      'The video platform could not be reached with the selected network settings.',
+    );
+  });
+
+  it('keeps unknown process and parse failures generic', async () => {
+    const toolchain = createToolchain();
+    const unknownProcess = vi.fn<DownloadProcessRunner>()
+      .mockRejectedValueOnce(processFailure('unknown extractor failure'));
+    const invalidJson = vi.fn<DownloadProcessRunner>()
+      .mockResolvedValueOnce(processResult({stdout: '{not-json'}));
+
+    await expectDownloadError(
+      createYtDlpClient({toolchain, runProcess: unknownProcess}).probe(
+        'https://youtu.be/abc',
+        operationOptions(toolchain),
+      ),
       'DOWNLOAD_PROBE_FAILED',
       PROBE_FAILED_MESSAGE,
     );
+    await expectDownloadError(
+      createYtDlpClient({toolchain, runProcess: invalidJson}).probe(
+        'https://youtu.be/abc',
+        operationOptions(toolchain),
+      ),
+      'DOWNLOAD_PROBE_FAILED',
+      PROBE_FAILED_MESSAGE,
+    );
+  });
 
-    expect(error).not.toBe(processFailure);
+  it('does not classify matching text from non-process errors', async () => {
+    const toolchain = createToolchain();
+    const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockRejectedValueOnce(Object.assign(
+        new Error('HTTP Error 429: Too Many Requests'),
+        {stderr: 'HTTP Error 429: Too Many Requests'},
+      ));
+
+    await expectDownloadError(
+      createYtDlpClient({toolchain, runProcess}).probe(
+        'https://youtu.be/abc',
+        operationOptions(toolchain),
+      ),
+      'DOWNLOAD_PROBE_FAILED',
+      PROBE_FAILED_MESSAGE,
+    );
+  });
+
+  it('never exposes stderr secrets in public errors or CLI JSON', async () => {
+    const sourceUrl = 'https://youtu.be/abc?source-url-secret-marker';
+    const markers = [
+      sourceUrl,
+      'http://proxy-user:proxy-password@127.0.0.1:7890',
+      '/Users/private/Chrome/Profile 1',
+      'po-token-secret-marker',
+      'visitor-data-secret-marker',
+      'https://signed.example/video?sig=signed-url-secret-marker',
+    ];
+    const toolchain = createToolchain();
+    const failure = processFailure([
+      ...markers,
+      'HTTP Error 429: Too Many Requests',
+    ].join('\n'));
+    const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockRejectedValueOnce(failure);
+
+    const error = await expectDownloadError(
+      createYtDlpClient({toolchain, runProcess}).probe(
+        sourceUrl,
+        operationOptions(toolchain),
+      ),
+      'DOWNLOAD_RATE_LIMITED',
+      'The video platform temporarily rate-limited this session.',
+    );
+    const publicValues = [
+      String(error),
+      JSON.stringify(error),
+      formatDownloadFailure(error.code, error.message, true),
+    ];
+
+    expect(error).not.toBe(failure);
     expect(error.cause).toBeUndefined();
-    expect(String(error)).not.toContain(url);
-    expect(String(error)).not.toContain(marker);
+    for (const value of publicValues) {
+      for (const marker of markers) expect(value).not.toContain(marker);
+    }
   });
 });
 
 describe('yt-dlp download', () => {
-  it('runs fixed download flags through the descriptor-bound Darwin wrapper', async () => {
+  it('uses identical profile arguments before archive-only flags', async () => {
+    const toolchain = createToolchain();
+    const options = operationOptions(toolchain);
     const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockResolvedValueOnce(processResult({stdout: youtubeInfo()}))
       .mockResolvedValueOnce(processResult());
-    const url = 'https://youtu.be/abc';
-    const stagingDirectoryFd = 41;
-
-    await expect(createYtDlpClient({runProcess}).download(url, stagingDirectoryFd))
-      .resolves.toBeUndefined();
-
-    expect(runProcess).toHaveBeenCalledTimes(1);
-    const [command, wrapperArgs, options] = runProcess.mock.calls[0] ?? [];
-    expect(command).toBe('/usr/bin/osascript');
-    expect(wrapperArgs?.slice(0, 3)).toEqual([
-      '-l',
-      'JavaScript',
-      '-e',
-    ]);
-    const wrapperScript = wrapperArgs?.[3];
-    expect(wrapperScript).toContain('fchdir(3)');
-    expect(wrapperScript).toContain('NSTask');
-    expect(wrapperScript).toContain('setStartsNewProcessGroup(false)');
-    expect(wrapperScript).not.toContain('do shell script');
-    expect(wrapperArgs?.[4]).toBe('--');
-    expect(wrapperArgs?.[5]).toBe('yt-dlp');
-    const ytDlpArgs = wrapperArgs?.slice(6) ?? [];
-    expect(ytDlpArgs).toEqual([
-      '--ignore-config',
-      '--proxy',
-      '',
-      '--no-geo-bypass',
-      '--no-playlist',
-      '--playlist-items',
-      '1',
-      '--no-progress',
-      '--write-thumbnail',
-      '--write-subs',
-      '--write-auto-subs',
-      '--sub-langs',
-      'zh.*,en.*',
-      '--output',
-      'video.%(ext)s',
-      url,
-    ]);
-    expect(options).toEqual({extraStdioFds: [stagingDirectoryFd]});
-
-    expect(ytDlpArgs.at(-1)).toBe(url);
-    expect(ytDlpArgs).not.toContain('--ffmpeg-location');
-    expect(ytDlpArgs).not.toContain('--write-info-json');
-    expect(ytDlpArgs).not.toContain('--clean-info-json');
-    expect(ytDlpArgs).not.toContain('--max-downloads');
-    expectFixedNetworkIsolation(ytDlpArgs);
-  });
-
-  it('adds exact Chrome Cookie arguments to the FD-bound download', async () => {
-    const canonicalDouyinUrl =
-      'https://www.douyin.com/video/7654841525762919726';
-    const runProcess = vi.fn<DownloadProcessRunner>()
-      .mockResolvedValueOnce(processResult());
-
-    await createYtDlpClient({runProcess}).download(
-      canonicalDouyinUrl,
-      45,
-      {browserCookieSource: 'chrome'},
-    );
-
-    const wrapperArgs = runProcess.mock.calls[0]?.[1] ?? [];
-    const ytDlpArgs = wrapperArgs.slice(6);
-    expect(ytDlpArgs).toEqual([
-      '--ignore-config',
-      '--proxy',
-      '',
-      '--no-geo-bypass',
-      '--no-playlist',
-      '--playlist-items',
-      '1',
-      '--cookies-from-browser',
-      'chrome',
-      '--no-progress',
-      '--write-thumbnail',
-      '--write-subs',
-      '--write-auto-subs',
-      '--sub-langs',
-      'zh.*,en.*',
-      '--output',
-      'video.%(ext)s',
-      canonicalDouyinUrl,
-    ]);
-    expect(ytDlpArgs).not.toContain('--write-info-json');
-    expect(ytDlpArgs).not.toContain('--clean-info-json');
-    expect(ytDlpArgs).not.toContain('--max-downloads');
-  });
-
-  it('adds only an explicitly configured ffmpeg location before the URL', async () => {
-    const runProcess = vi.fn<DownloadProcessRunner>()
-      .mockResolvedValueOnce(processResult());
+    const client = createYtDlpClient({toolchain, runProcess});
     const url = 'https://youtu.be/abc';
 
-    await createYtDlpClient({
-      runProcess,
-      ytDlpExecutable: '/tools/custom-yt-dlp',
-      ffmpegExecutable: '/tools/custom-ffmpeg',
-    }).download(url, 42);
+    await client.probe(url, options);
+    await client.download(url, 41, options);
 
-    const [command, wrapperArgs, options] = runProcess.mock.calls[0] ?? [];
+    const probeArgs = runProcess.mock.calls[0]?.[1] ?? [];
+    const [command, wrapperArgs, processOptions] = runProcess.mock.calls[1] ?? [];
+    const downloadArgs = wrapperArgs?.slice(6) ?? [];
+
     expect(command).toBe('/usr/bin/osascript');
     expect(wrapperArgs?.slice(0, 6)).toEqual([
       '-l',
@@ -618,17 +475,51 @@ describe('yt-dlp download', () => {
       '-e',
       expect.stringContaining('fchdir(3)'),
       '--',
-      '/tools/custom-yt-dlp',
+      toolchain.ytDlpExecutable,
     ]);
-    const ytDlpArgs = wrapperArgs?.slice(6) ?? [];
-    expect(ytDlpArgs).toEqual([
-      '--ignore-config',
-      '--proxy',
-      '',
-      '--no-geo-bypass',
-      '--no-playlist',
-      '--playlist-items',
-      '1',
+    expect(probeArgs.slice(0, options.profile.commonArgs.length))
+      .toEqual(options.profile.commonArgs);
+    expect(downloadArgs.slice(0, options.profile.commonArgs.length))
+      .toEqual(options.profile.commonArgs);
+    expect(downloadArgs).toEqual([
+      ...options.profile.commonArgs,
+      '--no-progress',
+      '--write-thumbnail',
+      '--write-subs',
+      '--write-auto-subs',
+      '--sub-langs',
+      'zh.*,en.*',
+      '--output',
+      'video.%(ext)s',
+      url,
+    ]);
+    expect(downloadArgs).not.toContain('--ffmpeg-location');
+    expect(downloadArgs).not.toContain('--write-info-json');
+    expect(downloadArgs).not.toContain('--clean-info-json');
+    expect(processOptions).toEqual({
+      env: toolchain.childEnvironment,
+      extraStdioFds: [41],
+    });
+  });
+
+  it('adds only an explicitly resolved FFmpeg location', async () => {
+    const toolchain = createToolchain({
+      ffmpegExecutable: '/private/custom-ffmpeg',
+      ffmpegExplicit: true,
+    });
+    const options = operationOptions(toolchain);
+    const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockResolvedValueOnce(processResult());
+
+    await createYtDlpClient({toolchain, runProcess}).download(
+      'https://youtu.be/abc',
+      42,
+      options,
+    );
+
+    const wrapperArgs = runProcess.mock.calls[0]?.[1] ?? [];
+    expect(wrapperArgs.slice(6)).toEqual([
+      ...options.profile.commonArgs,
       '--no-progress',
       '--write-thumbnail',
       '--write-subs',
@@ -638,52 +529,64 @@ describe('yt-dlp download', () => {
       '--output',
       'video.%(ext)s',
       '--ffmpeg-location',
-      '/tools/custom-ffmpeg',
-      url,
+      toolchain.ffmpegExecutable,
+      'https://youtu.be/abc',
     ]);
-    expect(options).toEqual({extraStdioFds: [42]});
-    expect(ytDlpArgs).not.toContain('--write-info-json');
-    expect(ytDlpArgs).not.toContain('--clean-info-json');
-    expect(ytDlpArgs).not.toContain('--max-downloads');
-    expectFixedNetworkIsolation(ytDlpArgs);
   });
 
-  it('snapshots the explicit FFmpeg path before caller option mutation', async () => {
+  it('passes the resolved environment, signal, and staging descriptor', async () => {
+    const toolchain = createToolchain();
+    const controller = new AbortController();
+    const options = operationOptions(toolchain, controller.signal);
     const runProcess = vi.fn<DownloadProcessRunner>()
       .mockResolvedValueOnce(processResult());
-    const options = {
-      runProcess,
-      ffmpegExecutable: '/tools/original-ffmpeg',
-    };
-    const client = createYtDlpClient(options);
 
-    options.ffmpegExecutable = '/tools/mutated-ffmpeg';
-    await client.download('https://youtu.be/abc', 43);
+    await createYtDlpClient({toolchain, runProcess}).download(
+      'https://youtu.be/abc',
+      45,
+      options,
+    );
 
-    const wrapperArgs = runProcess.mock.calls[0]?.[1] ?? [];
-    expect(wrapperArgs).toContain('/tools/original-ffmpeg');
-    expect(wrapperArgs).not.toContain('/tools/mutated-ffmpeg');
+    expect(runProcess.mock.calls[0]?.[2]).toEqual({
+      signal: controller.signal,
+      env: toolchain.childEnvironment,
+      extraStdioFds: [45],
+    });
   });
 
-  it('sanitizes download process failures and does not retain the raw URL', async () => {
-    const marker = 'download-secret-marker';
-    const url = `https://youtu.be/abc?token=${marker}`;
-    const processFailure = Object.assign(
-      new Error(`download failed for ${url}`),
-      {args: ['--output', '/private/output', url], stderr: marker},
-    );
+  it('classifies download process failures without retaining the cause', async () => {
+    const toolchain = createToolchain();
+    const failure = processFailure('bgutil script provider unavailable');
     const runProcess = vi.fn<DownloadProcessRunner>()
-      .mockRejectedValueOnce(processFailure);
+      .mockRejectedValueOnce(failure);
 
     const error = await expectDownloadError(
-      createYtDlpClient({runProcess}).download(url, 44),
+      createYtDlpClient({toolchain, runProcess}).download(
+        'https://youtu.be/abc',
+        44,
+        operationOptions(toolchain),
+      ),
+      'DOWNLOAD_PO_TOKEN_UNAVAILABLE',
+      'The YouTube compatibility provider is unavailable.',
+    );
+
+    expect(error).not.toBe(failure);
+    expect(error.cause).toBeUndefined();
+  });
+
+  it('keeps unknown download failures generic', async () => {
+    const toolchain = createToolchain();
+    const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockRejectedValueOnce(processFailure('unknown download failure'));
+
+    await expectDownloadError(
+      createYtDlpClient({toolchain, runProcess}).download(
+        'https://youtu.be/abc',
+        44,
+        operationOptions(toolchain),
+      ),
       'DOWNLOAD_PROCESS_FAILED',
       PROCESS_FAILED_MESSAGE,
     );
-
-    expect(error).not.toBe(processFailure);
-    expect(error.cause).toBeUndefined();
-    expect(String(error)).not.toContain(url);
-    expect(String(error)).not.toContain(marker);
   });
 });

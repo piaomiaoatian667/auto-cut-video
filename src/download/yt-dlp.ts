@@ -1,34 +1,59 @@
 import {z} from 'zod';
+import {ProcessExecutionError} from '../process/process-error';
 import {
   runProcess as runSystemProcess,
   type ProcessResult,
   type RunProcessOptions,
 } from '../process/run-process';
-import type {BrowserCookieSource} from './browser-cookies';
 import {DownloadError} from './errors';
+import type {ResolvedPlatformProfile} from './platform-profiles';
+import type {ResolvedDownloaderToolchain} from './toolchain/types';
 
-const TOOL_MISSING_MESSAGE = 'Required download tools are unavailable.';
 const PROBE_FAILED_MESSAGE = 'Video metadata could not be extracted.';
 const PROCESS_FAILED_MESSAGE = 'The video could not be downloaded.';
+const STDERR_CLASSIFICATION_LIMIT_BYTES = 64 * 1024;
 const ACTIVE_LIVE_STATUSES = new Set([
   'is_live',
   'is_upcoming',
   'post_live',
 ]);
-const FIXED_YT_DLP_ARGS = [
-  '--ignore-config',
-  '--proxy',
-  '',
-  '--no-geo-bypass',
-  '--no-playlist',
-  '--playlist-items',
-  '1',
+const CLASSIFICATIONS = [
+  [
+    /HTTP Error 429|Too Many Requests|confirm you(?:'| a)re not a bot/iu,
+    [
+      'DOWNLOAD_RATE_LIMITED',
+      'The video platform temporarily rate-limited this session.',
+    ],
+  ],
+  [
+    /HTTP Error 412|Precondition Failed/iu,
+    [
+      'DOWNLOAD_PLATFORM_CHALLENGE',
+      'The video platform rejected the selected public-session request.',
+    ],
+  ],
+  [
+    /timed out|failed to connect|network is unreachable|could not resolve/iu,
+    [
+      'DOWNLOAD_NETWORK_UNREACHABLE',
+      'The video platform could not be reached with the selected network settings.',
+    ],
+  ],
+  [
+    /impersonat(?:e|ion).*(?:unavailable|unsupported|missing)/iu,
+    [
+      'DOWNLOAD_IMPERSONATION_UNAVAILABLE',
+      'The required browser compatibility capability is unavailable.',
+    ],
+  ],
+  [
+    /bgutil|po token provider|generate_once\.(?:ts|js)/iu,
+    [
+      'DOWNLOAD_PO_TOKEN_UNAVAILABLE',
+      'The YouTube compatibility provider is unavailable.',
+    ],
+  ],
 ] as const;
-const browserCookieArgs = (
-  source: BrowserCookieSource | undefined,
-): readonly string[] => source === undefined
-  ? []
-  : ['--cookies-from-browser', source];
 const DARWIN_YT_DLP_WRAPPER_SCRIPT = [
   'ObjC.import("Foundation");',
   'ObjC.bindFunction("fchdir", ["int", ["int"]]);',
@@ -76,6 +101,7 @@ export const YtDlpInfoSchema = z.object({
   is_live: z.boolean().nullable().optional(),
   live_status: z.string().nullable().optional(),
   availability: z.string().nullable().optional(),
+  has_drm: z.boolean().nullable().optional(),
 }).passthrough();
 
 export const SafeYtDlpMetadataSchema = z.object({
@@ -96,6 +122,7 @@ export interface YtDlpProbe {
   extractor: string;
   extractorKey?: string;
   availability?: string | null;
+  hasDrm: boolean;
 }
 
 export const parseYtDlpInfo = (value: unknown): YtDlpProbe => {
@@ -121,6 +148,7 @@ export const parseYtDlpInfo = (value: unknown): YtDlpProbe => {
     ...(info.availability === undefined
       ? {}
       : {availability: info.availability}),
+    hasDrm: info.has_drm === true,
   };
 };
 
@@ -129,128 +157,147 @@ export interface DownloadToolVersions {
   ffmpegVersion: string;
 }
 
+export interface YtDlpClientOptions {
+  toolchain: ResolvedDownloaderToolchain;
+  runProcess?: DownloadProcessRunner;
+}
+
 export interface YtDlpOperationOptions {
-  browserCookieSource?: BrowserCookieSource;
+  profile: ResolvedPlatformProfile;
   signal?: AbortSignal;
 }
 
 export interface YtDlpClient {
   checkTools(signal?: AbortSignal): Promise<DownloadToolVersions>;
-  probe(url: string, options?: YtDlpOperationOptions): Promise<YtDlpProbe>;
+  probe(url: string, options: YtDlpOperationOptions): Promise<YtDlpProbe>;
   download(
     url: string,
     stagingDirectoryFd: number,
-    options?: YtDlpOperationOptions,
+    options: YtDlpOperationOptions,
   ): Promise<void>;
 }
 
-export interface YtDlpClientOptions {
-  runProcess?: DownloadProcessRunner;
-  ytDlpExecutable?: string;
-  ffmpegExecutable?: string;
-}
+const boundedStderr = (stderr: string): string => {
+  const candidate = stderr.length <= STDERR_CLASSIFICATION_LIMIT_BYTES
+    ? stderr
+    : stderr.slice(-STDERR_CLASSIFICATION_LIMIT_BYTES);
+  const bytes = Buffer.from(candidate);
+  if (bytes.byteLength <= STDERR_CLASSIFICATION_LIMIT_BYTES) return candidate;
 
-const firstNonemptyTrimmedLine = (stdout: string): string | undefined =>
-  stdout
-    .split(/\r\n|\n|\r/u)
-    .map((line) => line.trim())
-    .find((line) => line.length > 0);
+  let start = bytes.byteLength - STDERR_CLASSIFICATION_LIMIT_BYTES;
+  while (
+    start < bytes.byteLength &&
+    ((bytes[start] ?? 0) & 0xc0) === 0x80
+  ) {
+    start += 1;
+  }
+  return bytes.subarray(start).toString('utf8');
+};
+
+const classifiedDownloadError = (
+  error: unknown,
+): DownloadError | undefined => {
+  if (!(error instanceof ProcessExecutionError)) return undefined;
+  const stderr = boundedStderr(error.result.stderr);
+  for (const [pattern, [code, message]] of CLASSIFICATIONS) {
+    if (pattern.test(stderr)) return new DownloadError(code, message);
+  }
+  return undefined;
+};
+
+const processOptions = (
+  environment: Readonly<NodeJS.ProcessEnv>,
+  signal: AbortSignal | undefined,
+  extraStdioFds?: readonly number[],
+): RunProcessOptions => ({
+  ...(signal === undefined ? {} : {signal}),
+  env: environment,
+  ...(extraStdioFds === undefined ? {} : {extraStdioFds}),
+});
 
 export const createYtDlpClient = (
-  options: YtDlpClientOptions = {},
+  options: YtDlpClientOptions,
 ): YtDlpClient => {
   const runner = options.runProcess ?? runSystemProcess;
-  const ytDlpExecutable = options.ytDlpExecutable ?? 'yt-dlp';
-  const explicitFfmpegExecutable = options.ffmpegExecutable;
-  const ffmpegExecutable = explicitFfmpegExecutable ?? 'ffmpeg';
-  const runWithSignal = async (
-    command: string,
-    args: readonly string[],
-    signal: AbortSignal | undefined,
-  ): Promise<ProcessResult> => signal === undefined
-    ? await runner(command, args)
-    : await runner(command, args, {signal});
+  const toolchain = Object.freeze({
+    ytDlpExecutable: options.toolchain.ytDlpExecutable,
+    ffmpegExecutable: options.toolchain.ffmpegExecutable,
+    ytDlpVersion: options.toolchain.ytDlpVersion,
+    ffmpegVersion: options.toolchain.ffmpegVersion,
+    ffmpegExplicit: options.toolchain.ffmpegExplicit,
+    childEnvironment: options.toolchain.childEnvironment,
+  });
 
   return {
-    async checkTools(signal?: AbortSignal): Promise<DownloadToolVersions> {
-      try {
-        const ytDlpResult = await runWithSignal(
-          ytDlpExecutable,
-          ['--version'],
-          signal,
-        );
-        const ytDlpVersion = firstNonemptyTrimmedLine(ytDlpResult.stdout);
-        if (ytDlpVersion === undefined) throw new Error();
-
-        const ffmpegResult = await runWithSignal(
-          ffmpegExecutable,
-          ['-version'],
-          signal,
-        );
-        const ffmpegVersion = firstNonemptyTrimmedLine(ffmpegResult.stdout);
-        if (ffmpegVersion === undefined) throw new Error();
-
-        return {ytDlpVersion, ffmpegVersion};
-      } catch {
-        throw new DownloadError('DOWNLOAD_TOOL_MISSING', TOOL_MISSING_MESSAGE);
-      }
+    async checkTools(): Promise<DownloadToolVersions> {
+      return {
+        ytDlpVersion: toolchain.ytDlpVersion,
+        ffmpegVersion: toolchain.ffmpegVersion,
+      };
     },
 
     async probe(
       url: string,
-      options?: YtDlpOperationOptions,
+      operation: YtDlpOperationOptions,
     ): Promise<YtDlpProbe> {
-      const browserCookieSource = options?.browserCookieSource;
-      const signal = options?.signal;
+      const args = [
+        ...operation.profile.commonArgs,
+        '--skip-download',
+        '--dump-single-json',
+        url,
+      ];
       try {
-        const result = await runWithSignal(ytDlpExecutable, [
-          ...FIXED_YT_DLP_ARGS,
-          ...browserCookieArgs(browserCookieSource),
-          '--skip-download',
-          '--dump-single-json',
-          url,
-        ], signal);
+        const result = await runner(
+          toolchain.ytDlpExecutable,
+          args,
+          processOptions(toolchain.childEnvironment, operation.signal),
+        );
         return parseYtDlpInfo(JSON.parse(result.stdout));
-      } catch {
-        throw new DownloadError('DOWNLOAD_PROBE_FAILED', PROBE_FAILED_MESSAGE);
+      } catch (error) {
+        throw classifiedDownloadError(error)
+          ?? new DownloadError('DOWNLOAD_PROBE_FAILED', PROBE_FAILED_MESSAGE);
       }
     },
 
     async download(
       url: string,
       stagingDirectoryFd: number,
-      options?: YtDlpOperationOptions,
+      operation: YtDlpOperationOptions,
     ): Promise<void> {
-      const browserCookieSource = options?.browserCookieSource;
-      const signal = options?.signal;
+      const args = [
+        '-l',
+        'JavaScript',
+        '-e',
+        DARWIN_YT_DLP_WRAPPER_SCRIPT,
+        '--',
+        toolchain.ytDlpExecutable,
+        ...operation.profile.commonArgs,
+        '--no-progress',
+        '--write-thumbnail',
+        '--write-subs',
+        '--write-auto-subs',
+        '--sub-langs',
+        'zh.*,en.*',
+        '--output',
+        'video.%(ext)s',
+        ...(toolchain.ffmpegExplicit
+          ? ['--ffmpeg-location', toolchain.ffmpegExecutable]
+          : []),
+        url,
+      ];
       try {
-        await runner('/usr/bin/osascript', [
-          '-l',
-          'JavaScript',
-          '-e',
-          DARWIN_YT_DLP_WRAPPER_SCRIPT,
-          '--',
-          ytDlpExecutable,
-          ...FIXED_YT_DLP_ARGS,
-          ...browserCookieArgs(browserCookieSource),
-          '--no-progress',
-          '--write-thumbnail',
-          '--write-subs',
-          '--write-auto-subs',
-          '--sub-langs',
-          'zh.*,en.*',
-          '--output',
-          'video.%(ext)s',
-          ...(explicitFfmpegExecutable === undefined
-            ? []
-            : ['--ffmpeg-location', ffmpegExecutable]),
-          url,
-        ], {
-          ...(signal === undefined ? {} : {signal}),
-          extraStdioFds: [stagingDirectoryFd],
-        });
-      } catch {
-        throw new DownloadError('DOWNLOAD_PROCESS_FAILED', PROCESS_FAILED_MESSAGE);
+        await runner(
+          '/usr/bin/osascript',
+          args,
+          processOptions(
+            toolchain.childEnvironment,
+            operation.signal,
+            [stagingDirectoryFd],
+          ),
+        );
+      } catch (error) {
+        throw classifiedDownloadError(error)
+          ?? new DownloadError('DOWNLOAD_PROCESS_FAILED', PROCESS_FAILED_MESSAGE);
       }
     },
   };
