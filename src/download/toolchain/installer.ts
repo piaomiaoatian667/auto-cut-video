@@ -29,6 +29,10 @@ import {
   DOWNLOADER_TOOLCHAIN_MANIFEST,
   installedManifestForPinnedToolchain,
 } from './manifest';
+import {
+  DENO_WRAPPER_FILENAME,
+  DENO_WRAPPER_SOURCE,
+} from './deno-wrapper';
 import {resolveDownloaderToolchainPaths} from './paths';
 import type {
   DownloaderToolchainPaths,
@@ -329,6 +333,11 @@ const pathsForVersionDirectory = (
   versionDirectory,
   installedManifest: path.join(versionDirectory, 'manifest.json'),
   ytDlpExecutable: path.join(versionDirectory, 'bin/yt-dlp'),
+  denoWrapperExecutable: path.join(
+    versionDirectory,
+    'bin',
+    DENO_WRAPPER_FILENAME,
+  ),
   pluginDirectory: path.join(versionDirectory, 'plugins'),
   pluginArchive: path.join(
     versionDirectory,
@@ -356,6 +365,7 @@ const validatePublishedToolchainIntegrity = async (
   const [
     root,
     downloader,
+    denoWrapper,
     plugin,
     providerHeadStats,
     providerScriptStats,
@@ -365,6 +375,7 @@ const validatePublishedToolchainIntegrity = async (
   ] = await Promise.all([
     dependencies.lstat(paths.versionDirectory),
     dependencies.lstat(paths.ytDlpExecutable),
+    dependencies.lstat(paths.denoWrapperExecutable),
     dependencies.lstat(paths.pluginArchive),
     dependencies.lstat(providerHeadPath),
     dependencies.lstat(providerScriptPath),
@@ -376,6 +387,7 @@ const validatePublishedToolchainIntegrity = async (
   if (
     !isOwnedDirectory(root, uid)
     || !isOwnedRegularFile(downloader, uid)
+    || !isOwnedRegularFile(denoWrapper, uid)
     || !isOwnedRegularFile(plugin, uid)
     || !isOwnedRegularFile(providerHeadStats, uid)
     || !isOwnedRegularFile(providerScriptStats, uid)
@@ -383,6 +395,11 @@ const validatePublishedToolchainIntegrity = async (
   ) {
     throw invalidToolchain();
   }
+
+  const denoWrapperSource = await dependencies.readFile(
+    paths.denoWrapperExecutable,
+    'utf8',
+  );
 
   let installedManifest: unknown;
   try {
@@ -404,6 +421,7 @@ const validatePublishedToolchainIntegrity = async (
   if (
     downloaderHash !== DOWNLOADER_TOOLCHAIN_MANIFEST.ytDlp.sha256
     || pluginHash !== DOWNLOADER_TOOLCHAIN_MANIFEST.potPlugin.sha256
+    || denoWrapperSource !== DENO_WRAPPER_SOURCE
     || providerHead.trim()
       !== DOWNLOADER_TOOLCHAIN_MANIFEST.potProvider.commit
   ) {
@@ -651,6 +669,24 @@ const installProviderDependencies = async (
   });
 };
 
+const writeDenoWrapper = async (
+  stagingPaths: DownloaderToolchainPaths,
+  dependencies: InstallerDependencies,
+): Promise<void> => {
+  const handle = await dependencies.open(
+    stagingPaths.denoWrapperExecutable,
+    'wx',
+    0o700,
+  );
+  try {
+    await handle.writeFile(DENO_WRAPPER_SOURCE, 'utf8');
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await dependencies.chmod(stagingPaths.denoWrapperExecutable, 0o700);
+};
+
 const validateStagedToolchain = async (
   stagingPaths: DownloaderToolchainPaths,
   ffmpegOverride: string | undefined,
@@ -731,6 +767,7 @@ const syncToolchainTree = async (
   );
   for (const candidate of [
     paths.ytDlpExecutable,
+    paths.denoWrapperExecutable,
     paths.pluginArchive,
     paths.installedManifest,
     providerHead,
@@ -796,6 +833,7 @@ const installDownloaderToolchainTransaction = async (
       dependencies,
       options.signal,
     );
+    await writeDenoWrapper(stagingPaths, dependencies);
     await downloadPinnedAsset(
       DOWNLOADER_TOOLCHAIN_MANIFEST.ytDlp,
       stagingPaths.ytDlpExecutable,

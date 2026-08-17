@@ -22,6 +22,7 @@ import {
   DOWNLOADER_TOOLCHAIN_MANIFEST,
   installedManifestForPinnedToolchain,
 } from './manifest';
+import {DENO_WRAPPER_SOURCE} from './deno-wrapper';
 import type {
   DownloaderToolchainPaths,
   DownloaderToolchainSource,
@@ -231,6 +232,29 @@ const requirePublishedManifest = async (
   }
 };
 
+const requireManagedDenoWrapper = async (
+  paths: DownloaderToolchainPaths,
+  dependencies: DownloaderCapabilityDependencies,
+): Promise<void> => {
+  await requireOwnedRegularFile(
+    paths.denoWrapperExecutable,
+    dependencies,
+    invalidToolchain,
+  );
+  try {
+    if (
+      await dependencies.readFile(paths.denoWrapperExecutable, 'utf8')
+      !== DENO_WRAPPER_SOURCE
+    ) {
+      throw invalidToolchain();
+    }
+  } catch (error) {
+    const cancellation = downloadCancellationFrom(error);
+    if (cancellation !== undefined) throw cancellation;
+    throw invalidToolchain();
+  }
+};
+
 const requireHash = async (
   candidate: string,
   expected: string,
@@ -342,6 +366,7 @@ export const validateDownloaderCapabilities = async (
     dependencies,
     invalidToolchain,
   );
+  await requireManagedDenoWrapper(paths, dependencies);
   await requireOwnedRegularFile(providerHead, dependencies, invalidToolchain);
 
   if (validationMode === 'published') {
@@ -360,10 +385,10 @@ export const validateDownloaderCapabilities = async (
     dependencies,
   );
 
-  let denoExecutable: string;
+  let systemDenoExecutable: string;
   let ffmpegExecutable: string;
   try {
-    denoExecutable = await dependencies.resolveExecutable('deno');
+    systemDenoExecutable = await dependencies.resolveExecutable('deno');
     ffmpegExecutable = ffmpegOverride
       ?? await dependencies.resolveExecutable('ffmpeg');
   } catch (error) {
@@ -402,7 +427,7 @@ export const validateDownloaderCapabilities = async (
 
   const denoResult = await runChecked(
     dependencies.runProcess,
-    denoExecutable,
+    systemDenoExecutable,
     ['--version'],
     processOptions,
   );
@@ -430,7 +455,7 @@ export const validateDownloaderCapabilities = async (
     throw invalidProvider();
   }
 
-  await runProviderCheck(dependencies.runProcess, denoExecutable, [
+  await runProviderCheck(dependencies.runProcess, paths.denoWrapperExecutable, [
     'run',
     '--allow-env',
     `--allow-ffi=${denoPathList(path.join(paths.providerServerDirectory, 'node_modules'))}`,
@@ -469,7 +494,7 @@ export const validateDownloaderCapabilities = async (
     source,
     ytDlpExecutable,
     ffmpegExecutable,
-    denoExecutable,
+    denoExecutable: paths.denoWrapperExecutable,
     ytDlpVersion,
     ffmpegVersion,
     pluginDirectory: paths.pluginDirectory,

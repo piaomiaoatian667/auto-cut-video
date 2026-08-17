@@ -1,5 +1,6 @@
 import path from 'node:path';
 import {DownloadError} from '../errors';
+import {DENO_WRAPPER_FILENAME} from './deno-wrapper';
 import type {DownloaderToolchainPaths} from './types';
 
 export const resolveDownloaderToolchainPaths = (
@@ -25,6 +26,11 @@ export const resolveDownloaderToolchainPaths = (
     versionDirectory,
     installedManifest: path.join(versionDirectory, 'manifest.json'),
     ytDlpExecutable: path.join(versionDirectory, 'bin/yt-dlp'),
+    denoWrapperExecutable: path.join(
+      versionDirectory,
+      'bin',
+      DENO_WRAPPER_FILENAME,
+    ),
     pluginDirectory: path.join(versionDirectory, 'plugins'),
     pluginArchive: path.join(
       versionDirectory,

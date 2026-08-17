@@ -5,6 +5,7 @@ export interface DownloaderToolchainPaths {
   versionDirectory: string;
   installedManifest: string;
   ytDlpExecutable: string;
+  denoWrapperExecutable: string;
   pluginDirectory: string;
   pluginArchive: string;
   providerDirectory: string;

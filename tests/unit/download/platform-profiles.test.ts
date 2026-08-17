@@ -17,7 +17,7 @@ const createToolchain = (
   source: 'managed',
   ytDlpExecutable: '/managed/bin/yt-dlp',
   ffmpegExecutable: '/usr/local/bin/ffmpeg',
-  denoExecutable: '/usr/local/bin/deno',
+  denoExecutable: '/managed/bin/deno-isolated',
   ytDlpVersion: '2026.07.04',
   ffmpegVersion: '8.1.2',
   pluginDirectory: '/managed/plugins',
@@ -109,6 +109,9 @@ describe('resolvePlatformProfile', () => {
       '--sleep-requests',
       '1',
     ]);
+    expect(profile.commonArgs.filter((argument) =>
+      argument === 'chrome' || argument.startsWith('chrome:')
+    )).toEqual(['chrome']);
     expect(profile).toMatchObject({
       platform: 'youtube',
       probeToDownloadDelayMs: 5000,

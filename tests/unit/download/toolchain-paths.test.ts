@@ -14,6 +14,8 @@ describe('managed downloader toolchain paths', () => {
         '/Users/tester/Library/Caches/auto-cut-video/downloader/2026.07.04-macos-arm64/manifest.json',
       ytDlpExecutable:
         '/Users/tester/Library/Caches/auto-cut-video/downloader/2026.07.04-macos-arm64/bin/yt-dlp',
+      denoWrapperExecutable:
+        '/Users/tester/Library/Caches/auto-cut-video/downloader/2026.07.04-macos-arm64/bin/deno-isolated',
       pluginDirectory:
         '/Users/tester/Library/Caches/auto-cut-video/downloader/2026.07.04-macos-arm64/plugins',
       pluginArchive:

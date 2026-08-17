@@ -50,8 +50,24 @@ const pluginOutput = [
   ...pluginEntries,
   '',
 ].join('\n');
+const expectedDenoWrapperSource = [
+  '#!/bin/sh',
+  'set -eu',
+  ': "${XDG_CACHE_HOME:?XDG_CACHE_HOME must be set}"',
+  'export HOME="$XDG_CACHE_HOME"',
+  'export TMPDIR="$XDG_CACHE_HOME"',
+  'export NPM_CONFIG_REGISTRY="https://registry.npmjs.org/"',
+  'export NPM_CONFIG_USERCONFIG="/dev/null"',
+  'export NPM_CONFIG_GLOBALCONFIG="/dev/null"',
+  'exec deno "$@"',
+  '',
+].join('\n');
+const denoWrapperExecutableFor = (
+  toolchainPaths: DownloaderToolchainPaths,
+): string => path.join(toolchainPaths.versionDirectory, 'bin/deno-isolated');
 const paths = resolveDownloaderToolchainPaths('/Users/tester');
 const providerHeadPath = path.join(paths.providerDirectory, '.git/HEAD');
+const denoWrapperExecutable = denoWrapperExecutableFor(paths);
 const currentUid = 501;
 const denoExecutable = '/private/tools/deno';
 const ffmpegExecutable = '/private/tools/ffmpeg';
@@ -126,6 +142,7 @@ const createCapabilityFixture = (
       toolchainPaths.installedManifest,
       `${JSON.stringify(installedManifestForPinnedToolchain(), null, 2)}\n`,
     ],
+    [denoWrapperExecutableFor(toolchainPaths), expectedDenoWrapperSource],
     [providerHeadPath, `${DOWNLOADER_TOOLCHAIN_MANIFEST.potProvider.commit}\n`],
   ]);
   if (toolchainPaths !== paths) {
@@ -410,7 +427,7 @@ describe('validateDownloaderCapabilities', () => {
       source: 'managed',
       ytDlpExecutable: paths.ytDlpExecutable,
       ffmpegExecutable,
-      denoExecutable,
+      denoExecutable: denoWrapperExecutable,
       ytDlpVersion: '2026.07.04',
       ffmpegVersion: '8.1.2',
       pluginDirectory: paths.pluginDirectory,
@@ -441,7 +458,7 @@ describe('validateDownloaderCapabilities', () => {
     ]);
     const providerCall = fixture.runProcess.mock.calls[4];
     expect(providerCall).toEqual([
-      denoExecutable,
+      denoWrapperExecutable,
       [
         'run',
         '--allow-env',
@@ -456,6 +473,7 @@ describe('validateDownloaderCapabilities', () => {
         env: resolved.childEnvironment,
       },
     ]);
+    expect(fixture.readFile).toHaveBeenCalledWith(denoWrapperExecutable, 'utf8');
     expect(fixture.runProcess.mock.calls.slice(5)).toEqual([
       [
         paths.ytDlpExecutable,
@@ -601,6 +619,49 @@ describe('validateDownloaderCapabilities', () => {
       'DOWNLOAD_TOOLCHAIN_INVALID',
       INVALID_TOOLCHAIN_MESSAGE,
       ['privateMarker', paths.installedManifest],
+    );
+  });
+
+  it('rejects a missing managed Deno wrapper', async () => {
+    const fixture = createCapabilityFixture();
+    fixture.files.delete(denoWrapperExecutable);
+
+    await expectControlledError(
+      validateFixture(fixture),
+      'DOWNLOAD_TOOLCHAIN_INVALID',
+      INVALID_TOOLCHAIN_MESSAGE,
+      [denoWrapperExecutable],
+    );
+  });
+
+  it('rejects a tampered managed Deno wrapper', async () => {
+    const fixture = createCapabilityFixture();
+    fixture.files.set(
+      denoWrapperExecutable,
+      `${expectedDenoWrapperSource}private-wrapper-marker\n`,
+    );
+
+    await expectControlledError(
+      validateFixture(fixture),
+      'DOWNLOAD_TOOLCHAIN_INVALID',
+      INVALID_TOOLCHAIN_MESSAGE,
+      ['private-wrapper-marker', denoWrapperExecutable],
+    );
+  });
+
+  it.each([
+    ['a symlink', regularFileStats(currentUid, true)],
+    ['foreign ownership', regularFileStats(currentUid + 1)],
+    ['a non-regular type', nonRegularStats()],
+  ])('rejects a managed Deno wrapper with %s', async (_caseName, wrapperStats) => {
+    const fixture = createCapabilityFixture();
+    fixture.stats.set(denoWrapperExecutable, wrapperStats);
+
+    await expectControlledError(
+      validateFixture(fixture),
+      'DOWNLOAD_TOOLCHAIN_INVALID',
+      INVALID_TOOLCHAIN_MESSAGE,
+      [denoWrapperExecutable],
     );
   });
 

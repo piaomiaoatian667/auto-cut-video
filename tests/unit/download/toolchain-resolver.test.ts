@@ -2,6 +2,7 @@ import type {Stats} from 'node:fs';
 import path from 'node:path';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import type {DownloaderCapabilityDependencies} from '../../../src/download/toolchain/capabilities';
+import {DENO_WRAPPER_SOURCE} from '../../../src/download/toolchain/deno-wrapper';
 import {
   DOWNLOADER_TOOLCHAIN_MANIFEST,
   installedManifestForPinnedToolchain,
@@ -121,6 +122,9 @@ const createResolverFixture = (): ResolverFixture => {
       if (candidate === paths.installedManifest) {
         return `${JSON.stringify(installedManifestForPinnedToolchain(), null, 2)}\n`;
       }
+      if (candidate === paths.denoWrapperExecutable) {
+        return DENO_WRAPPER_SOURCE;
+      }
       if (candidate === path.join(paths.providerDirectory, '.git/HEAD')) {
         return `${DOWNLOADER_TOOLCHAIN_MANIFEST.potProvider.commit}\n`;
       }
@@ -201,6 +205,7 @@ describe('resolveDownloaderToolchain', () => {
     expect(resolved).toMatchObject({
       source: 'override',
       ytDlpExecutable: ytDlpOverride,
+      denoExecutable: paths.denoWrapperExecutable,
       ytDlpVersion: '2026.07.04',
     });
     expect(fixture.directoryExists).toHaveBeenCalledWith(paths.versionDirectory);
@@ -222,6 +227,7 @@ describe('resolveDownloaderToolchain', () => {
     expect(resolved).toMatchObject({
       source: 'managed',
       ytDlpExecutable: paths.ytDlpExecutable,
+      denoExecutable: paths.denoWrapperExecutable,
     });
     expect(fixture.runProcess.mock.calls[0]?.[0]).toBe(paths.ytDlpExecutable);
     expect(fixture.runProcess.mock.calls.some(([command]) => command === 'yt-dlp'))

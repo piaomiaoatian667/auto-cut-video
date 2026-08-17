@@ -1,3 +1,4 @@
+import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
 import type {Stats} from 'node:fs';
 import {
@@ -69,6 +70,21 @@ const providerInstallArguments = [
   '--allow-scripts=npm:canvas',
   '--frozen',
 ] as const;
+const expectedDenoWrapperSource = [
+  '#!/bin/sh',
+  'set -eu',
+  ': "${XDG_CACHE_HOME:?XDG_CACHE_HOME must be set}"',
+  'export HOME="$XDG_CACHE_HOME"',
+  'export TMPDIR="$XDG_CACHE_HOME"',
+  'export NPM_CONFIG_REGISTRY="https://registry.npmjs.org/"',
+  'export NPM_CONFIG_USERCONFIG="/dev/null"',
+  'export NPM_CONFIG_GLOBALCONFIG="/dev/null"',
+  'exec deno "$@"',
+  '',
+].join('\n');
+const denoWrapperExecutableFor = (
+  paths: DownloaderToolchainPaths,
+): string => path.join(paths.versionDirectory, 'bin/deno-isolated');
 
 type MutableAsset = {url: string; bytes: number; sha256: string};
 
@@ -263,7 +279,10 @@ const createInstallerFixture = async (): Promise<InstallerFixture> => {
       if (command === '/usr/bin/unzip') {
         return resultFor(command, args, pluginOutput);
       }
-      if (command === denoExecutable && args[0] === 'run') {
+      if (
+        (command === denoExecutable || path.basename(command) === 'deno-isolated')
+        && args[0] === 'run'
+      ) {
         return resultFor(command, args);
       }
       if (args.length === 1 && args[0] === '--list-impersonate-targets') {
@@ -380,6 +399,11 @@ const seedValidPublishedToolchain = async (
     {recursive: true, mode: 0o700},
   );
   await writeFile(paths.ytDlpExecutable, ytDlpContents, {mode: 0o700});
+  await writeFile(
+    denoWrapperExecutableFor(paths),
+    expectedDenoWrapperSource,
+    {mode: 0o700},
+  );
   await writeFile(paths.pluginArchive, pluginContents, {mode: 0o600});
   await writeFile(
     paths.installedManifest,
@@ -473,8 +497,13 @@ describe('installDownloaderToolchain', () => {
     expect(await readFile(fixture.paths.installedManifest, 'utf8')).toBe(
       `${JSON.stringify(installedManifestForPinnedToolchain(), null, 2)}\n`,
     );
+    const denoWrapperExecutable = denoWrapperExecutableFor(fixture.paths);
+    expect(await readFile(denoWrapperExecutable, 'utf8')).toBe(
+      expectedDenoWrapperSource,
+    );
     expect((await lstatFile(fixture.paths.ytDlpExecutable)).mode & 0o777)
       .toBe(0o700);
+    expect((await lstatFile(denoWrapperExecutable)).mode & 0o777).toBe(0o700);
     expect(fixture.fetch).toHaveBeenCalledTimes(2);
     expect(fixture.runProcess.mock.calls.slice(0, 6).map(([command, args]) => [
       command,
@@ -546,6 +575,7 @@ describe('installDownloaderToolchain', () => {
     expect(publication).toBeGreaterThan(-1);
     for (const requiredPath of [
       'bin/yt-dlp',
+      'bin/deno-isolated',
       'plugins/bgutil-ytdlp-pot-provider.zip',
       'manifest.json',
       'provider/.git/HEAD',
@@ -561,6 +591,75 @@ describe('installDownloaderToolchain', () => {
     expect(await exists(fixture.paths.setupLock)).toBe(false);
     expect(await Promise.all(fixture.stagingDirectories.map(exists)))
       .toEqual(fixture.stagingDirectories.map(() => false));
+  });
+
+  it('isolates Deno HOME and npm config while forwarding arguments and exit code', async () => {
+    const fixture = await createInstallerFixture();
+    await installDownloaderToolchain(
+      {homeDirectory: fixture.homeDirectory},
+      fixture.dependencies,
+    );
+    const fakeBinDirectory = path.join(fixture.homeDirectory, 'fake-bin');
+    const fakeDenoExecutable = path.join(fakeBinDirectory, 'deno');
+    const capturePath = path.join(fixture.homeDirectory, 'fake-deno-capture.txt');
+    const runtimeCache = path.join(fixture.homeDirectory, 'runtime-cache');
+    const poisonedHome = path.join(fixture.homeDirectory, 'poisoned-home');
+    await mkdirDirectory(fakeBinDirectory, {recursive: true, mode: 0o700});
+    await mkdirDirectory(runtimeCache, {recursive: true, mode: 0o700});
+    await writeFile(fakeDenoExecutable, [
+      '#!/bin/sh',
+      'set -eu',
+      '{',
+      '  printf \'HOME=%s\\n\' "$HOME"',
+      '  printf \'TMPDIR=%s\\n\' "$TMPDIR"',
+      '  printf \'NPM_CONFIG_REGISTRY=%s\\n\' "$NPM_CONFIG_REGISTRY"',
+      '  printf \'NPM_CONFIG_USERCONFIG=%s\\n\' "$NPM_CONFIG_USERCONFIG"',
+      '  printf \'NPM_CONFIG_GLOBALCONFIG=%s\\n\' "$NPM_CONFIG_GLOBALCONFIG"',
+      '  printf \'ARG=%s\\n\' "$@"',
+      '} > "$FAKE_DENO_CAPTURE"',
+      'exit 37',
+      '',
+    ].join('\n'), {mode: 0o700});
+    vi.stubEnv('HOME', poisonedHome);
+    vi.stubEnv('TMPDIR', path.join(fixture.homeDirectory, 'poisoned-tmp'));
+    vi.stubEnv('NPM_CONFIG_REGISTRY', 'https://private-registry.example.test/');
+    vi.stubEnv('NPM_CONFIG_USERCONFIG', '/private/user-npmrc');
+    vi.stubEnv('NPM_CONFIG_GLOBALCONFIG', '/private/global-npmrc');
+    const parentHome = process.env.HOME;
+
+    const completion = await new Promise<{
+      code: number | null;
+      signal: NodeJS.Signals | null;
+    }>((resolve, reject) => {
+      const child = spawn(
+        denoWrapperExecutableFor(fixture.paths),
+        ['argument with spaces', '--flag=$literal'],
+        {
+          env: {
+            ...process.env,
+            PATH: fakeBinDirectory,
+            XDG_CACHE_HOME: runtimeCache,
+            FAKE_DENO_CAPTURE: capturePath,
+          },
+          stdio: 'ignore',
+        },
+      );
+      child.once('error', reject);
+      child.once('exit', (code, signal) => resolve({code, signal}));
+    });
+
+    expect(completion).toEqual({code: 37, signal: null});
+    expect(await readFile(capturePath, 'utf8')).toBe([
+      `HOME=${runtimeCache}`,
+      `TMPDIR=${runtimeCache}`,
+      'NPM_CONFIG_REGISTRY=https://registry.npmjs.org/',
+      'NPM_CONFIG_USERCONFIG=/dev/null',
+      'NPM_CONFIG_GLOBALCONFIG=/dev/null',
+      'ARG=argument with spaces',
+      'ARG=--flag=$literal',
+      '',
+    ].join('\n'));
+    expect(process.env.HOME).toBe(parentHome);
   });
 
   it('uses a minimal staging-local environment for every installer subprocess', async () => {
@@ -632,6 +731,10 @@ describe('installDownloaderToolchain', () => {
     const providerCacheDirectory = path.join(
       stagingRoot,
       'deno/provider-cache',
+    );
+    const stagingDenoWrapperExecutable = path.join(
+      stagingRoot,
+      'bin/deno-isolated',
     );
     const expectedPath = [
       '/usr/bin',
@@ -726,14 +829,14 @@ describe('installDownloaderToolchain', () => {
       '--version',
     ];
     const providerProbe = fixture.runProcess.mock.calls.find(
-      ([command, args, options]) => command === denoExecutable
+      ([command, args, options]) => command === stagingDenoWrapperExecutable
         && args.length === providerProbeArguments.length
         && args.every((argument, index) =>
           argument === providerProbeArguments[index]
         )
         && options?.cwd === providerServerDirectory,
     );
-    expect(providerProbe?.[0]).toBe(denoExecutable);
+    expect(providerProbe?.[0]).toBe(stagingDenoWrapperExecutable);
     expect(providerProbe?.[1]).toEqual(providerProbeArguments);
     expect(providerProbe?.[2]?.cwd).toBe(providerServerDirectory);
 
@@ -776,6 +879,37 @@ describe('installDownloaderToolchain', () => {
     expect(fixture.randomUUID).not.toHaveBeenCalled();
     expect(await exists(fixture.paths.versionDirectory)).toBe(true);
     expect(await exists(fixture.paths.setupLock)).toBe(false);
+  });
+
+  it.each([
+    'missing',
+    'tampered',
+    'a directory',
+    'foreign-owned',
+  ] as const)('reinstalls when the published Deno wrapper is %s', async (state) => {
+    const fixture = await createInstallerFixture();
+    await seedValidPublishedToolchain(fixture.paths);
+    const denoWrapperExecutable = denoWrapperExecutableFor(fixture.paths);
+    if (state === 'missing') {
+      await removeFile(denoWrapperExecutable);
+    } else if (state === 'tampered') {
+      await writeFile(denoWrapperExecutable, 'private wrapper contents\n');
+    } else if (state === 'a directory') {
+      await removeFile(denoWrapperExecutable);
+      await mkdirDirectory(denoWrapperExecutable, {mode: 0o700});
+    } else {
+      fixture.state.foreignOwnedPath = denoWrapperExecutable;
+    }
+
+    await expect(installDownloaderToolchain(
+      {homeDirectory: fixture.homeDirectory},
+      fixture.dependencies,
+    )).resolves.toEqual({status: 'installed', version: '2026.07.04'});
+
+    expect(fixture.fetch).toHaveBeenCalledTimes(2);
+    expect(await readFile(denoWrapperExecutable, 'utf8')).toBe(
+      expectedDenoWrapperSource,
+    );
   });
 
   it('rejects a redirect to a non-allowlisted host without following it', async () => {
