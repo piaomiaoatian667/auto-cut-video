@@ -26,6 +26,7 @@ import {parseDownloadProxy} from '../../../src/download/network-options';
 import {resolvePlatformProfile} from '../../../src/download/platform-profiles';
 import type {DownloadPlatform} from '../../../src/download/platforms';
 import type {ResolvedDownloaderToolchain} from '../../../src/download/toolchain/types';
+import type {ResolveDownloaderToolchainOptions} from '../../../src/download/toolchain/resolver';
 import type {
   DownloadProcessRunner,
   YtDlpClient,
@@ -675,6 +676,33 @@ describe('downloadVideo', () => {
     expect(harness.cleanup).toHaveBeenCalledWith(STAGED);
   });
 
+  it('awaits a zero-delay non-YouTube wait before opening staging authority', async () => {
+    const waitGate = createDeferred<void>();
+    const staged = makeStaged('bilibili', 'BV1abc');
+    const harness = makeHarness({
+      waitPromise: waitGate.promise,
+      preparation: staged,
+      probe: {
+        id: 'BV1abc',
+        title: 'Bilibili fixture',
+        canonicalUrl: 'https://www.bilibili.com/video/BV1abc',
+        extractor: 'BiliBili',
+        hasDrm: false,
+      },
+    });
+    const operation = downloadVideo({
+      ...INPUT,
+      url: 'https://www.bilibili.com/video/BV1abc',
+    }, harness.dependencies);
+
+    await vi.waitFor(() => expect(harness.wait).toHaveBeenCalledWith(0, undefined));
+    expect(harness.openStagingDownloadAuthority).not.toHaveBeenCalled();
+
+    waitGate.resolve();
+    await expect(operation).resolves.toBe(DOWNLOADED);
+    expect(harness.openStagingDownloadAuthority).toHaveBeenCalledWith(staged);
+  });
+
   it('passes one signal and the same profile through the checked session', async () => {
     const controller = new AbortController();
     const harness = makeHarness();
@@ -761,6 +789,33 @@ describe('downloadVideo', () => {
     expect(harness.cleanup).toHaveBeenCalledWith(STAGED);
     expect(harness.writeMetadata).not.toHaveBeenCalled();
     expect(harness.finalize).not.toHaveBeenCalled();
+  });
+
+  it('awaits authority close before cleanup and preserves the operation failure', async () => {
+    const operationFailure = new DownloadError(
+      'DOWNLOAD_PROCESS_FAILED',
+      'The video could not be downloaded.',
+    );
+    const closeGate = createDeferred<void>();
+    const harness = makeHarness({
+      downloadError: operationFailure,
+      authorityClosePromise: closeGate.promise,
+      authorityCloseError: new Error('close failed'),
+      cleanupError: new Error('cleanup failed'),
+    });
+    const pending = Symbol('pending');
+    let outcome: unknown = pending;
+    const operation = downloadVideo(INPUT, harness.dependencies);
+    void operation.catch((error: unknown) => { outcome = error; });
+
+    await vi.waitFor(() => expect(harness.closeAuthority).toHaveBeenCalledTimes(1));
+    expect(harness.cleanup).not.toHaveBeenCalled();
+    expect(outcome).toBe(pending);
+
+    closeGate.resolve();
+    await expect(operation).rejects.toBe(operationFailure);
+    expect(harness.cleanup).toHaveBeenCalledWith(STAGED);
+    expect(outcome).toBe(operationFailure);
   });
 
   it('preserves a metadata failure over close and cleanup failures', async () => {
@@ -910,6 +965,43 @@ describe('waitForDownloadDelay', () => {
       addEventListener.mock.calls[0]?.[1],
     );
   });
+
+  it('clears its timer and removes the listener when aborted while pending', async () => {
+    vi.useFakeTimers();
+    try {
+      const controller = new AbortController();
+      const reason = new Error('abort pending delay');
+      const addEventListener = vi.spyOn(controller.signal, 'addEventListener');
+      const removeEventListener = vi.spyOn(
+        controller.signal,
+        'removeEventListener',
+      );
+      const delay = waitForDownloadDelay(5000, controller.signal);
+      const pending = Symbol('pending');
+      let outcome: unknown = pending;
+      void delay.then(
+        () => { outcome = 'resolved'; },
+        (error: unknown) => { outcome = error; },
+      );
+
+      await Promise.resolve();
+      expect(outcome).toBe(pending);
+      expect(vi.getTimerCount()).toBe(1);
+      expect(addEventListener).toHaveBeenCalledTimes(1);
+
+      controller.abort(reason);
+
+      await expect(delay).rejects.toBe(reason);
+      expect(outcome).toBe(reason);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(removeEventListener).toHaveBeenCalledWith(
+        'abort',
+        addEventListener.mock.calls[0]?.[1],
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('createSystemDownloadDependencies', () => {
@@ -977,5 +1069,60 @@ describe('createSystemDownloadDependencies', () => {
 
     expect(mutatedRunProcess).not.toHaveBeenCalled();
     expect(originalRunProcess).toHaveBeenCalledTimes(1);
+  });
+
+  it('snapshots resolver overrides and forwards the invocation signal', async () => {
+    const resolveToolchain = vi.fn(
+      async (_options: ResolveDownloaderToolchainOptions) => TOOLCHAIN,
+    );
+    vi.resetModules();
+    vi.doMock('../../../src/download/toolchain/resolver', () => ({
+      resolveDownloaderToolchain: resolveToolchain,
+    }));
+
+    try {
+      const {createSystemDownloadDependencies: createMockedDependencies} =
+        await import('../../../src/download/downloader');
+      const originalRunProcess = vi.fn<DownloadProcessRunner>()
+        .mockResolvedValue(processResult());
+      const mutatedRunProcess = vi.fn<DownloadProcessRunner>();
+      const options: SystemDownloadOptions = {
+        ytDlpOverride: '/tools/original-yt-dlp',
+        ffmpegOverride: '/tools/original-ffmpeg',
+        homeDirectory: '/home/original',
+        runProcess: originalRunProcess,
+      };
+      const dependencies = createMockedDependencies(options);
+      options.ytDlpOverride = '/tools/mutated-yt-dlp';
+      options.ffmpegOverride = '/tools/mutated-ffmpeg';
+      options.homeDirectory = '/home/mutated';
+      options.runProcess = mutatedRunProcess;
+      const controller = new AbortController();
+
+      await expect(dependencies.resolveToolchain(controller.signal))
+        .resolves.toBe(TOOLCHAIN);
+
+      expect(resolveToolchain).toHaveBeenCalledWith({
+        ytDlpOverride: '/tools/original-yt-dlp',
+        ffmpegOverride: '/tools/original-ffmpeg',
+        homeDirectory: '/home/original',
+        signal: controller.signal,
+      });
+      const resolverOptions = resolveToolchain.mock.calls[0]?.[0];
+      expect(resolverOptions).not.toHaveProperty('ytDlpExecutable');
+      expect(resolverOptions).not.toHaveProperty('ffmpegExecutable');
+
+      const client = dependencies.createClient(TOOLCHAIN);
+      const profile = resolvePlatformProfile({
+        platform: 'youtube',
+        toolchain: TOOLCHAIN,
+      });
+      await client.download('https://youtu.be/video-123', AUTHORITY_FD, {profile});
+      expect(mutatedRunProcess).not.toHaveBeenCalled();
+      expect(originalRunProcess).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.doUnmock('../../../src/download/toolchain/resolver');
+      vi.resetModules();
+    }
   });
 });
