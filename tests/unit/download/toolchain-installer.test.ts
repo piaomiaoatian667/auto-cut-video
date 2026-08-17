@@ -64,6 +64,11 @@ const targetsOutput = [
   'Client          OS           Source',
   'Chrome-136      Macos-15     curl_cffi',
 ].join('\n');
+const providerInstallArguments = [
+  'install',
+  '--allow-scripts=npm:canvas',
+  '--frozen',
+] as const;
 
 type MutableAsset = {url: string; bytes: number; sha256: string};
 
@@ -512,16 +517,23 @@ describe('installDownloaderToolchain', () => {
         ],
       ],
     ]);
-    const frozenInstall = fixture.runProcess.mock.calls.find(([, args]) =>
-      args[0] === 'install'
+    const stagingDirectory = fixture.stagingDirectories[0];
+    expect(stagingDirectory).toBeDefined();
+    const providerServerDirectory = path.join(
+      stagingDirectory as string,
+      'provider/server',
     );
-    expect(frozenInstall?.[1]).toEqual([
-      'install',
-      '--allow-scripts=npm:canvas',
-      '--frozen',
-    ]);
+    const frozenInstall = fixture.runProcess.mock.calls.find(
+      ([command, args, options]) => command === denoExecutable
+        && args.length === providerInstallArguments.length
+        && args.every((argument, index) =>
+          argument === providerInstallArguments[index]
+        )
+        && options?.cwd === providerServerDirectory,
+    );
+    expect(frozenInstall?.[1]).toEqual(providerInstallArguments);
     expect(frozenInstall?.[2]).toMatchObject({
-      cwd: expect.stringContaining('/.install-'),
+      cwd: providerServerDirectory,
       env: expect.objectContaining({
         DENO_NO_PROMPT: '1',
         DENO_NO_UPDATE_CHECK: '1',
@@ -551,126 +563,205 @@ describe('installDownloaderToolchain', () => {
       .toEqual(fixture.stagingDirectories.map(() => false));
   });
 
-  it('strips mixed-case system proxy variables from every Git and Deno child', async () => {
-    vi.stubEnv('HTTP_PROXY', 'http://private-http-proxy.test');
-    vi.stubEnv('https_proxy', 'http://private-https-proxy.test');
-    vi.stubEnv('ALL_PROXY', 'socks5://private-all-proxy.test');
-    vi.stubEnv('no_proxy', 'private-no-proxy.test');
-    vi.stubEnv('TOOLCHAIN_SAFE_ENV', 'preserved');
+  it('uses a minimal staging-local environment for every installer subprocess', async () => {
+    const sourcePath = [
+      'relative-bin',
+      '/usr/bin',
+      './local-bin',
+      '/opt/private-tools/bin',
+      '',
+      '/bin',
+    ].join(path.delimiter);
+    const poisonedEnvironment: Readonly<Record<string, string>> = {
+      PATH: sourcePath,
+      HOME: '/private/host-home',
+      TMPDIR: '/private/host-tmp',
+      OPENAI_API_KEY: 'private-openai-key',
+      ANTHROPIC_API_KEY: 'private-anthropic-key',
+      AWS_ACCESS_KEY_ID: 'private-aws-access-key',
+      AWS_SECRET_ACCESS_KEY: 'private-aws-secret-key',
+      AWS_SESSION_TOKEN: 'private-aws-session-token',
+      GOOGLE_APPLICATION_CREDENTIALS: '/private/google-credentials.json',
+      GOOGLE_CLOUD_PROJECT: 'private-google-project',
+      SSH_AUTH_SOCK: '/private/ssh-agent.sock',
+      NODE_OPTIONS: '--require=/private/host-hook.cjs',
+      NODE_PATH: '/private/host-node-modules',
+      NPM_CONFIG_REGISTRY: 'https://private-registry.example.test/',
+      npm_config_userconfig: '/private/user-npmrc',
+      NpM_CoNfIg_GlObAlCoNfIg: '/private/global-npmrc',
+      NPM_TOKEN: 'private-npm-token',
+      nPm_AuTh_ToKeN: 'private-npm-auth-token',
+      node_auth_token: 'private-node-auth-token',
+      DeNo_AuTh_ToKeNs: 'private-deno-auth-tokens',
+      HTTP_PROXY: 'http://private-http-proxy.test',
+      https_proxy: 'http://private-https-proxy.test',
+      ALL_PROXY: 'socks5://private-all-proxy.test',
+      no_proxy: 'private-no-proxy.test',
+      DENO_DIR: '/private/host-deno',
+      XDG_CACHE_HOME: '/private/host-cache',
+      DENO_NO_PROMPT: '0',
+      DENO_NO_UPDATE_CHECK: '0',
+      FORCE_COLOR: 'true',
+      GIT_CONFIG_NOSYSTEM: '0',
+      GIT_CONFIG_GLOBAL: '/private/host-gitconfig',
+      GIT_CONFIG_SYSTEM: '/private/system-gitconfig',
+      GIT_TERMINAL_PROMPT: '1',
+      GIT_SSH_COMMAND: '/private/host-ssh-command',
+      TOOLCHAIN_SAFE_ENV: 'private-unlisted-value',
+    };
     const fixture = await createInstallerFixture();
-
-    await expect(installDownloaderToolchain(
-      {homeDirectory: fixture.homeDirectory},
-      fixture.dependencies,
-    )).resolves.toEqual({status: 'installed', version: '2026.07.04'});
-
-    const gitAndDenoCalls = fixture.runProcess.mock.calls.filter(([command]) =>
-      command === 'git' || command === denoExecutable
-    );
-    expect(gitAndDenoCalls.length).toBeGreaterThan(0);
-    for (const [, , options] of gitAndDenoCalls) {
-      expect(options?.env).toBeDefined();
-      expect(Object.isFrozen(options?.env)).toBe(true);
-      expect(options?.env?.TOOLCHAIN_SAFE_ENV).toBe('preserved');
-      expect(Object.keys(options?.env ?? {}).filter((key) => [
-        'http_proxy',
-        'https_proxy',
-        'all_proxy',
-        'no_proxy',
-      ].includes(key.toLowerCase()))).toEqual([]);
+    for (const [key, value] of Object.entries(poisonedEnvironment)) {
+      vi.stubEnv(key, value);
     }
-  });
-
-  it('isolates provider dependency installation from ambient npm configuration', async () => {
-    const hostHome = '/private/host-home';
-    const poisonedValues = [
-      'https://private-registry.example.test/',
-      '/private/user-npmrc',
-      '/private/global-npmrc',
-      'private-npm-token',
-      'private-npm-auth-token',
-      'private-node-auth-token',
-      'private-deno-auth-tokens',
-    ];
-    vi.stubEnv('HOME', hostHome);
-    vi.stubEnv('NPM_CONFIG_REGISTRY', poisonedValues[0]);
-    vi.stubEnv('npm_config_userconfig', poisonedValues[1]);
-    vi.stubEnv('NpM_CoNfIg_GlObAlCoNfIg', poisonedValues[2]);
-    vi.stubEnv('NPM_TOKEN', poisonedValues[3]);
-    vi.stubEnv('nPm_AuTh_ToKeN', poisonedValues[4]);
-    vi.stubEnv('node_auth_token', poisonedValues[5]);
-    vi.stubEnv('DeNo_AuTh_ToKeNs', poisonedValues[6]);
-    vi.stubEnv('HTTP_PROXY', 'http://private-http-proxy.test');
-    vi.stubEnv('TOOLCHAIN_SAFE_ENV', 'preserved');
-    const fixture = await createInstallerFixture();
+    const controller = new AbortController();
 
     await expect(installDownloaderToolchain(
-      {homeDirectory: fixture.homeDirectory},
+      {homeDirectory: fixture.homeDirectory, signal: controller.signal},
       fixture.dependencies,
     )).resolves.toEqual({status: 'installed', version: '2026.07.04'});
 
-    const frozenInstall = fixture.runProcess.mock.calls.find(([, args]) =>
-      args[0] === 'install'
-    );
-    const installEnvironment = frozenInstall?.[2]?.env;
     const stagingDirectory = fixture.stagingDirectories[0];
     expect(stagingDirectory).toBeDefined();
-    expect(Object.isFrozen(installEnvironment)).toBe(true);
-    expect(installEnvironment).toMatchObject({
-      HOME: path.join(stagingDirectory as string, 'deno/provider-cache'),
-      NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
-      NPM_CONFIG_USERCONFIG: '/dev/null',
-      NPM_CONFIG_GLOBALCONFIG: '/dev/null',
-      DENO_DIR: path.join(stagingDirectory as string, 'deno'),
-      XDG_CACHE_HOME: path.join(stagingDirectory as string, 'deno/provider-cache'),
+    const stagingRoot = stagingDirectory as string;
+    const providerDirectory = path.join(stagingRoot, 'provider');
+    const providerServerDirectory = path.join(providerDirectory, 'server');
+    const providerModulesDirectory = path.join(
+      providerServerDirectory,
+      'node_modules',
+    );
+    const providerCacheDirectory = path.join(
+      stagingRoot,
+      'deno/provider-cache',
+    );
+    const expectedPath = [
+      '/usr/bin',
+      '/opt/private-tools/bin',
+      '/bin',
+    ].join(path.delimiter);
+    const installerEnvironment = {
+      PATH: expectedPath,
+      HOME: providerCacheDirectory,
+      TMPDIR: providerCacheDirectory,
+      DENO_DIR: path.join(stagingRoot, 'deno'),
+      XDG_CACHE_HOME: providerCacheDirectory,
       DENO_NO_PROMPT: '1',
       DENO_NO_UPDATE_CHECK: '1',
       FORCE_COLOR: 'false',
-      TOOLCHAIN_SAFE_ENV: 'preserved',
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_TERMINAL_PROMPT: '0',
+    };
+    const providerEnvironment = {
+      ...installerEnvironment,
+      NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
+      NPM_CONFIG_USERCONFIG: '/dev/null',
+      NPM_CONFIG_GLOBALCONFIG: '/dev/null',
+    };
+    const providerInstallCalls = fixture.runProcess.mock.calls.filter(
+      ([command, args, options]) => command === denoExecutable
+        && args.length === providerInstallArguments.length
+        && args.every((argument, index) =>
+          argument === providerInstallArguments[index]
+        )
+        && options?.cwd === providerServerDirectory,
+    );
+    expect(providerInstallCalls).toHaveLength(1);
+    const providerInstall = providerInstallCalls[0];
+    expect(providerInstall?.[0]).toBe(denoExecutable);
+    expect(providerInstall?.[1]).toEqual(providerInstallArguments);
+    expect(providerInstall?.[2]).toMatchObject({
+      cwd: providerServerDirectory,
+      signal: controller.signal,
+      env: providerEnvironment,
     });
-    expect(installEnvironment?.HOME).not.toBe(hostHome);
-    expect(Object.keys(installEnvironment ?? {}).filter((key) =>
-      key.toLowerCase().startsWith('npm_config_')
-    ).sort()).toEqual([
-      'NPM_CONFIG_GLOBALCONFIG',
-      'NPM_CONFIG_REGISTRY',
-      'NPM_CONFIG_USERCONFIG',
-    ]);
-    expect(Object.keys(installEnvironment ?? {}).filter((key) => [
-      'npm_token',
-      'npm_auth_token',
-      'node_auth_token',
-      'deno_auth_tokens',
-    ].includes(key.toLowerCase()))).toEqual([]);
-    expect(Object.keys(installEnvironment ?? {}).filter((key) =>
-      key.toLowerCase().includes('proxy')
-    )).toEqual([]);
-    expect(Object.values(installEnvironment ?? {}).filter((value) =>
-      value !== undefined && poisonedValues.includes(value)
-    )).toEqual([]);
 
-    const unchangedCalls = [
-      fixture.runProcess.mock.calls.find(([command, args]) =>
-        command === 'git' && args[0] === '--version'
-      ),
-      fixture.runProcess.mock.calls.find(([command, args]) =>
-        command === denoExecutable && args[0] === 'run'
-      ),
+    const expectedGitCalls = [
+      ['git', ['--version'], undefined],
+      ['git', ['init', providerDirectory], undefined],
+      [
+        'git',
+        [
+          '-C',
+          providerDirectory,
+          'remote',
+          'add',
+          'origin',
+          DOWNLOADER_TOOLCHAIN_MANIFEST.potProvider.repository,
+        ],
+        undefined,
+      ],
+      [
+        'git',
+        [
+          '-C',
+          providerDirectory,
+          'fetch',
+          '--depth',
+          '1',
+          'origin',
+          DOWNLOADER_TOOLCHAIN_MANIFEST.potProvider.commit,
+        ],
+        undefined,
+      ],
+      [
+        'git',
+        [
+          '-C',
+          providerDirectory,
+          'checkout',
+          '--detach',
+          'FETCH_HEAD',
+        ],
+        undefined,
+      ],
     ];
-    expect(unchangedCalls.every((call) => call !== undefined)).toBe(true);
-    for (const call of unchangedCalls) {
-      if (call === undefined) continue;
-      const [, , options] = call;
-      expect(options?.env).toMatchObject({
-        HOME: hostHome,
-        NPM_CONFIG_REGISTRY: poisonedValues[0],
-        npm_config_userconfig: poisonedValues[1],
-        NpM_CoNfIg_GlObAlCoNfIg: poisonedValues[2],
-        NPM_TOKEN: poisonedValues[3],
-        nPm_AuTh_ToKeN: poisonedValues[4],
-        node_auth_token: poisonedValues[5],
-        DeNo_AuTh_ToKeNs: poisonedValues[6],
-      });
+    expect(fixture.runProcess.mock.calls.filter(([command]) => command === 'git')
+      .map(([command, args, options]) => [command, args, options?.cwd]))
+      .toEqual(expectedGitCalls);
+
+    const providerProbeArguments = [
+      'run',
+      '--allow-env',
+      `--allow-ffi=${providerModulesDirectory}`,
+      `--allow-read=${providerServerDirectory},${providerModulesDirectory}`,
+      `--allow-write=${providerCacheDirectory}`,
+      path.join(providerServerDirectory, 'src/generate_once.ts'),
+      '--version',
+    ];
+    const providerProbe = fixture.runProcess.mock.calls.find(
+      ([command, args, options]) => command === denoExecutable
+        && args.length === providerProbeArguments.length
+        && args.every((argument, index) =>
+          argument === providerProbeArguments[index]
+        )
+        && options?.cwd === providerServerDirectory,
+    );
+    expect(providerProbe?.[0]).toBe(denoExecutable);
+    expect(providerProbe?.[1]).toEqual(providerProbeArguments);
+    expect(providerProbe?.[2]?.cwd).toBe(providerServerDirectory);
+
+    for (const call of fixture.runProcess.mock.calls) {
+      const environment = call[2]?.env;
+      expect(environment).toBeDefined();
+      expect(Object.isFrozen(environment)).toBe(true);
+      expect(call[2]?.signal).toBe(controller.signal);
+      expect(environment?.PATH).toBe(expectedPath);
+      expect(environment?.PATH?.split(path.delimiter).every((entry) =>
+        path.isAbsolute(entry)
+      )).toBe(true);
+      expect(environment).toEqual(
+        call === providerInstall ? providerEnvironment : installerEnvironment,
+      );
+      for (const [poisonedKey, poisonedValue] of Object.entries(
+        poisonedEnvironment,
+      )) {
+        const matchingKey = Object.keys(environment ?? {}).find((key) =>
+          key.toLowerCase() === poisonedKey.toLowerCase()
+        );
+        if (matchingKey !== undefined) {
+          expect(environment?.[matchingKey]).not.toBe(poisonedValue);
+        }
+      }
     }
   });
 

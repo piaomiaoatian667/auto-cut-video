@@ -21,7 +21,6 @@ import {runProcess as runSystemProcess, type RunProcessOptions} from '../../proc
 import {DownloadError} from '../errors';
 import type {DownloadProcessRunner} from '../yt-dlp';
 import {
-  buildDownloaderChildEnvironment,
   defaultDownloaderCapabilityDependencies,
   validateDownloaderCapabilities,
   type DownloaderCapabilityDependencies,
@@ -46,12 +45,12 @@ const ALLOWED_REDIRECT_HOSTS = new Set([
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const INSTALL_DIRECTORY_PREFIX = '.install-';
 const QUARANTINE_DIRECTORY_PREFIX = '.quarantine-';
-const PROVIDER_DEPENDENCY_AUTH_ENVIRONMENT_KEYS = new Set([
-  'deno_auth_tokens',
-  'node_auth_token',
-  'npm_auth_token',
-  'npm_token',
-]);
+const INSTALLER_PATH_FALLBACK = [
+  '/usr/bin',
+  '/bin',
+  '/usr/sbin',
+  '/sbin',
+].join(path.delimiter);
 const CACHE_PATH_COMPONENTS = [
   'Library',
   'Caches',
@@ -111,6 +110,40 @@ const processOptionsFor = (
 ): RunProcessOptions => ({
   env: environment,
   ...(signal === undefined ? {} : {signal}),
+});
+
+const buildInstallerChildEnvironment = (
+  paths: DownloaderToolchainPaths,
+  source: Readonly<NodeJS.ProcessEnv> = process.env,
+): Readonly<NodeJS.ProcessEnv> => {
+  const absolutePathEntries = (source.PATH ?? '')
+    .split(path.delimiter)
+    .filter((entry) => path.isAbsolute(entry));
+  return Object.freeze({
+    PATH: absolutePathEntries.length === 0
+      ? INSTALLER_PATH_FALLBACK
+      : absolutePathEntries.join(path.delimiter),
+    HOME: paths.providerCacheDirectory,
+    TMPDIR: paths.providerCacheDirectory,
+    DENO_DIR: paths.denoDirectory,
+    XDG_CACHE_HOME: paths.providerCacheDirectory,
+    DENO_NO_PROMPT: '1',
+    DENO_NO_UPDATE_CHECK: '1',
+    FORCE_COLOR: 'false',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_TERMINAL_PROMPT: '0',
+  });
+};
+
+const buildProviderDependencyEnvironment = (
+  paths: DownloaderToolchainPaths,
+  source: Readonly<NodeJS.ProcessEnv> = process.env,
+): Readonly<NodeJS.ProcessEnv> => Object.freeze({
+  ...buildInstallerChildEnvironment(paths, source),
+  NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
+  NPM_CONFIG_USERCONFIG: '/dev/null',
+  NPM_CONFIG_GLOBALCONFIG: '/dev/null',
 });
 
 const nodeErrorCode = (error: unknown): unknown => (
@@ -499,7 +532,7 @@ const requireGitAndDeno2 = async (
 ): Promise<string> => {
   const processOptions = processOptionsFor(
     signal,
-    buildDownloaderChildEnvironment(stagingPaths),
+    buildInstallerChildEnvironment(stagingPaths),
   );
   await dependencies.runProcess('git', ['--version'], processOptions);
   const denoExecutable = await dependencies.capabilities.resolveExecutable('deno');
@@ -568,7 +601,7 @@ const checkoutPinnedProvider = async (
 ): Promise<void> => {
   const processOptions = processOptionsFor(
     signal,
-    buildDownloaderChildEnvironment(paths),
+    buildInstallerChildEnvironment(paths),
   );
   await dependencies.runProcess(
     'git',
@@ -608,27 +641,6 @@ const checkoutPinnedProvider = async (
   }
 };
 
-const buildProviderDependencyEnvironment = (
-  stagingPaths: DownloaderToolchainPaths,
-): Readonly<NodeJS.ProcessEnv> => {
-  const environment = Object.fromEntries(
-    Object.entries(buildDownloaderChildEnvironment(stagingPaths)).filter(
-      ([key]) => {
-        const normalizedKey = key.toLowerCase();
-        return !normalizedKey.startsWith('npm_config_')
-          && !PROVIDER_DEPENDENCY_AUTH_ENVIRONMENT_KEYS.has(normalizedKey);
-      },
-    ),
-  );
-  return Object.freeze({
-    ...environment,
-    HOME: stagingPaths.providerCacheDirectory,
-    NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
-    NPM_CONFIG_USERCONFIG: '/dev/null',
-    NPM_CONFIG_GLOBALCONFIG: '/dev/null',
-  });
-};
-
 const installProviderDependencies = async (
   stagingPaths: DownloaderToolchainPaths,
   denoExecutable: string,
@@ -652,16 +664,13 @@ const validateStagedToolchain = async (
   dependencies: InstallerDependencies,
   signal?: AbortSignal,
 ): Promise<void> => {
-  const childEnvironment = buildDownloaderChildEnvironment(stagingPaths);
+  const childEnvironment = buildInstallerChildEnvironment(stagingPaths);
   const capabilityDependencies: DownloaderCapabilityDependencies = {
     ...dependencies.capabilities,
     runProcess: async (command, args, options = {}) =>
       await dependencies.capabilities.runProcess(command, args, {
         ...options,
-        env: buildDownloaderChildEnvironment(
-          stagingPaths,
-          options.env ?? childEnvironment,
-        ),
+        env: childEnvironment,
       }),
   };
   await validateDownloaderCapabilities({
