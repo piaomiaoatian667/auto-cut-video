@@ -7,7 +7,10 @@ import {
 
 const expectInvalidProxy = (value: string): void => {
   expect(() => parseDownloadProxy(value)).toThrowError(
-    expect.objectContaining({code: 'DOWNLOAD_PROXY_INVALID'}),
+    expect.objectContaining({
+      code: 'DOWNLOAD_PROXY_INVALID',
+      message: 'The proxy URL is invalid.',
+    }),
   );
 };
 
@@ -33,6 +36,12 @@ describe('download proxy options', () => {
     'http://proxy.example/path',
     'http://proxy.example/?query=1',
     'http://proxy.example/#fragment',
+    'http://proxy.example?',
+    'http://proxy.example/?',
+    'https://proxy.example#',
+    'https://proxy.example/#',
+    'socks5://proxy.example?#',
+    'socks5h://proxy.example/?#',
     'http:///missing-host',
     'http://proxy.example\n.invalid',
   ])('rejects %s without echoing it', (source) => {
@@ -53,5 +62,21 @@ describe('download proxy options', () => {
       scheme: 'http',
       url: 'http://secret-proxy.example:7890/',
     })).toThrowError(expect.objectContaining({code: 'DOWNLOAD_PROXY_INVALID'}));
+  });
+
+  it('round-trips a parsed proxy through runtime validation', () => {
+    const proxy = parseDownloadProxy('https://proxy.example:8443');
+    expect(validateDownloadProxy(proxy)).toEqual(proxy);
+  });
+
+  it('allows undefined runtime proxy values', () => {
+    expect(validateDownloadProxy(undefined)).toBeUndefined();
+  });
+
+  it('freezes parsed and validated proxy objects', () => {
+    const proxy = parseDownloadProxy('socks5://127.0.0.1:1080');
+    const validated = validateDownloadProxy(proxy);
+    expect(Object.isFrozen(proxy)).toBe(true);
+    expect(Object.isFrozen(validated)).toBe(true);
   });
 });

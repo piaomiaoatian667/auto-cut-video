@@ -2,10 +2,15 @@ import {DownloadError} from './errors';
 
 const proxyBrand: unique symbol = Symbol('download-proxy');
 const rawControlCharacters = /[\u0000-\u001f\u007f-\u009f]/u;
+const queryOrFragmentDelimiter = /[?#]/u;
 const absoluteProxyUrl = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/?#]/u;
-const acceptedSchemes = new Set(['http:', 'https:', 'socks5:', 'socks5h:']);
+const downloadProxySchemes = ['http', 'https', 'socks5', 'socks5h'] as const;
 
-export type DownloadProxyScheme = 'http' | 'https' | 'socks5' | 'socks5h';
+export type DownloadProxyScheme = (typeof downloadProxySchemes)[number];
+
+const acceptedSchemes: ReadonlySet<string> = new Set(downloadProxySchemes);
+const isDownloadProxyScheme = (value: string): value is DownloadProxyScheme =>
+  acceptedSchemes.has(value);
 
 export interface DownloadProxy {
   readonly [proxyBrand]: true;
@@ -23,7 +28,11 @@ const invalidProxy = (): DownloadError => new DownloadError(
 );
 
 export const parseDownloadProxy = (source: string): DownloadProxy => {
-  if (rawControlCharacters.test(source) || !absoluteProxyUrl.test(source)) {
+  if (
+    rawControlCharacters.test(source) ||
+    queryOrFragmentDelimiter.test(source) ||
+    !absoluteProxyUrl.test(source)
+  ) {
     throw invalidProxy();
   }
   let parsed: URL;
@@ -32,9 +41,10 @@ export const parseDownloadProxy = (source: string): DownloadProxy => {
   } catch {
     throw invalidProxy();
   }
+  const scheme = parsed.protocol.slice(0, -1);
   const port = parsed.port === '' ? undefined : Number(parsed.port);
   if (
-    !acceptedSchemes.has(parsed.protocol) ||
+    !isDownloadProxyScheme(scheme) ||
     parsed.username !== '' ||
     parsed.password !== '' ||
     parsed.hostname === '' ||
@@ -45,7 +55,6 @@ export const parseDownloadProxy = (source: string): DownloadProxy => {
   ) {
     throw invalidProxy();
   }
-  const scheme = parsed.protocol.slice(0, -1) as DownloadProxyScheme;
   return Object.freeze({[proxyBrand]: true as const, scheme, url: parsed.href});
 };
 
