@@ -1944,6 +1944,34 @@ describe('prepareArchive duplicate verification', () => {
       .toEqual([]);
   });
 
+  it('rejects a sensitive unknown receipt key at the public archive boundary', async () => {
+    const published = await publishArchive();
+    await makeTreeMutable(published.finalDirectory);
+    const receiptPath = path.join(published.finalDirectory, 'receipt.json');
+    const sensitiveKey =
+      'https://proxy.example/receipt?token=sensitive-key-name-marker';
+    const forgedReceipt = {
+      ...published.result.receipt,
+      [sensitiveKey]: true,
+    };
+    await writeFile(receiptPath, `${JSON.stringify(forgedReceipt, null, 2)}\n`);
+
+    const error = await expectDownloadError(
+      prepareArchive(
+        published.root,
+        'youtube',
+        'abc',
+        canonicalUrlFor('youtube', 'abc'),
+      ),
+      'DOWNLOAD_ARCHIVE_INVALID',
+      ARCHIVE_INVALID_MESSAGE,
+    );
+
+    expect(error.message).not.toContain(sensitiveKey);
+    expect(String(error)).not.toContain(sensitiveKey);
+    expect(error.cause).toBeUndefined();
+  });
+
   it('rejects an existing archive whose receipt canonical URL differs from the probe', async () => {
     const published = await publishArchive();
     const receiptSource = await readFile(

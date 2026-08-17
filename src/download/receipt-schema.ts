@@ -161,6 +161,9 @@ const DownloadReceiptV2Schema = z.object({
   }).strict(),
 }).strict();
 
+const YtDlpVersionV3Schema = z.string()
+  .regex(/^\d{4}\.\d{2}\.\d{2}$/u);
+
 const BrowserCookiesV3Schema = z.discriminatedUnion('used', [
   z.object({used: z.literal(false)}).strict(),
   z.object({used: z.literal(true), source: z.literal('chrome')}).strict(),
@@ -186,11 +189,20 @@ const NetworkAuditSchema = z.object({
       message: 'browser impersonation audit fields disagree',
     });
   }
-});
+}).transform((network) => ({
+  proxyUsed: network.proxyUsed,
+  ...(network.proxyScheme === undefined
+    ? {}
+    : {proxyScheme: network.proxyScheme}),
+  browserImpersonation: network.browserImpersonation,
+  ...(network.browserFamily === undefined
+    ? {}
+    : {browserFamily: network.browserFamily}),
+}));
 
 const ToolchainAuditSchema = z.object({
   source: z.enum(['managed', 'override']),
-  ytDlpVersion: z.string().min(1),
+  ytDlpVersion: YtDlpVersionV3Schema,
   managedAssetSha256: z.string()
     .regex(/^sha256:[0-9a-f]{64}$/u)
     .optional(),
@@ -218,11 +230,24 @@ const ToolchainAuditSchema = z.object({
       message: 'override digest is forbidden',
     });
   }
-});
+}).transform((toolchain) => ({
+  source: toolchain.source,
+  ytDlpVersion: toolchain.ytDlpVersion,
+  ...(toolchain.managedAssetSha256 === undefined
+    ? {}
+    : {managedAssetSha256: toolchain.managedAssetSha256}),
+  ...(toolchain.potProvider === undefined
+    ? {}
+    : {potProvider: toolchain.potProvider}),
+}));
 
 const DownloadReceiptV3Schema = z.object({
   version: z.literal(3),
   ...DownloadReceiptCommonShape,
+  tools: z.object({
+    ytDlpVersion: YtDlpVersionV3Schema,
+    ffmpegVersion: z.string().min(1),
+  }).strict(),
   browserCookies: BrowserCookiesV3Schema,
   network: NetworkAuditSchema,
   toolchain: ToolchainAuditSchema,

@@ -1429,7 +1429,20 @@ const readExistingArchive = async (
     ) {
       throw new Error();
     }
-    const receipt = DownloadReceiptSchema.parse(parsedInspection.receipt);
+    const receiptResult = DownloadReceiptSchema.safeParse(
+      parsedInspection.receipt,
+    );
+    if (!receiptResult.success) {
+      if (receiptResult.error.issues.some((issue) =>
+        issue.code === 'unrecognized_keys')) {
+        throw new DownloadError(
+          'DOWNLOAD_ARCHIVE_INVALID',
+          ARCHIVE_INVALID_MESSAGE,
+        );
+      }
+      throw new Error();
+    }
+    const receipt: DownloadReceipt = receiptResult.data;
     if (receipt.platform !== platform || receipt.videoId !== videoId) {
       throw new Error();
     }
@@ -1458,7 +1471,13 @@ const readExistingArchive = async (
       receiptPath: path.posix.join(relativeDirectory, 'receipt.json'),
       receipt,
     };
-  } catch {
+  } catch (error) {
+    if (
+      error instanceof DownloadError &&
+      error.code === 'DOWNLOAD_ARCHIVE_INVALID'
+    ) {
+      throw error;
+    }
     throw new DownloadError(
       'DOWNLOAD_DESTINATION_CONFLICT',
       DESTINATION_CONFLICT_MESSAGE,

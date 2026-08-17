@@ -326,6 +326,83 @@ describe('download receipt schema', () => {
     expect(DownloadReceiptSchema.parse(overrideReceipt)).toEqual(overrideReceipt);
   });
 
+  it.each([
+    'https://proxy.example/download?token=proxy-token-marker',
+    'token-value-marker',
+    '2026.08.01\ncontrol-character-marker',
+  ])('rejects equal unsafe version 3 yt-dlp versions %j', (ytDlpVersion) => {
+    const receipt = makeV3Receipt();
+
+    expectInvalid({
+      ...receipt,
+      tools: {...receipt.tools, ytDlpVersion},
+      toolchain: {...receipt.toolchain, ytDlpVersion},
+    });
+  });
+
+  it.each([
+    ['version 1', {
+      ...makeReceipt(),
+      tools: {
+        ...makeReceipt().tools,
+        ytDlpVersion: 'https://legacy.example/?token=v1-marker',
+      },
+    }],
+    ['version 2', {
+      ...makeDouyinReceipt(),
+      version: 2,
+      tools: {
+        ...makeDouyinReceipt().tools,
+        ytDlpVersion: 'legacy-token\ncontrol-marker',
+      },
+      browserCookies: {used: true, source: 'chrome'},
+    }],
+  ])('preserves nonempty legacy yt-dlp version compatibility for %s', (
+    _caseName,
+    receipt,
+  ) => {
+    expect(DownloadReceiptSchema.parse(receipt)).toEqual(receipt);
+  });
+
+  it('normalizes absent version 3 audit fields and round-trips through JSON', () => {
+    const receipt = makeV3Receipt();
+    const parsed = DownloadReceiptSchema.parse({
+      ...receipt,
+      network: {
+        proxyUsed: false,
+        proxyScheme: undefined,
+        browserImpersonation: false,
+        browserFamily: undefined,
+      },
+      toolchain: {
+        source: 'override',
+        ytDlpVersion: receipt.tools.ytDlpVersion,
+        managedAssetSha256: undefined,
+        potProvider: undefined,
+      },
+    });
+
+    expect(parsed.version).toBe(3);
+    if (parsed.version !== 3) throw new Error('Expected a version 3 receipt.');
+    expect(parsed.network).toEqual({
+      proxyUsed: false,
+      browserImpersonation: false,
+    });
+    expect('proxyScheme' in parsed.network).toBe(false);
+    expect('browserFamily' in parsed.network).toBe(false);
+    expect(parsed.toolchain).toEqual({
+      source: 'override',
+      ytDlpVersion: receipt.tools.ytDlpVersion,
+    });
+    expect('managedAssetSha256' in parsed.toolchain).toBe(false);
+    expect('potProvider' in parsed.toolchain).toBe(false);
+
+    const reparsed = DownloadReceiptSchema.parse(
+      JSON.parse(JSON.stringify(parsed)),
+    );
+    expect(reparsed).toEqual(parsed);
+  });
+
   it('rejects a version 2 cookie receipt for YouTube', () => {
     expectInvalid({
       ...makeReceipt(),
