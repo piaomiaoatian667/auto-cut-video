@@ -5,6 +5,7 @@ import {
   type ProcessResult,
   type RunProcessOptions,
 } from '../process/run-process';
+import {downloadCancellationFrom} from './cancellation';
 import {DownloadError} from './errors';
 import type {ResolvedPlatformProfile} from './platform-profiles';
 import type {ResolvedDownloaderToolchain} from './toolchain/types';
@@ -314,7 +315,8 @@ export const createYtDlpClient = (
         );
         return parseYtDlpInfo(JSON.parse(result.stdout));
       } catch (error) {
-        throw classifiedDownloadError(error)
+        throw downloadCancellationFrom(error)
+          ?? classifiedDownloadError(error)
           ?? new DownloadError('DOWNLOAD_PROBE_FAILED', PROBE_FAILED_MESSAGE);
       }
     },
@@ -356,7 +358,8 @@ export const createYtDlpClient = (
           ),
         );
       } catch (error) {
-        throw classifiedDownloadError(error)
+        throw downloadCancellationFrom(error)
+          ?? classifiedDownloadError(error)
           ?? new DownloadError('DOWNLOAD_PROCESS_FAILED', PROCESS_FAILED_MESSAGE);
       }
     },

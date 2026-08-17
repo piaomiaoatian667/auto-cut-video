@@ -4,6 +4,10 @@ import type {
 } from '../../download/downloader';
 import {parseBrowserCookieSource} from '../../download/browser-cookies';
 import {
+  DOWNLOAD_CANCELLATION_MESSAGE,
+  isDownloadCancellationError,
+} from '../../download/cancellation';
+import {
   DownloadError,
   isDownloadError,
   type DownloadErrorCode,
@@ -130,11 +134,17 @@ export const runDownloadCommand = async (
     dependencies.stdout.write(formatDownloadSuccess(result, json));
     return EXIT_CODES.success;
   } catch (error) {
+    if (isDownloadCancellationError(error)) {
+      writeFailure(
+        UNEXPECTED_ERROR_CODE,
+        DOWNLOAD_CANCELLATION_MESSAGE,
+        json,
+        dependencies,
+      );
+      return EXIT_CODES.cancelled;
+    }
     if (isDownloadError(error)) {
       writeFailure(error.code, error.message, json, dependencies);
-      if (dependencies.downloadSignal?.aborted === true) {
-        return EXIT_CODES.cancelled;
-      }
       return exitCodeForDownloadError(error.code);
     }
     writeFailure(
@@ -143,9 +153,6 @@ export const runDownloadCommand = async (
       json,
       dependencies,
     );
-    if (dependencies.downloadSignal?.aborted === true) {
-      return EXIT_CODES.cancelled;
-    }
     return EXIT_CODES.operationFailed;
   }
 };

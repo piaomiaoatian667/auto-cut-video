@@ -63,6 +63,7 @@ export const PROBE_SECRET_MARKERS = [
   '/Users/fixture/Library/Application Support/Google/Chrome/Default/Cookies',
 ] as const;
 export const NETWORK_COMMAND = /(?:^|\n)\s*(?:\S*\/)?(?:curl|wget|nc|ssh)\b/mu;
+export const NODE_NETWORK_API = /(?:['"](?:node:)?(?:http|https|net|tls)['"]|(?:http|https)\s*\.\s*(?:get|request)\s*\(|net\s*\.\s*(?:connect|createConnection)\s*\(|tls\s*\.\s*connect\s*\()/mu;
 
 export type FakeYtDlpScenario =
   | 'rate-limit'
@@ -87,6 +88,12 @@ export interface RecordedYtDlpOperation {
   extraStdioFds: readonly number[] | undefined;
 }
 
+export interface RecordedFixtureSubprocess {
+  command: string;
+  args: string[];
+  environment: Readonly<NodeJS.ProcessEnv>;
+}
+
 export interface DigestRecord {
   phase: 'probe' | 'download';
   digest: string;
@@ -102,6 +109,7 @@ export interface ManagedDownloadRuntime {
   dependencies: DownloadDependencies;
   resolveToolchain(signal?: AbortSignal): Promise<ResolvedDownloaderToolchain>;
   operations: RecordedYtDlpOperation[];
+  subprocesses: RecordedFixtureSubprocess[];
   processFailures: ProcessExecutionError[];
   delays: number[];
   actualHashes: Map<string, string>;
@@ -110,6 +118,7 @@ export interface ManagedDownloadRuntime {
   recordPath: string;
   stateDirectory: string;
   toolsDirectory: string;
+  temporaryDirectory: string;
 }
 
 export interface ManagedDownloadFixture extends ManagedDownloadRuntime {
@@ -127,6 +136,7 @@ interface FixtureLayout {
   recordDirectory: string;
   stateDirectory: string;
   toolsDirectory: string;
+  temporaryDirectory: string;
   pluginWorkspace: string;
   denoExecutable: string;
   ffmpegExecutable: string;
@@ -144,6 +154,7 @@ const fixtureLayout = (root: string): FixtureLayout => {
     recordDirectory: path.join(root, 'records'),
     stateDirectory: path.join(root, 'state'),
     toolsDirectory,
+    temporaryDirectory: path.join(root, 'tmp'),
     pluginWorkspace: path.join(root, 'plugin-workspace'),
     denoExecutable: path.join(toolsDirectory, 'deno'),
     ffmpegExecutable: path.join(toolsDirectory, 'ffmpeg'),
@@ -167,6 +178,7 @@ const sha256 = async (candidate: string): Promise<string> => createHash('sha256'
 const createPluginArchive = async (
   archive: string,
   workspace: string,
+  environment: Readonly<NodeJS.ProcessEnv>,
 ): Promise<void> => {
   const entries = [
     'yt_dlp_plugins/',
@@ -181,10 +193,44 @@ const createPluginArchive = async (
   await Promise.all(entries.slice(2).map(async (entry) => {
     await writeFile(path.join(workspace, entry), '# deterministic fixture\n');
   }));
-  await execFile('/usr/bin/zip', ['-q', archive, ...entries], {cwd: workspace});
+  await execFile('/usr/bin/zip', ['-q', archive, ...entries], {
+    cwd: workspace,
+    env: environment,
+  });
 };
 
-const initializeManagedCache = async (layout: FixtureLayout): Promise<void> => {
+const fixtureChildEnvironment = (
+  layout: FixtureLayout,
+  options: ManagedFixtureOptions,
+): Readonly<NodeJS.ProcessEnv> => Object.freeze({
+  HOME: layout.homeDirectory,
+  PATH: [
+    path.dirname(process.execPath),
+    layout.toolsDirectory,
+    '/usr/bin',
+    '/bin',
+  ].join(path.delimiter),
+  TMPDIR: layout.temporaryDirectory,
+  DENO_DIR: layout.paths.denoDirectory,
+  XDG_CACHE_HOME: layout.paths.providerCacheDirectory,
+  DENO_NO_PROMPT: '1',
+  DENO_NO_UPDATE_CHECK: '1',
+  FORCE_COLOR: 'false',
+  FAKE_YT_DLP_RECORD_DIRECTORY: layout.recordDirectory,
+  FAKE_YT_DLP_STATE_DIRECTORY: layout.stateDirectory,
+  ...(options.scenario === undefined
+    ? {}
+    : {FAKE_YT_DLP_SCENARIO: options.scenario}),
+  ...(options.failurePhase === undefined
+    ? {}
+    : {FAKE_YT_DLP_FAILURE_PHASE: options.failurePhase}),
+  ...(options.longRunning === true ? {FAKE_YT_DLP_LONG_RUNNING: '1'} : {}),
+});
+
+const initializeManagedCache = async (
+  layout: FixtureLayout,
+  options: ManagedFixtureOptions,
+): Promise<void> => {
   const {paths} = layout;
   await Promise.all([
     mkdir(path.dirname(paths.ytDlpExecutable), {recursive: true}),
@@ -200,11 +246,16 @@ const initializeManagedCache = async (layout: FixtureLayout): Promise<void> => {
     mkdir(layout.recordDirectory, {recursive: true}),
     mkdir(layout.stateDirectory, {recursive: true}),
     mkdir(layout.toolsDirectory, {recursive: true}),
+    mkdir(layout.temporaryDirectory, {recursive: true}),
     mkdir(layout.pluginWorkspace, {recursive: true}),
   ]);
   await copyFile(FAKE_YT_DLP_FIXTURE, paths.ytDlpExecutable);
   await chmod(paths.ytDlpExecutable, 0o755);
-  await createPluginArchive(paths.pluginArchive, layout.pluginWorkspace);
+  await createPluginArchive(
+    paths.pluginArchive,
+    layout.pluginWorkspace,
+    fixtureChildEnvironment(layout, options),
+  );
   await Promise.all([
     writeFile(
       paths.installedManifest,
@@ -252,32 +303,17 @@ const operationForInvocation = (
   return {phase: 'download', args: args.slice(separator + 2)};
 };
 
-const runtimeEnvironment = (
-  base: Readonly<NodeJS.ProcessEnv>,
-  layout: FixtureLayout,
-  options: ManagedFixtureOptions,
-): Readonly<NodeJS.ProcessEnv> => Object.freeze({
-  ...base,
-  FAKE_YT_DLP_RECORD_DIRECTORY: layout.recordDirectory,
-  FAKE_YT_DLP_STATE_DIRECTORY: layout.stateDirectory,
-  ...(options.scenario === undefined
-    ? {}
-    : {FAKE_YT_DLP_SCENARIO: options.scenario}),
-  ...(options.failurePhase === undefined
-    ? {}
-    : {FAKE_YT_DLP_FAILURE_PHASE: options.failurePhase}),
-  ...(options.longRunning === true ? {FAKE_YT_DLP_LONG_RUNNING: '1'} : {}),
-});
-
 export const createManagedDownloadRuntime = (
   root: string,
   options: ManagedFixtureOptions = {},
 ): ManagedDownloadRuntime => {
   const layout = fixtureLayout(root);
   const operations: RecordedYtDlpOperation[] = [];
+  const subprocesses: RecordedFixtureSubprocess[] = [];
   const processFailures: ProcessExecutionError[] = [];
   const delays: number[] = [];
   const actualHashes = new Map<string, string>();
+  const childEnvironment = fixtureChildEnvironment(layout, options);
   const processRunner: DownloadProcessRunner = async (
     command,
     args,
@@ -292,14 +328,22 @@ export const createManagedDownloadRuntime = (
       operations.push({
         phase: operation.phase,
         args: operation.args,
-        environment: runOptions.env,
+        environment: childEnvironment,
         extraStdioFds: runOptions.extraStdioFds === undefined
           ? undefined
           : [...runOptions.extraStdioFds],
       });
     }
+    subprocesses.push({
+      command,
+      args: [...args],
+      environment: childEnvironment,
+    });
     try {
-      return await runSystemProcess(command, args, runOptions);
+      return await runSystemProcess(command, args, {
+        ...runOptions,
+        env: childEnvironment,
+      });
     } catch (error) {
       if (operation !== undefined && error instanceof ProcessExecutionError) {
         processFailures.push(error);
@@ -336,11 +380,7 @@ export const createManagedDownloadRuntime = (
     }, capabilityDependencies);
     return {
       ...resolved,
-      childEnvironment: runtimeEnvironment(
-        resolved.childEnvironment,
-        layout,
-        options,
-      ),
+      childEnvironment,
     };
   };
   const dependencies = createSystemDownloadDependencies({
@@ -358,6 +398,7 @@ export const createManagedDownloadRuntime = (
     dependencies,
     resolveToolchain,
     operations,
+    subprocesses,
     processFailures,
     delays,
     actualHashes,
@@ -366,11 +407,17 @@ export const createManagedDownloadRuntime = (
     recordPath: path.join(layout.recordDirectory, 'operations.jsonl'),
     stateDirectory: layout.stateDirectory,
     toolsDirectory: layout.toolsDirectory,
+    temporaryDirectory: layout.temporaryDirectory,
   };
 };
 
-const clearImmutableFlags = async (target: string): Promise<void> => {
-  await execFile('/usr/bin/chflags', ['-R', 'nouchg', target]).catch(() => {});
+const clearImmutableFlags = async (
+  target: string,
+  environment: Readonly<NodeJS.ProcessEnv>,
+): Promise<void> => {
+  await execFile('/usr/bin/chflags', ['-R', 'nouchg', target], {
+    env: environment,
+  }).catch(() => {});
 };
 
 const makeTreeWritable = async (target: string): Promise<void> => {
@@ -394,8 +441,9 @@ export const createManagedDownloadFixture = async (
 ): Promise<ManagedDownloadFixture> => {
   const root = await mkdtemp(path.join(tmpdir(), 'managed-download-test-'));
   const layout = fixtureLayout(root);
-  await initializeManagedCache(layout);
+  await initializeManagedCache(layout, options);
   const runtime = createManagedDownloadRuntime(root, options);
+  const childEnvironment = fixtureChildEnvironment(layout, options);
   return {
     ...runtime,
     root,
@@ -418,7 +466,7 @@ export const createManagedDownloadFixture = async (
       };
     },
     cleanup: async () => {
-      await clearImmutableFlags(root);
+      await clearImmutableFlags(root, childEnvironment);
       await makeTreeWritable(root);
       await rm(root, {recursive: true, force: true});
     },

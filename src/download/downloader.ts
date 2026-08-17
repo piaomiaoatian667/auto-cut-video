@@ -16,6 +16,7 @@ import {
   validateBrowserCookieRequest,
   type BrowserCookieSource,
 } from './browser-cookies';
+import {DownloadCancellationError} from './cancellation';
 import {DownloadError} from './errors';
 import {
   validateDownloadProxy,
@@ -288,11 +289,11 @@ export const waitForDownloadDelay = async (
   signal?: AbortSignal,
 ): Promise<void> => await new Promise((resolve, reject) => {
   if (signal?.aborted === true) {
-    reject(signal.reason);
+    reject(new DownloadCancellationError());
     return;
   }
   const timer = setTimeout(settle, milliseconds);
-  const abort = (): void => settle(signal?.reason, true);
+  const abort = (): void => settle(new DownloadCancellationError(), true);
   function settle(reason?: unknown, aborted = false): void {
     clearTimeout(timer);
     signal?.removeEventListener('abort', abort);

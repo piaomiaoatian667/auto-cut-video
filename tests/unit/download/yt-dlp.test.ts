@@ -122,6 +122,18 @@ const processFailure = (stderr: string): ProcessExecutionError =>
     }),
   );
 
+const processAbortFailure = (): ProcessExecutionError =>
+  new ProcessExecutionError(
+    'PROCESS_ABORTED',
+    'process was aborted: private signal reason',
+    processResult({
+      exitCode: -1,
+      args: ['--secret-argument'],
+      stderr: 'HTTP Error 429: Too Many Requests',
+    }),
+    new Error('private signal reason'),
+  );
+
 const youtubeInfo = (overrides: Record<string, unknown> = {}): string =>
   JSON.stringify({
     id: 'abc',
@@ -243,6 +255,32 @@ describe('yt-dlp resolved toolchain', () => {
 });
 
 describe('yt-dlp probe', () => {
+  it('preserves explicit process cancellation ahead of stderr classification', async () => {
+    const toolchain = createToolchain();
+    const failure = processAbortFailure();
+    const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockRejectedValueOnce(failure);
+
+    let caught: unknown;
+    try {
+      await createYtDlpClient({toolchain, runProcess}).probe(
+        'https://youtu.be/abc',
+        operationOptions(toolchain),
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      name: 'DownloadCancellationError',
+      message: 'The download operation was cancelled.',
+    });
+    expect(caught).not.toBe(failure);
+    expect((caught as Error & {cause?: unknown}).cause).toBeUndefined();
+    expect(`${String(caught)}${JSON.stringify(caught)}`)
+      .not.toContain('private signal reason');
+  });
+
   it('uses the profile common arguments exactly before fixed probe flags', async () => {
     const toolchain = createToolchain();
     const options = operationOptions(toolchain);
@@ -570,6 +608,33 @@ describe('yt-dlp probe', () => {
 });
 
 describe('yt-dlp download', () => {
+  it('preserves explicit process cancellation without retaining raw reason', async () => {
+    const toolchain = createToolchain();
+    const failure = processAbortFailure();
+    const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockRejectedValueOnce(failure);
+
+    let caught: unknown;
+    try {
+      await createYtDlpClient({toolchain, runProcess}).download(
+        'https://youtu.be/abc',
+        41,
+        operationOptions(toolchain),
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      name: 'DownloadCancellationError',
+      message: 'The download operation was cancelled.',
+    });
+    expect(caught).not.toBe(failure);
+    expect((caught as Error & {cause?: unknown}).cause).toBeUndefined();
+    expect(`${String(caught)}${JSON.stringify(caught)}`)
+      .not.toContain('private signal reason');
+  });
+
   it('uses the static Darwin NSTask wrapper without shell execution', async () => {
     const toolchain = createToolchain();
     const runProcess = vi.fn<DownloadProcessRunner>()

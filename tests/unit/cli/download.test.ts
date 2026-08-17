@@ -550,13 +550,37 @@ describe('videoctl download', () => {
     expect(run.stdout()).toBe('');
   });
 
-  it('maps an aborted download to cancellation', async () => {
+  it('keeps invalid proxy input classified as validation when pre-aborted', async () => {
     const controller = new AbortController();
-    controller.abort(new Error('The command was cancelled.'));
+    const privateReason = 'private pre-abort reason';
+    controller.abort(new Error(privateReason));
+    const run = fixture();
+    run.dependencies.downloadSignal = controller.signal;
+
+    const exitCode = await runVideoctl([
+      'download',
+      inputUrl,
+      '--rights-confirmed',
+      '--proxy',
+      'ftp://private-proxy.invalid:21',
+    ], run.dependencies);
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(run.download).not.toHaveBeenCalled();
+    expect(run.stderr()).toBe(
+      'Download failed [DOWNLOAD_PROXY_INVALID]: The proxy URL is invalid.\n',
+    );
+    expect(`${run.stdout()}${run.stderr()}`).not.toContain(privateReason);
+  });
+
+  it('keeps a rate-limit failure classified as operation after signal abort', async () => {
+    const controller = new AbortController();
+    const privateReason = 'private racing abort reason';
     const run = fixture(async () => {
+      controller.abort(new Error(privateReason));
       throw new DownloadError(
-        'DOWNLOAD_PROCESS_FAILED',
-        'The video could not be downloaded.',
+        'DOWNLOAD_RATE_LIMITED',
+        'The video platform temporarily rate-limited this session.',
       );
     });
     run.dependencies.downloadSignal = controller.signal;
@@ -566,12 +590,13 @@ describe('videoctl download', () => {
       run.dependencies,
     );
 
-    expect(exitCode).toBe(EXIT_CODES.cancelled);
+    expect(exitCode).toBe(EXIT_CODES.operationFailed);
     expect(run.stderr()).toBe(
-      'Download failed [DOWNLOAD_PROCESS_FAILED]: '
-      + 'The video could not be downloaded.\n',
+      'Download failed [DOWNLOAD_RATE_LIMITED]: '
+      + 'The video platform temporarily rate-limited this session.\n',
     );
     expect(run.stdout()).toBe('');
+    expect(run.stderr()).not.toContain(privateReason);
   });
 
   it('maps unexpected errors to a fixed sanitized operation failure', async () => {
@@ -805,7 +830,7 @@ describe('videoctl download', () => {
       ytDlpOverride: '/configured/yt-dlp',
       ffmpegOverride: '/configured/ffmpeg',
     });
-    expect(dependencies.ffmpegExecutable).toBeUndefined();
+    expect(dependencies.ffmpegExecutable).toBe('/configured/ffmpeg');
     expect(dependencies.ffprobeExecutable).toBe('/configured/ffprobe');
     expect(dependencies.downloadSignal).toBe(controller.signal);
   });

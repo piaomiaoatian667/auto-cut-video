@@ -1,4 +1,8 @@
 import {homedir} from 'node:os';
+import {
+  downloadCancellationFrom,
+  throwIfDownloadCancelled,
+} from '../cancellation';
 import {DownloadError} from '../errors';
 import {
   defaultDownloaderCapabilityDependencies,
@@ -25,6 +29,7 @@ export const resolveDownloaderToolchain = async (
   dependencies: DownloaderCapabilityDependencies =
     defaultDownloaderCapabilityDependencies,
 ): Promise<ResolvedDownloaderToolchain> => {
+  throwIfDownloadCancelled(options.signal);
   if (process.platform !== 'darwin' || process.arch !== 'arm64') {
     throw invalidToolchain();
   }
@@ -36,7 +41,9 @@ export const resolveDownloaderToolchain = async (
     managedDirectoryExists = await dependencies.directoryExists(
       paths.versionDirectory,
     );
-  } catch {
+  } catch (error) {
+    const cancellation = downloadCancellationFrom(error);
+    if (cancellation !== undefined) throw cancellation;
     throw invalidToolchain();
   }
   if (!managedDirectoryExists) {

@@ -1,6 +1,7 @@
 import type {Stats} from 'node:fs';
 import path from 'node:path';
 import {afterEach, describe, expect, it, vi} from 'vitest';
+import {ProcessExecutionError} from '../../../src/process/process-error';
 import {
   buildDownloaderChildEnvironment,
   compareYtDlpVersions,
@@ -345,6 +346,31 @@ describe('downloader toolchain capability helpers', () => {
 });
 
 describe('validateDownloaderCapabilities', () => {
+  it('preserves process cancellation without exposing the abort reason', async () => {
+    const fixture = createCapabilityFixture();
+    const privateReason = 'private capability abort reason';
+    fixture.runProcess.mockRejectedValueOnce(new ProcessExecutionError(
+      'PROCESS_ABORTED',
+      `process was aborted: ${privateReason}`,
+      resultFor(paths.ytDlpExecutable, ['--version'], ''),
+      new Error(privateReason),
+    ));
+
+    let caught: unknown;
+    try {
+      await validateFixture(fixture);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      name: 'DownloadCancellationError',
+      message: 'The download operation was cancelled.',
+    });
+    expect((caught as Error & {cause?: unknown}).cause).toBeUndefined();
+    expect(`${String(caught)}${JSON.stringify(caught)}`).not.toContain(privateReason);
+  });
+
   it('validates the exact managed toolchain and local command contract', async () => {
     vi.stubEnv('HTTP_PROXY', 'http://uppercase-proxy.invalid');
     vi.stubEnv('Https_Proxy', 'https://mixed-proxy.invalid');

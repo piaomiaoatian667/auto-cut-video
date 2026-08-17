@@ -10,6 +10,7 @@ import {
 import path from 'node:path';
 
 const args = process.argv.slice(2);
+delete process.env.__CF_USER_TEXT_ENCODING;
 
 if (args.includes('--version')) {
   process.stdout.write('2026.07.04\n');
@@ -360,6 +361,8 @@ if (process.env.FAKE_YT_DLP_LONG_RUNNING === '1') {
     'const {writeFileSync, appendFileSync, renameSync} = require("node:fs");',
     'const path = require("node:path");',
     'const state = process.env.FAKE_YT_DLP_STATE_DIRECTORY;',
+    'delete process.env.__CF_USER_TEXT_ENCODING;',
+    'writeFileSync(path.join(state, "child-environment.json"), JSON.stringify(process.env));',
     'process.on("SIGTERM", () => {});',
     'let count = 0;',
     'setInterval(() => {',
@@ -371,7 +374,7 @@ if (process.env.FAKE_YT_DLP_LONG_RUNNING === '1') {
     '}, 20);',
   ].join('\n');
   const child = spawn(process.execPath, ['-e', childScript], {
-    env: process.env,
+    env: {...process.env},
     stdio: 'ignore',
   });
   await writeFile(

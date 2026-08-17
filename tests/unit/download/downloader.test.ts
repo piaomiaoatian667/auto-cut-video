@@ -687,7 +687,14 @@ describe('downloadVideo', () => {
     await vi.waitFor(() => expect(harness.wait).toHaveBeenCalledTimes(1));
     controller.abort(reason);
 
-    await expect(operation).rejects.toBe(reason);
+    await expect(operation).rejects.toMatchObject({
+      name: 'DownloadCancellationError',
+      message: 'The download operation was cancelled.',
+    });
+    await operation.catch((error: unknown) => {
+      expect(error).not.toBe(reason);
+      expect(`${String(error)}${JSON.stringify(error)}`).not.toContain(reason.message);
+    });
     expect(harness.openStagingDownloadAuthority).not.toHaveBeenCalled();
     expect(harness.cleanup).toHaveBeenCalledWith(STAGED);
   });
@@ -956,13 +963,21 @@ describe('checkVideoDownload', () => {
 });
 
 describe('waitForDownloadDelay', () => {
-  it('rejects a pre-aborted signal immediately with its reason', async () => {
+  it('rejects a pre-aborted signal with a sanitized cancellation marker', async () => {
     const controller = new AbortController();
     const reason = new Error('already aborted');
     controller.abort(reason);
     const addEventListener = vi.spyOn(controller.signal, 'addEventListener');
 
-    await expect(waitForDownloadDelay(5000, controller.signal)).rejects.toBe(reason);
+    const delay = waitForDownloadDelay(5000, controller.signal);
+    await expect(delay).rejects.toMatchObject({
+      name: 'DownloadCancellationError',
+      message: 'The download operation was cancelled.',
+    });
+    await delay.catch((error: unknown) => {
+      expect(error).not.toBe(reason);
+      expect(`${String(error)}${JSON.stringify(error)}`).not.toContain(reason.message);
+    });
     expect(addEventListener).not.toHaveBeenCalled();
   });
 
@@ -1007,8 +1022,13 @@ describe('waitForDownloadDelay', () => {
 
       controller.abort(reason);
 
-      await expect(delay).rejects.toBe(reason);
-      expect(outcome).toBe(reason);
+      await expect(delay).rejects.toMatchObject({
+        name: 'DownloadCancellationError',
+        message: 'The download operation was cancelled.',
+      });
+      expect(outcome).not.toBe(reason);
+      expect(`${String(outcome)}${JSON.stringify(outcome)}`)
+        .not.toContain(reason.message);
       expect(vi.getTimerCount()).toBe(0);
       expect(removeEventListener).toHaveBeenCalledWith(
         'abort',

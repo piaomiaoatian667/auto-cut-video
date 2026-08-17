@@ -1,4 +1,4 @@
-import {describe, expect, it, vi} from 'vitest';
+import {afterEach, describe, expect, it, vi} from 'vitest';
 import {createEditFixture, createProjectFixture, createScriptFixture} from '../../helpers/temp-project';
 import type {ProjectInputs} from '../../../src/domain/load-project';
 import {
@@ -7,7 +7,15 @@ import {
 } from '../../../src/fs/project-paths';
 import type {PreflightResult} from '../../../src/pipeline/stages/preflight';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
-import {runVideoctl, type VideoctlDependencies} from '../../../src/cli/videoctl';
+import {
+  createSystemVideoctlDependencies,
+  runVideoctl,
+  type VideoctlDependencies,
+} from '../../../src/cli/videoctl';
+import type {
+  DownloadDependencies,
+  SystemDownloadOptions,
+} from '../../../src/download/downloader';
 
 const successfulResult = (): PreflightResult => ({
   checks: [
@@ -103,7 +111,39 @@ const fixture = (result: PreflightResult = successfulResult()) => {
   };
 };
 
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 describe('videoctl doctor', () => {
+  it('forwards snapshotted FFMPEG_PATH to downloader and doctor preflight', async () => {
+    vi.stubEnv('FFMPEG_PATH', '/configured/system-ffmpeg');
+    const downloadDependencies = {} as DownloadDependencies;
+    const createDownloadDependencies = vi.fn(
+      (_options: SystemDownloadOptions) => downloadDependencies,
+    );
+    const projectInputs = loadedProject();
+    const dependencies = createSystemVideoctlDependencies({
+      createDownloadDependencies,
+    });
+    dependencies.workspaceRoot = '/workspace';
+    dependencies.stdout = {write: () => {}};
+    dependencies.stderr = {write: () => {}};
+    dependencies.loadProject = vi.fn(async () => projectInputs);
+    dependencies.measureSourceBytes = vi.fn(async () => 1024);
+    dependencies.preflight = vi.fn(async () => successfulResult());
+
+    await expect(runVideoctl(['doctor', 'demo'], dependencies))
+      .resolves.toBe(EXIT_CODES.success);
+
+    expect(createDownloadDependencies).toHaveBeenCalledWith({
+      ffmpegOverride: '/configured/system-ffmpeg',
+    });
+    expect(dependencies.preflight).toHaveBeenCalledWith(expect.objectContaining({
+      ffmpegExecutable: '/configured/system-ffmpeg',
+    }));
+  });
+
   it('exports the exact shared exit-code contract', () => {
     expect(EXIT_CODES).toEqual({
       success: 0,

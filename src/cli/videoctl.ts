@@ -843,6 +843,7 @@ export const createSystemVideoctlDependencies = (
       resolveToolchain: () => resolveToolchain(),
     }),
     ...(signal === undefined ? {} : {signal, downloadSignal: signal}),
+    ...(ffmpegOverride === undefined ? {} : {ffmpegExecutable: ffmpegOverride}),
     ...(ffprobeExecutable === undefined ? {} : {ffprobeExecutable}),
   };
 };

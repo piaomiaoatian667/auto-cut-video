@@ -13,6 +13,10 @@ import {
   type RunProcessOptions,
 } from '../../process/run-process';
 import {DownloadError} from '../errors';
+import {
+  downloadCancellationFrom,
+  throwIfDownloadCancelled,
+} from '../cancellation';
 import type {DownloadProcessRunner} from '../yt-dlp';
 import {
   DOWNLOADER_TOOLCHAIN_MANIFEST,
@@ -193,7 +197,9 @@ const requireOwnedRegularFile = async (
     ) {
       throw failure();
     }
-  } catch {
+  } catch (error) {
+    const cancellation = downloadCancellationFrom(error);
+    if (cancellation !== undefined) throw cancellation;
     throw failure();
   }
 };
@@ -210,7 +216,9 @@ const requirePublishedManifest = async (
     )) {
       throw invalidToolchain();
     }
-  } catch {
+  } catch (error) {
+    const cancellation = downloadCancellationFrom(error);
+    if (cancellation !== undefined) throw cancellation;
     throw invalidToolchain();
   }
 };
@@ -224,7 +232,9 @@ const requireHash = async (
     if (await dependencies.hashFile(candidate) !== expected) {
       throw invalidToolchain();
     }
-  } catch {
+  } catch (error) {
+    const cancellation = downloadCancellationFrom(error);
+    if (cancellation !== undefined) throw cancellation;
     throw invalidToolchain();
   }
 };
@@ -237,7 +247,9 @@ const runChecked = async (
 ): Promise<ProcessResult> => {
   try {
     return await runner(command, args, options);
-  } catch {
+  } catch (error) {
+    const cancellation = downloadCancellationFrom(error);
+    if (cancellation !== undefined) throw cancellation;
     throw invalidToolchain();
   }
 };
@@ -250,7 +262,9 @@ const runProviderCheck = async (
 ): Promise<void> => {
   try {
     await runner(command, args, options);
-  } catch {
+  } catch (error) {
+    const cancellation = downloadCancellationFrom(error);
+    if (cancellation !== undefined) throw cancellation;
     throw invalidProvider();
   }
 };
@@ -302,6 +316,7 @@ export const validateDownloaderCapabilities = async (
     paths,
     signal,
   } = options;
+  throwIfDownloadCancelled(signal);
   const childEnvironment = buildDownloaderChildEnvironment(paths);
   const processOptions: RunProcessOptions = {
     env: childEnvironment,
@@ -343,7 +358,9 @@ export const validateDownloaderCapabilities = async (
     denoExecutable = await dependencies.resolveExecutable('deno');
     ffmpegExecutable = ffmpegOverride
       ?? await dependencies.resolveExecutable('ffmpeg');
-  } catch {
+  } catch (error) {
+    const cancellation = downloadCancellationFrom(error);
+    if (cancellation !== undefined) throw cancellation;
     throw invalidToolchain();
   }
 
@@ -399,7 +416,9 @@ export const validateDownloaderCapabilities = async (
     ) {
       throw invalidProvider();
     }
-  } catch {
+  } catch (error) {
+    const cancellation = downloadCancellationFrom(error);
+    if (cancellation !== undefined) throw cancellation;
     throw invalidProvider();
   }
 
@@ -423,7 +442,9 @@ export const validateDownloaderCapabilities = async (
       ['--list-impersonate-targets'],
       processOptions,
     );
-  } catch {
+  } catch (error) {
+    const cancellation = downloadCancellationFrom(error);
+    if (cancellation !== undefined) throw cancellation;
     throw unavailableImpersonation();
   }
   const chromeImpersonationTarget = selectChromeMacosTarget(targetsResult.stdout);

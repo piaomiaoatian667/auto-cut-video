@@ -11,7 +11,10 @@ import {promisify} from 'node:util';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {runVideoctl} from '../../../src/cli/videoctl';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
-import {downloadVideo} from '../../../src/download/downloader';
+import {
+  downloadVideo,
+  waitForDownloadDelay,
+} from '../../../src/download/downloader';
 import {parseDownloadProxy} from '../../../src/download/network-options';
 import {DownloadReceiptSchema} from '../../../src/download/receipt-schema';
 import type {DownloadPlatform} from '../../../src/download/platforms';
@@ -19,6 +22,7 @@ import {
   FAKE_YT_DLP_FIXTURE,
   FIXED_DOWNLOAD_TIME,
   NETWORK_COMMAND,
+  NODE_NETWORK_API,
   PROBE_SECRET_MARKERS,
   createManagedDownloadFixture,
   installNetworkSocketGuard,
@@ -108,6 +112,9 @@ const expectNoSecrets = (value: unknown): void => {
 const fileSha256 = (contents: Buffer): string =>
   `sha256:${createHash('sha256').update(contents).digest('hex')}`;
 
+const rawFileSha256 = (contents: Buffer): string =>
+  createHash('sha256').update(contents).digest('hex');
+
 afterEach(async () => {
   vi.unstubAllEnvs();
   for (const guard of socketGuards.splice(0)) guard.restore();
@@ -117,6 +124,78 @@ afterEach(async () => {
 });
 
 describe('managed multi-platform download integration', () => {
+  it('isolates every managed subprocess from poisoned host environment', async () => {
+    vi.stubEnv('NODE_OPTIONS', '--no-warnings');
+    vi.stubEnv('NODE_PATH', '/host/node-path-marker');
+    vi.stubEnv('AWS_SECRET_ACCESS_KEY', 'credential-marker');
+    vi.stubEnv('HOME', '/host/home-marker');
+    vi.stubEnv('PATH', '/host/path-marker');
+    vi.stubEnv('HTTP_PROXY', 'http://host-proxy.invalid:8080');
+    vi.stubEnv('HTTPS_PROXY', 'https://host-proxy.invalid:8443');
+    vi.stubEnv('ALL_PROXY', 'socks5://host-proxy.invalid:1080');
+    vi.stubEnv('NO_PROXY', 'host-private.invalid');
+    const fixture = await createManagedDownloadFixture();
+    fixtures.push(fixture);
+    const run = fixture.createCommandHarness();
+
+    const exitCode = await runVideoctl([
+      'download',
+      'https://www.douyin.com/video/environment',
+      '--rights-confirmed',
+    ], run.dependencies);
+
+    expect(exitCode).toBe(EXIT_CODES.success);
+    expect(run.stderr()).toBe('');
+    const expectedEnvironment = {
+      HOME: fixture.homeDirectory,
+      PATH: [
+        path.dirname(process.execPath),
+        fixture.toolsDirectory,
+        '/usr/bin',
+        '/bin',
+      ].join(path.delimiter),
+      TMPDIR: path.join(fixture.root, 'tmp'),
+      DENO_DIR: fixture.paths.denoDirectory,
+      XDG_CACHE_HOME: fixture.paths.providerCacheDirectory,
+      DENO_NO_PROMPT: '1',
+      DENO_NO_UPDATE_CHECK: '1',
+      FORCE_COLOR: 'false',
+      FAKE_YT_DLP_RECORD_DIRECTORY: fixture.recordDirectory,
+      FAKE_YT_DLP_STATE_DIRECTORY: fixture.stateDirectory,
+    };
+    expect(fixture.subprocesses.length).toBeGreaterThan(fixture.operations.length);
+    for (const subprocess of fixture.subprocesses) {
+      expect(subprocess.environment).toEqual(expectedEnvironment);
+    }
+    const serializedEnvironments = JSON.stringify(
+      fixture.subprocesses.map((subprocess) => subprocess.environment),
+    );
+    for (const marker of [
+      'NODE_OPTIONS',
+      'NODE_PATH',
+      'AWS_SECRET_ACCESS_KEY',
+      'credential-marker',
+      '/host/home-marker',
+      '/host/path-marker',
+      'host-proxy.invalid',
+      'host-private.invalid',
+    ]) {
+      expect(serializedEnvironments).not.toContain(marker);
+    }
+
+    const expectedHashPaths = [
+      fixture.paths.pluginArchive,
+      fixture.paths.ytDlpExecutable,
+    ].sort();
+    expect([...fixture.actualHashes.keys()].sort()).toEqual(expectedHashPaths);
+    expect(fixture.actualHashes.get(fixture.paths.ytDlpExecutable)).toBe(
+      rawFileSha256(await readFile(fixture.paths.ytDlpExecutable)),
+    );
+    expect(fixture.actualHashes.get(fixture.paths.pluginArchive)).toBe(
+      rawFileSha256(await readFile(fixture.paths.pluginArchive)),
+    );
+  });
+
   it('keeps the managed toolchain environment below temporary HOME', async () => {
     const fixture = await createManagedDownloadFixture();
     fixtures.push(fixture);
@@ -355,8 +434,8 @@ describe('managed multi-platform download integration', () => {
     const observedDelays: number[] = [];
     fixture.dependencies.wait = async (milliseconds, signal) => {
       observedDelays.push(milliseconds);
-      controller.abort(new Error('The command was cancelled.'));
-      if (signal?.aborted === true) throw signal.reason;
+      controller.abort(new Error('private delay cancellation reason'));
+      await waitForDownloadDelay(milliseconds, signal);
     };
     const run = fixture.createCommandHarness(controller.signal);
 
@@ -372,8 +451,9 @@ describe('managed multi-platform download integration', () => {
     expect(run.stdout()).toBe('');
     expect(run.stderr()).toBe(
       'Download failed [DOWNLOAD_PROCESS_FAILED]: '
-      + 'The download operation failed unexpectedly.\n',
+      + 'The download operation was cancelled.\n',
     );
+    expect(run.stderr()).not.toContain('private delay cancellation reason');
     expect(await readDigestRecords(fixture.recordPath)).toHaveLength(1);
     await expect(access(path.join(
       fixture.workspaceRoot,
@@ -456,8 +536,24 @@ describe('managed multi-platform download integration', () => {
   it('contains no real network command or fetch implementation', async () => {
     const source = await readFile(FAKE_YT_DLP_FIXTURE, 'utf8');
 
+    expect('curl https://example.invalid/video').toMatch(NETWORK_COMMAND);
+    expect('/usr/local/bin/wget https://example.invalid/video')
+      .toMatch(NETWORK_COMMAND);
+    for (const control of [
+      "import http from 'node:http';",
+      "const https = require('node:https');",
+      "const net = await import('node:net');",
+      "import tls from 'node:tls';",
+      "http.get('https://example.invalid');",
+      "https.request('https://example.invalid');",
+      "net.connect({host: 'example.invalid'});",
+      "net.createConnection({host: 'example.invalid'});",
+      "tls.connect({host: 'example.invalid'});",
+    ]) {
+      expect(control).toMatch(NODE_NETWORK_API);
+    }
     expect(source).not.toMatch(NETWORK_COMMAND);
+    expect(source).not.toMatch(NODE_NETWORK_API);
     expect(source).not.toMatch(/\bfetch\s*\(/u);
-    expect(source).not.toMatch(/\bhttps?\.request\s*\(/u);
   });
 });

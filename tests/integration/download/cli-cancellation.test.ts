@@ -43,8 +43,11 @@ const isProcessAlive = (pid: number): boolean => {
   }
 };
 
-const readWhenReady = async (target: string): Promise<string> => {
-  const deadline = Date.now() + 10_000;
+const readWhenReady = async (
+  target: string,
+  timeoutMs = 10_000,
+): Promise<string> => {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
       return await readFile(target, 'utf8');
@@ -122,6 +125,14 @@ describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
         cwd: fixture.workspaceRoot,
         env: {
           ...process.env,
+          HOME: '/host/home-marker',
+          NODE_OPTIONS: '--no-warnings',
+          NODE_PATH: '/host/node-path-marker',
+          AWS_SECRET_ACCESS_KEY: 'credential-marker',
+          HTTP_PROXY: 'http://host-proxy.invalid:8080',
+          HTTPS_PROXY: 'https://host-proxy.invalid:8443',
+          ALL_PROXY: 'socks5://host-proxy.invalid:1080',
+          NO_PROXY: 'host-private.invalid',
           MANAGED_DOWNLOAD_FIXTURE_ROOT: fixture.root,
           FAKE_YT_DLP_LONG_RUNNING: '1',
         },
@@ -138,6 +149,28 @@ describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
       const recordedPids = JSON.parse(await readWhenReady(
         path.join(fixture.stateDirectory, 'pids.json'),
       )) as RecordedPids;
+      const childEnvironment = JSON.parse(await readWhenReady(
+        path.join(fixture.stateDirectory, 'child-environment.json'),
+        1500,
+      )) as NodeJS.ProcessEnv;
+      expect(childEnvironment).toEqual({
+        HOME: fixture.homeDirectory,
+        PATH: [
+          path.dirname(process.execPath),
+          fixture.toolsDirectory,
+          '/usr/bin',
+          '/bin',
+        ].join(path.delimiter),
+        TMPDIR: fixture.temporaryDirectory,
+        DENO_DIR: fixture.paths.denoDirectory,
+        XDG_CACHE_HOME: fixture.paths.providerCacheDirectory,
+        DENO_NO_PROMPT: '1',
+        DENO_NO_UPDATE_CHECK: '1',
+        FORCE_COLOR: 'false',
+        FAKE_YT_DLP_RECORD_DIRECTORY: fixture.recordDirectory,
+        FAKE_YT_DLP_STATE_DIRECTORY: fixture.stateDirectory,
+        FAKE_YT_DLP_LONG_RUNNING: '1',
+      });
       descendantPids.push(recordedPids.parent, recordedPids.child);
       const countBeforeSignal = Number(await readWhenReady(
         path.join(fixture.stateDirectory, 'write-count'),
@@ -165,7 +198,7 @@ describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
       expect(stdout).toBe('');
       expect(stderr).toBe(
         'Download failed [DOWNLOAD_PROCESS_FAILED]: '
-        + 'The video could not be downloaded.\n',
+        + 'The download operation was cancelled.\n',
       );
       expect(await readdir(stagingRoot)).toEqual([]);
       await expect(access(path.join(

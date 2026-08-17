@@ -164,6 +164,31 @@ afterEach(() => {
 });
 
 describe('resolveDownloaderToolchain', () => {
+  it('rejects a pre-aborted resolver signal with sanitized cancellation', async () => {
+    const fixture = createResolverFixture();
+    const controller = new AbortController();
+    const privateReason = 'private resolver abort reason';
+    controller.abort(new Error(privateReason));
+
+    let caught: unknown;
+    try {
+      await resolveDownloaderToolchain({
+        homeDirectory,
+        signal: controller.signal,
+      }, fixture.dependencies);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      name: 'DownloadCancellationError',
+      message: 'The download operation was cancelled.',
+    });
+    expect(`${String(caught)}${JSON.stringify(caught)}`).not.toContain(privateReason);
+    expect(fixture.directoryExists).not.toHaveBeenCalled();
+    expect(fixture.runProcess).not.toHaveBeenCalled();
+  });
+
   it('uses an explicit override before the exact managed downloader', async () => {
     const fixture = createResolverFixture();
     const ytDlpOverride = '/private/overrides/yt-dlp';
