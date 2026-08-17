@@ -13,9 +13,8 @@ import {
 } from 'node:fs/promises';
 import path from 'node:path';
 import {runProcess} from '../process/run-process';
-import type {BrowserCookieSource} from './browser-cookies';
 import {DownloadError} from './errors';
-import type {ResolvedPlatformProfile} from './platform-profiles';
+import type {PlatformNetworkAudit} from './platform-profiles';
 import {
   assertExtractorMatches,
   DownloadPlatformSchema,
@@ -1001,10 +1000,9 @@ export interface FinalizeArchiveInput {
   canonicalUrl: string;
   downloadedAt: Date;
   tools: DownloadToolVersions;
-  browserCookies?: ResolvedPlatformProfile['browserCookies'];
-  network?: ResolvedPlatformProfile['networkAudit'];
-  toolchain?: DownloaderToolchainAudit;
-  browserCookieSource?: BrowserCookieSource;
+  browserCookies: {used: false} | {used: true; source: 'chrome'};
+  network: PlatformNetworkAudit;
+  toolchain: DownloaderToolchainAudit;
 }
 
 export interface DownloadedArchive {
@@ -1220,7 +1218,6 @@ const validatePreparedPaths = (
   prepared: StagedArchive,
   input: FinalizeArchiveInput,
 ): void => {
-  const runtimeBrowserCookieSource: unknown = input.browserCookieSource;
   const expectedFinalDirectory = path.join(
     prepared.root.absolutePath,
     prepared.platform,
@@ -1238,8 +1235,6 @@ const validatePreparedPaths = (
     prepared.relativeDirectory !== expectedRelativeDirectory ||
     !validVideoId(input.videoId) ||
     !DownloadPlatformSchema.safeParse(input.platform).success ||
-    (runtimeBrowserCookieSource !== undefined &&
-      (runtimeBrowserCookieSource !== 'chrome' || input.platform !== 'douyin')) ||
     !isOwnedStagingDirectory(prepared) ||
     !stagedArchiveOwnership.has(prepared)
   ) {
@@ -1363,15 +1358,13 @@ const buildReceipt = (
       tools: input.tools,
       files,
     };
-    const receipt = DownloadReceiptSchema.parse(
-      input.browserCookieSource === undefined
-        ? {version: 1, ...commonReceipt}
-        : {
-            version: 2,
-            ...commonReceipt,
-            browserCookies: {used: true, source: input.browserCookieSource},
-          },
-    );
+    const receipt = DownloadReceiptSchema.parse({
+      version: 3,
+      ...commonReceipt,
+      browserCookies: input.browserCookies,
+      network: input.network,
+      toolchain: input.toolchain,
+    });
     return {receipt, mediaFilename: mediaFiles[0]?.name ?? ''};
   } catch {
     throw new DownloadError('DOWNLOAD_ARCHIVE_INVALID', ARCHIVE_INVALID_MESSAGE);

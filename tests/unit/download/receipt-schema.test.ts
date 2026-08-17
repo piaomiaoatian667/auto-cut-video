@@ -33,7 +33,23 @@ interface ReceiptFixture {
   files: ArchiveFileFixture[];
   browserCookies?: {
     used: boolean;
+    source?: string;
+  };
+  network?: {
+    proxyUsed: boolean;
+    proxyScheme?: string;
+    browserImpersonation: boolean;
+    browserFamily?: string;
+  };
+  toolchain?: {
     source: string;
+    ytDlpVersion: string;
+    managedAssetSha256?: string;
+    potProvider?: {
+      name: string;
+      version: string;
+      mode: string;
+    };
   };
 }
 
@@ -88,6 +104,138 @@ const makeDouyinReceipt = (): ReceiptFixture => ({
   title: 'Public Douyin fixture',
   canonicalUrl: 'https://www.douyin.com/video/7654841525762919726',
 });
+
+const makeV3Receipt = (): ReceiptFixture => ({
+  ...makeReceipt(),
+  version: 3,
+  videoId: 'abc',
+  canonicalUrl: 'https://www.youtube.com/watch?v=abc',
+  browserCookies: {used: false},
+  network: {
+    proxyUsed: true,
+    proxyScheme: 'socks5h',
+    browserImpersonation: false,
+  },
+  toolchain: {
+    source: 'managed',
+    ytDlpVersion: '2026.08.01',
+    managedAssetSha256: sha256('c'),
+    potProvider: {
+      name: 'bgutil',
+      version: '1.3.1',
+      mode: 'script',
+    },
+  },
+});
+
+const SENSITIVE_VALUE = 'sensitive-value-marker';
+
+const sensitiveReceiptCases: ReadonlyArray<readonly [string, () => unknown]> = [
+  ['proxy URL', () => {
+    const receipt = makeV3Receipt();
+    return {
+      ...receipt,
+      network: {
+        ...receipt.network,
+        proxyUrl: `socks5h://user:${SENSITIVE_VALUE}@proxy.example`,
+      },
+    };
+  }],
+  ['proxy credentials', () => {
+    const receipt = makeV3Receipt();
+    return {
+      ...receipt,
+      network: {
+        ...receipt.network,
+        proxyCredentials: {username: 'user', password: SENSITIVE_VALUE},
+      },
+    };
+  }],
+  ['browser path', () => ({
+    ...makeV3Receipt(),
+    browserCookies: {
+      used: true,
+      source: 'chrome',
+      browserPath: `/private/${SENSITIVE_VALUE}`,
+    },
+  })],
+  ['browser profile', () => ({
+    ...makeV3Receipt(),
+    browserCookies: {
+      used: true,
+      source: 'chrome',
+      profile: SENSITIVE_VALUE,
+    },
+  })],
+  ['browser impersonation target', () => {
+    const receipt = makeV3Receipt();
+    return {
+      ...receipt,
+      network: {
+        proxyUsed: true,
+        proxyScheme: 'socks5h',
+        browserImpersonation: true,
+        browserFamily: 'chrome',
+        impersonationTarget: SENSITIVE_VALUE,
+      },
+    };
+  }],
+  ['token', () => {
+    const receipt = makeV3Receipt();
+    return {
+      ...receipt,
+      toolchain: {...receipt.toolchain, token: SENSITIVE_VALUE},
+    };
+  }],
+  ['visitor data', () => {
+    const receipt = makeV3Receipt();
+    return {
+      ...receipt,
+      network: {...receipt.network, visitorData: SENSITIVE_VALUE},
+    };
+  }],
+  ['child arguments', () => {
+    const receipt = makeV3Receipt();
+    return {
+      ...receipt,
+      toolchain: {...receipt.toolchain, childArgs: [SENSITIVE_VALUE]},
+    };
+  }],
+  ['child environment', () => {
+    const receipt = makeV3Receipt();
+    return {
+      ...receipt,
+      toolchain: {
+        ...receipt.toolchain,
+        childEnvironment: {TOKEN: SENSITIVE_VALUE},
+      },
+    };
+  }],
+  ['provider path', () => {
+    const receipt = makeV3Receipt();
+    return {
+      ...receipt,
+      toolchain: {
+        ...receipt.toolchain,
+        potProvider: {
+          ...receipt.toolchain?.potProvider,
+          path: `/private/${SENSITIVE_VALUE}`,
+        },
+      },
+    };
+  }],
+  ['staging path', () => ({
+    ...makeV3Receipt(),
+    stagingPath: `/tmp/${SENSITIVE_VALUE}`,
+  })],
+  ['nested unknown key', () => {
+    const receipt = makeV3Receipt();
+    return {
+      ...receipt,
+      tools: {...receipt.tools, futureAudit: SENSITIVE_VALUE},
+    };
+  }],
+];
 
 const expectInvalid = (receipt: unknown): void => {
   expect(DownloadReceiptSchema.safeParse(receipt).success).toBe(false);
@@ -144,6 +292,40 @@ describe('download receipt schema', () => {
     expect(DownloadReceiptSchema.parse(receipt)).toEqual(receipt);
   });
 
+  it('parses a valid strict version 3 audit receipt unchanged', () => {
+    const receipt = makeV3Receipt();
+    const parsed: DownloadReceipt = DownloadReceiptSchema.parse(receipt);
+
+    expect(parsed).toEqual(receipt);
+    expect(parsed.version).toBe(3);
+    if (parsed.version !== 3) throw new Error('Expected a version 3 receipt.');
+    expect(parsed.browserCookies).toEqual({used: false});
+    expect(parsed.network).toEqual({
+      proxyUsed: true,
+      proxyScheme: 'socks5h',
+      browserImpersonation: false,
+    });
+    expect(parsed.toolchain).toEqual({
+      source: 'managed',
+      ytDlpVersion: '2026.08.01',
+      managedAssetSha256: sha256('c'),
+      potProvider: {name: 'bgutil', version: '1.3.1', mode: 'script'},
+    });
+  });
+
+  it('parses a valid version 3 override audit without a managed digest', () => {
+    const receipt = makeV3Receipt();
+    const overrideReceipt = {
+      ...receipt,
+      toolchain: {
+        source: 'override',
+        ytDlpVersion: receipt.tools.ytDlpVersion,
+      },
+    };
+
+    expect(DownloadReceiptSchema.parse(overrideReceipt)).toEqual(overrideReceipt);
+  });
+
   it('rejects a version 2 cookie receipt for YouTube', () => {
     expectInvalid({
       ...makeReceipt(),
@@ -154,6 +336,31 @@ describe('download receipt schema', () => {
 
   it('rejects cookie audit fields on version 1', () => {
     expectInvalid(makeReceipt({used: true, source: 'chrome'}));
+  });
+
+  it.each([
+    ['version 1', {
+      ...makeReceipt(),
+      network: {proxyUsed: false, browserImpersonation: false},
+      toolchain: {
+        source: 'managed',
+        ytDlpVersion: '2026.08.01',
+        managedAssetSha256: sha256('c'),
+      },
+    }],
+    ['version 2', {
+      ...makeDouyinReceipt(),
+      version: 2,
+      browserCookies: {used: true, source: 'chrome'},
+      network: {proxyUsed: false, browserImpersonation: false},
+      toolchain: {
+        source: 'managed',
+        ytDlpVersion: '2026.08.01',
+        managedAssetSha256: sha256('c'),
+      },
+    }],
+  ])('rejects version 3 audit fields on %s', (_caseName, receipt) => {
+    expectInvalid(receipt);
   });
 
   it.each([
@@ -189,6 +396,91 @@ describe('download receipt schema', () => {
   ])('rejects version 2 receipt with %s', (_caseName, receipt) => {
     expectInvalid(receipt);
   });
+
+  it.each([
+    ['proxy enabled without scheme', {
+      proxyUsed: true,
+      browserImpersonation: false,
+    }, 'proxy audit fields disagree'],
+    ['proxy disabled with scheme', {
+      proxyUsed: false,
+      proxyScheme: 'https',
+      browserImpersonation: false,
+    }, 'proxy audit fields disagree'],
+    ['impersonation enabled without family', {
+      proxyUsed: false,
+      browserImpersonation: true,
+    }, 'browser impersonation audit fields disagree'],
+    ['impersonation disabled with family', {
+      proxyUsed: false,
+      browserImpersonation: false,
+      browserFamily: 'chrome',
+    }, 'browser impersonation audit fields disagree'],
+  ])('rejects version 3 network audit with %s', (
+    _caseName,
+    network,
+    message,
+  ) => {
+    const result = DownloadReceiptSchema.safeParse({
+      ...makeV3Receipt(),
+      network,
+    });
+
+    expect(result.success).toBe(false);
+    if (result.success) throw new Error('Expected invalid network audit.');
+    expect(result.error.issues).toContainEqual(expect.objectContaining({message}));
+  });
+
+  it.each([
+    ['unused cookies with a source', {used: false, source: 'chrome'}],
+    ['used cookies without a source', {used: true}],
+    ['used cookies with an unsupported source', {used: true, source: 'firefox'}],
+  ])('rejects version 3 Cookie audit with %s', (
+    _caseName,
+    browserCookies,
+  ) => {
+    expectInvalid({...makeV3Receipt(), browserCookies});
+  });
+
+  it('rejects version 3 tools and toolchain version disagreement', () => {
+    const receipt = makeV3Receipt();
+
+    expectInvalid({
+      ...receipt,
+      toolchain: {...receipt.toolchain, ytDlpVersion: '2026.08.02'},
+    });
+  });
+
+  it.each([
+    ['managed toolchain without digest', {
+      source: 'managed',
+      ytDlpVersion: '2026.08.01',
+    }],
+    ['managed toolchain with malformed digest', {
+      source: 'managed',
+      ytDlpVersion: '2026.08.01',
+      managedAssetSha256: 'sha256:not-a-digest',
+    }],
+    ['override toolchain with digest', {
+      source: 'override',
+      ytDlpVersion: '2026.08.01',
+      managedAssetSha256: sha256('c'),
+    }],
+  ])('rejects version 3 %s', (_caseName, toolchain) => {
+    expectInvalid({...makeV3Receipt(), toolchain});
+  });
+
+  it.each(sensitiveReceiptCases)(
+    'rejects version 3 receipt containing %s without retaining its value',
+    (_caseName, makeUnsafeReceipt) => {
+      const result = DownloadReceiptSchema.safeParse(makeUnsafeReceipt());
+
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error('Expected a private audit field rejection.');
+      expect(result.error.message).not.toContain(SENSITIVE_VALUE);
+      expect(JSON.stringify(result)).not.toContain(SENSITIVE_VALUE);
+    },
+  );
 
   it('rejects an unexpected top-level key', () => {
     expectInvalid({...makeReceipt(), unexpected: true});

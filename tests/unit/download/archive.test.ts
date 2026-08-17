@@ -53,6 +53,7 @@ const DESTINATION_CONFLICT_MESSAGE =
   'The download destination conflicts with an existing archive.';
 const FINALIZE_FAILED_MESSAGE = 'The download archive could not be finalized.';
 const DOUYIN_VIDEO_ID = '7654841525762919726';
+const MANAGED_ASSET_SHA256 = `sha256:${'c'.repeat(64)}` as const;
 
 const temporaryDirectories: string[] = [];
 const execFileAsync = promisify(execFile);
@@ -208,10 +209,10 @@ const writeStagedFiles = async (
   );
 };
 
-const finalize = (
+const finalizeInput = (
   prepared: StagedArchive,
   overrides: Partial<FinalizeArchiveInput> = {},
-): Promise<DownloadedArchive> => finalizeArchive(prepared, {
+): FinalizeArchiveInput => ({
   platform: prepared.platform,
   videoId: prepared.videoId,
   title: 'Example',
@@ -223,9 +224,19 @@ const finalize = (
   },
   browserCookies: {used: false},
   network: {proxyUsed: false, browserImpersonation: false},
-  toolchain: {source: 'managed', ytDlpVersion: '2026.07.04'},
+  toolchain: {
+    source: 'managed',
+    ytDlpVersion: '2026.07.04',
+    managedAssetSha256: MANAGED_ASSET_SHA256,
+  },
   ...overrides,
 });
+
+const finalize = (
+  prepared: StagedArchive,
+  overrides: Partial<FinalizeArchiveInput> = {},
+): Promise<DownloadedArchive> =>
+  finalizeArchive(prepared, finalizeInput(prepared, overrides));
 
 interface PublishedArchive {
   workspaceRoot: string;
@@ -250,9 +261,42 @@ const publishArchive = async (): Promise<PublishedArchive> => {
   };
 };
 
+const commonReceiptFields = (receipt: DownloadReceipt) => ({
+  status: receipt.status,
+  platform: receipt.platform,
+  videoId: receipt.videoId,
+  title: receipt.title,
+  canonicalUrl: receipt.canonicalUrl,
+  downloadedAt: receipt.downloadedAt,
+  purpose: receipt.purpose,
+  rightsConfirmed: receipt.rightsConfirmed,
+  transcoded: receipt.transcoded,
+  tools: receipt.tools,
+  files: receipt.files,
+});
+
+const legacyV1Receipt = (receipt: DownloadReceipt): DownloadReceipt =>
+  DownloadReceiptSchema.parse({
+    version: 1,
+    ...commonReceiptFields(receipt),
+  });
+
+const legacyV2Receipt = (receipt: DownloadReceipt): DownloadReceipt => {
+  if (receipt.platform !== 'douyin') {
+    throw new Error('Expected a Douyin receipt.');
+  }
+  return DownloadReceiptSchema.parse({
+    version: 2,
+    ...commonReceiptFields(receipt),
+    platform: 'douyin',
+    browserCookies: {used: true, source: 'chrome'},
+  });
+};
+
 const rewritePublishedMetadata = async (
   published: PublishedArchive,
   replacement: string | Readonly<Record<string, unknown>>,
+  baseReceipt: DownloadReceipt = published.result.receipt,
 ): Promise<{metadataSource: string; receiptSource: string}> => {
   await makeTreeMutable(published.finalDirectory);
   const metadataPath = path.join(published.finalDirectory, 'video.info.json');
@@ -267,8 +311,8 @@ const rewritePublishedMetadata = async (
   await writeFile(metadataPath, metadataContents);
 
   const forgedReceipt = DownloadReceiptSchema.parse({
-    ...published.result.receipt,
-    files: published.result.receipt.files.map((file) =>
+    ...baseReceipt,
+    files: baseReceipt.files.map((file) =>
       file.path === 'video.info.json'
         ? {
             ...file,
@@ -761,8 +805,20 @@ describe('finalizeArchive', () => {
       mediaPath: `${expectedDirectory}/video.webm`,
       receiptPath: `${expectedDirectory}/receipt.json`,
     });
-    expect(result.receipt.version).toBe(1);
-    expect('browserCookies' in result.receipt).toBe(false);
+    expect(result.receipt.version).toBe(3);
+    if (result.receipt.version !== 3) {
+      throw new Error('Expected a version 3 receipt.');
+    }
+    expect(result.receipt.browserCookies).toEqual({used: false});
+    expect(result.receipt.network).toEqual({
+      proxyUsed: false,
+      browserImpersonation: false,
+    });
+    expect(result.receipt.toolchain).toEqual({
+      source: 'managed',
+      ytDlpVersion: '2026.07.04',
+      managedAssetSha256: MANAGED_ASSET_SHA256,
+    });
     expect((await lstat(finalDirectory)).isDirectory()).toBe(true);
     await expectMissing(prepared.stagingDirectory);
 
@@ -771,7 +827,7 @@ describe('finalizeArchive', () => {
     );
     expect(result.receipt).toEqual(receipt);
     expect(receipt).toMatchObject({
-      version: 1,
+      version: 3,
       status: 'downloaded',
       platform: 'youtube',
       videoId: 'abc',
@@ -784,6 +840,16 @@ describe('finalizeArchive', () => {
       tools: {
         ytDlpVersion: '2026.07.04',
         ffmpegVersion: 'ffmpeg version test',
+      },
+      browserCookies: {used: false},
+      network: {
+        proxyUsed: false,
+        browserImpersonation: false,
+      },
+      toolchain: {
+        source: 'managed',
+        ytDlpVersion: '2026.07.04',
+        managedAssetSha256: MANAGED_ASSET_SHA256,
       },
     });
     expect(receipt.files.map((file) => file.path)).toEqual(sortNames([
@@ -814,7 +880,7 @@ describe('finalizeArchive', () => {
       name.includes('receipt-') || name.endsWith('.tmp'))).toBe(false);
   });
 
-  it('records Chrome cookie use in a strict version 2 receipt', async () => {
+  it('records Chrome cookie use in a strict version 3 receipt', async () => {
     const workspaceRoot = await createWorkspace();
     const {prepared} = await prepareStaging(
       workspaceRoot,
@@ -824,24 +890,53 @@ describe('finalizeArchive', () => {
     );
     await writeStagedFiles(prepared);
 
-    const result = await finalize(prepared, {browserCookieSource: 'chrome'});
+    const result = await finalize(prepared, {
+      browserCookies: {used: true, source: 'chrome'},
+    });
 
     expect(result.receipt).toMatchObject({
-      version: 2,
+      version: 3,
       platform: 'douyin',
       videoId: DOUYIN_VIDEO_ID,
       canonicalUrl: `https://www.douyin.com/video/${DOUYIN_VIDEO_ID}`,
       browserCookies: {used: true, source: 'chrome'},
+      network: {proxyUsed: false, browserImpersonation: false},
+      toolchain: {
+        source: 'managed',
+        ytDlpVersion: '2026.07.04',
+        managedAssetSha256: MANAGED_ASSET_SHA256,
+      },
     });
   });
 
-  it('rejects direct Chrome cookie finalization for a non-Douyin archive', async () => {
+  it.each([
+    ['tools and toolchain version mismatch', {
+      toolchain: {
+        source: 'managed' as const,
+        ytDlpVersion: '2026.07.05',
+        managedAssetSha256: MANAGED_ASSET_SHA256,
+      },
+    }],
+    ['managed toolchain without digest', {
+      toolchain: {
+        source: 'managed' as const,
+        ytDlpVersion: '2026.07.04',
+      },
+    }],
+    ['override toolchain with managed digest', {
+      toolchain: {
+        source: 'override' as const,
+        ytDlpVersion: '2026.07.04',
+        managedAssetSha256: MANAGED_ASSET_SHA256,
+      },
+    }],
+  ])('rejects %s during finalization', async (_caseName, overrides) => {
     const workspaceRoot = await createWorkspace();
     const {prepared} = await prepareStaging(workspaceRoot);
     await writeStagedFiles(prepared);
 
     await expectDownloadError(
-      finalize(prepared, {browserCookieSource: 'chrome'}),
+      finalize(prepared, overrides),
       'DOWNLOAD_ARCHIVE_INVALID',
       ARCHIVE_INVALID_MESSAGE,
     );
@@ -1122,17 +1217,7 @@ describe('finalizeArchive', () => {
       prepared = archivePreparation;
       await writeStagedFiles(prepared);
       try {
-        await racedArchive.finalizeArchive(prepared, {
-          platform: 'youtube',
-          videoId: prepared.videoId,
-          title: 'Example',
-          canonicalUrl: `https://youtu.be/${prepared.videoId}`,
-          downloadedAt: new Date('2026-08-12T00:00:00.000Z'),
-          tools: {
-            ytDlpVersion: '2026.07.04',
-            ffmpegVersion: 'ffmpeg version test',
-          },
-        });
+        await racedArchive.finalizeArchive(prepared, finalizeInput(prepared));
       } catch (error) {
         failure = error;
       }
@@ -1208,17 +1293,7 @@ describe('finalizeArchive', () => {
       prepared = archivePreparation;
       await writeStagedFiles(prepared);
       try {
-        await racedArchive.finalizeArchive(prepared, {
-          platform: 'youtube',
-          videoId: prepared.videoId,
-          title: 'Example',
-          canonicalUrl: `https://youtu.be/${prepared.videoId}`,
-          downloadedAt: new Date('2026-08-12T00:00:00.000Z'),
-          tools: {
-            ytDlpVersion: '2026.07.04',
-            ffmpegVersion: 'ffmpeg version test',
-          },
-        });
+        await racedArchive.finalizeArchive(prepared, finalizeInput(prepared));
       } catch (error) {
         failure = error;
       }
@@ -1384,17 +1459,10 @@ describe('finalizeArchive', () => {
       }
       prepared = archivePreparation;
       await writeStagedFiles(prepared);
-      result = await racedArchive.finalizeArchive(prepared, {
-        platform: 'youtube',
-        videoId: prepared.videoId,
-        title: 'Example',
-        canonicalUrl: `https://youtu.be/${prepared.videoId}`,
-        downloadedAt: new Date('2026-08-12T00:00:00.000Z'),
-        tools: {
-          ytDlpVersion: '2026.07.04',
-          ffmpegVersion: 'ffmpeg version test',
-        },
-      });
+      result = await racedArchive.finalizeArchive(
+        prepared,
+        finalizeInput(prepared),
+      );
     } finally {
       vi.doUnmock('../../../src/process/run-process');
       vi.resetModules();
@@ -1472,17 +1540,7 @@ describe('finalizeArchive', () => {
       prepared = archivePreparation;
       await writeStagedFiles(prepared);
       try {
-        await racedArchive.finalizeArchive(prepared, {
-          platform: 'youtube',
-          videoId: prepared.videoId,
-          title: 'Example',
-          canonicalUrl: `https://youtu.be/${prepared.videoId}`,
-          downloadedAt: new Date('2026-08-12T00:00:00.000Z'),
-          tools: {
-            ytDlpVersion: '2026.07.04',
-            ffmpegVersion: 'ffmpeg version test',
-          },
-        });
+        await racedArchive.finalizeArchive(prepared, finalizeInput(prepared));
       } catch (error) {
         failure = error;
       }
@@ -1547,17 +1605,10 @@ describe('finalizeArchive', () => {
         throw new Error('Expected staging archive.');
       }
       await writeStagedFiles(archivePreparation);
-      await racedArchive.finalizeArchive(archivePreparation, {
-        platform: 'youtube',
-        videoId: archivePreparation.videoId,
-        title: 'Example',
-        canonicalUrl: `https://youtu.be/${archivePreparation.videoId}`,
-        downloadedAt: new Date('2026-08-12T00:00:00.000Z'),
-        tools: {
-          ytDlpVersion: '2026.07.04',
-          ffmpegVersion: 'ffmpeg version test',
-        },
-      });
+      await racedArchive.finalizeArchive(
+        archivePreparation,
+        finalizeInput(archivePreparation),
+      );
     } finally {
       vi.doUnmock('../../../src/process/run-process');
       vi.resetModules();
@@ -1648,17 +1699,10 @@ describe('finalizeArchive', () => {
       }
       await writeStagedFiles(archivePreparation);
       try {
-        await racedArchive.finalizeArchive(archivePreparation, {
-          platform: 'youtube',
-          videoId: archivePreparation.videoId,
-          title: 'Example',
-          canonicalUrl: `https://youtu.be/${archivePreparation.videoId}`,
-          downloadedAt: new Date('2026-08-12T00:00:00.000Z'),
-          tools: {
-            ytDlpVersion: '2026.07.04',
-            ffmpegVersion: 'ffmpeg version test',
-          },
-        });
+        await racedArchive.finalizeArchive(
+          archivePreparation,
+          finalizeInput(archivePreparation),
+        );
       } catch (error) {
         failure = error;
       }
@@ -1715,17 +1759,7 @@ describe('finalizeArchive', () => {
       prepared = archivePreparation;
       await writeStagedFiles(prepared);
       try {
-        await racedArchive.finalizeArchive(prepared, {
-          platform: 'youtube',
-          videoId: prepared.videoId,
-          title: 'Example',
-          canonicalUrl: `https://youtu.be/${prepared.videoId}`,
-          downloadedAt: new Date('2026-08-12T00:00:00.000Z'),
-          tools: {
-            ytDlpVersion: '2026.07.04',
-            ffmpegVersion: 'ffmpeg version test',
-          },
-        });
+        await racedArchive.finalizeArchive(prepared, finalizeInput(prepared));
       } catch (error) {
         failure = error;
       }
@@ -1798,17 +1832,10 @@ describe('finalizeArchive', () => {
         throw new Error('Expected staging archive.');
       }
       await writeStagedFiles(archivePreparation);
-      await racedArchive.finalizeArchive(archivePreparation, {
-        platform: 'youtube',
-        videoId: archivePreparation.videoId,
-        title: 'Example',
-        canonicalUrl: `https://youtu.be/${archivePreparation.videoId}`,
-        downloadedAt: new Date('2026-08-12T00:00:00.000Z'),
-        tools: {
-          ytDlpVersion: '2026.07.04',
-          ffmpegVersion: 'ffmpeg version test',
-        },
-      });
+      await racedArchive.finalizeArchive(
+        archivePreparation,
+        finalizeInput(archivePreparation),
+      );
     } finally {
       vi.doUnmock('../../../src/process/run-process');
       vi.resetModules();
@@ -1867,17 +1894,7 @@ describe('finalizeArchive', () => {
       prepared = archivePreparation;
       await writeStagedFiles(prepared);
       try {
-        await racedArchive.finalizeArchive(prepared, {
-          platform: 'youtube',
-          videoId: prepared.videoId,
-          title: 'Example',
-          canonicalUrl: `https://youtu.be/${prepared.videoId}`,
-          downloadedAt: new Date('2026-08-12T00:00:00.000Z'),
-          tools: {
-            ytDlpVersion: '2026.07.04',
-            ffmpegVersion: 'ffmpeg version test',
-          },
-        });
+        await racedArchive.finalizeArchive(prepared, finalizeInput(prepared));
       } catch (error) {
         failure = error;
       }
@@ -1953,7 +1970,7 @@ describe('prepareArchive duplicate verification', () => {
       .toEqual([]);
   });
 
-  it('returns a sealed version 2 receipt unchanged', async () => {
+  it('returns a sealed version 3 receipt unchanged', async () => {
     const workspaceRoot = await createWorkspace();
     const {root, prepared} = await prepareStaging(
       workspaceRoot,
@@ -1962,7 +1979,9 @@ describe('prepareArchive duplicate verification', () => {
       'douyin',
     );
     await writeStagedFiles(prepared);
-    const result = await finalize(prepared, {browserCookieSource: 'chrome'});
+    const result = await finalize(prepared, {
+      browserCookies: {used: true, source: 'chrome'},
+    });
 
     const duplicate = await prepareArchive(
       root,
@@ -1972,7 +1991,7 @@ describe('prepareArchive duplicate verification', () => {
     );
 
     expect(result.receipt).toMatchObject({
-      version: 2,
+      version: 3,
       platform: 'douyin',
       videoId: DOUYIN_VIDEO_ID,
       browserCookies: {used: true, source: 'chrome'},
@@ -1994,10 +2013,11 @@ describe('prepareArchive duplicate verification', () => {
       url: 'signed-url-marker',
       filepath: '/private/profile-marker',
       http_headers: {Authorization: 'header-marker'},
-    });
+    }, legacyV1Receipt(published.result.receipt));
     const expectedReceipt = DownloadReceiptSchema.parse(
       JSON.parse(legacy.receiptSource),
     );
+    expect(expectedReceipt.version).toBe(1);
 
     expect(Buffer.byteLength(legacy.metadataSource))
       .toBeGreaterThan(PROCESS_OUTPUT_LIMIT_BYTES);
@@ -2036,7 +2056,9 @@ describe('prepareArchive duplicate verification', () => {
       'douyin',
     );
     await writeStagedFiles(prepared);
-    const result = await finalize(prepared, {browserCookieSource: 'chrome'});
+    const result = await finalize(prepared, {
+      browserCookies: {used: true, source: 'chrome'},
+    });
     const published: PublishedArchive = {
       workspaceRoot,
       root,
@@ -2050,10 +2072,11 @@ describe('prepareArchive duplicate verification', () => {
       url: 'signed-url-marker',
       filepath: '/private/profile-marker',
       http_headers: {Authorization: 'header-marker'},
-    });
+    }, legacyV2Receipt(result.receipt));
     const expectedReceipt = DownloadReceiptSchema.parse(
       JSON.parse(legacy.receiptSource),
     );
+    expect(expectedReceipt.version).toBe(2);
 
     const duplicate = await prepareArchive(
       root,
@@ -2500,17 +2523,7 @@ describe('cleanupArchive', () => {
       prepared = archivePreparation;
       await writeStagedFiles(prepared);
       try {
-        await racedArchive.finalizeArchive(prepared, {
-          platform: 'youtube',
-          videoId: prepared.videoId,
-          title: 'Example',
-          canonicalUrl: `https://youtu.be/${prepared.videoId}`,
-          downloadedAt: new Date('2026-08-12T00:00:00.000Z'),
-          tools: {
-            ytDlpVersion: '2026.07.04',
-            ffmpegVersion: 'ffmpeg version test',
-          },
-        });
+        await racedArchive.finalizeArchive(prepared, finalizeInput(prepared));
       } catch (error) {
         finalizeFailure = error;
       }
@@ -2590,17 +2603,7 @@ describe('cleanupArchive', () => {
 
       let finalizeFailure: unknown;
       try {
-        await racedArchive.finalizeArchive(prepared, {
-          platform: 'youtube',
-          videoId: prepared.videoId,
-          title: 'Example',
-          canonicalUrl: `https://youtu.be/${prepared.videoId}`,
-          downloadedAt: new Date('2026-08-12T00:00:00.000Z'),
-          tools: {
-            ytDlpVersion: '2026.07.04',
-            ffmpegVersion: 'ffmpeg version test',
-          },
-        });
+        await racedArchive.finalizeArchive(prepared, finalizeInput(prepared));
       } catch (error) {
         finalizeFailure = error;
       }

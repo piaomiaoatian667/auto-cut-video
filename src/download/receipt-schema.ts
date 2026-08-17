@@ -161,9 +161,85 @@ const DownloadReceiptV2Schema = z.object({
   }).strict(),
 }).strict();
 
+const BrowserCookiesV3Schema = z.discriminatedUnion('used', [
+  z.object({used: z.literal(false)}).strict(),
+  z.object({used: z.literal(true), source: z.literal('chrome')}).strict(),
+]);
+
+const NetworkAuditSchema = z.object({
+  proxyUsed: z.boolean(),
+  proxyScheme: z.enum(['http', 'https', 'socks5', 'socks5h']).optional(),
+  browserImpersonation: z.boolean(),
+  browserFamily: z.literal('chrome').optional(),
+}).strict().superRefine((network, context) => {
+  if (network.proxyUsed !== (network.proxyScheme !== undefined)) {
+    context.addIssue({
+      code: 'custom',
+      message: 'proxy audit fields disagree',
+    });
+  }
+  if (
+    network.browserImpersonation !== (network.browserFamily !== undefined)
+  ) {
+    context.addIssue({
+      code: 'custom',
+      message: 'browser impersonation audit fields disagree',
+    });
+  }
+});
+
+const ToolchainAuditSchema = z.object({
+  source: z.enum(['managed', 'override']),
+  ytDlpVersion: z.string().min(1),
+  managedAssetSha256: z.string()
+    .regex(/^sha256:[0-9a-f]{64}$/u)
+    .optional(),
+  potProvider: z.object({
+    name: z.literal('bgutil'),
+    version: z.literal('1.3.1'),
+    mode: z.literal('script'),
+  }).strict().optional(),
+}).strict().superRefine((toolchain, context) => {
+  if (
+    toolchain.source === 'managed' &&
+    toolchain.managedAssetSha256 === undefined
+  ) {
+    context.addIssue({
+      code: 'custom',
+      message: 'managed digest is required',
+    });
+  }
+  if (
+    toolchain.source === 'override' &&
+    toolchain.managedAssetSha256 !== undefined
+  ) {
+    context.addIssue({
+      code: 'custom',
+      message: 'override digest is forbidden',
+    });
+  }
+});
+
+const DownloadReceiptV3Schema = z.object({
+  version: z.literal(3),
+  ...DownloadReceiptCommonShape,
+  browserCookies: BrowserCookiesV3Schema,
+  network: NetworkAuditSchema,
+  toolchain: ToolchainAuditSchema,
+}).strict().superRefine((receipt, context) => {
+  if (receipt.toolchain.ytDlpVersion !== receipt.tools.ytDlpVersion) {
+    context.addIssue({
+      code: 'custom',
+      message: 'tools and toolchain yt-dlp versions disagree',
+      path: ['toolchain', 'ytDlpVersion'],
+    });
+  }
+});
+
 type DownloadReceiptVariant =
   | z.infer<typeof DownloadReceiptV1Schema>
-  | z.infer<typeof DownloadReceiptV2Schema>;
+  | z.infer<typeof DownloadReceiptV2Schema>
+  | z.infer<typeof DownloadReceiptV3Schema>;
 
 const validateDownloadReceipt = (
   receipt: DownloadReceiptVariant,
@@ -236,6 +312,7 @@ const validateDownloadReceipt = (
 export const DownloadReceiptSchema = z.discriminatedUnion('version', [
   DownloadReceiptV1Schema,
   DownloadReceiptV2Schema,
+  DownloadReceiptV3Schema,
 ]).superRefine(validateDownloadReceipt);
 
 export type DownloadReceipt = z.infer<typeof DownloadReceiptSchema>;

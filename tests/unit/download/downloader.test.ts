@@ -46,6 +46,7 @@ const TOOLS = {
   ytDlpVersion: '2026.08.01',
   ffmpegVersion: 'ffmpeg version 8.0',
 };
+const MANAGED_ASSET_SHA256 = `sha256:${'a'.repeat(64)}` as const;
 const TOOLCHAIN: ResolvedDownloaderToolchain = {
   source: 'managed',
   ytDlpExecutable: '/managed/bin/yt-dlp',
@@ -64,7 +65,7 @@ const TOOLCHAIN: ResolvedDownloaderToolchain = {
   audit: {
     source: 'managed',
     ytDlpVersion: TOOLS.ytDlpVersion,
-    managedAssetSha256: 'sha256:managed-asset',
+    managedAssetSha256: MANAGED_ASSET_SHA256,
   },
 };
 const ROOT: ValidatedArchiveRoot = {
@@ -88,7 +89,7 @@ const makeStaged = (
 
 const STAGED = makeStaged();
 const RECEIPT = {
-  version: 1 as const,
+  version: 3 as const,
   status: 'downloaded' as const,
   platform: 'youtube' as const,
   videoId: 'video-123',
@@ -99,6 +100,21 @@ const RECEIPT = {
   rightsConfirmed: true as const,
   transcoded: false as const,
   tools: TOOLS,
+  browserCookies: {used: false as const},
+  network: {
+    proxyUsed: false,
+    browserImpersonation: false,
+  },
+  toolchain: {
+    source: 'managed' as const,
+    ytDlpVersion: TOOLS.ytDlpVersion,
+    managedAssetSha256: MANAGED_ASSET_SHA256,
+    potProvider: {
+      name: 'bgutil' as const,
+      version: '1.3.1' as const,
+      mode: 'script' as const,
+    },
+  },
   files: [
     {
       role: 'metadata' as const,
@@ -377,7 +393,7 @@ describe('downloadVideo', () => {
           return 'managed' as const;
         },
         ytDlpVersion: TOOLCHAIN.audit.ytDlpVersion,
-        managedAssetSha256: 'sha256:managed-asset',
+        managedAssetSha256: MANAGED_ASSET_SHA256,
       },
     };
     const instrumentedProbe: YtDlpProbe = {
@@ -470,7 +486,7 @@ describe('downloadVideo', () => {
       toolchain: {
         source: 'managed',
         ytDlpVersion: TOOLS.ytDlpVersion,
-        managedAssetSha256: 'sha256:managed-asset',
+        managedAssetSha256: MANAGED_ASSET_SHA256,
         potProvider: {name: 'bgutil', version: '1.3.1', mode: 'script'},
       },
     });
