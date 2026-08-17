@@ -26,6 +26,7 @@ import {
 } from '../../../src/cli/videoctl';
 import {
   createSystemDownloadDependencies,
+  waitForDownloadDelay,
   type DownloadDependencies,
 } from '../../../src/download/downloader';
 import {
@@ -79,6 +80,15 @@ export interface ManagedFixtureOptions {
   scenario?: FakeYtDlpScenario;
   failurePhase?: 'probe' | 'download';
   longRunning?: boolean;
+  beforeDelay?: (
+    milliseconds: number,
+    signal?: AbortSignal,
+  ) => void | Promise<void>;
+}
+
+export interface ManagedFixtureSubprocessEnvironmentOptions {
+  recordDirectory?: string;
+  managedFixtureRoot?: string;
 }
 
 export interface RecordedYtDlpOperation {
@@ -108,6 +118,9 @@ export interface ManagedFixtureCommandHarness {
 export interface ManagedDownloadRuntime {
   dependencies: DownloadDependencies;
   resolveToolchain(signal?: AbortSignal): Promise<ResolvedDownloaderToolchain>;
+  createSubprocessEnvironment(
+    options?: ManagedFixtureSubprocessEnvironmentOptions,
+  ): Readonly<NodeJS.ProcessEnv>;
   operations: RecordedYtDlpOperation[];
   subprocesses: RecordedFixtureSubprocess[];
   processFailures: ProcessExecutionError[];
@@ -202,6 +215,7 @@ const createPluginArchive = async (
 const fixtureChildEnvironment = (
   layout: FixtureLayout,
   options: ManagedFixtureOptions,
+  environmentOptions: ManagedFixtureSubprocessEnvironmentOptions = {},
 ): Readonly<NodeJS.ProcessEnv> => Object.freeze({
   HOME: layout.homeDirectory,
   PATH: [
@@ -216,7 +230,8 @@ const fixtureChildEnvironment = (
   DENO_NO_PROMPT: '1',
   DENO_NO_UPDATE_CHECK: '1',
   FORCE_COLOR: 'false',
-  FAKE_YT_DLP_RECORD_DIRECTORY: layout.recordDirectory,
+  FAKE_YT_DLP_RECORD_DIRECTORY:
+    environmentOptions.recordDirectory ?? layout.recordDirectory,
   FAKE_YT_DLP_STATE_DIRECTORY: layout.stateDirectory,
   ...(options.scenario === undefined
     ? {}
@@ -225,6 +240,9 @@ const fixtureChildEnvironment = (
     ? {}
     : {FAKE_YT_DLP_FAILURE_PHASE: options.failurePhase}),
   ...(options.longRunning === true ? {FAKE_YT_DLP_LONG_RUNNING: '1'} : {}),
+  ...(environmentOptions.managedFixtureRoot === undefined
+    ? {}
+    : {MANAGED_DOWNLOAD_FIXTURE_ROOT: environmentOptions.managedFixtureRoot}),
 });
 
 const initializeManagedCache = async (
@@ -313,7 +331,14 @@ export const createManagedDownloadRuntime = (
   const processFailures: ProcessExecutionError[] = [];
   const delays: number[] = [];
   const actualHashes = new Map<string, string>();
-  const childEnvironment = fixtureChildEnvironment(layout, options);
+  const createSubprocessEnvironment = (
+    environmentOptions: ManagedFixtureSubprocessEnvironmentOptions = {},
+  ): Readonly<NodeJS.ProcessEnv> => fixtureChildEnvironment(
+    layout,
+    options,
+    environmentOptions,
+  );
+  const childEnvironment = createSubprocessEnvironment();
   const processRunner: DownloadProcessRunner = async (
     command,
     args,
@@ -390,13 +415,15 @@ export const createManagedDownloadRuntime = (
   dependencies.resolveToolchain = resolveToolchain;
   dependencies.wait = async (milliseconds, signal) => {
     delays.push(milliseconds);
-    if (signal?.aborted === true) throw signal.reason;
+    await options.beforeDelay?.(milliseconds, signal);
+    await waitForDownloadDelay(0, signal);
   };
   dependencies.now = () => new Date(FIXED_DOWNLOAD_TIME);
 
   return {
     dependencies,
     resolveToolchain,
+    createSubprocessEnvironment,
     operations,
     subprocesses,
     processFailures,

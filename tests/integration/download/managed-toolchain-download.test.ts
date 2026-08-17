@@ -11,10 +11,7 @@ import {promisify} from 'node:util';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {runVideoctl} from '../../../src/cli/videoctl';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
-import {
-  downloadVideo,
-  waitForDownloadDelay,
-} from '../../../src/download/downloader';
+import {downloadVideo} from '../../../src/download/downloader';
 import {parseDownloadProxy} from '../../../src/download/network-options';
 import {DownloadReceiptSchema} from '../../../src/download/receipt-schema';
 import type {DownloadPlatform} from '../../../src/download/platforms';
@@ -428,15 +425,13 @@ describe('managed multi-platform download integration', () => {
   });
 
   it('cancels during the injected YouTube delay without starting download', async () => {
-    const fixture = await createManagedDownloadFixture();
-    fixtures.push(fixture);
     const controller = new AbortController();
-    const observedDelays: number[] = [];
-    fixture.dependencies.wait = async (milliseconds, signal) => {
-      observedDelays.push(milliseconds);
-      controller.abort(new Error('private delay cancellation reason'));
-      await waitForDownloadDelay(milliseconds, signal);
-    };
+    const fixture = await createManagedDownloadFixture({
+      beforeDelay: () => {
+        controller.abort(new Error('private delay cancellation reason'));
+      },
+    });
+    fixtures.push(fixture);
     const run = fixture.createCommandHarness(controller.signal);
 
     const exitCode = await runVideoctl([
@@ -446,7 +441,7 @@ describe('managed multi-platform download integration', () => {
     ], run.dependencies);
 
     expect(exitCode).toBe(EXIT_CODES.cancelled);
-    expect(observedDelays).toEqual([5000]);
+    expect(fixture.delays).toEqual([5000]);
     expect(fixture.operations.map((operation) => operation.phase)).toEqual(['probe']);
     expect(run.stdout()).toBe('');
     expect(run.stderr()).toBe(
@@ -464,6 +459,16 @@ describe('managed multi-platform download integration', () => {
   });
 
   it('rejects forbidden mutations and mismatched probe/download profiles', async () => {
+    vi.stubEnv('NODE_OPTIONS', '--no-warnings');
+    vi.stubEnv('NODE_PATH', '/host/node-path-marker');
+    vi.stubEnv('AWS_SECRET_ACCESS_KEY', 'credential-marker');
+    vi.stubEnv('HOME', '/host/home-marker');
+    vi.stubEnv('PATH', '/host/path-marker');
+    vi.stubEnv('HTTP_PROXY', 'http://host-proxy.invalid:8080');
+    vi.stubEnv('HTTPS_PROXY', 'https://host-proxy.invalid:8443');
+    vi.stubEnv('ALL_PROXY', 'socks5://host-proxy.invalid:1080');
+    vi.stubEnv('NO_PROXY', 'host-private.invalid');
+    vi.stubEnv('DYLD_FAKE_MARKER', 'dyld-host-marker');
     const fixture = await createManagedDownloadFixture();
     fixtures.push(fixture);
     await downloadVideo({
@@ -479,10 +484,27 @@ describe('managed multi-platform download integration', () => {
     if (probeArgs === undefined || downloadArgs === undefined) {
       throw new Error('Expected strict fake invocations.');
     }
-    const directEnvironment = {
-      ...process.env,
-      FAKE_YT_DLP_RECORD_DIRECTORY: path.join(fixture.root, 'direct-records'),
-    };
+    const directRecordDirectory = path.join(fixture.root, 'direct-records');
+    const directEnvironment = fixture.createSubprocessEnvironment({
+      recordDirectory: directRecordDirectory,
+    });
+    expect(directEnvironment).toEqual({
+      HOME: fixture.homeDirectory,
+      PATH: [
+        path.dirname(process.execPath),
+        fixture.toolsDirectory,
+        '/usr/bin',
+        '/bin',
+      ].join(path.delimiter),
+      TMPDIR: fixture.temporaryDirectory,
+      DENO_DIR: fixture.paths.denoDirectory,
+      XDG_CACHE_HOME: fixture.paths.providerCacheDirectory,
+      DENO_NO_PROMPT: '1',
+      DENO_NO_UPDATE_CHECK: '1',
+      FORCE_COLOR: 'false',
+      FAKE_YT_DLP_RECORD_DIRECTORY: directRecordDirectory,
+      FAKE_YT_DLP_STATE_DIRECTORY: fixture.stateDirectory,
+    });
     const direct = async (args: string[]) => await execFile(
       fixture.paths.ytDlpExecutable,
       args,
@@ -515,10 +537,9 @@ describe('managed multi-platform download integration', () => {
     await expect(direct(arbitraryExtractor)).rejects.toMatchObject({code: 64});
 
     const mismatchDirectory = path.join(fixture.root, 'mismatch-records');
-    const mismatchEnvironment = {
-      ...process.env,
-      FAKE_YT_DLP_RECORD_DIRECTORY: mismatchDirectory,
-    };
+    const mismatchEnvironment = fixture.createSubprocessEnvironment({
+      recordDirectory: mismatchDirectory,
+    });
     await execFile(fixture.paths.ytDlpExecutable, probeArgs, {
       cwd: fixture.workspaceRoot,
       env: mismatchEnvironment,

@@ -7,7 +7,7 @@ import {
 import path from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
 import {fileURLToPath} from 'node:url';
-import {afterEach, describe, expect, it} from 'vitest';
+import {afterEach, describe, expect, it, vi} from 'vitest';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
 import {
   FAKE_YT_DLP_FIXTURE,
@@ -91,6 +91,7 @@ const waitForExit = async (
 ]) as {code: number | null; signal: NodeJS.Signals | null};
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   for (const child of childProcesses.splice(0)) {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
   }
@@ -111,8 +112,40 @@ describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
   () => {
     it('waits for managed process-group termination and staging cleanup after SIGINT', async () => {
       expect(await readFile(FAKE_YT_DLP_FIXTURE, 'utf8')).not.toMatch(NETWORK_COMMAND);
+      vi.stubEnv('NODE_OPTIONS', '--no-warnings');
+      vi.stubEnv('NODE_PATH', '/host/node-path-marker');
+      vi.stubEnv('AWS_SECRET_ACCESS_KEY', 'credential-marker');
+      vi.stubEnv('HOME', '/host/home-marker');
+      vi.stubEnv('PATH', '/host/path-marker');
+      vi.stubEnv('HTTP_PROXY', 'http://host-proxy.invalid:8080');
+      vi.stubEnv('HTTPS_PROXY', 'https://host-proxy.invalid:8443');
+      vi.stubEnv('ALL_PROXY', 'socks5://host-proxy.invalid:1080');
+      vi.stubEnv('NO_PROXY', 'host-private.invalid');
+      vi.stubEnv('DYLD_FAKE_MARKER', 'dyld-host-marker');
       const fixture = await createManagedDownloadFixture({longRunning: true});
       fixtures.push(fixture);
+      const runnerEnvironment = fixture.createSubprocessEnvironment({
+        managedFixtureRoot: fixture.root,
+      });
+      expect(runnerEnvironment).toEqual({
+        HOME: fixture.homeDirectory,
+        PATH: [
+          path.dirname(process.execPath),
+          fixture.toolsDirectory,
+          '/usr/bin',
+          '/bin',
+        ].join(path.delimiter),
+        TMPDIR: fixture.temporaryDirectory,
+        DENO_DIR: fixture.paths.denoDirectory,
+        XDG_CACHE_HOME: fixture.paths.providerCacheDirectory,
+        DENO_NO_PROMPT: '1',
+        DENO_NO_UPDATE_CHECK: '1',
+        FORCE_COLOR: 'false',
+        FAKE_YT_DLP_RECORD_DIRECTORY: fixture.recordDirectory,
+        FAKE_YT_DLP_STATE_DIRECTORY: fixture.stateDirectory,
+        FAKE_YT_DLP_LONG_RUNNING: '1',
+        MANAGED_DOWNLOAD_FIXTURE_ROOT: fixture.root,
+      });
 
       let stdout = '';
       let stderr = '';
@@ -123,19 +156,7 @@ describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
         '--rights-confirmed',
       ], {
         cwd: fixture.workspaceRoot,
-        env: {
-          ...process.env,
-          HOME: '/host/home-marker',
-          NODE_OPTIONS: '--no-warnings',
-          NODE_PATH: '/host/node-path-marker',
-          AWS_SECRET_ACCESS_KEY: 'credential-marker',
-          HTTP_PROXY: 'http://host-proxy.invalid:8080',
-          HTTPS_PROXY: 'https://host-proxy.invalid:8443',
-          ALL_PROXY: 'socks5://host-proxy.invalid:1080',
-          NO_PROXY: 'host-private.invalid',
-          MANAGED_DOWNLOAD_FIXTURE_ROOT: fixture.root,
-          FAKE_YT_DLP_LONG_RUNNING: '1',
-        },
+        env: runnerEnvironment,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       childProcesses.push(child);
