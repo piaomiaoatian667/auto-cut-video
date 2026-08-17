@@ -86,17 +86,29 @@ const targetsSignalAwareCommand = (argv: readonly string[]): boolean =>
   || targetsSetupDownloader(argv)
   || argv[0] === 'doctor-downloader';
 
-const requestsDownloadJson = (argv: readonly string[]): boolean =>
-  targetsDownload(argv)
-  && argv.slice(1).some((value) => (
+const tokensBeforeOptionSeparator = (
+  argv: readonly string[],
+): readonly string[] => {
+  const separatorIndex = argv.indexOf('--');
+  return separatorIndex === -1 ? argv : argv.slice(0, separatorIndex);
+};
+
+const requestsCommandJson = (
+  argv: readonly string[],
+  command: 'download' | 'setup-downloader',
+): boolean => {
+  const tokens = tokensBeforeOptionSeparator(argv);
+  return tokens[0] === command
+  && tokens.slice(1).some((value) => (
     value === '--json' || value.startsWith('--json=')
   ));
+};
+
+const requestsDownloadJson = (argv: readonly string[]): boolean =>
+  requestsCommandJson(argv, 'download');
 
 const requestsSetupDownloaderJson = (argv: readonly string[]): boolean =>
-  targetsSetupDownloader(argv)
-  && argv.slice(1).some((value) => (
-    value === '--json' || value.startsWith('--json=')
-  ));
+  requestsCommandJson(argv, 'setup-downloader');
 
 export interface SourceMeterStat {
   dev: bigint;
@@ -758,7 +770,7 @@ export const runWithCommandSignalHandlers = async <Result>(
   };
   const cancel = (): void => {
     if (controller.signal.aborted) return;
-    controller.abort(new Error('The download operation was cancelled.'));
+    controller.abort(new Error('The command was cancelled.'));
   };
   signalHost.on('SIGINT', cancel);
   signalHost.on('SIGTERM', cancel);

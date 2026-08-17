@@ -7,7 +7,7 @@ import {
 } from '../../../src/cli/commands/download';
 import {
   createSystemVideoctlDependencies,
-  runWithDownloadSignalHandlers,
+  runWithCommandSignalHandlers,
   runVideoctl,
   type VideoctlDependencies,
 } from '../../../src/cli/videoctl';
@@ -623,6 +623,17 @@ describe('videoctl download', () => {
         'unknown option',
       ],
     },
+    {
+      name: 'JSON-looking argument after the option separator',
+      argv: [
+        'download',
+        inputUrl,
+        '--rights-confirmed',
+        '--',
+        '--json',
+      ],
+      forbidden: ['--json', 'too many arguments'],
+    },
   ])('sanitizes human parser failure for $name', async ({argv, forbidden}) => {
     const run = fixture();
 
@@ -668,12 +679,12 @@ describe('videoctl download', () => {
   });
 });
 
-describe('direct download signal handling', () => {
+describe('direct command signal handling', () => {
   it('installs listeners before running and removes them after success', async () => {
     const signalHost = new EventEmitter();
     let operationSignal: AbortSignal | undefined;
 
-    await expect(runWithDownloadSignalHandlers(signalHost, async (signal) => {
+    await expect(runWithCommandSignalHandlers(signalHost, async (signal) => {
       operationSignal = signal;
       expect(signalHost.listenerCount('SIGINT')).toBe(1);
       expect(signalHost.listenerCount('SIGTERM')).toBe(1);
@@ -689,7 +700,7 @@ describe('direct download signal handling', () => {
     const signalHost = new EventEmitter();
     const failure = new Error('operation failed');
 
-    await expect(runWithDownloadSignalHandlers(signalHost, async () => {
+    await expect(runWithCommandSignalHandlers(signalHost, async () => {
       expect(signalHost.listenerCount('SIGINT')).toBe(1);
       expect(signalHost.listenerCount('SIGTERM')).toBe(1);
       throw failure;
@@ -704,18 +715,20 @@ describe('direct download signal handling', () => {
     let operationSignal: AbortSignal | undefined;
     let abortEvents = 0;
     let resolveOperation!: (value: number) => void;
-    const operation = runWithDownloadSignalHandlers(signalHost, async (signal) => {
+    const operation = runWithCommandSignalHandlers(signalHost, async (signal) => {
       operationSignal = signal;
       signal.addEventListener('abort', () => { abortEvents += 1; });
       return await new Promise<number>((resolve) => {
         resolveOperation = resolve;
       });
     });
+    const sharedSignal = operationSignal;
 
     signalHost.emit('SIGINT');
+    expect(operationSignal).toBe(sharedSignal);
     expect(operationSignal?.aborted).toBe(true);
     expect(operationSignal?.reason).toEqual(
-      new Error('The download operation was cancelled.'),
+      new Error('The command was cancelled.'),
     );
     expect(abortEvents).toBe(1);
     expect(signalHost.listenerCount('SIGINT')).toBe(1);
@@ -723,9 +736,10 @@ describe('direct download signal handling', () => {
 
     signalHost.emit('SIGTERM');
     signalHost.emit('SIGINT');
+    expect(operationSignal).toBe(sharedSignal);
     expect(abortEvents).toBe(1);
     expect(operationSignal?.reason).toEqual(
-      new Error('The download operation was cancelled.'),
+      new Error('The command was cancelled.'),
     );
     expect(signalHost.listenerCount('SIGINT')).toBe(1);
     expect(signalHost.listenerCount('SIGTERM')).toBe(1);

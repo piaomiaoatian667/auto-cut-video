@@ -158,6 +158,72 @@ describe('videoctl setup-downloader', () => {
     expect(run.stderr()).not.toContain('token=secret');
   });
 
+  it.each<{
+    name: string;
+    argv: string[];
+    exitCode: number;
+    stdout: string;
+    stderr: string | RegExp;
+    installCalls: number;
+  }>([
+    {
+      name: 'JSON option before the command',
+      argv: ['--json', 'setup-downloader'],
+      exitCode: EXIT_CODES.validationFailed,
+      stdout: '',
+      stderr: /^error: unknown option '--json'/u,
+      installCalls: 0,
+    },
+    {
+      name: 'JSON option after the command',
+      argv: ['setup-downloader', '--json'],
+      exitCode: EXIT_CODES.success,
+      stdout: `${JSON.stringify({
+        command: 'setup-downloader',
+        ok: true,
+        status: 'installed',
+        version: '2026.07.04',
+      }, null, 2)}\n`,
+      stderr: '',
+      installCalls: 1,
+    },
+    {
+      name: 'JSON-looking argument after the option separator',
+      argv: ['setup-downloader', '--', '--json'],
+      exitCode: EXIT_CODES.validationFailed,
+      stdout: '',
+      stderr: `setup-downloader failed [DOWNLOAD_TOOLCHAIN_INVALID]: ${parseFailureMessage}\n`,
+      installCalls: 0,
+    },
+    {
+      name: 'similar command name',
+      argv: ['setup-downloader-copy', '--json'],
+      exitCode: EXIT_CODES.validationFailed,
+      stdout: '',
+      stderr: /^error: unknown command 'setup-downloader-copy'/u,
+      installCalls: 0,
+    },
+  ])('routes $name without misdetecting JSON', async ({
+    argv,
+    exitCode: expectedExitCode,
+    stdout: expectedStdout,
+    stderr: expectedStderr,
+    installCalls,
+  }) => {
+    const run = fixture();
+
+    const exitCode = await runVideoctl(argv, run.dependencies);
+
+    expect(exitCode).toBe(expectedExitCode);
+    expect(run.stdout()).toBe(expectedStdout);
+    if (typeof expectedStderr === 'string') {
+      expect(run.stderr()).toBe(expectedStderr);
+    } else {
+      expect(run.stderr()).toMatch(expectedStderr);
+    }
+    expect(run.setupDownloader).toHaveBeenCalledTimes(installCalls);
+  });
+
   it('sanitizes JSON parser failure without invoking the installer', async () => {
     const run = fixture();
     const cacheOption = '--cache=/Users/private/.cache/downloader?token=secret';
