@@ -25,6 +25,13 @@ import {
 const inputUrl = 'https://www.youtube.com/watch?v=abc';
 const jingxuanUrl =
   'https://www.douyin.com/jingxuan?modal_id=7654841525762919726';
+const chromeCookieCases = [
+  ['youtube', inputUrl],
+  ['bilibili', 'https://www.bilibili.com/video/BV1abc'],
+  ['douyin', 'https://www.douyin.com/video/123'],
+  ['tiktok', 'https://www.tiktok.com/@fixture/video/123'],
+  ['vimeo', 'https://vimeo.com/123'],
+] as const;
 
 const downloadResult = (
   status: DownloadResult['status'] = 'downloaded',
@@ -125,13 +132,17 @@ describe('videoctl download', () => {
       .not.toHaveProperty('browserCookieSource');
   });
 
-  it('forwards explicitly confirmed Chrome cookie access', async () => {
+  it.each(chromeCookieCases)(
+    'forwards explicit proxy and Chrome cookie access for %s',
+    async (_platform, platformUrl) => {
     const run = fixture();
 
     const exitCode = await runVideoctl([
       'download',
-      jingxuanUrl,
+      platformUrl,
       '--rights-confirmed',
+      '--proxy',
+      'http://127.0.0.1:7890',
       '--browser-cookies',
       'chrome',
       '--cookie-access-confirmed',
@@ -140,13 +151,54 @@ describe('videoctl download', () => {
     expect(exitCode).toBe(EXIT_CODES.success);
     expect(run.download).toHaveBeenCalledWith({
       workspaceRoot: '/workspace',
-      url: jingxuanUrl,
+      url: platformUrl,
       outputRoot: 'downloads',
       rightsConfirmed: true,
+      proxy: expect.objectContaining({
+        scheme: 'http',
+        url: 'http://127.0.0.1:7890/',
+      }),
       browserCookieSource: 'chrome',
       cookieAccessConfirmed: true,
     });
     expect(run.stderr()).toBe('');
+    },
+  );
+
+  it.each([
+    ['unsupported scheme', 'ftp://127.0.0.1:21'],
+    ['credentials', 'http://user:password@127.0.0.1:7890'],
+    ['path', 'http://127.0.0.1:7890/private'],
+    ['query', 'http://127.0.0.1:7890/?token=secret'],
+    ['fragment', 'http://127.0.0.1:7890/#secret'],
+    ['control characters', 'http://127.0.0.1:7890/\nsecret'],
+    ['missing host', 'http:///'],
+    ['zero port', 'http://127.0.0.1:0'],
+    ['overflow port', 'http://127.0.0.1:65536'],
+    ['non-numeric port', 'http://127.0.0.1:not-a-port'],
+  ])('rejects proxy %s before download', async (_name, proxy) => {
+    const run = fixture();
+    const expected = {
+      command: 'download',
+      ok: false,
+      code: 'DOWNLOAD_PROXY_INVALID',
+      message: 'The proxy URL is invalid.',
+    };
+
+    const exitCode = await runVideoctl([
+      'download',
+      inputUrl,
+      '--rights-confirmed',
+      '--proxy',
+      proxy,
+      '--json',
+    ], run.dependencies);
+
+    expect(exitCode).toBe(EXIT_CODES.validationFailed);
+    expect(run.download).not.toHaveBeenCalled();
+    expect(run.stdout()).toBe(`${JSON.stringify(expected, null, 2)}\n`);
+    expect(run.stderr()).toBe('');
+    expect(run.stdout()).not.toContain(proxy);
   });
 
   it('rejects unsupported browser sources without exposing them', async () => {
@@ -188,9 +240,13 @@ describe('videoctl download', () => {
 
     expect(exitCode).toBe(EXIT_CODES.success);
     const help = run.stdout().replace(/\s+/g, ' ');
+    expect(help).toContain('--proxy <url>');
+    expect(help).toContain(
+      'explicit http, https, socks5, or socks5h proxy; credentials are unsupported',
+    );
     expect(help).toContain('--browser-cookies <browser>');
     expect(help).toContain(
-      'exact lowercase chrome for authorized public Douyin only; requires --cookie-access-confirmed',
+      'exact lowercase chrome for authorized public YouTube, Bilibili, Douyin, TikTok, or Vimeo; requires --cookie-access-confirmed',
     );
     expect(help).toContain('--cookie-access-confirmed');
     expect(help).toContain(
@@ -383,6 +439,7 @@ describe('videoctl download', () => {
     {code: 'DOWNLOAD_URL_INVALID', message: 'The video URL is invalid.'},
     {code: 'DOWNLOAD_HOST_UNSUPPORTED', message: 'The video host is not supported.'},
     {code: 'DOWNLOAD_OUTPUT_INVALID', message: 'The output directory is invalid.'},
+    {code: 'DOWNLOAD_PROXY_INVALID', message: 'The proxy URL is invalid.'},
     {
       code: 'DOWNLOAD_COOKIE_OPTIONS_INVALID',
       message:
@@ -410,12 +467,32 @@ describe('videoctl download', () => {
     expect(run.stdout()).toBe('');
   });
 
-  it('maps download tool failures to the dependency exit code', async () => {
-    const error = new DownloadError(
-      'DOWNLOAD_TOOL_MISSING',
-      'Required download tools are unavailable.',
-    );
-    const run = fixture(async () => { throw error; });
+  it.each<{
+    code: DownloadErrorCode;
+    message: string;
+  }>([
+    {
+      code: 'DOWNLOAD_TOOL_MISSING',
+      message: 'Required download tools are unavailable.',
+    },
+    {
+      code: 'DOWNLOAD_TOOLCHAIN_MISSING',
+      message: 'The managed downloader is not installed. Run setup-downloader.',
+    },
+    {
+      code: 'DOWNLOAD_TOOLCHAIN_INVALID',
+      message: 'The managed downloader failed integrity or capability checks.',
+    },
+    {
+      code: 'DOWNLOAD_IMPERSONATION_UNAVAILABLE',
+      message: 'The required browser compatibility capability is unavailable.',
+    },
+    {
+      code: 'DOWNLOAD_PO_TOKEN_UNAVAILABLE',
+      message: 'The YouTube compatibility provider is unavailable.',
+    },
+  ])('maps $code to the environment exit code', async ({code, message}) => {
+    const run = fixture(async () => { throw new DownloadError(code, message); });
 
     const exitCode = await runVideoctl(
       ['download', inputUrl, '--rights-confirmed'],
@@ -423,10 +500,7 @@ describe('videoctl download', () => {
     );
 
     expect(exitCode).toBe(EXIT_CODES.environmentFailed);
-    expect(run.stderr()).toBe(
-      'Download failed [DOWNLOAD_TOOL_MISSING]: '
-      + 'Required download tools are unavailable.\n',
-    );
+    expect(run.stderr()).toBe(`Download failed [${code}]: ${message}\n`);
     expect(run.stdout()).toBe('');
   });
 
@@ -450,6 +524,19 @@ describe('videoctl download', () => {
       code: 'DOWNLOAD_EXTRACTOR_MISMATCH',
       message: 'The resolved video platform did not match the requested platform.',
     },
+    {
+      code: 'DOWNLOAD_NETWORK_UNREACHABLE',
+      message:
+        'The video platform could not be reached with the selected network settings.',
+    },
+    {
+      code: 'DOWNLOAD_RATE_LIMITED',
+      message: 'The video platform temporarily rate-limited this session.',
+    },
+    {
+      code: 'DOWNLOAD_PLATFORM_CHALLENGE',
+      message: 'The video platform rejected the selected public-session request.',
+    },
   ])('maps $code to operation failure', async ({code, message}) => {
     const run = fixture(async () => { throw new DownloadError(code, message); });
 
@@ -460,6 +547,30 @@ describe('videoctl download', () => {
 
     expect(exitCode).toBe(EXIT_CODES.operationFailed);
     expect(run.stderr()).toBe(`Download failed [${code}]: ${message}\n`);
+    expect(run.stdout()).toBe('');
+  });
+
+  it('maps an aborted download to cancellation', async () => {
+    const controller = new AbortController();
+    controller.abort(new Error('The command was cancelled.'));
+    const run = fixture(async () => {
+      throw new DownloadError(
+        'DOWNLOAD_PROCESS_FAILED',
+        'The video could not be downloaded.',
+      );
+    });
+    run.dependencies.downloadSignal = controller.signal;
+
+    const exitCode = await runVideoctl(
+      ['download', inputUrl, '--rights-confirmed'],
+      run.dependencies,
+    );
+
+    expect(exitCode).toBe(EXIT_CODES.cancelled);
+    expect(run.stderr()).toBe(
+      'Download failed [DOWNLOAD_PROCESS_FAILED]: '
+      + 'The video could not be downloaded.\n',
+    );
     expect(run.stdout()).toBe('');
   });
 
@@ -573,6 +684,18 @@ describe('videoctl download', () => {
       argv: ['download', inputUrl, '--json=token=secret'],
       forbidden: [inputUrl, '--json=token=secret', 'token=secret'],
     },
+    {
+      name: 'value-taking option consumes the separator before JSON',
+      argv: [
+        'download',
+        inputUrl,
+        '--output',
+        '--',
+        '--json',
+        'token=secret',
+      ],
+      forbidden: [inputUrl, 'token=secret'],
+    },
   ])('sanitizes JSON parser failure for $name', async ({argv, forbidden}) => {
     const run = fixture();
     const expected = {
@@ -657,9 +780,10 @@ describe('videoctl download', () => {
     }
   });
 
-  it('snapshots configured downloader tool paths during system construction', () => {
+  it('uses configured downloader paths only as resolver overrides', () => {
     vi.stubEnv('YT_DLP_PATH', '/configured/yt-dlp');
     vi.stubEnv('FFMPEG_PATH', '/configured/ffmpeg');
+    vi.stubEnv('FFPROBE_PATH', '/configured/ffprobe');
     const downloadDependencies = {} as DownloadDependencies;
     const createDownloadDependencies = vi.fn(
       (_options: SystemDownloadOptions) => downloadDependencies,
@@ -681,7 +805,8 @@ describe('videoctl download', () => {
       ytDlpOverride: '/configured/yt-dlp',
       ffmpegOverride: '/configured/ffmpeg',
     });
-    expect(dependencies.ffmpegExecutable).toBe('/configured/ffmpeg');
+    expect(dependencies.ffmpegExecutable).toBeUndefined();
+    expect(dependencies.ffprobeExecutable).toBe('/configured/ffprobe');
     expect(dependencies.downloadSignal).toBe(controller.signal);
   });
 });

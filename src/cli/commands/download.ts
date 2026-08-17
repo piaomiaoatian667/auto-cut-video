@@ -8,6 +8,7 @@ import {
   isDownloadError,
   type DownloadErrorCode,
 } from '../../download/errors';
+import {parseDownloadProxy} from '../../download/network-options';
 import {
   formatDownloadFailure,
   formatDownloadSuccess,
@@ -19,6 +20,7 @@ export interface DownloadCommandOptions {
   rightsConfirmed?: boolean;
   output?: string;
   json?: boolean;
+  proxy?: string;
   browserCookies?: string;
   cookieAccessConfirmed?: boolean;
 }
@@ -36,9 +38,18 @@ const INVALID_INPUT_CODES = new Set<DownloadErrorCode>([
   'DOWNLOAD_URL_INVALID',
   'DOWNLOAD_HOST_UNSUPPORTED',
   'DOWNLOAD_OUTPUT_INVALID',
+  'DOWNLOAD_PROXY_INVALID',
   'DOWNLOAD_COOKIE_OPTIONS_INVALID',
   'DOWNLOAD_COOKIE_HOST_UNSUPPORTED',
   'DOWNLOAD_CONTENT_RESTRICTED',
+]);
+
+const ENVIRONMENT_ERROR_CODES = new Set<DownloadErrorCode>([
+  'DOWNLOAD_TOOL_MISSING',
+  'DOWNLOAD_TOOLCHAIN_MISSING',
+  'DOWNLOAD_TOOLCHAIN_INVALID',
+  'DOWNLOAD_IMPERSONATION_UNAVAILABLE',
+  'DOWNLOAD_PO_TOKEN_UNAVAILABLE',
 ]);
 
 const UNEXPECTED_ERROR_CODE: DownloadErrorCode = 'DOWNLOAD_PROCESS_FAILED';
@@ -63,7 +74,7 @@ const parseOptionalBooleanFlag = (
 
 const exitCodeForDownloadError = (code: DownloadErrorCode): number => {
   if (INVALID_INPUT_CODES.has(code)) return EXIT_CODES.validationFailed;
-  if (code === 'DOWNLOAD_TOOL_MISSING') return EXIT_CODES.environmentFailed;
+  if (ENVIRONMENT_ERROR_CODES.has(code)) return EXIT_CODES.environmentFailed;
   return EXIT_CODES.operationFailed;
 };
 
@@ -98,6 +109,9 @@ export const runDownloadCommand = async (
       'DOWNLOAD_COOKIE_OPTIONS_INVALID',
       COOKIE_OPTIONS_MESSAGE,
     );
+    const proxy = options.proxy === undefined
+      ? undefined
+      : parseDownloadProxy(options.proxy);
     const browserCookieSource = parseBrowserCookieSource(
       options.browserCookies,
     );
@@ -106,6 +120,7 @@ export const runDownloadCommand = async (
       url,
       outputRoot: options.output ?? 'downloads',
       rightsConfirmed,
+      ...(proxy === undefined ? {} : {proxy}),
       ...(browserCookieSource === undefined ? {} : {browserCookieSource}),
       cookieAccessConfirmed,
       ...(dependencies.downloadSignal === undefined
@@ -117,6 +132,9 @@ export const runDownloadCommand = async (
   } catch (error) {
     if (isDownloadError(error)) {
       writeFailure(error.code, error.message, json, dependencies);
+      if (dependencies.downloadSignal?.aborted === true) {
+        return EXIT_CODES.cancelled;
+      }
       return exitCodeForDownloadError(error.code);
     }
     writeFailure(
@@ -125,6 +143,9 @@ export const runDownloadCommand = async (
       json,
       dependencies,
     );
+    if (dependencies.downloadSignal?.aborted === true) {
+      return EXIT_CODES.cancelled;
+    }
     return EXIT_CODES.operationFailed;
   }
 };

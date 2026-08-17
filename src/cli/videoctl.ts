@@ -108,22 +108,34 @@ const targetsSignalAwareCommand = (argv: readonly string[]): boolean =>
   || targetsSetupDownloader(argv)
   || targetsDoctorDownloader(argv);
 
-const tokensBeforeOptionSeparator = (
-  argv: readonly string[],
-): readonly string[] => {
-  const separatorIndex = argv.indexOf('--');
-  return separatorIndex === -1 ? argv : argv.slice(0, separatorIndex);
-};
+const VALUE_TAKING_OPTIONS = {
+  download: new Set(['--output', '--proxy', '--browser-cookies']),
+  'setup-downloader': new Set<string>(),
+  'doctor-downloader': new Set([
+    '--check-url',
+    '--proxy',
+    '--browser-cookies',
+  ]),
+} as const;
 
 const requestsCommandJson = (
   argv: readonly string[],
   command: 'download' | 'setup-downloader' | 'doctor-downloader',
 ): boolean => {
-  const tokens = tokensBeforeOptionSeparator(argv);
-  return tokens[0] === command
-  && tokens.slice(1).some((value) => (
-    value === '--json' || value.startsWith('--json=')
-  ));
+  if (argv[0] !== command) return false;
+  let expectsValue = false;
+  for (const value of argv.slice(1)) {
+    if (expectsValue) {
+      expectsValue = false;
+      continue;
+    }
+    if (value === '--') return false;
+    if (value === '--json' || value.startsWith('--json=')) return true;
+    if (!value.includes('=') && VALUE_TAKING_OPTIONS[command].has(value)) {
+      expectsValue = true;
+    }
+  }
+  return false;
 };
 
 const requestsDownloadJson = (argv: readonly string[]): boolean =>
@@ -651,8 +663,12 @@ export async function runVideoctl(
     .option('--rights-confirmed', 'confirm permission to save this public video')
     .option('--output <directory>', 'workspace-relative archive directory', 'downloads')
     .option(
+      '--proxy <url>',
+      'explicit http, https, socks5, or socks5h proxy; credentials are unsupported',
+    )
+    .option(
       '--browser-cookies <browser>',
-      'exact lowercase chrome for authorized public Douyin only; requires --cookie-access-confirmed',
+      'exact lowercase chrome for authorized public YouTube, Bilibili, Douyin, TikTok, or Vimeo; requires --cookie-access-confirmed',
     )
     .option(
       '--cookie-access-confirmed',
@@ -827,7 +843,6 @@ export const createSystemVideoctlDependencies = (
       resolveToolchain: () => resolveToolchain(),
     }),
     ...(signal === undefined ? {} : {signal, downloadSignal: signal}),
-    ...(ffmpegOverride === undefined ? {} : {ffmpegExecutable: ffmpegOverride}),
     ...(ffprobeExecutable === undefined ? {} : {ffprobeExecutable}),
   };
 };

@@ -1,98 +1,32 @@
 import {spawn, type ChildProcess} from 'node:child_process';
 import {
   access,
-  chmod,
-  mkdir,
-  mkdtemp,
   readFile,
   readdir,
-  rm,
-  writeFile,
 } from 'node:fs/promises';
-import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
 import {fileURLToPath} from 'node:url';
 import {afterEach, describe, expect, it} from 'vitest';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
+import {
+  FAKE_YT_DLP_FIXTURE,
+  MANAGED_FIXTURE_RUNNER,
+  NETWORK_COMMAND,
+  createManagedDownloadFixture,
+  type ManagedDownloadFixture,
+} from './managed-toolchain-fixture';
 
 const PROJECT_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
-const VIDEOCTL_PATH = path.join(PROJECT_ROOT, 'src', 'cli', 'videoctl.ts');
 const TSX_PATH = path.join(PROJECT_ROOT, 'node_modules', '.bin', 'tsx');
 const CANONICAL_URL = 'https://www.youtube.com/watch?v=cancelled';
-const INFO_DOCUMENT = {
-  id: 'cancelled',
-  title: 'Cancellation fixture',
-  webpage_url: CANONICAL_URL,
-  extractor: 'youtube',
-  extractor_key: 'Youtube',
-  _type: 'video',
-};
-const LONG_RUNNING_YT_DLP_SCRIPT = [
-  '#!/bin/sh',
-  'set -eu',
-  'for argument in "$@"; do',
-  '  if [ "$argument" = "--version" ]; then',
-  '    printf \'%s\\n\' \'2026.08.13-cancel-test\'',
-  '    exit 0',
-  '  fi',
-  '  if [ "$argument" = "--dump-single-json" ]; then',
-  `    printf '%s\\n' '${JSON.stringify(INFO_DOCUMENT)}'`,
-  '    exit 0',
-  '  fi',
-  'done',
-  'output=',
-  'while [ "$#" -gt 0 ]; do',
-  '  if [ "$1" = "--output" ]; then',
-  '    shift',
-  '    [ "$#" -gt 0 ] || exit 64',
-  '    output=$1',
-  '  fi',
-  '  shift',
-  'done',
-  '[ "$output" = "video.%(ext)s" ] || exit 65',
-  'state=${FAKE_STATE_DIR:?}',
-  'index=0',
-  'while [ "$index" -lt 2000 ]; do',
-  '  printf x > "video.$index.tmp"',
-  '  index=$((index + 1))',
-  'done',
-  'trap \'\' TERM',
-  '(',
-  '  trap \'\' TERM',
-  '  count=0',
-  '  while :; do',
-  '    count=$((count + 1))',
-  '    printf \'%s\\n\' "$count" > "$state/write-count.tmp"',
-  '    mv "$state/write-count.tmp" "$state/write-count"',
-  '    printf x >> video.part',
-  '    /bin/sleep 0.02',
-  '  done',
-  ') &',
-  'writer=$!',
-  'printf \'{"parent":%s,"child":%s}\\n\' "$$" "$writer" > "$state/pids.json"',
-  'touch "$state/ready"',
-  'wait "$writer"',
-  '',
-].join('\n');
-const FAKE_FFMPEG_SCRIPT = [
-  '#!/bin/sh',
-  'set -eu',
-  'if [ "${1-}" = "-version" ]; then',
-  '  printf \'%s\\n\' \'ffmpeg version cancellation-test\'',
-  '  exit 0',
-  'fi',
-  'exit 64',
-  '',
-].join('\n');
-const NETWORK_COMMAND = /(?:^|\n)\s*(?:curl|wget|nc|ssh)\b/mu;
 
 interface RecordedPids {
   parent: number;
   child: number;
 }
 
-const temporaryDirectories: string[] = [];
+const fixtures: ManagedDownloadFixture[] = [];
 const childProcesses: ChildProcess[] = [];
 const descendantPids: number[] = [];
 
@@ -153,11 +87,6 @@ const waitForExit = async (
   }),
 ]) as {code: number | null; signal: NodeJS.Signals | null};
 
-const writeExecutable = async (target: string, source: string): Promise<void> => {
-  await writeFile(target, source, {mode: 0o700});
-  await chmod(target, 0o700);
-};
-
 afterEach(async () => {
   for (const child of childProcesses.splice(0)) {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
@@ -169,44 +98,32 @@ afterEach(async () => {
     } catch {
     }
   }
-  await Promise.all(temporaryDirectories.splice(0).map(async (directory) => {
-    await rm(directory, {recursive: true, force: true});
+  await Promise.all(fixtures.splice(0).map(async (fixture) => {
+    await fixture.cleanup();
   }));
 });
 
 describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
   'videoctl child-process cancellation',
   () => {
-    it('waits for process-group termination and staging cleanup after SIGINT', async () => {
-      expect(LONG_RUNNING_YT_DLP_SCRIPT).not.toMatch(NETWORK_COMMAND);
-      expect(FAKE_FFMPEG_SCRIPT).not.toMatch(NETWORK_COMMAND);
-
-      const workspaceRoot = await mkdtemp(path.join(tmpdir(), 'videoctl-cancel-test-'));
-      temporaryDirectories.push(workspaceRoot);
-      const toolsDirectory = path.join(workspaceRoot, 'tools');
-      const stateDirectory = path.join(workspaceRoot, 'state');
-      const ytDlpExecutable = path.join(toolsDirectory, 'yt-dlp');
-      const ffmpegExecutable = path.join(toolsDirectory, 'ffmpeg');
-      await Promise.all([mkdir(toolsDirectory), mkdir(stateDirectory)]);
-      await Promise.all([
-        writeExecutable(ytDlpExecutable, LONG_RUNNING_YT_DLP_SCRIPT),
-        writeExecutable(ffmpegExecutable, FAKE_FFMPEG_SCRIPT),
-      ]);
+    it('waits for managed process-group termination and staging cleanup after SIGINT', async () => {
+      expect(await readFile(FAKE_YT_DLP_FIXTURE, 'utf8')).not.toMatch(NETWORK_COMMAND);
+      const fixture = await createManagedDownloadFixture({longRunning: true});
+      fixtures.push(fixture);
 
       let stdout = '';
       let stderr = '';
       const child = spawn(TSX_PATH, [
-        VIDEOCTL_PATH,
+        MANAGED_FIXTURE_RUNNER,
         'download',
         CANONICAL_URL,
         '--rights-confirmed',
       ], {
-        cwd: workspaceRoot,
+        cwd: fixture.workspaceRoot,
         env: {
           ...process.env,
-          YT_DLP_PATH: ytDlpExecutable,
-          FFMPEG_PATH: ffmpegExecutable,
-          FAKE_STATE_DIR: stateDirectory,
+          MANAGED_DOWNLOAD_FIXTURE_ROOT: fixture.root,
+          FAKE_YT_DLP_LONG_RUNNING: '1',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -217,16 +134,16 @@ describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
       child.stderr?.on('data', (chunk: string) => { stderr += chunk; });
       const exit = waitForExit(child);
 
-      await readWhenReady(path.join(stateDirectory, 'ready'));
+      await readWhenReady(path.join(fixture.stateDirectory, 'ready'));
       const recordedPids = JSON.parse(await readWhenReady(
-        path.join(stateDirectory, 'pids.json'),
+        path.join(fixture.stateDirectory, 'pids.json'),
       )) as RecordedPids;
       descendantPids.push(recordedPids.parent, recordedPids.child);
       const countBeforeSignal = Number(await readWhenReady(
-        path.join(stateDirectory, 'write-count'),
+        path.join(fixture.stateDirectory, 'write-count'),
       ));
       expect(countBeforeSignal).toBeGreaterThan(0);
-      const stagingRoot = path.join(workspaceRoot, 'downloads', '.staging');
+      const stagingRoot = path.join(fixture.workspaceRoot, 'downloads', '.staging');
       const stagingEntries = await readdir(stagingRoot);
       expect(stagingEntries).toHaveLength(1);
       await expect(access(path.join(
@@ -241,7 +158,7 @@ describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
       expect(child.signalCode).toBeNull();
       expect(child.kill('SIGTERM')).toBe(true);
       await expect(exit).resolves.toEqual({
-        code: EXIT_CODES.operationFailed,
+        code: EXIT_CODES.cancelled,
         signal: null,
       });
 
@@ -252,19 +169,19 @@ describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
       );
       expect(await readdir(stagingRoot)).toEqual([]);
       await expect(access(path.join(
-        workspaceRoot,
+        fixture.workspaceRoot,
         'downloads',
         'youtube',
         'cancelled',
       ))).rejects.toMatchObject({code: 'ENOENT'});
 
       const countAtExit = await readFile(
-        path.join(stateDirectory, 'write-count'),
+        path.join(fixture.stateDirectory, 'write-count'),
         'utf8',
       );
       await delay(250);
       expect(await readFile(
-        path.join(stateDirectory, 'write-count'),
+        path.join(fixture.stateDirectory, 'write-count'),
         'utf8',
       )).toBe(countAtExit);
       await expect.poll(
