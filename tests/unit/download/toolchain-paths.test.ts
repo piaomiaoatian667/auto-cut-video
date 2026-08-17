@@ -7,6 +7,7 @@ const INVALID_TOOLCHAIN_MESSAGE =
 describe('managed downloader toolchain paths', () => {
   it('resolves the fixed cache layout', () => {
     expect(resolveDownloaderToolchainPaths('/Users/tester')).toEqual({
+      homeDirectory: '/Users/tester',
       cacheRoot: '/Users/tester/Library/Caches/auto-cut-video/downloader',
       versionDirectory:
         '/Users/tester/Library/Caches/auto-cut-video/downloader/2026.07.04-macos-arm64',

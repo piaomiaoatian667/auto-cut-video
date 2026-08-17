@@ -22,6 +22,7 @@ export const resolveDownloaderToolchainPaths = (
   );
   const versionDirectory = path.join(cacheRoot, '2026.07.04-macos-arm64');
   return {
+    homeDirectory: canonicalHomeDirectory,
     cacheRoot,
     versionDirectory,
     installedManifest: path.join(versionDirectory, 'manifest.json'),

@@ -79,6 +79,16 @@ first probe and download; there is no anonymous-to-Cookie fallback. Cookie or
 Keychain denial produces a controlled failure without profile guessing or a
 prompting loop.
 
+Downloader capability checks, probes, and downloads do not copy the host
+environment wholesale. Each child receives a frozen allowlist containing the
+resolved user's real `HOME` for Chrome and Keychain access, only absolute
+deduplicated `PATH` entries (with a system fallback), an absolute `TMPDIR` when
+available, required locale and user identifiers, and fixed Deno, XDG, and npm
+settings. Proxy variables, cloud or model credentials, SSH agent sockets,
+Node/Deno injection settings, dynamic-loader variables, and every other
+unlisted value are omitted. Chrome access is still requested only through
+`--cookies-from-browser chrome`; no Chrome profile path is added.
+
 There is no browser-profile selector, Cookie file or export input, direct
 Cookie-value input, PO-token input, arbitrary downloader or extractor argument,
 hosted downloader or URL resolver, or transcoding feature.

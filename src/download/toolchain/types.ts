@@ -1,6 +1,7 @@
 export type DownloaderToolchainSource = 'managed' | 'override';
 
 export interface DownloaderToolchainPaths {
+  homeDirectory: string;
   cacheRoot: string;
   versionDirectory: string;
   installedManifest: string;

@@ -125,7 +125,7 @@ describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
       vi.stubEnv('DYLD_FAKE_MARKER', 'dyld-host-marker');
       const fixture = await createManagedDownloadFixture({longRunning: true});
       fixtures.push(fixture);
-      const runnerEnvironment = fixture.createSubprocessEnvironment({
+      const runnerEnvironment = fixture.createHarnessEnvironment({
         managedFixtureRoot: fixture.root,
       });
       expect(runnerEnvironment).toEqual({
@@ -197,6 +197,9 @@ describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
         DENO_NO_PROMPT: '1',
         DENO_NO_UPDATE_CHECK: '1',
         FORCE_COLOR: 'false',
+        NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
+        NPM_CONFIG_USERCONFIG: '/dev/null',
+        NPM_CONFIG_GLOBALCONFIG: '/dev/null',
         FAKE_YT_DLP_RECORD_DIRECTORY: fixture.recordDirectory,
         FAKE_YT_DLP_STATE_DIRECTORY: fixture.stateDirectory,
         FAKE_YT_DLP_LONG_RUNNING: '1',

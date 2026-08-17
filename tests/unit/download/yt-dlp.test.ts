@@ -744,6 +744,33 @@ describe('yt-dlp download', () => {
     ]);
   });
 
+  it('forwards canonical executable paths unchanged to probe and staged JXA', async () => {
+    const toolchain = createToolchain({
+      ytDlpExecutable: '/private/canonical/bin/yt-dlp',
+      ffmpegExecutable: '/private/canonical/bin/ffmpeg',
+      ffmpegExplicit: true,
+    });
+    const options = operationOptions(toolchain);
+    const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockResolvedValueOnce(processResult({stdout: youtubeInfo()}))
+      .mockResolvedValueOnce(processResult());
+    const client = createYtDlpClient({toolchain, runProcess});
+
+    await client.probe('https://youtu.be/abc', options);
+    await client.download('https://youtu.be/abc', 43, options);
+
+    expect(runProcess.mock.calls[0]?.[0]).toBe(toolchain.ytDlpExecutable);
+    const wrapperArguments = runProcess.mock.calls[1]?.[1] ?? [];
+    expect(wrapperArguments.slice(4, 6)).toEqual([
+      '--',
+      toolchain.ytDlpExecutable,
+    ]);
+    const ffmpegLocation = wrapperArguments.indexOf('--ffmpeg-location');
+    expect(wrapperArguments[ffmpegLocation + 1]).toBe(
+      toolchain.ffmpegExecutable,
+    );
+  });
+
   it('passes the resolved environment, signal, and staging descriptor', async () => {
     const toolchain = createToolchain();
     const controller = new AbortController();

@@ -256,6 +256,12 @@ The setup command does not accept arbitrary asset URLs or redirect hosts.
 `FFMPEG_PATH` keeps its existing precedence. Otherwise use the system `ffmpeg`
 resolution already implemented by the application.
 
+At the start of capability validation, capture the current working directory
+before any asynchronous work and resolve both explicit override strings against
+that one directory. Validation, the returned toolchain, metadata probes, staged
+JXA downloads, and `--ffmpeg-location` must all reuse those exact absolute
+strings. Do not call `realpath`; existing symlink validation remains unchanged.
+
 ### 7.5 Capability validation
 
 Before network access, require:
@@ -275,6 +281,22 @@ Before network access, require:
 
 An override executable cannot bypass provider, Deno, impersonation, or FFmpeg
 checks.
+
+### 7.6 Downloader child environment
+
+Capability checks and runtime downloader processes build a frozen environment
+from an allowlist rather than copying `process.env`. Preserve the canonical
+resolver home as `HOME` so `--cookies-from-browser chrome` can use the real
+Chrome and Keychain context without selecting or exposing a profile path.
+
+The allowlist contains only deduplicated absolute `PATH` entries (or
+`/usr/bin:/bin:/usr/sbin:/sbin` when none are usable), an absolute `TMPDIR` when
+present, `LANG`, `LC_*`, `USER`, `LOGNAME`, the macOS text-encoding and security
+session identifiers when present, and the fixed Deno, XDG, npm, internal Deno
+binding, and `FORCE_COLOR=false` values required by the managed toolchain.
+Proxy variables in any casing, credentials and tokens, SSH agent sockets,
+Node/Deno runtime injection variables, dynamic-loader variables, and all other
+unlisted host values are excluded.
 
 ## 8. CLI Contract
 

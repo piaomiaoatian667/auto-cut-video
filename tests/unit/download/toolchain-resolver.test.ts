@@ -217,6 +217,37 @@ describe('resolveDownloaderToolchain', () => {
     expect(fixture.resolveExecutable.mock.calls).toEqual([['deno'], ['ffmpeg']]);
   });
 
+  it('returns relative overrides canonicalized against the capability cwd', async () => {
+    const fixture = createResolverFixture();
+    const capabilityCwd = '/private/resolver-cwd';
+    const ytDlpOverride = 'relative-tools/yt-dlp';
+    const ffmpegOverride = 'relative-tools/ffmpeg';
+    const absoluteYtDlpOverride = path.resolve(capabilityCwd, ytDlpOverride);
+    const absoluteFfmpegOverride = path.resolve(capabilityCwd, ffmpegOverride);
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(capabilityCwd);
+
+    const resolved = await resolveDownloaderToolchain({
+      ytDlpOverride,
+      ffmpegOverride,
+      homeDirectory,
+    }, fixture.dependencies);
+
+    expect(cwd).toHaveBeenCalledTimes(1);
+    expect(resolved).toMatchObject({
+      source: 'override',
+      ytDlpExecutable: absoluteYtDlpOverride,
+      ffmpegExecutable: absoluteFfmpegOverride,
+      ffmpegExplicit: true,
+    });
+    expect(fixture.runProcess.mock.calls[0]?.[0]).toBe(absoluteYtDlpOverride);
+    expect(fixture.runProcess).toHaveBeenCalledWith(
+      absoluteFfmpegOverride,
+      ['-version'],
+      expect.objectContaining({env: expect.any(Object)}),
+    );
+    expect(fixture.resolveExecutable.mock.calls).toEqual([['deno']]);
+  });
+
   it('uses only the exact managed cache path when no override is present', async () => {
     const fixture = createResolverFixture();
 

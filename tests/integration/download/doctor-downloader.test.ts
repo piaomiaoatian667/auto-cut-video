@@ -3,7 +3,6 @@ import {createHash} from 'node:crypto';
 import type {Stats} from 'node:fs';
 import {
   chmod,
-  copyFile,
   mkdir,
   mkdtemp,
   readFile,
@@ -12,6 +11,7 @@ import {
 } from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
+import {pathToFileURL} from 'node:url';
 import {promisify} from 'node:util';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {
@@ -134,8 +134,12 @@ const createManagedFixture = async (): Promise<ManagedFixture> => {
     mkdir(toolsDirectory, {recursive: true}),
     mkdir(pluginWorkspace, {recursive: true}),
   ]);
-  await copyFile(FAKE_YT_DLP_FIXTURE, paths.ytDlpExecutable);
-  await chmod(paths.ytDlpExecutable, 0o755);
+  await writeExecutable(paths.ytDlpExecutable, [
+    `#!${process.execPath}`,
+    `process.env.FAKE_YT_DLP_RECORD = ${JSON.stringify(recordPath)};`,
+    `await import(${JSON.stringify(pathToFileURL(FAKE_YT_DLP_FIXTURE).href)});`,
+    '',
+  ].join('\n'));
   await createPluginArchive(paths.pluginArchive, pluginWorkspace);
   await Promise.all([
     writeFile(
@@ -156,7 +160,7 @@ const createManagedFixture = async (): Promise<ManagedFixture> => {
       0o700,
     ),
     writeExecutable(denoExecutable, [
-      '#!/usr/bin/env node',
+      `#!${process.execPath}`,
       "const args = process.argv.slice(2);",
       "if (args.length === 1 && args[0] === '--version') {",
       "  process.stdout.write('deno 2.8.3\\n');",
@@ -167,7 +171,7 @@ const createManagedFixture = async (): Promise<ManagedFixture> => {
       '',
     ].join('\n')),
     writeExecutable(ffmpegExecutable, [
-      '#!/usr/bin/env node',
+      `#!${process.execPath}`,
       "process.stdout.write('ffmpeg version 8.1.2\\n');",
       '',
     ].join('\n')),
@@ -286,7 +290,6 @@ afterEach(async () => {
 describe('doctor-downloader managed integration', () => {
   it('reports only deterministic local capabilities without a probe or download', async () => {
     const fixture = await createManagedFixture();
-    vi.stubEnv('FAKE_YT_DLP_RECORD', fixture.recordPath);
     vi.stubEnv('HTTP_PROXY', 'http://ambient-proxy.invalid:8080');
     vi.stubEnv('HTTPS_PROXY', 'https://ambient-proxy.invalid:8443');
     vi.stubEnv('ALL_PROXY', 'socks5://ambient-proxy.invalid:1080');
@@ -324,7 +327,6 @@ describe('doctor-downloader managed integration', () => {
 
   it('runs exactly one metadata probe with the same managed toolchain', async () => {
     const fixture = await createManagedFixture();
-    vi.stubEnv('FAKE_YT_DLP_RECORD', fixture.recordPath);
     vi.stubEnv('HTTP_PROXY', 'http://ambient-proxy.invalid:8080');
     vi.stubEnv('https_proxy', 'https://ambient-proxy.invalid:8443');
     const run = commandDependencies(fixture);
@@ -356,7 +358,7 @@ describe('doctor-downloader managed integration', () => {
     expect(environmentKeys).not.toContain('https_proxy');
     expect(environmentKeys).not.toContain('all_proxy');
     expect(environmentKeys).not.toContain('no_proxy');
-    expect(environment.FAKE_YT_DLP_RECORD).toBe(fixture.recordPath);
+    expect(environment.FAKE_YT_DLP_RECORD).toBeUndefined();
     expect(run.stdout()).not.toContain(CHECK_URL);
     expect(run.stdout()).not.toContain('Doctor fixture');
     expect(run.stdout()).not.toContain(fixture.homeDirectory);

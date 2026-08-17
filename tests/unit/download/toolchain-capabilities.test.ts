@@ -262,6 +262,7 @@ const validateFixture = (
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.restoreAllMocks();
 });
 
 const expectControlledError = async (
@@ -327,15 +328,40 @@ describe('downloader toolchain capability helpers', () => {
     expect(pluginEntriesMatch(output)).toBe(false);
   });
 
-  it('builds a frozen proxy-free npm-isolated child environment from a snapshot', () => {
-    const privateMarker = 'private-npm-marker';
+  it('builds a frozen minimal child environment from an allowlisted snapshot', () => {
+    const privateMarker = 'private-environment-marker';
     const source: NodeJS.ProcessEnv = {
-      PATH: '/usr/bin',
-      HOME: '/Users/downloader',
+      PATH: [
+        'relative-bin',
+        '/usr/bin',
+        '/usr/bin',
+        '/bin',
+        '../relative-tools',
+      ].join(path.delimiter),
+      HOME: `/host/${privateMarker}/home`,
+      TMPDIR: '/private/runtime-tmp',
+      LANG: 'en_US.UTF-8',
+      LC_ALL: 'C',
+      LC_CTYPE: 'UTF-8',
+      USER: 'downloader-user',
+      LOGNAME: 'downloader-logname',
+      __CF_USER_TEXT_ENCODING: '0x1F5:0x0:0x0',
+      SECURITYSESSIONID: '186a6',
       HTTP_PROXY: 'http://private-marker',
       https_proxy: 'http://private-marker',
       All_Proxy: 'socks5://private-marker',
       no_PROXY: 'localhost',
+      AWS_SECRET_ACCESS_KEY: privateMarker,
+      GOOGLE_APPLICATION_CREDENTIALS: `/private/${privateMarker}/gcp.json`,
+      OPENAI_API_KEY: privateMarker,
+      ANTHROPIC_API_KEY: privateMarker,
+      SSH_AUTH_SOCK: `/private/${privateMarker}/ssh-agent.sock`,
+      NODE_OPTIONS: `--require=/${privateMarker}/inject.cjs`,
+      NODE_PATH: `/private/${privateMarker}/node_modules`,
+      DYLD_INSERT_LIBRARIES: `/private/${privateMarker}/inject.dylib`,
+      DENO_AUTH_TOKENS: privateMarker,
+      NPM_TOKEN: privateMarker,
+      CUSTOM_RUNTIME_MARKER: privateMarker,
       NPM_CONFIG_REGISTRY: `https://${privateMarker}.example.test/`,
       npm_config_userconfig: `/${privateMarker}/user-npmrc`,
       NpM_CoNfIg_GlObAlCoNfIg: `/${privateMarker}/global-npmrc`,
@@ -343,7 +369,6 @@ describe('downloader toolchain capability helpers', () => {
       [DENO_EXECUTABLE_ENVIRONMENT_KEY]: `/${privateMarker}/poisoned-deno`,
       [DENO_EXECUTABLE_ENVIRONMENT_KEY.toLowerCase()]:
         `relative-${privateMarker}`,
-      PRESERVED: 'closed-value',
     };
 
     const environment = buildDownloaderChildEnvironment(
@@ -352,11 +377,19 @@ describe('downloader toolchain capability helpers', () => {
       source,
     );
     source.PATH = '/mutated';
+    source.LANG = 'mutated';
 
-    expect(environment).toMatchObject({
-      PATH: '/usr/bin',
-      HOME: '/Users/downloader',
-      PRESERVED: 'closed-value',
+    expect(environment).toEqual({
+      PATH: ['/usr/bin', '/bin'].join(path.delimiter),
+      HOME: '/Users/tester',
+      TMPDIR: '/private/runtime-tmp',
+      LANG: 'en_US.UTF-8',
+      LC_ALL: 'C',
+      LC_CTYPE: 'UTF-8',
+      USER: 'downloader-user',
+      LOGNAME: 'downloader-logname',
+      __CF_USER_TEXT_ENCODING: '0x1F5:0x0:0x0',
+      SECURITYSESSIONID: '186a6',
       NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
       NPM_CONFIG_USERCONFIG: '/dev/null',
       NPM_CONFIG_GLOBALCONFIG: '/dev/null',
@@ -367,20 +400,25 @@ describe('downloader toolchain capability helpers', () => {
       DENO_NO_UPDATE_CHECK: '1',
       FORCE_COLOR: 'false',
     });
-    expect(Object.keys(environment).filter((key) => key.toLowerCase().includes('proxy')))
-      .toEqual([]);
-    expect(Object.keys(environment).filter((key) =>
-      key.toLowerCase().startsWith('npm_config_')
-    ).sort()).toEqual([
-      'NPM_CONFIG_GLOBALCONFIG',
-      'NPM_CONFIG_REGISTRY',
-      'NPM_CONFIG_USERCONFIG',
-    ]);
     expect(JSON.stringify(environment)).not.toContain(privateMarker);
     expect(Object.keys(environment).filter((key) =>
       key.toLowerCase() === DENO_EXECUTABLE_ENVIRONMENT_KEY.toLowerCase()
     )).toEqual([DENO_EXECUTABLE_ENVIRONMENT_KEY]);
     expect(Object.isFrozen(environment)).toBe(true);
+  });
+
+  it('uses the safe PATH fallback and omits a relative TMPDIR', () => {
+    const environment = buildDownloaderChildEnvironment(
+      paths,
+      denoExecutable,
+      {
+        PATH: ['relative-bin', '../tools'].join(path.delimiter),
+        TMPDIR: 'relative-tmp',
+      },
+    );
+
+    expect(environment.PATH).toBe('/usr/bin:/bin:/usr/sbin:/sbin');
+    expect(environment).not.toHaveProperty('TMPDIR');
   });
 
   it.each(['ENOENT', 'ENOTDIR'] as const)(
@@ -663,6 +701,69 @@ describe('validateDownloaderCapabilities', () => {
     });
     expect(resolved.audit).not.toHaveProperty('managedAssetSha256');
     expect(fixture.resolveExecutable.mock.calls).toEqual([['deno']]);
+  });
+
+  it('canonicalizes both relative overrides from one captured capability cwd', async () => {
+    const fixture = createCapabilityFixture();
+    const capabilityCwd = '/private/capability-cwd';
+    const laterCwd = '/private/later-cwd';
+    const ytDlpOverride = 'relative-tools/yt-dlp';
+    const ffmpegOverride = 'relative-tools/ffmpeg';
+    const absoluteYtDlpOverride = path.resolve(capabilityCwd, ytDlpOverride);
+    const absoluteFfmpegOverride = path.resolve(capabilityCwd, ffmpegOverride);
+    const cwd = vi.spyOn(process, 'cwd')
+      .mockReturnValueOnce(capabilityCwd)
+      .mockReturnValue(laterCwd);
+
+    const resolved = await validateFixture(fixture, {
+      source: 'override',
+      ytDlpExecutable: ytDlpOverride,
+      ffmpegOverride,
+    });
+
+    expect(cwd).toHaveBeenCalledTimes(1);
+    expect(resolved.ytDlpExecutable).toBe(absoluteYtDlpOverride);
+    expect(resolved.ffmpegExecutable).toBe(absoluteFfmpegOverride);
+    expect(fixture.lstat).toHaveBeenCalledWith(absoluteYtDlpOverride);
+    expect(fixture.runProcess.mock.calls.filter(([, args]) =>
+      args.length === 1 && ['--version', '--help', '--list-impersonate-targets']
+        .includes(args[0] ?? '')
+    ).map(([command]) => command)).toEqual([
+      absoluteYtDlpOverride,
+      absoluteYtDlpOverride,
+      denoExecutable,
+      absoluteYtDlpOverride,
+    ]);
+    expect(fixture.runProcess).toHaveBeenCalledWith(
+      absoluteFfmpegOverride,
+      ['-version'],
+      expect.objectContaining({env: expect.any(Object)}),
+    );
+  });
+
+  it('sanitizes a missing canonicalized relative override path', async () => {
+    const fixture = createCapabilityFixture();
+    const capabilityCwd = '/private/canonical-cwd-marker';
+    const ytDlpOverride = 'missing/private-override-marker';
+    const absoluteYtDlpOverride = path.resolve(capabilityCwd, ytDlpOverride);
+    vi.spyOn(process, 'cwd').mockReturnValue(capabilityCwd);
+    fixture.lstat.mockImplementation(async (candidate) => {
+      if (candidate === absoluteYtDlpOverride) {
+        throw new Error(`private missing path ${candidate}`);
+      }
+      return regularFileStats();
+    });
+
+    await expectControlledError(
+      validateFixture(fixture, {
+        source: 'override',
+        ytDlpExecutable: ytDlpOverride,
+      }),
+      'DOWNLOAD_TOOLCHAIN_INVALID',
+      INVALID_TOOLCHAIN_MESSAGE,
+      [capabilityCwd, ytDlpOverride, absoluteYtDlpOverride],
+    );
+    expect(fixture.lstat).toHaveBeenCalledWith(absoluteYtDlpOverride);
   });
 
   it.each([

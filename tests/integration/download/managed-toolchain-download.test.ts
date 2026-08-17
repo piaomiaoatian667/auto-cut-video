@@ -123,17 +123,35 @@ afterEach(async () => {
 
 describe('managed multi-platform download integration', () => {
   it('isolates every managed subprocess from poisoned host environment', async () => {
+    const fixture = await createManagedDownloadFixture();
+    fixtures.push(fixture);
     vi.stubEnv('NODE_OPTIONS', '--no-warnings');
     vi.stubEnv('NODE_PATH', '/host/node-path-marker');
     vi.stubEnv('AWS_SECRET_ACCESS_KEY', 'credential-marker');
+    vi.stubEnv('SSH_AUTH_SOCK', '/host/ssh-agent-marker.sock');
+    vi.stubEnv('OPENAI_API_KEY', 'openai-credential-marker');
+    vi.stubEnv('ANTHROPIC_API_KEY', 'anthropic-credential-marker');
+    vi.stubEnv('CUSTOM_RUNTIME_MARKER', 'custom-runtime-marker');
     vi.stubEnv('HOME', '/host/home-marker');
-    vi.stubEnv('PATH', '/host/path-marker');
+    vi.stubEnv('PATH', [
+      'relative-path-marker',
+      '/host/path-marker',
+      '/host/path-marker',
+      '/usr/bin',
+    ].join(path.delimiter));
+    vi.stubEnv('TMPDIR', fixture.temporaryDirectory);
+    vi.stubEnv('LANG', 'en_US.UTF-8');
+    vi.stubEnv('LC_ALL', 'C');
+    vi.stubEnv('LC_CTYPE', 'C.UTF-8');
+    vi.stubEnv('LC_MESSAGES', 'en_US.UTF-8');
+    vi.stubEnv('USER', 'fixture-user');
+    vi.stubEnv('LOGNAME', 'fixture-logname');
+    vi.stubEnv('__CF_USER_TEXT_ENCODING', '0x1F5:0x0:0x0');
+    vi.stubEnv('SECURITYSESSIONID', 'fixture-security-session');
     vi.stubEnv('HTTP_PROXY', 'http://host-proxy.invalid:8080');
     vi.stubEnv('HTTPS_PROXY', 'https://host-proxy.invalid:8443');
     vi.stubEnv('ALL_PROXY', 'socks5://host-proxy.invalid:1080');
     vi.stubEnv('NO_PROXY', 'host-private.invalid');
-    const fixture = await createManagedDownloadFixture();
-    fixtures.push(fixture);
     const run = fixture.createCommandHarness();
 
     const exitCode = await runVideoctl([
@@ -144,30 +162,45 @@ describe('managed multi-platform download integration', () => {
 
     expect(exitCode).toBe(EXIT_CODES.success);
     expect(run.stderr()).toBe('');
-    const expectedEnvironment = {
+    const expectedValidationEnvironment = {
       HOME: fixture.homeDirectory,
-      PATH: [
-        path.dirname(process.execPath),
-        fixture.toolsDirectory,
-        '/usr/bin',
-        '/bin',
-      ].join(path.delimiter),
-      TMPDIR: path.join(fixture.root, 'tmp'),
+      PATH: ['/host/path-marker', '/usr/bin'].join(path.delimiter),
+      TMPDIR: fixture.temporaryDirectory,
+      LANG: 'en_US.UTF-8',
+      LC_ALL: 'C',
+      LC_CTYPE: 'C.UTF-8',
+      LC_MESSAGES: 'en_US.UTF-8',
+      USER: 'fixture-user',
+      LOGNAME: 'fixture-logname',
+      __CF_USER_TEXT_ENCODING: '0x1F5:0x0:0x0',
+      SECURITYSESSIONID: 'fixture-security-session',
       DENO_DIR: fixture.paths.denoDirectory,
       XDG_CACHE_HOME: fixture.paths.providerCacheDirectory,
+      DENO_NO_PROMPT: '1',
+      DENO_NO_UPDATE_CHECK: '1',
+      FORCE_COLOR: 'false',
+      NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
+      NPM_CONFIG_USERCONFIG: '/dev/null',
+      NPM_CONFIG_GLOBALCONFIG: '/dev/null',
+    };
+    const expectedChildEnvironment = {
+      ...expectedValidationEnvironment,
       [DENO_EXECUTABLE_ENVIRONMENT_KEY]: path.join(
         fixture.toolsDirectory,
         'deno',
       ),
-      DENO_NO_PROMPT: '1',
-      DENO_NO_UPDATE_CHECK: '1',
-      FORCE_COLOR: 'false',
-      FAKE_YT_DLP_RECORD_DIRECTORY: fixture.recordDirectory,
-      FAKE_YT_DLP_STATE_DIRECTORY: fixture.stateDirectory,
     };
     expect(fixture.subprocesses.length).toBeGreaterThan(fixture.operations.length);
     for (const subprocess of fixture.subprocesses) {
-      expect(subprocess.environment).toEqual(expectedEnvironment);
+      expect([
+        expectedValidationEnvironment,
+        expectedChildEnvironment,
+      ]).toContainEqual(subprocess.environment);
+      expect(Object.isFrozen(subprocess.environment)).toBe(true);
+    }
+    for (const operation of fixture.operations) {
+      expect(operation.environment).toEqual(expectedChildEnvironment);
+      expect(Object.isFrozen(operation.environment)).toBe(true);
     }
     expect(fixture.subprocesses.filter((subprocess) =>
       subprocess.command === path.join(fixture.toolsDirectory, 'deno')
@@ -186,9 +219,17 @@ describe('managed multi-platform download integration', () => {
       'NODE_OPTIONS',
       'NODE_PATH',
       'AWS_SECRET_ACCESS_KEY',
+      'SSH_AUTH_SOCK',
+      'OPENAI_API_KEY',
+      'ANTHROPIC_API_KEY',
+      'CUSTOM_RUNTIME_MARKER',
       'credential-marker',
+      'ssh-agent-marker',
+      'openai-credential-marker',
+      'anthropic-credential-marker',
+      'custom-runtime-marker',
       '/host/home-marker',
-      '/host/path-marker',
+      'relative-path-marker',
       'host-proxy.invalid',
       'host-private.invalid',
     ]) {
@@ -206,6 +247,86 @@ describe('managed multi-platform download integration', () => {
     expect(fixture.actualHashes.get(fixture.paths.pluginArchive)).toBe(
       rawFileSha256(await readFile(fixture.paths.pluginArchive)),
     );
+  });
+
+  it('uses one absolute override identity for doctor, probe, and staged download', async () => {
+    const fixture = await createManagedDownloadFixture({relativeOverrides: true});
+    fixtures.push(fixture);
+    const originalCwd = process.cwd();
+    process.chdir(fixture.root);
+    try {
+      const capabilityCwd = process.cwd();
+      const expectedYtDlpExecutable = path.resolve(
+        capabilityCwd,
+        'overrides/yt-dlp',
+      );
+      const expectedFfmpegExecutable = path.resolve(
+        capabilityCwd,
+        'overrides/ffmpeg',
+      );
+      const doctor = fixture.createCommandHarness();
+      const doctorExitCode = await runVideoctl([
+        'doctor-downloader',
+        '--check-url',
+        'https://vimeo.com/relative-override',
+        '--rights-confirmed',
+        '--json',
+      ], doctor.dependencies);
+      expect(doctorExitCode).toBe(EXIT_CODES.success);
+      expect(doctor.stderr()).toBe('');
+
+      const download = fixture.createCommandHarness();
+      const downloadExitCode = await runVideoctl([
+        'download',
+        'https://vimeo.com/relative-override',
+        '--rights-confirmed',
+        '--json',
+      ], download.dependencies);
+      expect(downloadExitCode).toBe(EXIT_CODES.success);
+      expect(download.stderr()).toBe('');
+
+      expect(fixture.operations.map((operation) => operation.phase)).toEqual([
+        'probe',
+        'probe',
+        'download',
+      ]);
+      const probeCommands = fixture.subprocesses.filter((subprocess) =>
+        subprocess.args.includes('--dump-single-json')
+      ).map((subprocess) => subprocess.command);
+      expect(probeCommands).toEqual([
+        expectedYtDlpExecutable,
+        expectedYtDlpExecutable,
+      ]);
+      expect(fixture.subprocesses.filter((subprocess) =>
+        subprocess.args.length === 1 && subprocess.args[0] === '--version'
+      ).map((subprocess) => subprocess.command)).toContain(
+        expectedYtDlpExecutable,
+      );
+      expect(fixture.subprocesses).toContainEqual(expect.objectContaining({
+        command: expectedFfmpegExecutable,
+        args: ['-version'],
+      }));
+      const stagedDownload = fixture.subprocesses.filter((subprocess) =>
+        subprocess.command === '/usr/bin/osascript'
+      ).at(-1);
+      expect(stagedDownload).toBeDefined();
+      const separator = stagedDownload?.args.indexOf('--') ?? -1;
+      expect(stagedDownload?.args[separator + 1]).toBe(
+        expectedYtDlpExecutable,
+      );
+      const downloadArguments = fixture.operations.at(-1)?.args ?? [];
+      const ffmpegLocation = downloadArguments.indexOf('--ffmpeg-location');
+      expect(ffmpegLocation).toBeGreaterThanOrEqual(0);
+      expect(downloadArguments[ffmpegLocation + 1]).toBe(
+        expectedFfmpegExecutable,
+      );
+      expect(fixture.subprocesses.some((subprocess) =>
+        subprocess.command === 'overrides/yt-dlp'
+        || subprocess.command === 'overrides/ffmpeg'
+      )).toBe(false);
+    } finally {
+      process.chdir(originalCwd);
+    }
   });
 
   it('keeps the managed toolchain environment below temporary HOME', async () => {
@@ -295,8 +416,8 @@ describe('managed multi-platform download integration', () => {
         expect(keys).not.toContain('https_proxy');
         expect(keys).not.toContain('all_proxy');
         expect(keys).not.toContain('no_proxy');
-        expect(environment.FAKE_YT_DLP_RECORD_DIRECTORY)
-          .toBe(fixture.recordDirectory);
+        expect(environment.FAKE_YT_DLP_RECORD_DIRECTORY).toBeUndefined();
+        expect(environment.FAKE_YT_DLP_STATE_DIRECTORY).toBeUndefined();
       }
       expect(fixture.delays).toEqual([platform === 'youtube' ? 5000 : 0]);
       const records = await readDigestRecords(fixture.recordPath);
@@ -501,7 +622,7 @@ describe('managed multi-platform download integration', () => {
       throw new Error('Expected strict fake invocations.');
     }
     const directRecordDirectory = path.join(fixture.root, 'direct-records');
-    const directEnvironment = fixture.createSubprocessEnvironment({
+    const directEnvironment = fixture.createHarnessEnvironment({
       recordDirectory: directRecordDirectory,
     });
     expect(directEnvironment).toEqual({
@@ -557,7 +678,7 @@ describe('managed multi-platform download integration', () => {
     await expect(direct(arbitraryExtractor)).rejects.toMatchObject({code: 64});
 
     const mismatchDirectory = path.join(fixture.root, 'mismatch-records');
-    const mismatchEnvironment = fixture.createSubprocessEnvironment({
+    const mismatchEnvironment = fixture.createHarnessEnvironment({
       recordDirectory: mismatchDirectory,
     });
     await execFile(fixture.paths.ytDlpExecutable, probeArgs, {

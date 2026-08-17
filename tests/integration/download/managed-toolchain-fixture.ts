@@ -3,7 +3,6 @@ import {createHash} from 'node:crypto';
 import type {Stats} from 'node:fs';
 import {
   chmod,
-  copyFile,
   lstat,
   mkdir,
   mkdtemp,
@@ -84,6 +83,7 @@ export interface ManagedFixtureOptions {
   scenario?: FakeYtDlpScenario;
   failurePhase?: 'probe' | 'download';
   longRunning?: boolean;
+  relativeOverrides?: boolean;
   beforeDelay?: (
     milliseconds: number,
     signal?: AbortSignal,
@@ -122,7 +122,7 @@ export interface ManagedFixtureCommandHarness {
 export interface ManagedDownloadRuntime {
   dependencies: DownloadDependencies;
   resolveToolchain(signal?: AbortSignal): Promise<ResolvedDownloaderToolchain>;
-  createSubprocessEnvironment(
+  createHarnessEnvironment(
     options?: ManagedFixtureSubprocessEnvironmentOptions,
   ): Readonly<NodeJS.ProcessEnv>;
   operations: RecordedYtDlpOperation[];
@@ -158,6 +158,9 @@ interface FixtureLayout {
   denoExecutable: string;
   ffmpegExecutable: string;
   gitExecutable: string;
+  overrideDirectory: string;
+  ytDlpOverrideExecutable: string;
+  ffmpegOverrideExecutable: string;
   paths: ReturnType<typeof resolveDownloaderToolchainPaths>;
 }
 
@@ -176,6 +179,9 @@ const fixtureLayout = (root: string): FixtureLayout => {
     denoExecutable: path.join(toolsDirectory, 'deno'),
     ffmpegExecutable: path.join(toolsDirectory, 'ffmpeg'),
     gitExecutable: path.join(toolsDirectory, 'git'),
+    overrideDirectory: path.join(root, 'overrides'),
+    ytDlpOverrideExecutable: path.join(root, 'overrides/yt-dlp'),
+    ffmpegOverrideExecutable: path.join(root, 'overrides/ffmpeg'),
     paths: resolveDownloaderToolchainPaths(homeDirectory),
   };
 };
@@ -217,7 +223,7 @@ const createPluginArchive = async (
   });
 };
 
-const fixtureChildEnvironment = (
+const fixtureHarnessEnvironment = (
   layout: FixtureLayout,
   options: ManagedFixtureOptions,
   environmentOptions: ManagedFixtureSubprocessEnvironmentOptions = {},
@@ -251,6 +257,27 @@ const fixtureChildEnvironment = (
     : {MANAGED_DOWNLOAD_FIXTURE_ROOT: environmentOptions.managedFixtureRoot}),
 });
 
+const fakeYtDlpWrapperSource = (
+  layout: FixtureLayout,
+  options: ManagedFixtureOptions,
+): string => [
+  `#!${process.execPath}`,
+  `process.env.FAKE_YT_DLP_RECORD_DIRECTORY ??= ${JSON.stringify(layout.recordDirectory)};`,
+  `process.env.FAKE_YT_DLP_STATE_DIRECTORY ??= ${JSON.stringify(layout.stateDirectory)};`,
+  'delete process.env.FAKE_YT_DLP_RECORD;',
+  options.scenario === undefined
+    ? 'delete process.env.FAKE_YT_DLP_SCENARIO;'
+    : `process.env.FAKE_YT_DLP_SCENARIO = ${JSON.stringify(options.scenario)};`,
+  options.failurePhase === undefined
+    ? 'delete process.env.FAKE_YT_DLP_FAILURE_PHASE;'
+    : `process.env.FAKE_YT_DLP_FAILURE_PHASE = ${JSON.stringify(options.failurePhase)};`,
+  options.longRunning === true
+    ? "process.env.FAKE_YT_DLP_LONG_RUNNING = '1';"
+    : 'delete process.env.FAKE_YT_DLP_LONG_RUNNING;',
+  `await import(${JSON.stringify(pathToFileURL(FAKE_YT_DLP_FIXTURE).href)});`,
+  '',
+].join('\n');
+
 const initializeManagedCache = async (
   layout: FixtureLayout,
   options: ManagedFixtureOptions,
@@ -270,15 +297,19 @@ const initializeManagedCache = async (
     mkdir(layout.recordDirectory, {recursive: true}),
     mkdir(layout.stateDirectory, {recursive: true}),
     mkdir(layout.toolsDirectory, {recursive: true}),
+    mkdir(layout.overrideDirectory, {recursive: true}),
     mkdir(layout.temporaryDirectory, {recursive: true}),
     mkdir(layout.pluginWorkspace, {recursive: true}),
   ]);
-  await copyFile(FAKE_YT_DLP_FIXTURE, paths.ytDlpExecutable);
-  await chmod(paths.ytDlpExecutable, 0o755);
+  const ytDlpWrapperSource = fakeYtDlpWrapperSource(layout, options);
+  await Promise.all([
+    writeExecutable(paths.ytDlpExecutable, ytDlpWrapperSource),
+    writeExecutable(layout.ytDlpOverrideExecutable, ytDlpWrapperSource),
+  ]);
   await createPluginArchive(
     paths.pluginArchive,
     layout.pluginWorkspace,
-    fixtureChildEnvironment(layout, options),
+    fixtureHarnessEnvironment(layout, options),
   );
   await Promise.all([
     writeFile(
@@ -299,7 +330,7 @@ const initializeManagedCache = async (
       0o700,
     ),
     writeExecutable(layout.denoExecutable, [
-      '#!/usr/bin/env node',
+      `#!${process.execPath}`,
       'const args = process.argv.slice(2);',
       "if (args.length === 1 && args[0] === '--version') {",
       "  process.stdout.write('deno 2.8.3\\n');",
@@ -310,12 +341,17 @@ const initializeManagedCache = async (
       '',
     ].join('\n')),
     writeExecutable(layout.ffmpegExecutable, [
-      '#!/usr/bin/env node',
+      `#!${process.execPath}`,
+      "process.stdout.write('ffmpeg version 8.1.2\\n');",
+      '',
+    ].join('\n')),
+    writeExecutable(layout.ffmpegOverrideExecutable, [
+      `#!${process.execPath}`,
       "process.stdout.write('ffmpeg version 8.1.2\\n');",
       '',
     ].join('\n')),
     writeExecutable(layout.gitExecutable, [
-      '#!/usr/bin/env node',
+      `#!${process.execPath}`,
       "process.stdout.write('git version 2.50.1\\n');",
       '',
     ].join('\n')),
@@ -325,16 +361,13 @@ const initializeManagedCache = async (
 const operationForInvocation = (
   command: string,
   args: readonly string[],
-  ytDlpExecutable: string,
 ): {phase: 'probe' | 'download'; args: string[]} | undefined => {
-  if (command === ytDlpExecutable && args.includes('--dump-single-json')) {
+  if (args.includes('--dump-single-json')) {
     return {phase: 'probe', args: [...args]};
   }
   if (command !== '/usr/bin/osascript') return undefined;
   const separator = args.indexOf('--');
-  if (separator === -1 || args[separator + 1] !== ytDlpExecutable) {
-    return undefined;
-  }
+  if (separator === -1 || args[separator + 1] === undefined) return undefined;
   return {phase: 'download', args: args.slice(separator + 2)};
 };
 
@@ -348,29 +381,25 @@ export const createManagedDownloadRuntime = (
   const processFailures: ProcessExecutionError[] = [];
   const delays: number[] = [];
   const actualHashes = new Map<string, string>();
-  const createSubprocessEnvironment = (
+  const createHarnessEnvironment = (
     environmentOptions: ManagedFixtureSubprocessEnvironmentOptions = {},
-  ): Readonly<NodeJS.ProcessEnv> => fixtureChildEnvironment(
+  ): Readonly<NodeJS.ProcessEnv> => fixtureHarnessEnvironment(
     layout,
     options,
     environmentOptions,
   );
-  const childEnvironment = createSubprocessEnvironment();
   const processRunner: DownloadProcessRunner = async (
     command,
     args,
     runOptions = {},
   ) => {
-    const operation = operationForInvocation(
-      command,
-      args,
-      layout.paths.ytDlpExecutable,
-    );
+    const environment = Object.freeze({...runOptions.env});
+    const operation = operationForInvocation(command, args);
     if (operation !== undefined) {
       operations.push({
         phase: operation.phase,
         args: operation.args,
-        environment: childEnvironment,
+        environment,
         extraStdioFds: runOptions.extraStdioFds === undefined
           ? undefined
           : [...runOptions.extraStdioFds],
@@ -379,13 +408,10 @@ export const createManagedDownloadRuntime = (
     subprocesses.push({
       command,
       args: [...args],
-      environment: childEnvironment,
+      environment,
     });
     try {
-      return await runSystemProcess(command, args, {
-        ...runOptions,
-        env: childEnvironment,
-      });
+      return await runSystemProcess(command, args, runOptions);
     } catch (error) {
       if (operation !== undefined && error instanceof ProcessExecutionError) {
         processFailures.push(error);
@@ -415,16 +441,22 @@ export const createManagedDownloadRuntime = (
   };
   const resolveToolchain = async (
     signal?: AbortSignal,
-  ): Promise<ResolvedDownloaderToolchain> => {
-    const resolved = await resolveDownloaderToolchain({
+  ): Promise<ResolvedDownloaderToolchain> => await resolveDownloaderToolchain({
       homeDirectory: layout.homeDirectory,
+      ...(options.relativeOverrides === true
+        ? {
+            ytDlpOverride: path.relative(
+              layout.root,
+              layout.ytDlpOverrideExecutable,
+            ),
+            ffmpegOverride: path.relative(
+              layout.root,
+              layout.ffmpegOverrideExecutable,
+            ),
+          }
+        : {}),
       ...(signal === undefined ? {} : {signal}),
     }, capabilityDependencies);
-    return {
-      ...resolved,
-      childEnvironment,
-    };
-  };
   const dependencies = createSystemDownloadDependencies({
     homeDirectory: layout.homeDirectory,
     runProcess: processRunner,
@@ -440,7 +472,7 @@ export const createManagedDownloadRuntime = (
   return {
     dependencies,
     resolveToolchain,
-    createSubprocessEnvironment,
+    createHarnessEnvironment,
     operations,
     subprocesses,
     processFailures,
@@ -487,7 +519,7 @@ export const createManagedDownloadFixture = async (
   const layout = fixtureLayout(root);
   await initializeManagedCache(layout, options);
   const runtime = createManagedDownloadRuntime(root, options);
-  const childEnvironment = fixtureChildEnvironment(layout, options);
+  const harnessEnvironment = fixtureHarnessEnvironment(layout, options);
   return {
     ...runtime,
     root,
@@ -510,7 +542,7 @@ export const createManagedDownloadFixture = async (
       };
     },
     cleanup: async () => {
-      await clearImmutableFlags(root, childEnvironment);
+      await clearImmutableFlags(root, harnessEnvironment);
       await makeTreeWritable(root);
       await rm(root, {recursive: true, force: true});
     },

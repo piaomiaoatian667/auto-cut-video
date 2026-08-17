@@ -53,14 +53,19 @@ const EXPECTED_PLUGIN_ENTRIES = [
   'yt_dlp_plugins/extractor/getpot_bgutil_http.py',
   'yt_dlp_plugins/extractor/getpot_bgutil_script.py',
 ] as const;
-const PROXY_ENVIRONMENT_KEYS = new Set([
-  'http_proxy',
-  'https_proxy',
-  'all_proxy',
-  'no_proxy',
+const DOWNLOADER_PATH_FALLBACK = [
+  '/usr/bin',
+  '/bin',
+  '/usr/sbin',
+  '/sbin',
+].join(path.delimiter);
+const PASSTHROUGH_ENVIRONMENT_KEYS = new Set([
+  'LANG',
+  'USER',
+  'LOGNAME',
+  '__CF_USER_TEXT_ENCODING',
+  'SECURITYSESSIONID',
 ]);
-const DENO_EXECUTABLE_ENVIRONMENT_KEY_NORMALIZED =
-  DENO_EXECUTABLE_ENVIRONMENT_KEY.toLowerCase();
 
 const invalidToolchain = (): DownloadError => new DownloadError(
   'DOWNLOAD_TOOLCHAIN_INVALID',
@@ -104,16 +109,14 @@ const buildDownloaderBaseEnvironment = (
   paths: DownloaderToolchainPaths,
   source: Readonly<NodeJS.ProcessEnv> = process.env,
 ): Readonly<NodeJS.ProcessEnv> => {
-  const environment = Object.fromEntries(
-    Object.entries(source).filter(([key]) => {
-      const normalizedKey = key.toLowerCase();
-      return !PROXY_ENVIRONMENT_KEYS.has(normalizedKey)
-        && !normalizedKey.startsWith('npm_config_')
-        && normalizedKey !== DENO_EXECUTABLE_ENVIRONMENT_KEY_NORMALIZED;
-    }),
-  );
-  return Object.freeze({
-    ...environment,
+  const pathEntries = [...new Set((source.PATH ?? '')
+    .split(path.delimiter)
+    .filter((entry) => path.isAbsolute(entry)))];
+  const environment: NodeJS.ProcessEnv = {
+    PATH: pathEntries.length === 0
+      ? DOWNLOADER_PATH_FALLBACK
+      : pathEntries.join(path.delimiter),
+    HOME: paths.homeDirectory,
     NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
     NPM_CONFIG_USERCONFIG: '/dev/null',
     NPM_CONFIG_GLOBALCONFIG: '/dev/null',
@@ -122,7 +125,19 @@ const buildDownloaderBaseEnvironment = (
     DENO_NO_PROMPT: '1',
     DENO_NO_UPDATE_CHECK: '1',
     FORCE_COLOR: 'false',
-  });
+  };
+  if (source.TMPDIR !== undefined && path.isAbsolute(source.TMPDIR)) {
+    environment.TMPDIR = source.TMPDIR;
+  }
+  for (const [key, value] of Object.entries(source)) {
+    if (
+      value !== undefined
+      && (PASSTHROUGH_ENVIRONMENT_KEYS.has(key) || key.startsWith('LC_'))
+    ) {
+      environment[key] = value;
+    }
+  }
+  return Object.freeze(environment);
 };
 
 export const buildDownloaderChildEnvironment = (
@@ -361,12 +376,18 @@ export const validateDownloaderCapabilities = async (
   dependencies: DownloaderCapabilityDependencies =
     defaultDownloaderCapabilityDependencies,
 ): Promise<ResolvedDownloaderToolchain> => {
+  const capabilityCwd = process.cwd();
+  const ytDlpExecutable = path.resolve(
+    capabilityCwd,
+    options.ytDlpExecutable,
+  );
+  const ffmpegOverride = options.ffmpegOverride === undefined
+    ? undefined
+    : path.resolve(capabilityCwd, options.ffmpegOverride);
   const {
     source,
     validationMode,
-    ytDlpExecutable,
     validatedSystemDenoExecutable,
-    ffmpegOverride,
     paths,
     signal,
   } = options;
