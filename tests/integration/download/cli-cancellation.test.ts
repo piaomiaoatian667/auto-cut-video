@@ -32,16 +32,32 @@ interface RecordedPids {
 interface ProcessSnapshot {
   pid: number;
   parentPid: number;
+  processGroupId: number;
+  state: string;
   command: string;
 }
 
 const fixtures: ManagedDownloadFixture[] = [];
 const childProcesses: ChildProcess[] = [];
 const descendantPids: number[] = [];
+const stoppedProcessGroupIds: number[] = [];
 
 const isProcessAlive = (pid: number): boolean => {
   try {
     process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !(
+      error instanceof Error
+      && 'code' in error
+      && error.code === 'ESRCH'
+    );
+  }
+};
+
+const isProcessGroupAlive = (processGroupId: number): boolean => {
+  try {
+    process.kill(-processGroupId, 0);
     return true;
   } catch (error) {
     return !(
@@ -70,23 +86,29 @@ const readWhenReady = async (
   throw new Error(`Timed out waiting for ${path.basename(target)}.`);
 };
 
-const descendantProcesses = async (rootPid: number): Promise<ProcessSnapshot[]> => {
+const processSnapshots = async (): Promise<ProcessSnapshot[]> => {
   const {stdout} = await execFileAsync('/bin/ps', [
     '-axo',
-    'pid=,ppid=,command=',
+    'pid=,ppid=,pgid=,state=,command=',
   ]);
-  const processes = stdout
+  return stdout
     .split(/\r?\n/u)
     .map((line): ProcessSnapshot | undefined => {
-      const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/u.exec(line);
+      const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/u.exec(line);
       if (match === null) return undefined;
       return {
         pid: Number(match[1]),
         parentPid: Number(match[2]),
-        command: match[3] ?? '',
+        processGroupId: Number(match[3]),
+        state: match[4] ?? '',
+        command: match[5] ?? '',
       };
     })
     .filter((entry): entry is ProcessSnapshot => entry !== undefined);
+};
+
+const descendantProcesses = async (rootPid: number): Promise<ProcessSnapshot[]> => {
+  const processes = await processSnapshots();
   const descendants: ProcessSnapshot[] = [];
   const parents = new Set([rootPid]);
   let found = true;
@@ -106,43 +128,66 @@ const descendantProcesses = async (rootPid: number): Promise<ProcessSnapshot[]> 
   return descendants;
 };
 
-const waitForDescendantCommand = async (
+const archiveHelperOperation = (command: string): string | undefined => {
+  const separatorIndex = command.lastIndexOf(' -- ');
+  if (separatorIndex === -1) return undefined;
+  return command.slice(separatorIndex + 4).trimStart().split(/\s+/u)[0];
+};
+
+const isArchiveInspectHelper = (processSnapshot: ProcessSnapshot): boolean =>
+  /^\/usr\/bin\/osascript(?:\s|$)/u.test(processSnapshot.command)
+  && archiveHelperOperation(processSnapshot.command) === 'inspect-staging';
+
+interface StoppedArchiveHelper {
+  helper: ProcessSnapshot;
+  groupProcesses: ProcessSnapshot[];
+}
+
+const stopArchiveInspectHelper = async (
   rootPid: number,
-  marker: string,
   timeoutMs = 10_000,
-): Promise<ProcessSnapshot[]> => {
+): Promise<StoppedArchiveHelper> => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const descendants = await descendantProcesses(rootPid);
-    if (descendants.some((entry) => entry.command.includes(marker))) {
-      return descendants;
+    const helper = descendants.find(isArchiveInspectHelper);
+    if (helper === undefined) {
+      await delay(2);
+      continue;
     }
-    await delay(2);
+    if (helper.processGroupId !== helper.pid) {
+      throw new Error('Inspect helper must lead its process group.');
+    }
+    try {
+      process.kill(-helper.processGroupId, 'SIGSTOP');
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && error.code === 'ESRCH') {
+        continue;
+      }
+      throw error;
+    }
+    stoppedProcessGroupIds.push(helper.processGroupId);
+    const stoppedHelper = await waitForStoppedProcess(helper.pid);
+    const groupProcesses = (await processSnapshots()).filter(
+      (entry) => entry.processGroupId === helper.processGroupId,
+    );
+    return {helper: stoppedHelper, groupProcesses};
   }
-  throw new Error(`Timed out waiting for descendant command ${marker}.`);
+  throw new Error('Timed out waiting for inspect-staging archive helper.');
 };
 
-const waitForStagingMetadata = async (
-  stagingRoot: string,
-  timeoutMs = 10_000,
-): Promise<string> => {
+const waitForStoppedProcess = async (
+  pid: number,
+  timeoutMs = 2000,
+): Promise<ProcessSnapshot> => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    try {
-      const entries = await readdir(stagingRoot);
-      if (entries.length === 1) {
-        const stagingDirectory = path.join(stagingRoot, entries[0] ?? '');
-        await access(path.join(stagingDirectory, 'video.info.json'));
-        return stagingDirectory;
-      }
-    } catch (error) {
-      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) {
-        throw error;
-      }
-    }
+    const processSnapshot = (await processSnapshots())
+      .find((entry) => entry.pid === pid);
+    if (processSnapshot?.state.includes('T') === true) return processSnapshot;
     await delay(2);
   }
-  throw new Error('Timed out waiting for staged metadata.');
+  throw new Error('Timed out waiting for inspect helper to stop.');
 };
 
 const waitForCleanupQuarantine = async (stagingRoot: string): Promise<string> => {
@@ -176,6 +221,13 @@ const waitForExit = async (
 
 afterEach(async () => {
   vi.unstubAllEnvs();
+  for (const processGroupId of stoppedProcessGroupIds.splice(0)) {
+    if (!isProcessGroupAlive(processGroupId)) continue;
+    try {
+      process.kill(-processGroupId, 'SIGKILL');
+    } catch {
+    }
+  }
   for (const child of childProcesses.splice(0)) {
     if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
   }
@@ -357,10 +409,7 @@ describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
         '--rights-confirmed',
       ], {
         cwd: fixture.workspaceRoot,
-        env: {
-          ...runnerEnvironment,
-          FAKE_YT_DLP_LARGE_MEDIA_BYTES: String(1024 * 1024 * 1024),
-        },
+        env: runnerEnvironment,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       childProcesses.push(child);
@@ -381,13 +430,14 @@ describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
         {timeout: 3000, interval: 5},
       ).toBe(false);
       const stagingRoot = path.join(fixture.workspaceRoot, 'downloads', '.staging');
-      await waitForStagingMetadata(stagingRoot);
       if (child.pid === undefined) throw new Error('Expected videoctl PID.');
-      const finalizeDescendants = await waitForDescendantCommand(
-        child.pid,
-        'inspect-staging',
+      const stoppedArchiveHelper = await stopArchiveInspectHelper(child.pid);
+      const inspectHelper = stoppedArchiveHelper.helper;
+      descendantPids.push(
+        ...stoppedArchiveHelper.groupProcesses.map((entry) => entry.pid),
       );
-      descendantPids.push(...finalizeDescendants.map((entry) => entry.pid));
+      expect(isProcessAlive(inspectHelper.pid)).toBe(true);
+      expect(inspectHelper.state).toContain('T');
 
       expect(child.kill('SIGINT')).toBe(true);
       await expect(exit).resolves.toEqual({
@@ -408,9 +458,15 @@ describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
         'cancelled',
       ))).rejects.toMatchObject({code: 'ENOENT'});
       await expect.poll(
-        () => finalizeDescendants.map((entry) => isProcessAlive(entry.pid)),
+        () => isProcessGroupAlive(inspectHelper.processGroupId),
         {timeout: 3000, interval: 10},
-      ).toEqual(finalizeDescendants.map(() => false));
+      ).toBe(false);
+      await expect.poll(
+        () => stoppedArchiveHelper.groupProcesses.map(
+          (entry) => isProcessAlive(entry.pid),
+        ),
+        {timeout: 3000, interval: 10},
+      ).toEqual(stoppedArchiveHelper.groupProcesses.map(() => false));
     });
   },
 );

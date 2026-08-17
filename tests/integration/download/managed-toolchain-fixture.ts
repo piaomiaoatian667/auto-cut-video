@@ -84,7 +84,6 @@ export interface ManagedFixtureOptions {
   scenario?: FakeYtDlpScenario;
   failurePhase?: 'probe' | 'download';
   longRunning?: boolean;
-  largeMediaBytes?: number;
   relativeOverrides?: boolean;
   beforeDelay?: (
     milliseconds: number,
@@ -258,9 +257,6 @@ const fixtureHarnessEnvironment = (
     ? {}
     : {FAKE_YT_DLP_FAILURE_PHASE: options.failurePhase}),
   ...(options.longRunning === true ? {FAKE_YT_DLP_LONG_RUNNING: '1'} : {}),
-  ...(options.largeMediaBytes === undefined
-    ? {}
-    : {FAKE_YT_DLP_LARGE_MEDIA_BYTES: String(options.largeMediaBytes)}),
   ...(environmentOptions.managedFixtureRoot === undefined
     ? {}
     : {MANAGED_DOWNLOAD_FIXTURE_ROOT: environmentOptions.managedFixtureRoot}),
@@ -283,9 +279,6 @@ const fakeYtDlpWrapperSource = (
   options.longRunning === true
     ? "process.env.FAKE_YT_DLP_LONG_RUNNING = '1';"
     : 'delete process.env.FAKE_YT_DLP_LONG_RUNNING;',
-  options.largeMediaBytes === undefined
-    ? 'delete process.env.FAKE_YT_DLP_LARGE_MEDIA_BYTES;'
-    : `process.env.FAKE_YT_DLP_LARGE_MEDIA_BYTES = ${JSON.stringify(String(options.largeMediaBytes))};`,
   `await import(${JSON.stringify(pathToFileURL(FAKE_YT_DLP_FIXTURE).href)});`,
   '',
 ].join('\n');
@@ -653,9 +646,6 @@ if (directlyExecuted) {
       ? {failurePhase: process.env.FAKE_YT_DLP_FAILURE_PHASE}
       : {}),
     longRunning: process.env.FAKE_YT_DLP_LONG_RUNNING === '1',
-    ...(process.env.FAKE_YT_DLP_LARGE_MEDIA_BYTES === undefined
-      ? {}
-      : {largeMediaBytes: Number(process.env.FAKE_YT_DLP_LARGE_MEDIA_BYTES)}),
   });
   const argv = process.argv.slice(2);
   const operation = runWithCommandSignalHandlers(process, async (signal) => {
