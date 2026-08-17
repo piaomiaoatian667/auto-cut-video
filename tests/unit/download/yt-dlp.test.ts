@@ -20,6 +20,7 @@ import type {ProcessResult} from '../../../src/process/run-process';
 
 const PROBE_FAILED_MESSAGE = 'Video metadata could not be extracted.';
 const PROCESS_FAILED_MESSAGE = 'The video could not be downloaded.';
+const STDERR_CLASSIFICATION_LIMIT_BYTES = 64 * 1024;
 const CLASSIFIED_FAILURES = [
   [
     'HTTP Error 429: Too Many Requests',
@@ -289,6 +290,36 @@ describe('yt-dlp probe', () => {
     });
   });
 
+  it('snapshots and freezes child environment before caller mutation', async () => {
+    const sourceEnvironment: NodeJS.ProcessEnv = {
+      PATH: '/original/bin',
+      HTTP_PROXY: 'http://original-proxy:7890',
+    };
+    const toolchain = createToolchain({childEnvironment: sourceEnvironment});
+    const options = operationOptions(toolchain);
+    const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockResolvedValueOnce(processResult({stdout: youtubeInfo()}))
+      .mockResolvedValueOnce(processResult());
+    const client = createYtDlpClient({toolchain, runProcess});
+
+    sourceEnvironment.PATH = '/mutated/bin';
+    sourceEnvironment.HTTP_PROXY = 'http://mutated-proxy:7890';
+    sourceEnvironment.NO_PROXY = 'private.example';
+
+    await client.probe('https://youtu.be/abc', options);
+    await client.download('https://youtu.be/abc', 46, options);
+
+    const probeEnvironment = runProcess.mock.calls[0]?.[2]?.env;
+    const downloadEnvironment = runProcess.mock.calls[1]?.[2]?.env;
+    expect(probeEnvironment).toEqual({
+      PATH: '/original/bin',
+      HTTP_PROXY: 'http://original-proxy:7890',
+    });
+    expect(probeEnvironment).not.toBe(sourceEnvironment);
+    expect(downloadEnvironment).toBe(probeEnvironment);
+    expect(Object.isFrozen(probeEnvironment)).toBe(true);
+  });
+
   it('returns only safe probe fields and excludes raw signed metadata', async () => {
     const markers = [
       'format-secret-marker',
@@ -348,11 +379,29 @@ describe('yt-dlp probe', () => {
     },
   );
 
-  it('matches only the bounded stderr tail', async () => {
+  it('classifies a pattern present only in the bounded stderr head', async () => {
     const toolchain = createToolchain();
     const stderr = [
-      'HTTP Error 429: Too Many Requests',
-      'x'.repeat(64 * 1024),
+      'HTTP Error 412: Precondition Failed',
+      'x'.repeat(STDERR_CLASSIFICATION_LIMIT_BYTES * 2),
+    ].join('\n');
+    const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockRejectedValueOnce(processFailure(stderr));
+
+    await expectDownloadError(
+      createYtDlpClient({toolchain, runProcess}).probe(
+        'https://youtu.be/abc',
+        operationOptions(toolchain),
+      ),
+      'DOWNLOAD_PLATFORM_CHALLENGE',
+      'The video platform rejected the selected public-session request.',
+    );
+  });
+
+  it('classifies a pattern present only in the bounded stderr tail', async () => {
+    const toolchain = createToolchain();
+    const stderr = [
+      'x'.repeat(STDERR_CLASSIFICATION_LIMIT_BYTES * 2),
       'Connection timed out',
     ].join('\n');
     const runProcess = vi.fn<DownloadProcessRunner>()
@@ -366,6 +415,75 @@ describe('yt-dlp probe', () => {
       'DOWNLOAD_NETWORK_UNREACHABLE',
       'The video platform could not be reached with the selected network settings.',
     );
+  });
+
+  it('preserves classification priority across head and tail windows', async () => {
+    const toolchain = createToolchain();
+    const stderr = [
+      'HTTP Error 429: Too Many Requests',
+      'x'.repeat(STDERR_CLASSIFICATION_LIMIT_BYTES * 2),
+      'Connection timed out',
+    ].join('\n');
+    const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockRejectedValueOnce(processFailure(stderr));
+
+    await expectDownloadError(
+      createYtDlpClient({toolchain, runProcess}).probe(
+        'https://youtu.be/abc',
+        operationOptions(toolchain),
+      ),
+      'DOWNLOAD_RATE_LIMITED',
+      'The video platform temporarily rate-limited this session.',
+    );
+  });
+
+  it('uses UTF-8 safe head and tail windows totaling at most 64 KiB', async () => {
+    const headMarker = 'head-window-marker';
+    const tailMarker = 'tail-window-marker';
+    const stderr = [
+      headMarker,
+      '界🙂'.repeat(20_000),
+      tailMarker,
+    ].join('');
+    const observedWindows: string[] = [];
+    const originalTest = RegExp.prototype.test;
+    const testSpy = vi.spyOn(RegExp.prototype, 'test').mockImplementation(
+      function captureWindow(this: RegExp, value: string): boolean {
+        if (
+          value.includes(headMarker) ||
+          value.includes(tailMarker)
+        ) {
+          observedWindows.push(value);
+        }
+        return originalTest.call(this, value);
+      },
+    );
+    const toolchain = createToolchain();
+    const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockRejectedValueOnce(processFailure(stderr));
+
+    try {
+      await expectDownloadError(
+        createYtDlpClient({toolchain, runProcess}).probe(
+          'https://youtu.be/abc',
+          operationOptions(toolchain),
+        ),
+        'DOWNLOAD_PROBE_FAILED',
+        PROBE_FAILED_MESSAGE,
+      );
+    } finally {
+      testSpy.mockRestore();
+    }
+
+    const windows = [...new Set(observedWindows)];
+    expect(windows).toHaveLength(2);
+    expect(windows.some((window) => window.startsWith(headMarker))).toBe(true);
+    expect(windows.some((window) => window.endsWith(tailMarker))).toBe(true);
+    expect(windows.reduce(
+      (total, window) => total + Buffer.byteLength(window, 'utf8'),
+      0,
+    )).toBeLessThanOrEqual(STDERR_CLASSIFICATION_LIMIT_BYTES);
+    for (const window of windows) expect(window).not.toContain('\ufffd');
   });
 
   it('keeps unknown process and parse failures generic', async () => {
@@ -452,6 +570,33 @@ describe('yt-dlp probe', () => {
 });
 
 describe('yt-dlp download', () => {
+  it('uses the static Darwin NSTask wrapper without shell execution', async () => {
+    const toolchain = createToolchain();
+    const runProcess = vi.fn<DownloadProcessRunner>()
+      .mockResolvedValueOnce(processResult());
+
+    await createYtDlpClient({toolchain, runProcess}).download(
+      'https://youtu.be/abc',
+      40,
+      operationOptions(toolchain),
+    );
+
+    expect(runProcess).toHaveBeenCalledTimes(1);
+    const [command, wrapperArgs, processOptions] = runProcess.mock.calls[0] ?? [];
+    const wrapperScript = wrapperArgs?.[3];
+    expect(command).toBe('/usr/bin/osascript');
+    expect(command).not.toBe(toolchain.ytDlpExecutable);
+    expect(wrapperScript).toContain('NSTask');
+    expect(wrapperScript).toContain('setStartsNewProcessGroup(false)');
+    expect(wrapperScript).toContain('fchdir(3)');
+    expect(wrapperScript).not.toContain('do shell script');
+    expect(wrapperArgs?.slice(4, 6)).toEqual([
+      '--',
+      toolchain.ytDlpExecutable,
+    ]);
+    expect(processOptions).not.toHaveProperty('shell');
+  });
+
   it('uses identical profile arguments before archive-only flags', async () => {
     const toolchain = createToolchain();
     const options = operationOptions(toolchain);

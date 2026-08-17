@@ -12,6 +12,8 @@ import type {ResolvedDownloaderToolchain} from './toolchain/types';
 const PROBE_FAILED_MESSAGE = 'Video metadata could not be extracted.';
 const PROCESS_FAILED_MESSAGE = 'The video could not be downloaded.';
 const STDERR_CLASSIFICATION_LIMIT_BYTES = 64 * 1024;
+const STDERR_CLASSIFICATION_WINDOW_BYTES =
+  STDERR_CLASSIFICATION_LIMIT_BYTES / 2;
 const ACTIVE_LIVE_STATUSES = new Set([
   'is_live',
   'is_upcoming',
@@ -177,30 +179,85 @@ export interface YtDlpClient {
   ): Promise<void>;
 }
 
-const boundedStderr = (stderr: string): string => {
-  const candidate = stderr.length <= STDERR_CLASSIFICATION_LIMIT_BYTES
-    ? stderr
-    : stderr.slice(-STDERR_CLASSIFICATION_LIMIT_BYTES);
-  const bytes = Buffer.from(candidate);
-  if (bytes.byteLength <= STDERR_CLASSIFICATION_LIMIT_BYTES) return candidate;
-
-  let start = bytes.byteLength - STDERR_CLASSIFICATION_LIMIT_BYTES;
-  while (
-    start < bytes.byteLength &&
-    ((bytes[start] ?? 0) & 0xc0) === 0x80
+const nextCharacterEnd = (value: string, start: number): number => {
+  const first = value.charCodeAt(start);
+  if (
+    first >= 0xd800 &&
+    first <= 0xdbff &&
+    start + 1 < value.length
   ) {
-    start += 1;
+    const second = value.charCodeAt(start + 1);
+    if (second >= 0xdc00 && second <= 0xdfff) return start + 2;
   }
-  return bytes.subarray(start).toString('utf8');
+  return start + 1;
+};
+
+const previousCharacterStart = (value: string, end: number): number => {
+  const last = value.charCodeAt(end - 1);
+  if (last >= 0xdc00 && last <= 0xdfff && end >= 2) {
+    const previous = value.charCodeAt(end - 2);
+    if (previous >= 0xd800 && previous <= 0xdbff) return end - 2;
+  }
+  return end - 1;
+};
+
+const utf8PrefixWithinBytes = (
+  value: string,
+  maximumBytes: number,
+): string => {
+  let end = 0;
+  let bytes = 0;
+  while (end < value.length) {
+    const nextEnd = nextCharacterEnd(value, end);
+    const characterBytes = Buffer.byteLength(value.slice(end, nextEnd), 'utf8');
+    if (bytes + characterBytes > maximumBytes) break;
+    bytes += characterBytes;
+    end = nextEnd;
+  }
+  return value.slice(0, end);
+};
+
+const utf8SuffixWithinBytes = (
+  value: string,
+  maximumBytes: number,
+): string => {
+  let start = value.length;
+  let bytes = 0;
+  while (start > 0) {
+    const previousStart = previousCharacterStart(value, start);
+    const characterBytes = Buffer.byteLength(
+      value.slice(previousStart, start),
+      'utf8',
+    );
+    if (bytes + characterBytes > maximumBytes) break;
+    bytes += characterBytes;
+    start = previousStart;
+  }
+  return value.slice(start);
+};
+
+const boundedStderrWindows = (stderr: string): readonly string[] => {
+  if (
+    stderr.length <= STDERR_CLASSIFICATION_LIMIT_BYTES &&
+    Buffer.byteLength(stderr, 'utf8') <= STDERR_CLASSIFICATION_LIMIT_BYTES
+  ) {
+    return [stderr];
+  }
+  return [
+    utf8PrefixWithinBytes(stderr, STDERR_CLASSIFICATION_WINDOW_BYTES),
+    utf8SuffixWithinBytes(stderr, STDERR_CLASSIFICATION_WINDOW_BYTES),
+  ];
 };
 
 const classifiedDownloadError = (
   error: unknown,
 ): DownloadError | undefined => {
   if (!(error instanceof ProcessExecutionError)) return undefined;
-  const stderr = boundedStderr(error.result.stderr);
+  const stderrWindows = boundedStderrWindows(error.result.stderr);
   for (const [pattern, [code, message]] of CLASSIFICATIONS) {
-    if (pattern.test(stderr)) return new DownloadError(code, message);
+    if (stderrWindows.some((stderr) => pattern.test(stderr))) {
+      return new DownloadError(code, message);
+    }
   }
   return undefined;
 };
@@ -219,13 +276,16 @@ export const createYtDlpClient = (
   options: YtDlpClientOptions,
 ): YtDlpClient => {
   const runner = options.runProcess ?? runSystemProcess;
+  const childEnvironment = Object.freeze({
+    ...options.toolchain.childEnvironment,
+  });
   const toolchain = Object.freeze({
     ytDlpExecutable: options.toolchain.ytDlpExecutable,
     ffmpegExecutable: options.toolchain.ffmpegExecutable,
     ytDlpVersion: options.toolchain.ytDlpVersion,
     ffmpegVersion: options.toolchain.ffmpegVersion,
     ffmpegExplicit: options.toolchain.ffmpegExplicit,
-    childEnvironment: options.toolchain.childEnvironment,
+    childEnvironment,
   });
 
   return {
