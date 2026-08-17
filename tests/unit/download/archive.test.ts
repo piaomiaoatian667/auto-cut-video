@@ -137,7 +137,12 @@ const prepareStaging = async (
   platform: DownloadPlatform = 'youtube',
 ): Promise<{root: ValidatedArchiveRoot; prepared: StagedArchive}> => {
   const root = await validateArchiveRoot(workspaceRoot, outputRoot);
-  const prepared = await prepareArchive(root, platform, videoId);
+  const prepared = await prepareArchive(
+    root,
+    platform,
+    videoId,
+    canonicalUrlFor(platform, videoId),
+  );
   if (prepared.status !== 'staging') throw new Error('Expected staging archive.');
   return {root, prepared};
 };
@@ -216,6 +221,9 @@ const finalize = (
     ytDlpVersion: '2026.07.04',
     ffmpegVersion: 'ffmpeg version test',
   },
+  browserCookies: {used: false},
+  network: {proxyUsed: false, browserImpersonation: false},
+  toolchain: {source: 'managed', ytDlpVersion: '2026.07.04'},
   ...overrides,
 });
 
@@ -428,7 +436,12 @@ describe('prepareArchive', () => {
     try {
       const failingArchive = await import('../../../src/download/archive');
       try {
-        await failingArchive.prepareArchive(root, 'youtube', 'abc');
+        await failingArchive.prepareArchive(
+          root,
+          'youtube',
+          'abc',
+          canonicalUrlFor('youtube', 'abc'),
+        );
       } catch (error) {
         failure = error;
       }
@@ -488,7 +501,12 @@ describe('prepareArchive', () => {
     try {
       const failingArchive = await import('../../../src/download/archive');
       try {
-        await failingArchive.prepareArchive(root, 'youtube', 'abc');
+        await failingArchive.prepareArchive(
+          root,
+          'youtube',
+          'abc',
+          canonicalUrlFor('youtube', 'abc'),
+        );
       } catch (error) {
         failure = error;
       }
@@ -550,7 +568,12 @@ describe('prepareArchive', () => {
     try {
       const failingArchive = await import('../../../src/download/archive');
       try {
-        await failingArchive.prepareArchive(root, 'youtube', 'abc');
+        await failingArchive.prepareArchive(
+          root,
+          'youtube',
+          'abc',
+          canonicalUrlFor('youtube', 'abc'),
+        );
       } catch (error) {
         failure = error;
       }
@@ -587,7 +610,12 @@ describe('prepareArchive', () => {
     const root = await validateArchiveRoot(workspaceRoot, 'downloads');
 
     await expectDownloadError(
-      prepareArchive(root, 'youtube', videoId),
+      prepareArchive(
+        root,
+        'youtube',
+        videoId,
+        canonicalUrlFor('youtube', videoId),
+      ),
       'DOWNLOAD_ARCHIVE_INVALID',
       ARCHIVE_INVALID_MESSAGE,
     );
@@ -1086,6 +1114,7 @@ describe('finalizeArchive', () => {
         root,
         'youtube',
         'abc',
+        canonicalUrlFor('youtube', 'abc'),
       );
       if (archivePreparation.status !== 'staging') {
         throw new Error('Expected staging archive.');
@@ -1171,6 +1200,7 @@ describe('finalizeArchive', () => {
         root,
         'youtube',
         'abc',
+        canonicalUrlFor('youtube', 'abc'),
       );
       if (archivePreparation.status !== 'staging') {
         throw new Error('Expected staging archive.');
@@ -1347,6 +1377,7 @@ describe('finalizeArchive', () => {
         root,
         'youtube',
         'abc',
+        canonicalUrlFor('youtube', 'abc'),
       );
       if (archivePreparation.status !== 'staging') {
         throw new Error('Expected staging archive.');
@@ -1433,6 +1464,7 @@ describe('finalizeArchive', () => {
         root,
         'youtube',
         'abc',
+        canonicalUrlFor('youtube', 'abc'),
       );
       if (archivePreparation.status !== 'staging') {
         throw new Error('Expected staging archive.');
@@ -1509,6 +1541,7 @@ describe('finalizeArchive', () => {
         root,
         'youtube',
         'abc',
+        canonicalUrlFor('youtube', 'abc'),
       );
       if (archivePreparation.status !== 'staging') {
         throw new Error('Expected staging archive.');
@@ -1608,6 +1641,7 @@ describe('finalizeArchive', () => {
         root,
         'youtube',
         'abc',
+        canonicalUrlFor('youtube', 'abc'),
       );
       if (archivePreparation.status !== 'staging') {
         throw new Error('Expected staging archive.');
@@ -1673,6 +1707,7 @@ describe('finalizeArchive', () => {
         root,
         'youtube',
         'abc',
+        canonicalUrlFor('youtube', 'abc'),
       );
       if (archivePreparation.status !== 'staging') {
         throw new Error('Expected staging archive.');
@@ -1694,7 +1729,12 @@ describe('finalizeArchive', () => {
       } catch (error) {
         failure = error;
       }
-      duplicate = await racedArchive.prepareArchive(root, 'youtube', 'abc');
+      duplicate = await racedArchive.prepareArchive(
+        root,
+        'youtube',
+        'abc',
+        canonicalUrlFor('youtube', 'abc'),
+      );
     } finally {
       vi.doUnmock('../../../src/process/run-process');
       vi.resetModules();
@@ -1752,6 +1792,7 @@ describe('finalizeArchive', () => {
         root,
         'youtube',
         'abc',
+        canonicalUrlFor('youtube', 'abc'),
       );
       if (archivePreparation.status !== 'staging') {
         throw new Error('Expected staging archive.');
@@ -1818,6 +1859,7 @@ describe('finalizeArchive', () => {
         root,
         'youtube',
         'abc',
+        canonicalUrlFor('youtube', 'abc'),
       );
       if (archivePreparation.status !== 'staging') {
         throw new Error('Expected staging archive.');
@@ -1865,7 +1907,12 @@ describe('prepareArchive duplicate verification', () => {
   it('returns already-present only after validating and rehashing the archive', async () => {
     const published = await publishArchive();
 
-    const duplicate = await prepareArchive(published.root, 'youtube', 'abc');
+    const duplicate = await prepareArchive(
+      published.root,
+      'youtube',
+      'abc',
+      'https://YOUTU.BE:443/abc#probe',
+    );
 
     expect(duplicate).toEqual({
       status: 'already-present',
@@ -1876,6 +1923,32 @@ describe('prepareArchive duplicate verification', () => {
       receiptPath: 'downloads/youtube/abc/receipt.json',
       receipt: published.result.receipt,
     });
+    expect(await readdir(path.join(published.root.absolutePath, '.staging')))
+      .toEqual([]);
+  });
+
+  it('rejects an existing archive whose receipt canonical URL differs from the probe', async () => {
+    const published = await publishArchive();
+    const receiptSource = await readFile(
+      path.join(published.finalDirectory, 'receipt.json'),
+      'utf8',
+    );
+
+    await expectDownloadError(
+      prepareArchive(
+        published.root,
+        'youtube',
+        'abc',
+        'https://www.youtube.com/watch?v=different-video',
+      ),
+      'DOWNLOAD_DESTINATION_CONFLICT',
+      DESTINATION_CONFLICT_MESSAGE,
+    );
+
+    expect(await readFile(
+      path.join(published.finalDirectory, 'receipt.json'),
+      'utf8',
+    )).toBe(receiptSource);
     expect(await readdir(path.join(published.root.absolutePath, '.staging')))
       .toEqual([]);
   });
@@ -1891,7 +1964,12 @@ describe('prepareArchive duplicate verification', () => {
     await writeStagedFiles(prepared);
     const result = await finalize(prepared, {browserCookieSource: 'chrome'});
 
-    const duplicate = await prepareArchive(root, 'douyin', DOUYIN_VIDEO_ID);
+    const duplicate = await prepareArchive(
+      root,
+      'douyin',
+      DOUYIN_VIDEO_ID,
+      canonicalUrlFor('douyin', DOUYIN_VIDEO_ID),
+    );
 
     expect(result.receipt).toMatchObject({
       version: 2,
@@ -1923,7 +2001,12 @@ describe('prepareArchive duplicate verification', () => {
 
     expect(Buffer.byteLength(legacy.metadataSource))
       .toBeGreaterThan(PROCESS_OUTPUT_LIMIT_BYTES);
-    const duplicate = await prepareArchive(published.root, 'youtube', 'abc');
+    const duplicate = await prepareArchive(
+      published.root,
+      'youtube',
+      'abc',
+      canonicalUrlFor('youtube', 'abc'),
+    );
 
     expect(duplicate).toMatchObject({
       status: 'already-present',
@@ -1972,7 +2055,12 @@ describe('prepareArchive duplicate verification', () => {
       JSON.parse(legacy.receiptSource),
     );
 
-    const duplicate = await prepareArchive(root, 'douyin', DOUYIN_VIDEO_ID);
+    const duplicate = await prepareArchive(
+      root,
+      'douyin',
+      DOUYIN_VIDEO_ID,
+      canonicalUrlFor('douyin', DOUYIN_VIDEO_ID),
+    );
 
     expect(duplicate).toMatchObject({
       status: 'already-present',
@@ -2001,7 +2089,12 @@ describe('prepareArchive duplicate verification', () => {
       await chmod(path.join(published.finalDirectory, entry), 0o644);
     }
 
-    const duplicate = await prepareArchive(published.root, 'youtube', 'abc');
+    const duplicate = await prepareArchive(
+      published.root,
+      'youtube',
+      'abc',
+      canonicalUrlFor('youtube', 'abc'),
+    );
 
     expect(duplicate).toEqual({
       status: 'already-present',
@@ -2040,7 +2133,12 @@ describe('prepareArchive duplicate verification', () => {
     const entriesBefore = sortNames(await readdir(published.finalDirectory));
 
     await expectDownloadError(
-      prepareArchive(published.root, 'youtube', 'abc'),
+      prepareArchive(
+        published.root,
+        'youtube',
+        'abc',
+        canonicalUrlFor('youtube', 'abc'),
+      ),
       'DOWNLOAD_DESTINATION_CONFLICT',
       DESTINATION_CONFLICT_MESSAGE,
     );
@@ -2064,7 +2162,12 @@ describe('prepareArchive duplicate verification', () => {
     const entriesBefore = sortNames(await readdir(published.finalDirectory));
 
     await expectDownloadError(
-      prepareArchive(published.root, 'youtube', 'abc'),
+      prepareArchive(
+        published.root,
+        'youtube',
+        'abc',
+        canonicalUrlFor('youtube', 'abc'),
+      ),
       'DOWNLOAD_DESTINATION_CONFLICT',
       DESTINATION_CONFLICT_MESSAGE,
     );
@@ -2092,7 +2195,12 @@ describe('prepareArchive duplicate verification', () => {
     const entriesBefore = sortNames(await readdir(published.finalDirectory));
 
     await expectDownloadError(
-      prepareArchive(published.root, 'youtube', 'abc'),
+      prepareArchive(
+        published.root,
+        'youtube',
+        'abc',
+        canonicalUrlFor('youtube', 'abc'),
+      ),
       'DOWNLOAD_DESTINATION_CONFLICT',
       DESTINATION_CONFLICT_MESSAGE,
     );
@@ -2151,7 +2259,12 @@ describe('prepareArchive duplicate verification', () => {
     try {
       const racedArchive = await import('../../../src/download/archive');
       try {
-        await racedArchive.prepareArchive(published.root, 'youtube', 'abc');
+        await racedArchive.prepareArchive(
+          published.root,
+          'youtube',
+          'abc',
+          canonicalUrlFor('youtube', 'abc'),
+        );
       } catch (error) {
         failure = error;
       }
@@ -2181,7 +2294,12 @@ describe('prepareArchive duplicate verification', () => {
     const entriesBefore = sortNames(await readdir(published.finalDirectory));
 
     await expectDownloadError(
-      prepareArchive(published.root, 'youtube', 'abc'),
+      prepareArchive(
+        published.root,
+        'youtube',
+        'abc',
+        canonicalUrlFor('youtube', 'abc'),
+      ),
       'DOWNLOAD_DESTINATION_CONFLICT',
       DESTINATION_CONFLICT_MESSAGE,
     );
@@ -2198,7 +2316,12 @@ describe('prepareArchive duplicate verification', () => {
     const entriesBefore = sortNames(await readdir(published.finalDirectory));
 
     await expectDownloadError(
-      prepareArchive(published.root, 'youtube', 'abc'),
+      prepareArchive(
+        published.root,
+        'youtube',
+        'abc',
+        canonicalUrlFor('youtube', 'abc'),
+      ),
       'DOWNLOAD_DESTINATION_CONFLICT',
       DESTINATION_CONFLICT_MESSAGE,
     );
@@ -2214,7 +2337,12 @@ describe('prepareArchive duplicate verification', () => {
     await writeFile(extraPath, 'extra');
 
     await expectDownloadError(
-      prepareArchive(published.root, 'youtube', 'abc'),
+      prepareArchive(
+        published.root,
+        'youtube',
+        'abc',
+        canonicalUrlFor('youtube', 'abc'),
+      ),
       'DOWNLOAD_DESTINATION_CONFLICT',
       DESTINATION_CONFLICT_MESSAGE,
     );
@@ -2232,7 +2360,12 @@ describe('prepareArchive duplicate verification', () => {
     await symlink(target, mediaPath);
 
     await expectDownloadError(
-      prepareArchive(published.root, 'youtube', 'abc'),
+      prepareArchive(
+        published.root,
+        'youtube',
+        'abc',
+        canonicalUrlFor('youtube', 'abc'),
+      ),
       'DOWNLOAD_DESTINATION_CONFLICT',
       DESTINATION_CONFLICT_MESSAGE,
     );
@@ -2252,7 +2385,12 @@ describe('prepareArchive duplicate verification', () => {
     await symlink(target, path.join(root.absolutePath, 'youtube', 'abc'));
 
     await expectDownloadError(
-      prepareArchive(root, 'youtube', 'abc'),
+      prepareArchive(
+        root,
+        'youtube',
+        'abc',
+        canonicalUrlFor('youtube', 'abc'),
+      ),
       'DOWNLOAD_DESTINATION_CONFLICT',
       DESTINATION_CONFLICT_MESSAGE,
     );
@@ -2354,6 +2492,7 @@ describe('cleanupArchive', () => {
         root,
         'youtube',
         'abc',
+        canonicalUrlFor('youtube', 'abc'),
       );
       if (archivePreparation.status !== 'staging') {
         throw new Error('Expected staging archive.');
@@ -2441,6 +2580,7 @@ describe('cleanupArchive', () => {
         root,
         'youtube',
         'abc',
+        canonicalUrlFor('youtube', 'abc'),
       );
       if (archivePreparation.status !== 'staging') {
         throw new Error('Expected staging archive.');
@@ -2519,6 +2659,7 @@ describe('cleanupArchive', () => {
         root,
         'youtube',
         'abc',
+        canonicalUrlFor('youtube', 'abc'),
       );
       if (archivePreparation.status !== 'staging') {
         throw new Error('Expected staging archive.');
@@ -2603,6 +2744,7 @@ describe('cleanupArchive', () => {
           root,
           'youtube',
           'abc',
+          canonicalUrlFor('youtube', 'abc'),
         );
         if (archivePreparation.status !== 'staging') {
           throw new Error('Expected staging archive.');

@@ -8,8 +8,8 @@ import {
   type DownloadedArchive,
   type ExistingArchive,
   type FinalizeArchiveInput,
-  type StagingDownloadAuthority,
   type StagedArchive,
+  type StagingDownloadAuthority,
   type ValidatedArchiveRoot,
 } from './archive';
 import {
@@ -18,15 +18,27 @@ import {
 } from './browser-cookies';
 import {DownloadError} from './errors';
 import {
+  validateDownloadProxy,
+  type DownloadProxy,
+} from './network-options';
+import {
+  resolvePlatformProfile,
+  type ResolvedPlatformProfile,
+} from './platform-profiles';
+import {
   assertExtractorMatches,
   parseDownloadUrl,
   type DownloadPlatform,
+  type ValidatedDownloadUrl,
 } from './platforms';
+import {resolveDownloaderToolchain} from './toolchain/resolver';
+import type {ResolvedDownloaderToolchain} from './toolchain/types';
 import {
   createYtDlpClient,
+  type DownloadProcessRunner,
   type SafeYtDlpMetadata,
   type YtDlpClient,
-  type YtDlpClientOptions,
+  type YtDlpProbe,
 } from './yt-dlp';
 
 const EXTRACTOR_MISMATCH_MESSAGE =
@@ -38,14 +50,23 @@ const RESTRICTED_AVAILABILITY = new Set([
   'needs_auth',
 ]);
 
-export interface DownloadInput {
-  workspaceRoot: string;
+export interface DownloadCheckInput {
   url: string;
-  outputRoot: string;
   rightsConfirmed: boolean;
+  proxy?: DownloadProxy;
   browserCookieSource?: BrowserCookieSource;
   cookieAccessConfirmed: boolean;
   signal?: AbortSignal;
+}
+
+export interface DownloadCheckResult {
+  platform: DownloadPlatform;
+  result: 'available';
+}
+
+export interface DownloadInput extends DownloadCheckInput {
+  workspaceRoot: string;
+  outputRoot: string;
 }
 
 export type DownloadResult = DownloadedArchive | ExistingArchive;
@@ -59,6 +80,7 @@ export interface DownloadArchiveDependencies {
     root: ValidatedArchiveRoot,
     platform: DownloadPlatform,
     videoId: string,
+    canonicalUrl: string,
   ): Promise<ArchivePreparation>;
   openStagingDownloadAuthority(
     prepared: StagedArchive,
@@ -71,98 +93,161 @@ export interface DownloadArchiveDependencies {
 }
 
 export interface DownloadDependencies {
-  client: YtDlpClient;
+  resolveToolchain(signal?: AbortSignal): Promise<ResolvedDownloaderToolchain>;
+  createClient(toolchain: ResolvedDownloaderToolchain): YtDlpClient;
   archive: DownloadArchiveDependencies;
+  wait(milliseconds: number, signal?: AbortSignal): Promise<void>;
   now(): Date;
 }
 
-export const downloadVideo = async (
-  input: DownloadInput,
-  dependencies: DownloadDependencies,
-): Promise<DownloadResult> => {
-  if (input.rightsConfirmed !== true) {
-    throw new DownloadError(
-      'DOWNLOAD_RIGHTS_NOT_CONFIRMED',
-      'Confirm that you are permitted to save this public video.',
-    );
-  }
+export interface SystemDownloadOptions {
+  ytDlpOverride?: string;
+  ffmpegOverride?: string;
+  homeDirectory?: string;
+  runProcess?: DownloadProcessRunner;
+}
 
-  const requested = parseDownloadUrl(input.url);
-  const browserCookieSource = validateBrowserCookieRequest(
-    input.browserCookieSource,
-    input.cookieAccessConfirmed,
-    requested.platform,
-  );
-  const operationOptions =
-    browserCookieSource === undefined && input.signal === undefined
-      ? undefined
-      : Object.freeze({
-          ...(browserCookieSource === undefined ? {} : {browserCookieSource}),
-          ...(input.signal === undefined ? {} : {signal: input.signal}),
-        });
-  const root = await dependencies.archive.validateRoot(
-    input.workspaceRoot,
-    input.outputRoot,
-  );
-  const tools = input.signal === undefined
-    ? await dependencies.client.checkTools()
-    : await dependencies.client.checkTools(input.signal);
-  const probe = await dependencies.client.probe(requested.url, operationOptions);
-  assertExtractorMatches(requested.platform, probe.extractor);
-  if (
-    probe.availability !== null &&
-    probe.availability !== undefined &&
-    RESTRICTED_AVAILABILITY.has(probe.availability)
-  ) {
-    throw new DownloadError(
-      'DOWNLOAD_CONTENT_RESTRICTED',
-      'The requested video is not available as authorized public content.',
-    );
-  }
+interface ResolvedDownloadSession {
+  requested: ValidatedDownloadUrl;
+  toolchain: ResolvedDownloaderToolchain;
+  profile: ResolvedPlatformProfile;
+  client: YtDlpClient;
+}
 
-  let canonical: ReturnType<typeof parseDownloadUrl>;
+interface InspectedDownloadRequest extends ResolvedDownloadSession {
+  canonical: ValidatedDownloadUrl;
+  probe: YtDlpProbe;
+}
+
+const parseCanonicalForPlatform = (
+  source: string,
+  platform: DownloadPlatform,
+): ValidatedDownloadUrl => {
   try {
-    canonical = parseDownloadUrl(probe.canonicalUrl);
+    const canonical = parseDownloadUrl(source);
+    if (canonical.platform !== platform) throw new Error();
+    return canonical;
   } catch {
     throw new DownloadError(
       'DOWNLOAD_EXTRACTOR_MISMATCH',
       EXTRACTOR_MISMATCH_MESSAGE,
     );
   }
-  if (canonical.platform !== requested.platform) {
+};
+
+const resolveDownloadSession = async (
+  input: DownloadCheckInput,
+  dependencies: DownloadDependencies,
+): Promise<ResolvedDownloadSession> => {
+  if (input.rightsConfirmed !== true) {
     throw new DownloadError(
-      'DOWNLOAD_EXTRACTOR_MISMATCH',
-      EXTRACTOR_MISMATCH_MESSAGE,
+      'DOWNLOAD_RIGHTS_NOT_CONFIRMED',
+      'Confirm that you are permitted to save this public video.',
     );
   }
+  const requested = parseDownloadUrl(input.url);
+  const proxy = validateDownloadProxy(input.proxy);
+  const browserCookieSource = validateBrowserCookieRequest(
+    input.browserCookieSource,
+    input.cookieAccessConfirmed,
+    requested.platform,
+  );
+  const toolchain = await dependencies.resolveToolchain(input.signal);
+  const profile = resolvePlatformProfile({
+    platform: requested.platform,
+    toolchain,
+    ...(proxy === undefined ? {} : {proxy}),
+    ...(browserCookieSource === undefined ? {} : {browserCookieSource}),
+  });
+  return {
+    requested,
+    toolchain,
+    profile,
+    client: dependencies.createClient(toolchain),
+  };
+};
+
+const inspectResolvedSession = async (
+  session: ResolvedDownloadSession,
+  signal?: AbortSignal,
+): Promise<InspectedDownloadRequest> => {
+  const probe = await session.client.probe(session.requested.url, {
+    profile: session.profile,
+    ...(signal === undefined ? {} : {signal}),
+  });
+  assertExtractorMatches(session.requested.platform, probe.extractor);
+  if (
+    probe.hasDrm ||
+    (probe.availability !== undefined &&
+      probe.availability !== null &&
+      RESTRICTED_AVAILABILITY.has(probe.availability))
+  ) {
+    throw new DownloadError(
+      'DOWNLOAD_CONTENT_RESTRICTED',
+      'The requested video is not available as authorized public content.',
+    );
+  }
+  const canonical = parseCanonicalForPlatform(
+    probe.canonicalUrl,
+    session.requested.platform,
+  );
+  return {...session, canonical, probe};
+};
+
+export const checkVideoDownload = async (
+  input: DownloadCheckInput,
+  dependencies: DownloadDependencies,
+): Promise<DownloadCheckResult> => {
+  const session = await resolveDownloadSession(input, dependencies);
+  const checked = await inspectResolvedSession(session, input.signal);
+  return {platform: checked.requested.platform, result: 'available'};
+};
+
+export const downloadVideo = async (
+  input: DownloadInput,
+  dependencies: DownloadDependencies,
+): Promise<DownloadResult> => {
+  const session = await resolveDownloadSession(input, dependencies);
+  const root = await dependencies.archive.validateRoot(
+    input.workspaceRoot,
+    input.outputRoot,
+  );
+  const checked = await inspectResolvedSession(session, input.signal);
   const safeMetadata: SafeYtDlpMetadata = {
-    id: probe.id,
-    title: probe.title,
-    webpage_url: canonical.url,
-    extractor: probe.extractor,
-    ...(probe.extractorKey === undefined
+    id: checked.probe.id,
+    title: checked.probe.title,
+    webpage_url: checked.canonical.url,
+    extractor: checked.probe.extractor,
+    ...(checked.probe.extractorKey === undefined
       ? {}
-      : {extractor_key: probe.extractorKey}),
+      : {extractor_key: checked.probe.extractorKey}),
     _type: 'video',
   };
-
   const prepared = await dependencies.archive.prepare(
     root,
-    requested.platform,
-    probe.id,
+    checked.requested.platform,
+    checked.probe.id,
+    checked.canonical.url,
   );
   if (prepared.status === 'already-present') return prepared;
 
   try {
+    await dependencies.wait(
+      checked.profile.probeToDownloadDelayMs,
+      input.signal,
+    );
     const authority = await dependencies.archive.openStagingDownloadAuthority(
       prepared,
     );
     let authorityOperationFailure: unknown;
     try {
-      await dependencies.client.download(
-        requested.url,
+      await checked.client.download(
+        checked.requested.url,
         authority.fd,
-        operationOptions,
+        {
+          profile: checked.profile,
+          ...(input.signal === undefined ? {} : {signal: input.signal}),
+        },
       );
       await authority.writeMetadata(safeMetadata);
     } catch (error) {
@@ -176,13 +261,18 @@ export const downloadVideo = async (
     if (authorityOperationFailure !== undefined) throw authorityOperationFailure;
 
     return await dependencies.archive.finalize(prepared, {
-      platform: requested.platform,
-      videoId: probe.id,
-      title: probe.title,
-      canonicalUrl: canonical.url,
+      platform: checked.requested.platform,
+      videoId: checked.probe.id,
+      title: checked.probe.title,
+      canonicalUrl: checked.canonical.url,
       downloadedAt: dependencies.now(),
-      tools,
-      ...(browserCookieSource === undefined ? {} : {browserCookieSource}),
+      tools: {
+        ytDlpVersion: checked.toolchain.ytDlpVersion,
+        ffmpegVersion: checked.toolchain.ffmpegVersion,
+      },
+      browserCookies: checked.profile.browserCookies,
+      network: checked.profile.networkAudit,
+      toolchain: checked.profile.toolchainAudit,
     });
   } catch (error) {
     try {
@@ -193,23 +283,50 @@ export const downloadVideo = async (
   }
 };
 
+export const waitForDownloadDelay = async (
+  milliseconds: number,
+  signal?: AbortSignal,
+): Promise<void> => await new Promise((resolve, reject) => {
+  if (signal?.aborted === true) {
+    reject(signal.reason);
+    return;
+  }
+  const timer = setTimeout(settle, milliseconds);
+  const abort = (): void => settle(signal?.reason, true);
+  function settle(reason?: unknown, aborted = false): void {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
+    if (aborted) reject(reason);
+    else resolve();
+  }
+  signal?.addEventListener('abort', abort, {once: true});
+});
+
 export const createSystemDownloadDependencies = (
-  options: YtDlpClientOptions = {},
+  options: SystemDownloadOptions = {},
 ): DownloadDependencies => {
-  const clientOptions: YtDlpClientOptions = {
-    ...(options.runProcess === undefined
+  const resolverOptions = {
+    ...(options.ytDlpOverride === undefined
       ? {}
-      : {runProcess: options.runProcess}),
-    ...(options.ytDlpExecutable === undefined
+      : {ytDlpOverride: options.ytDlpOverride}),
+    ...(options.ffmpegOverride === undefined
       ? {}
-      : {ytDlpExecutable: options.ytDlpExecutable}),
-    ...(options.ffmpegExecutable === undefined
+      : {ffmpegOverride: options.ffmpegOverride}),
+    ...(options.homeDirectory === undefined
       ? {}
-      : {ffmpegExecutable: options.ffmpegExecutable}),
+      : {homeDirectory: options.homeDirectory}),
   };
+  const runProcess = options.runProcess;
 
   return {
-    client: createYtDlpClient(clientOptions),
+    resolveToolchain: async (signal) => await resolveDownloaderToolchain({
+      ...resolverOptions,
+      ...(signal === undefined ? {} : {signal}),
+    }),
+    createClient: (toolchain) => createYtDlpClient({
+      toolchain,
+      ...(runProcess === undefined ? {} : {runProcess}),
+    }),
     archive: {
       validateRoot: validateArchiveRoot,
       prepare: prepareArchive,
@@ -217,6 +334,7 @@ export const createSystemDownloadDependencies = (
       finalize: finalizeArchive,
       cleanup: cleanupArchive,
     },
+    wait: waitForDownloadDelay,
     now: () => new Date(),
   };
 };

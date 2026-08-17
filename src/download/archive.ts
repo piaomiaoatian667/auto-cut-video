@@ -15,6 +15,7 @@ import path from 'node:path';
 import {runProcess} from '../process/run-process';
 import type {BrowserCookieSource} from './browser-cookies';
 import {DownloadError} from './errors';
+import type {ResolvedPlatformProfile} from './platform-profiles';
 import {
   assertExtractorMatches,
   DownloadPlatformSchema,
@@ -27,6 +28,7 @@ import {
   type DownloadArchiveFile,
   type DownloadReceipt,
 } from './receipt-schema';
+import type {DownloaderToolchainAudit} from './toolchain/types';
 import {
   parseYtDlpInfo,
   SafeYtDlpMetadataSchema,
@@ -999,6 +1001,9 @@ export interface FinalizeArchiveInput {
   canonicalUrl: string;
   downloadedAt: Date;
   tools: DownloadToolVersions;
+  browserCookies?: ResolvedPlatformProfile['browserCookies'];
+  network?: ResolvedPlatformProfile['networkAudit'];
+  toolchain?: DownloaderToolchainAudit;
   browserCookieSource?: BrowserCookieSource;
 }
 
@@ -1380,6 +1385,7 @@ const readExistingArchive = async (
   relativeDirectory: string,
   platform: DownloadPlatform,
   videoId: string,
+  canonicalUrl: string,
 ): Promise<ExistingArchive | null> => {
   const handles: FileHandle[] = [];
   try {
@@ -1442,7 +1448,8 @@ const readExistingArchive = async (
     if (
       metadataCanonical.platform !== receipt.platform ||
       receiptCanonical.platform !== receipt.platform ||
-      metadataCanonical.url !== receiptCanonical.url
+      metadataCanonical.url !== receiptCanonical.url ||
+      receiptCanonical.url !== canonicalUrl
     ) {
       throw new Error();
     }
@@ -1811,8 +1818,20 @@ export const prepareArchive = async (
   root: ValidatedArchiveRoot,
   platform: DownloadPlatform,
   videoId: string,
+  canonicalUrl: string,
 ): Promise<ArchivePreparation> => {
-  if (!validVideoId(videoId) || !DownloadPlatformSchema.safeParse(platform).success) {
+  let canonical: ReturnType<typeof parseDownloadUrl>;
+  try {
+    if (
+      !validVideoId(videoId) ||
+      !DownloadPlatformSchema.safeParse(platform).success ||
+      typeof canonicalUrl !== 'string'
+    ) {
+      throw new Error();
+    }
+    canonical = parseDownloadUrl(canonicalUrl);
+    if (canonical.platform !== platform) throw new Error();
+  } catch {
     throw new DownloadError('DOWNLOAD_ARCHIVE_INVALID', ARCHIVE_INVALID_MESSAGE);
   }
 
@@ -1843,6 +1862,7 @@ export const prepareArchive = async (
     relativeDirectory,
     platform,
     videoId,
+    canonical.url,
   );
   if (existingArchive !== null) return existingArchive;
 
