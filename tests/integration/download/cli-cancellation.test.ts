@@ -1,4 +1,4 @@
-import {spawn, type ChildProcess} from 'node:child_process';
+import {execFile, spawn, type ChildProcess} from 'node:child_process';
 import {
   access,
   readFile,
@@ -7,6 +7,7 @@ import {
 import path from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
 import {fileURLToPath} from 'node:url';
+import {promisify} from 'node:util';
 import {afterEach, describe, expect, it, vi} from 'vitest';
 import {DENO_EXECUTABLE_ENVIRONMENT_KEY} from '../../../src/download/toolchain/deno-wrapper';
 import {EXIT_CODES} from '../../../src/cli/exit-codes';
@@ -21,10 +22,17 @@ import {
 const PROJECT_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
 const TSX_PATH = path.join(PROJECT_ROOT, 'node_modules', '.bin', 'tsx');
 const CANONICAL_URL = 'https://www.youtube.com/watch?v=cancelled';
+const execFileAsync = promisify(execFile);
 
 interface RecordedPids {
   parent: number;
   child: number;
+}
+
+interface ProcessSnapshot {
+  pid: number;
+  parentPid: number;
+  command: string;
 }
 
 const fixtures: ManagedDownloadFixture[] = [];
@@ -60,6 +68,81 @@ const readWhenReady = async (
     await delay(10);
   }
   throw new Error(`Timed out waiting for ${path.basename(target)}.`);
+};
+
+const descendantProcesses = async (rootPid: number): Promise<ProcessSnapshot[]> => {
+  const {stdout} = await execFileAsync('/bin/ps', [
+    '-axo',
+    'pid=,ppid=,command=',
+  ]);
+  const processes = stdout
+    .split(/\r?\n/u)
+    .map((line): ProcessSnapshot | undefined => {
+      const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/u.exec(line);
+      if (match === null) return undefined;
+      return {
+        pid: Number(match[1]),
+        parentPid: Number(match[2]),
+        command: match[3] ?? '',
+      };
+    })
+    .filter((entry): entry is ProcessSnapshot => entry !== undefined);
+  const descendants: ProcessSnapshot[] = [];
+  const parents = new Set([rootPid]);
+  let found = true;
+  while (found) {
+    found = false;
+    for (const processSnapshot of processes) {
+      if (
+        parents.has(processSnapshot.parentPid)
+        && !parents.has(processSnapshot.pid)
+      ) {
+        parents.add(processSnapshot.pid);
+        descendants.push(processSnapshot);
+        found = true;
+      }
+    }
+  }
+  return descendants;
+};
+
+const waitForDescendantCommand = async (
+  rootPid: number,
+  marker: string,
+  timeoutMs = 10_000,
+): Promise<ProcessSnapshot[]> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const descendants = await descendantProcesses(rootPid);
+    if (descendants.some((entry) => entry.command.includes(marker))) {
+      return descendants;
+    }
+    await delay(2);
+  }
+  throw new Error(`Timed out waiting for descendant command ${marker}.`);
+};
+
+const waitForStagingMetadata = async (
+  stagingRoot: string,
+  timeoutMs = 10_000,
+): Promise<string> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const entries = await readdir(stagingRoot);
+      if (entries.length === 1) {
+        const stagingDirectory = path.join(stagingRoot, entries[0] ?? '');
+        await access(path.join(stagingDirectory, 'video.info.json'));
+        return stagingDirectory;
+      }
+    } catch (error) {
+      if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) {
+        throw error;
+      }
+    }
+    await delay(2);
+  }
+  throw new Error('Timed out waiting for staged metadata.');
 };
 
 const waitForCleanupQuarantine = async (stagingRoot: string): Promise<string> => {
@@ -259,6 +342,75 @@ describe.skipIf(process.platform !== 'darwin' || process.arch !== 'arm64')(
         ],
         {timeout: 3000, interval: 10},
       ).toEqual([false, false]);
+    });
+
+    it('cancels during post-download archive inspection without publishing', async () => {
+      const fixture = await createManagedDownloadFixture();
+      fixtures.push(fixture);
+      const runnerEnvironment = fixture.createHarnessEnvironment({
+        managedFixtureRoot: fixture.root,
+      });
+      const child = spawn(TSX_PATH, [
+        MANAGED_FIXTURE_RUNNER,
+        'download',
+        CANONICAL_URL,
+        '--rights-confirmed',
+      ], {
+        cwd: fixture.workspaceRoot,
+        env: {
+          ...runnerEnvironment,
+          FAKE_YT_DLP_LARGE_MEDIA_BYTES: String(1024 * 1024 * 1024),
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      childProcesses.push(child);
+      let stdout = '';
+      let stderr = '';
+      child.stdout?.setEncoding('utf8');
+      child.stderr?.setEncoding('utf8');
+      child.stdout?.on('data', (chunk: string) => { stdout += chunk; });
+      child.stderr?.on('data', (chunk: string) => { stderr += chunk; });
+      const exit = waitForExit(child);
+
+      const downloadPid = Number((await readWhenReady(
+        path.join(fixture.stateDirectory, 'download-complete'),
+      )).trim());
+      expect(Number.isSafeInteger(downloadPid)).toBe(true);
+      await expect.poll(
+        () => isProcessAlive(downloadPid),
+        {timeout: 3000, interval: 5},
+      ).toBe(false);
+      const stagingRoot = path.join(fixture.workspaceRoot, 'downloads', '.staging');
+      await waitForStagingMetadata(stagingRoot);
+      if (child.pid === undefined) throw new Error('Expected videoctl PID.');
+      const finalizeDescendants = await waitForDescendantCommand(
+        child.pid,
+        'inspect-staging',
+      );
+      descendantPids.push(...finalizeDescendants.map((entry) => entry.pid));
+
+      expect(child.kill('SIGINT')).toBe(true);
+      await expect(exit).resolves.toEqual({
+        code: EXIT_CODES.cancelled,
+        signal: null,
+      });
+
+      expect(stdout).toBe('');
+      expect(stderr).toBe(
+        'Download failed [DOWNLOAD_PROCESS_FAILED]: '
+        + 'The download operation was cancelled.\n',
+      );
+      expect(await readdir(stagingRoot)).toEqual([]);
+      await expect(access(path.join(
+        fixture.workspaceRoot,
+        'downloads',
+        'youtube',
+        'cancelled',
+      ))).rejects.toMatchObject({code: 'ENOENT'});
+      await expect.poll(
+        () => finalizeDescendants.map((entry) => isProcessAlive(entry.pid)),
+        {timeout: 3000, interval: 10},
+      ).toEqual(finalizeDescendants.map(() => false));
     });
   },
 );

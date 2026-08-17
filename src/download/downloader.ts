@@ -16,7 +16,11 @@ import {
   validateBrowserCookieRequest,
   type BrowserCookieSource,
 } from './browser-cookies';
-import {DownloadCancellationError} from './cancellation';
+import {
+  DownloadCancellationError,
+  downloadCancellationFrom,
+  throwIfDownloadCancelled,
+} from './cancellation';
 import {DownloadError} from './errors';
 import {
   validateDownloadProxy,
@@ -89,6 +93,7 @@ export interface DownloadArchiveDependencies {
   finalize(
     prepared: StagedArchive,
     input: FinalizeArchiveInput,
+    signal?: AbortSignal,
   ): Promise<DownloadedArchive>;
   cleanup(prepared: StagedArchive): Promise<void>;
 }
@@ -250,18 +255,26 @@ export const downloadVideo = async (
           ...(input.signal === undefined ? {} : {signal: input.signal}),
         },
       );
-      await authority.writeMetadata(safeMetadata);
+      throwIfDownloadCancelled(input.signal);
+      await authority.writeMetadata(safeMetadata, input.signal);
+      throwIfDownloadCancelled(input.signal);
     } catch (error) {
-      authorityOperationFailure = error;
+      authorityOperationFailure = downloadCancellationFrom(error) ?? error;
     }
     try {
       await authority.close();
     } catch (error) {
-      if (authorityOperationFailure === undefined) throw error;
+      if (authorityOperationFailure === undefined) {
+        const cancellation = downloadCancellationFrom(error);
+        if (cancellation !== undefined) throw cancellation;
+        throwIfDownloadCancelled(input.signal);
+        throw error;
+      }
     }
     if (authorityOperationFailure !== undefined) throw authorityOperationFailure;
+    throwIfDownloadCancelled(input.signal);
 
-    return await dependencies.archive.finalize(prepared, {
+    const finalizeInput: FinalizeArchiveInput = {
       platform: checked.requested.platform,
       videoId: checked.probe.id,
       title: checked.probe.title,
@@ -274,13 +287,20 @@ export const downloadVideo = async (
       browserCookies: checked.profile.browserCookies,
       network: checked.profile.networkAudit,
       toolchain: checked.profile.toolchainAudit,
-    });
+    };
+    throwIfDownloadCancelled(input.signal);
+    return await dependencies.archive.finalize(
+      prepared,
+      finalizeInput,
+      input.signal,
+    );
   } catch (error) {
+    const failure = downloadCancellationFrom(error) ?? error;
     try {
       await dependencies.archive.cleanup(prepared);
     } catch {
     }
-    throw error;
+    throw failure;
   }
 };
 

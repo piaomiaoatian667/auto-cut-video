@@ -13,6 +13,10 @@ import {
 } from 'node:fs/promises';
 import path from 'node:path';
 import {runProcess} from '../process/run-process';
+import {
+  downloadCancellationFrom,
+  throwIfDownloadCancelled,
+} from './cancellation';
 import {DownloadError} from './errors';
 import type {PlatformNetworkAudit} from './platform-profiles';
 import {
@@ -977,7 +981,7 @@ export interface StagedArchive {
 
 export interface StagingDownloadAuthority {
   readonly fd: number;
-  writeMetadata(metadata: SafeYtDlpMetadata): Promise<void>;
+  writeMetadata(metadata: SafeYtDlpMetadata, signal?: AbortSignal): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -1490,6 +1494,7 @@ const readExistingArchive = async (
 const runDarwinArchiveHelper = async (
   args: readonly string[],
   handles: readonly FileHandle[],
+  signal?: AbortSignal,
 ): Promise<string> => {
   if (process.platform !== 'darwin' || process.arch !== 'arm64') {
     throw new Error();
@@ -1503,6 +1508,7 @@ const runDarwinArchiveHelper = async (
     ...args,
   ], {
     extraStdioFds: handles.map((handle) => handle.fd),
+    ...(signal === undefined ? {} : {signal}),
   });
   if (result.exitCode !== 0 || result.signal !== null) throw new Error();
   return result.stdout.trim();
@@ -1512,6 +1518,7 @@ const writeStagingMetadata = async (
   handle: FileHandle,
   identity: DirectoryIdentity,
   metadata: SafeYtDlpMetadata,
+  signal?: AbortSignal,
 ): Promise<void> => {
   let contentsBase64: string;
   try {
@@ -1533,8 +1540,10 @@ const writeStagingMetadata = async (
       contentsBase64,
       identity.device,
       identity.inode,
-    ], [handle]);
-  } catch {
+    ], [handle], signal);
+  } catch (error) {
+    const cancellation = downloadCancellationFrom(error);
+    if (cancellation !== undefined) throw cancellation;
     throw new DownloadError('DOWNLOAD_FINALIZE_FAILED', FINALIZE_FAILED_MESSAGE);
   }
   if (result !== 'written') {
@@ -1640,6 +1649,7 @@ const inspectStagedArchive = async (
   prepared: StagedArchive,
   ownership: StagedArchiveOwnership,
   authority: FinalizeArchiveAuthority,
+  signal?: AbortSignal,
 ): Promise<StagingInspection> => {
   const stagingRoot = path.dirname(prepared.stagingDirectory);
   let inspectionResult: string;
@@ -1651,8 +1661,10 @@ const inspectStagedArchive = async (
       ...identityArguments(prepared.root.absolutePath, ownership.root),
       ...identityArguments(stagingRoot, ownership.stagingRoot),
       ...identityArguments(prepared.stagingDirectory, ownership.stagingDirectory),
-    ], [authority.stagingDirectory]);
-  } catch {
+    ], [authority.stagingDirectory], signal);
+  } catch (error) {
+    const cancellation = downloadCancellationFrom(error);
+    if (cancellation !== undefined) throw cancellation;
     throw new DownloadError('DOWNLOAD_FINALIZE_FAILED', FINALIZE_FAILED_MESSAGE);
   }
   if (inspectionResult === 'ownership-conflict') {
@@ -1671,6 +1683,7 @@ const sealStagedArchive = async (
   ownership: StagedArchiveOwnership,
   authority: FinalizeArchiveAuthority,
   receipt: DownloadReceipt,
+  signal?: AbortSignal,
 ): Promise<void> => {
   const stagingRoot = path.dirname(prepared.stagingDirectory);
   let sealResult: string;
@@ -1683,8 +1696,10 @@ const sealStagedArchive = async (
       ...identityArguments(prepared.root.absolutePath, ownership.root),
       ...identityArguments(stagingRoot, ownership.stagingRoot),
       ...identityArguments(prepared.stagingDirectory, ownership.stagingDirectory),
-    ], [authority.stagingDirectory]);
-  } catch {
+    ], [authority.stagingDirectory], signal);
+  } catch (error) {
+    const cancellation = downloadCancellationFrom(error);
+    if (cancellation !== undefined) throw cancellation;
     throw new DownloadError('DOWNLOAD_FINALIZE_FAILED', FINALIZE_FAILED_MESSAGE);
   }
   if (sealResult === 'content-conflict') {
@@ -1946,14 +1961,22 @@ export const openStagingDownloadAuthority = async (
   let openAuthority = true;
   return {
     fd: handle.fd,
-    async writeMetadata(metadata: SafeYtDlpMetadata): Promise<void> {
+    async writeMetadata(
+      metadata: SafeYtDlpMetadata,
+      signal?: AbortSignal,
+    ): Promise<void> {
       if (!openAuthority) {
         throw new DownloadError(
           'DOWNLOAD_FINALIZE_FAILED',
           FINALIZE_FAILED_MESSAGE,
         );
       }
-      await writeStagingMetadata(handle, ownership.stagingDirectory, metadata);
+      await writeStagingMetadata(
+        handle,
+        ownership.stagingDirectory,
+        metadata,
+        signal,
+      );
     },
     async close(): Promise<void> {
       if (!openAuthority) return;
@@ -1973,6 +1996,7 @@ export const openStagingDownloadAuthority = async (
 export const finalizeArchive = async (
   prepared: StagedArchive,
   input: FinalizeArchiveInput,
+  signal?: AbortSignal,
 ): Promise<DownloadedArchive> => {
   try {
     validatePreparedPaths(prepared, input);
@@ -1985,17 +2009,36 @@ export const finalizeArchive = async (
     throw new DownloadError('DOWNLOAD_FINALIZE_FAILED', FINALIZE_FAILED_MESSAGE);
   }
 
+  throwIfDownloadCancelled(signal);
   let authority: FinalizeArchiveAuthority;
   try {
     authority = await openFinalizeArchiveAuthority(prepared, ownership);
-  } catch {
+  } catch (error) {
+    const cancellation = downloadCancellationFrom(error);
+    if (cancellation !== undefined) throw cancellation;
+    throwIfDownloadCancelled(signal);
     throw new DownloadError('DOWNLOAD_FINALIZE_FAILED', FINALIZE_FAILED_MESSAGE);
   }
 
   try {
-    const inspection = await inspectStagedArchive(prepared, ownership, authority);
+    throwIfDownloadCancelled(signal);
+    const inspection = await inspectStagedArchive(
+      prepared,
+      ownership,
+      authority,
+      signal,
+    );
+    throwIfDownloadCancelled(signal);
     const {receipt, mediaFilename} = buildReceipt(prepared, input, inspection);
-    await sealStagedArchive(prepared, ownership, authority, receipt);
+    throwIfDownloadCancelled(signal);
+    await sealStagedArchive(
+      prepared,
+      ownership,
+      authority,
+      receipt,
+      signal,
+    );
+    throwIfDownloadCancelled(signal);
     const downloadedArchive: DownloadedArchive = {
       status: 'downloaded',
       platform: input.platform,
@@ -2006,6 +2049,7 @@ export const finalizeArchive = async (
       receipt,
     };
 
+    throwIfDownloadCancelled(signal);
     let publicationResult:
       | 'published'
       | 'destination-conflict'

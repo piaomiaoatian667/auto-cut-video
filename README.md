@@ -171,6 +171,13 @@ If a valid archive already exists for the resolved platform and video ID, the
 command reports `already-present` and does not redownload or overwrite it. An
 incomplete or conflicting destination fails instead of being replaced.
 
+Cancellation remains effective while staging metadata is written and while the
+archive is inspected, hashed, receipted, and sealed. The final no-replace
+publication helper is the commit barrier: once it starts, the command waits for
+its real `published`, destination-conflict, or source-conflict result and does
+not reinterpret or roll back that result because a cancellation signal arrived
+afterward.
+
 ## Supported platform families
 
 - YouTube

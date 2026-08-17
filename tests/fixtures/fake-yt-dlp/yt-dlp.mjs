@@ -5,6 +5,7 @@ import {
   appendFile,
   mkdir,
   readFile,
+  truncate,
   writeFile,
 } from 'node:fs/promises';
 import path from 'node:path';
@@ -394,6 +395,16 @@ const thumbnail = Buffer.from(
   'UklGRhoAAABXRUJQVlA4TA4AAAAvAAAAAAcQEf0PRET/Aw==',
   'base64',
 );
+const largeMediaBytesSource = process.env.FAKE_YT_DLP_LARGE_MEDIA_BYTES;
+const largeMediaBytes = largeMediaBytesSource === undefined
+  ? undefined
+  : Number(largeMediaBytesSource);
+if (
+  largeMediaBytes !== undefined
+  && (!Number.isSafeInteger(largeMediaBytes) || largeMediaBytes < media.byteLength)
+) {
+  reject('large media bytes must be a safe integer at least the fixture size');
+}
 await Promise.all([
   writeFile('video.webm', media),
   writeFile('video.en.vtt', [
@@ -405,3 +416,14 @@ await Promise.all([
   ].join('\n')),
   writeFile('video.webp', thumbnail),
 ]);
+if (largeMediaBytes !== undefined) {
+  await truncate('video.webm', largeMediaBytes);
+}
+const completionStateDirectory = process.env.FAKE_YT_DLP_STATE_DIRECTORY;
+if (completionStateDirectory !== undefined) {
+  await mkdir(completionStateDirectory, {recursive: true});
+  await writeFile(
+    path.join(completionStateDirectory, 'download-complete'),
+    `${process.pid}\n`,
+  );
+}

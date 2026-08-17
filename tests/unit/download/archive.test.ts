@@ -45,6 +45,7 @@ import type {DownloadPlatform} from '../../../src/download/platforms';
 import {
   PROCESS_OUTPUT_LIMIT_BYTES,
   runProcess,
+  type ProcessResult,
 } from '../../../src/process/run-process';
 
 const OUTPUT_INVALID_MESSAGE = 'The download output path is invalid.';
@@ -116,6 +117,27 @@ const expectDownloadError = async (
   throw new Error(`Expected ${code}.`);
 };
 
+const expectDownloadCancellation = async (
+  operation: Promise<unknown>,
+  sensitiveMarker?: string,
+): Promise<unknown> => {
+  try {
+    await operation;
+  } catch (error) {
+    expect(error).toMatchObject({
+      name: 'DownloadCancellationError',
+      message: 'The download operation was cancelled.',
+    });
+    expect((error as {cause?: unknown}).cause).toBeUndefined();
+    if (sensitiveMarker !== undefined) {
+      expect(`${String(error)}${JSON.stringify(error)}`)
+        .not.toContain(sensitiveMarker);
+    }
+    return error;
+  }
+  throw new Error('Expected download cancellation.');
+};
+
 const expectMissing = async (target: string): Promise<void> => {
   await expect(access(target)).rejects.toMatchObject({code: 'ENOENT'});
 };
@@ -126,6 +148,61 @@ const sortNames = (names: readonly string[]): string[] =>
 const archiveHelperOperation = (args: readonly string[]): string | undefined => {
   const separatorIndex = args.indexOf('--');
   return separatorIndex === -1 ? undefined : args[separatorIndex + 1];
+};
+
+const helperProcessResult = (stdout: string): ProcessResult => ({
+  command: '/usr/bin/osascript',
+  args: [],
+  exitCode: 0,
+  signal: null,
+  stdout,
+  stderr: '',
+  durationMs: 1,
+});
+
+const helperProcessAborted = async (
+  sensitiveMarker: string,
+): Promise<Error> => {
+  const {ProcessExecutionError} = await import('../../../src/process/process-error');
+  return new ProcessExecutionError(
+    'PROCESS_ABORTED',
+    sensitiveMarker,
+    helperProcessResult(''),
+    new Error(sensitiveMarker),
+  );
+};
+
+type ArchiveModule = typeof import('../../../src/download/archive');
+type RunProcessModule = typeof import('../../../src/process/run-process');
+type RunProcessArguments = Parameters<RunProcessModule['runProcess']>;
+type RunProcessInterceptor = (
+  actual: RunProcessModule,
+  args: RunProcessArguments,
+) => Promise<ProcessResult>;
+
+const withMockedArchiveRunProcess = async <Result>(
+  interceptor: RunProcessInterceptor,
+  operation: (archive: ArchiveModule) => Promise<Result>,
+): Promise<Result> => {
+  vi.resetModules();
+  vi.doMock('../../../src/process/run-process', async () => {
+    const actual = await vi.importActual<RunProcessModule>(
+      '../../../src/process/run-process',
+    );
+    return {
+      ...actual,
+      runProcess: async (...args: RunProcessArguments) =>
+        await interceptor(actual, args),
+    };
+  });
+
+  try {
+    const archive = await import('../../../src/download/archive');
+    return await operation(archive);
+  } finally {
+    vi.doUnmock('../../../src/process/run-process');
+    vi.resetModules();
+  }
 };
 
 const sha256 = (contents: Buffer): string =>
@@ -153,7 +230,23 @@ const canonicalUrlFor = (
   videoId: string,
 ): string => platform === 'douyin'
   ? `https://www.douyin.com/video/${videoId}`
-  : `https://youtu.be/${videoId}`;
+    : `https://youtu.be/${videoId}`;
+
+const prepareStagingWithArchive = async (
+  archive: ArchiveModule,
+  workspaceRoot: string,
+  videoId = 'abc',
+): Promise<StagedArchive> => {
+  const root = await archive.validateArchiveRoot(workspaceRoot, 'downloads');
+  const prepared = await archive.prepareArchive(
+    root,
+    'youtube',
+    videoId,
+    canonicalUrlFor('youtube', videoId),
+  );
+  if (prepared.status !== 'staging') throw new Error('Expected staging archive.');
+  return prepared;
+};
 
 const extractorFor = (platform: DownloadPlatform): string =>
   platform === 'douyin' ? 'Douyin' : 'youtube';
@@ -668,6 +761,49 @@ describe('prepareArchive', () => {
 });
 
 describe('staging download authority', () => {
+  it('forwards cancellation to metadata helpers and keeps cleanup uncancelled', async () => {
+    const workspaceRoot = await createWorkspace();
+    const controller = new AbortController();
+    const sensitiveMarker = 'sensitive metadata helper abort';
+    let cleanupCalls = 0;
+
+    await withMockedArchiveRunProcess(
+      async (actual, args) => {
+        const operation = archiveHelperOperation(args[1]);
+        if (operation === 'write-metadata') {
+          expect(args[2]).toEqual(expect.objectContaining({
+            signal: controller.signal,
+          }));
+          throw await helperProcessAborted(sensitiveMarker);
+        }
+        if (operation === 'cleanup') {
+          cleanupCalls += 1;
+          expect(args[2]).not.toHaveProperty('signal');
+        }
+        return await actual.runProcess(...args);
+      },
+      async (archive) => {
+        const prepared = await prepareStagingWithArchive(archive, workspaceRoot);
+        const authority = await archive.openStagingDownloadAuthority(prepared);
+        try {
+          await expectDownloadCancellation(
+            authority.writeMetadata(
+              safeMetadataFor(prepared),
+              controller.signal,
+            ),
+            sensitiveMarker,
+          );
+        } finally {
+          controller.abort(new Error('cleanup must ignore cancellation'));
+          await authority.close();
+          await archive.cleanupArchive(prepared);
+        }
+      },
+    );
+
+    expect(cleanupCalls).toBe(1);
+  });
+
   it('keeps descriptor-bound writes on the owned inode after path substitution', async () => {
     const workspaceRoot = await createWorkspace();
     const outsideRoot = await createWorkspace();
@@ -781,6 +917,383 @@ describe('staging download authority', () => {
 });
 
 describe('finalizeArchive', () => {
+  it('rejects a pre-aborted finalize without publishing', async () => {
+    const workspaceRoot = await createWorkspace();
+    const {prepared} = await prepareStaging(workspaceRoot);
+    await writeStagedFiles(prepared);
+    const controller = new AbortController();
+    const sensitiveMarker = 'sensitive pre-aborted finalize';
+    controller.abort(new Error(sensitiveMarker));
+
+    await expectDownloadCancellation(
+      finalizeArchive(prepared, finalizeInput(prepared), controller.signal),
+      sensitiveMarker,
+    );
+
+    await expectMissing(prepared.finalDirectory);
+  });
+
+  it('cancels after finalize authority opens and before inspection', async () => {
+    const workspaceRoot = await createWorkspace();
+    const controller = new AbortController();
+    const sensitiveMarker = 'sensitive authority-open cancellation';
+    let stagingDirectory: string | undefined;
+    let cancelOnStagingOpen = false;
+    let inspectionCalls = 0;
+
+    vi.resetModules();
+    vi.doMock('node:fs/promises', async () => {
+      const actual = await vi.importActual<typeof import('node:fs/promises')>(
+        'node:fs/promises',
+      );
+      return {
+        ...actual,
+        open: async (...args: Parameters<typeof actual.open>) => {
+          const handle = await Reflect.apply(actual.open, undefined, args);
+          if (
+            cancelOnStagingOpen
+            && stagingDirectory !== undefined
+            && String(args[0]) === stagingDirectory
+          ) {
+            cancelOnStagingOpen = false;
+            controller.abort(new Error(sensitiveMarker));
+          }
+          return handle;
+        },
+      };
+    });
+    vi.doMock('../../../src/process/run-process', async () => {
+      const actual = await vi.importActual<RunProcessModule>(
+        '../../../src/process/run-process',
+      );
+      return {
+        ...actual,
+        runProcess: async (...args: RunProcessArguments) => {
+          if (archiveHelperOperation(args[1]) === 'inspect-staging') {
+            inspectionCalls += 1;
+          }
+          return await actual.runProcess(...args);
+        },
+      };
+    });
+
+    let prepared: StagedArchive | undefined;
+    try {
+      const archive = await import('../../../src/download/archive');
+      prepared = await prepareStagingWithArchive(archive, workspaceRoot);
+      stagingDirectory = prepared.stagingDirectory;
+      await writeStagedFiles(prepared);
+      cancelOnStagingOpen = true;
+
+      await expectDownloadCancellation(
+        archive.finalizeArchive(
+          prepared,
+          finalizeInput(prepared),
+          controller.signal,
+        ),
+        sensitiveMarker,
+      );
+    } finally {
+      vi.doUnmock('node:fs/promises');
+      vi.doUnmock('../../../src/process/run-process');
+      vi.resetModules();
+    }
+
+    expect(inspectionCalls).toBe(0);
+    expect(prepared).toBeDefined();
+    await expectMissing(prepared?.finalDirectory ?? '');
+  });
+
+  it('preserves inspect helper PROCESS_ABORTED as sanitized cancellation', async () => {
+    const workspaceRoot = await createWorkspace();
+    const controller = new AbortController();
+    const sensitiveMarker = 'sensitive inspect helper abort';
+
+    await withMockedArchiveRunProcess(
+      async (actual, args) => {
+        if (archiveHelperOperation(args[1]) === 'inspect-staging') {
+          expect(args[2]).toEqual(expect.objectContaining({
+            signal: controller.signal,
+          }));
+          throw await helperProcessAborted(sensitiveMarker);
+        }
+        return await actual.runProcess(...args);
+      },
+      async (archive) => {
+        const prepared = await prepareStagingWithArchive(archive, workspaceRoot);
+        await writeStagedFiles(prepared);
+
+        await expectDownloadCancellation(
+          archive.finalizeArchive(
+            prepared,
+            finalizeInput(prepared),
+            controller.signal,
+          ),
+          sensitiveMarker,
+        );
+        await expectMissing(prepared.finalDirectory);
+      },
+    );
+  });
+
+  it('cancels after inspection before building the receipt', async () => {
+    const workspaceRoot = await createWorkspace();
+    const controller = new AbortController();
+    const sensitiveMarker = 'sensitive post-inspection cancellation';
+    let sealCalls = 0;
+
+    await withMockedArchiveRunProcess(
+      async (actual, args) => {
+        const operation = archiveHelperOperation(args[1]);
+        if (operation === 'inspect-staging') {
+          const result = await actual.runProcess(...args);
+          controller.abort(new Error(sensitiveMarker));
+          return result;
+        }
+        if (operation === 'seal-staging') sealCalls += 1;
+        return await actual.runProcess(...args);
+      },
+      async (archive) => {
+        const prepared = await prepareStagingWithArchive(archive, workspaceRoot);
+        await writeStagedFiles(prepared);
+
+        await expectDownloadCancellation(
+          archive.finalizeArchive(
+            prepared,
+            finalizeInput(prepared),
+            controller.signal,
+          ),
+          sensitiveMarker,
+        );
+        await expectMissing(prepared.finalDirectory);
+      },
+    );
+
+    expect(sealCalls).toBe(0);
+  });
+
+  it('cancels after receipt construction before sealing', async () => {
+    const workspaceRoot = await createWorkspace();
+    const controller = new AbortController();
+    const sensitiveMarker = 'sensitive receipt cancellation';
+    let sealCalls = 0;
+
+    await withMockedArchiveRunProcess(
+      async (actual, args) => {
+        if (archiveHelperOperation(args[1]) === 'seal-staging') sealCalls += 1;
+        return await actual.runProcess(...args);
+      },
+      async (archive) => {
+        const prepared = await prepareStagingWithArchive(archive, workspaceRoot);
+        await writeStagedFiles(prepared);
+        const input = finalizeInput(prepared);
+        Object.defineProperty(input, 'title', {
+          configurable: true,
+          enumerable: true,
+          get: () => {
+            controller.abort(new Error(sensitiveMarker));
+            return 'Example';
+          },
+        });
+
+        await expectDownloadCancellation(
+          archive.finalizeArchive(prepared, input, controller.signal),
+          sensitiveMarker,
+        );
+        await expectMissing(prepared.finalDirectory);
+      },
+    );
+
+    expect(sealCalls).toBe(0);
+  });
+
+  it('preserves seal helper PROCESS_ABORTED as sanitized cancellation', async () => {
+    const workspaceRoot = await createWorkspace();
+    const controller = new AbortController();
+    const sensitiveMarker = 'sensitive seal helper abort';
+
+    await withMockedArchiveRunProcess(
+      async (actual, args) => {
+        if (archiveHelperOperation(args[1]) === 'seal-staging') {
+          expect(args[2]).toEqual(expect.objectContaining({
+            signal: controller.signal,
+          }));
+          throw await helperProcessAborted(sensitiveMarker);
+        }
+        return await actual.runProcess(...args);
+      },
+      async (archive) => {
+        const prepared = await prepareStagingWithArchive(archive, workspaceRoot);
+        await writeStagedFiles(prepared);
+
+        await expectDownloadCancellation(
+          archive.finalizeArchive(
+            prepared,
+            finalizeInput(prepared),
+            controller.signal,
+          ),
+          sensitiveMarker,
+        );
+        await expectMissing(prepared.finalDirectory);
+      },
+    );
+  });
+
+  it('cancels after sealing and before the publish commit barrier', async () => {
+    const workspaceRoot = await createWorkspace();
+    const controller = new AbortController();
+    const sensitiveMarker = 'sensitive pre-publish cancellation';
+    let publishCalls = 0;
+
+    await withMockedArchiveRunProcess(
+      async (actual, args) => {
+        const operation = archiveHelperOperation(args[1]);
+        if (operation === 'seal-staging') {
+          const result = await actual.runProcess(...args);
+          controller.abort(new Error(sensitiveMarker));
+          return result;
+        }
+        if (operation === 'publish') publishCalls += 1;
+        return await actual.runProcess(...args);
+      },
+      async (archive) => {
+        const prepared = await prepareStagingWithArchive(archive, workspaceRoot);
+        await writeStagedFiles(prepared);
+
+        await expectDownloadCancellation(
+          archive.finalizeArchive(
+            prepared,
+            finalizeInput(prepared),
+            controller.signal,
+          ),
+          sensitiveMarker,
+        );
+        await expectMissing(prepared.finalDirectory);
+      },
+    );
+
+    expect(publishCalls).toBe(0);
+  });
+
+  it('returns published success when cancellation races after commit starts', async () => {
+    const workspaceRoot = await createWorkspace();
+    const controller = new AbortController();
+    let publishCalls = 0;
+
+    await withMockedArchiveRunProcess(
+      async (actual, args) => {
+        if (archiveHelperOperation(args[1]) !== 'publish') {
+          return await actual.runProcess(...args);
+        }
+        publishCalls += 1;
+        expect(args[2]).not.toHaveProperty('signal');
+        const publication = actual.runProcess(...args);
+        controller.abort(new Error('abort after publish starts'));
+        return await publication;
+      },
+      async (archive) => {
+        const prepared = await prepareStagingWithArchive(archive, workspaceRoot);
+        await writeStagedFiles(prepared);
+
+        await expect(archive.finalizeArchive(
+          prepared,
+          finalizeInput(prepared),
+          controller.signal,
+        )).resolves.toMatchObject({
+          status: 'downloaded',
+          platform: 'youtube',
+          videoId: 'abc',
+        });
+        await expect(access(prepared.finalDirectory)).resolves.toBeUndefined();
+      },
+    );
+
+    expect(publishCalls).toBe(1);
+    expect(controller.signal.aborted).toBe(true);
+  });
+
+  it('keeps destination conflict when cancellation races with publish result', async () => {
+    const workspaceRoot = await createWorkspace();
+    const controller = new AbortController();
+    let failure: unknown;
+
+    await withMockedArchiveRunProcess(
+      async (actual, args) => {
+        if (archiveHelperOperation(args[1]) !== 'publish') {
+          return await actual.runProcess(...args);
+        }
+        expect(args[2]).not.toHaveProperty('signal');
+        const publication = actual.runProcess(...args);
+        controller.abort(new Error('abort with destination conflict'));
+        return await publication;
+      },
+      async (archive) => {
+        const prepared = await prepareStagingWithArchive(archive, workspaceRoot);
+        await writeStagedFiles(prepared);
+        await mkdir(prepared.finalDirectory);
+        await writeFile(path.join(prepared.finalDirectory, 'sentinel'), 'keep');
+
+        try {
+          await archive.finalizeArchive(
+            prepared,
+            finalizeInput(prepared),
+            controller.signal,
+          );
+        } catch (error) {
+          failure = error;
+        }
+        expect(await readFile(
+          path.join(prepared.finalDirectory, 'sentinel'),
+          'utf8',
+        )).toBe('keep');
+      },
+    );
+
+    expect(failure).toMatchObject({
+      name: 'DownloadError',
+      code: 'DOWNLOAD_DESTINATION_CONFLICT',
+      message: DESTINATION_CONFLICT_MESSAGE,
+    });
+  });
+
+  it('keeps source conflict when cancellation races with publish result', async () => {
+    const workspaceRoot = await createWorkspace();
+    const controller = new AbortController();
+    let failure: unknown;
+
+    await withMockedArchiveRunProcess(
+      async (actual, args) => {
+        if (archiveHelperOperation(args[1]) !== 'publish') {
+          return await actual.runProcess(...args);
+        }
+        expect(args[2]).not.toHaveProperty('signal');
+        controller.abort(new Error('abort with source conflict'));
+        return helperProcessResult('source-conflict\n');
+      },
+      async (archive) => {
+        const prepared = await prepareStagingWithArchive(archive, workspaceRoot);
+        await writeStagedFiles(prepared);
+
+        try {
+          await archive.finalizeArchive(
+            prepared,
+            finalizeInput(prepared),
+            controller.signal,
+          );
+        } catch (error) {
+          failure = error;
+        }
+        await expectMissing(prepared.finalDirectory);
+      },
+    );
+
+    expect(failure).toMatchObject({
+      name: 'DownloadError',
+      code: 'DOWNLOAD_FINALIZE_FAILED',
+      message: FINALIZE_FAILED_MESSAGE,
+    });
+  });
+
   it('publishes sorted, hashed files and an atomic mode-0600 receipt', async () => {
     const workspaceRoot = await createWorkspace();
     const {root, prepared} = await prepareStaging(

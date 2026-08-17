@@ -32,6 +32,7 @@ import type {
   YtDlpClient,
   YtDlpProbe,
 } from '../../../src/download/yt-dlp';
+import {ProcessExecutionError} from '../../../src/process/process-error';
 import type {ProcessResult} from '../../../src/process/run-process';
 
 const RIGHTS_MESSAGE =
@@ -369,6 +370,14 @@ const processResult = (stdout = ''): ProcessResult => ({
   durationMs: 1,
 });
 
+const processAborted = (reason: string): ProcessExecutionError =>
+  new ProcessExecutionError(
+    'PROCESS_ABORTED',
+    reason,
+    processResult(),
+    new Error(reason),
+  );
+
 describe('downloadVideo', () => {
   it('requires the explicit DownloadInput cookie access contract', () => {
     const inputWithoutCookieAccessState = {
@@ -470,7 +479,7 @@ describe('downloadVideo', () => {
     const downloadProfile = harness.download.mock.calls[0]?.[2].profile;
     expect(downloadProfile).toBe(probeProfile);
     expect(Object.isFrozen(probeProfile)).toBe(true);
-    expect(harness.writeMetadata).toHaveBeenCalledWith(SAFE_METADATA);
+    expect(harness.writeMetadata).toHaveBeenCalledWith(SAFE_METADATA, undefined);
     expect(harness.finalize).toHaveBeenCalledWith(STAGED, {
       platform: 'youtube',
       videoId: 'video-123',
@@ -489,7 +498,7 @@ describe('downloadVideo', () => {
         managedAssetSha256: MANAGED_ASSET_SHA256,
         potProvider: {name: 'bgutil', version: '1.3.1', mode: 'script'},
       },
-    });
+    }, undefined);
   });
 
   it('rejects unconfirmed rights before URL parsing or dependencies', async () => {
@@ -744,6 +753,129 @@ describe('downloadVideo', () => {
     expect(probeOptions.signal).toBe(controller.signal);
     expect(downloadOptions.signal).toBe(controller.signal);
     expect(downloadOptions.profile).toBe(probeOptions.profile);
+    expect(harness.writeMetadata).toHaveBeenCalledWith(
+      SAFE_METADATA,
+      controller.signal,
+    );
+    expect(harness.finalize).toHaveBeenCalledWith(
+      STAGED,
+      expect.any(Object),
+      controller.signal,
+    );
+  });
+
+  it('closes and cleans without metadata when cancellation lands after download', async () => {
+    const controller = new AbortController();
+    const reason = new Error('sensitive post-download cancellation');
+    const harness = makeHarness({
+      cleanupError: new Error('cleanup failed'),
+      downloadImplementation: async () => {
+        controller.abort(reason);
+      },
+    });
+
+    const failure = await captureRejection(downloadVideo({
+      ...INPUT,
+      signal: controller.signal,
+    }, harness.dependencies));
+
+    expect(failure).toMatchObject({
+      name: 'DownloadCancellationError',
+      message: 'The download operation was cancelled.',
+    });
+    expect(failure).not.toBe(reason);
+    expect(`${String(failure)}${JSON.stringify(failure)}`)
+      .not.toContain(reason.message);
+    expect(harness.writeMetadata).not.toHaveBeenCalled();
+    expect(harness.closeAuthority).toHaveBeenCalledTimes(1);
+    expect(harness.finalize).not.toHaveBeenCalled();
+    expect(harness.cleanup).toHaveBeenCalledWith(STAGED);
+  });
+
+  it('closes and cleans when cancellation lands after metadata', async () => {
+    const controller = new AbortController();
+    const metadataGate = createDeferred<void>();
+    const harness = makeHarness({metadataWritePromise: metadataGate.promise});
+    const operation = downloadVideo({
+      ...INPUT,
+      signal: controller.signal,
+    }, harness.dependencies);
+
+    await vi.waitFor(() => expect(harness.writeMetadata).toHaveBeenCalledWith(
+      SAFE_METADATA,
+      controller.signal,
+    ));
+    controller.abort(new Error('cancel after metadata'));
+    metadataGate.resolve();
+
+    await expect(operation).rejects.toMatchObject({
+      name: 'DownloadCancellationError',
+      message: 'The download operation was cancelled.',
+    });
+    expect(harness.closeAuthority).toHaveBeenCalledTimes(1);
+    expect(harness.finalize).not.toHaveBeenCalled();
+    expect(harness.cleanup).toHaveBeenCalledWith(STAGED);
+  });
+
+  it('cleans without finalizing when cancellation lands during authority close', async () => {
+    const controller = new AbortController();
+    const closeGate = createDeferred<void>();
+    const harness = makeHarness({authorityClosePromise: closeGate.promise});
+    const operation = downloadVideo({
+      ...INPUT,
+      signal: controller.signal,
+    }, harness.dependencies);
+
+    await vi.waitFor(() => expect(harness.closeAuthority).toHaveBeenCalledTimes(1));
+    controller.abort(new Error('cancel while closing'));
+    closeGate.resolve();
+
+    await expect(operation).rejects.toMatchObject({
+      name: 'DownloadCancellationError',
+      message: 'The download operation was cancelled.',
+    });
+    expect(harness.finalize).not.toHaveBeenCalled();
+    expect(harness.cleanup).toHaveBeenCalledWith(STAGED);
+  });
+
+  it('sanitizes raw process cancellation and preserves it over cleanup failure', async () => {
+    const rawCancellation = processAborted('sensitive helper abort reason');
+    const harness = makeHarness({
+      finalizeError: rawCancellation,
+      cleanupError: new Error('cleanup failed'),
+    });
+
+    const failure = await captureRejection(downloadVideo(INPUT, harness.dependencies));
+
+    expect(failure).toMatchObject({
+      name: 'DownloadCancellationError',
+      message: 'The download operation was cancelled.',
+    });
+    expect(failure).not.toBe(rawCancellation);
+    expect(`${String(failure)}${JSON.stringify(failure)}`)
+      .not.toContain('sensitive helper abort reason');
+    expect(harness.cleanup).toHaveBeenCalledWith(STAGED);
+  });
+
+  it('returns committed finalize success even when its signal aborts before resolution', async () => {
+    const controller = new AbortController();
+    const finalizeGate = createDeferred<DownloadedArchive>();
+    const harness = makeHarness({finalizePromise: finalizeGate.promise});
+    const operation = downloadVideo({
+      ...INPUT,
+      signal: controller.signal,
+    }, harness.dependencies);
+
+    await vi.waitFor(() => expect(harness.finalize).toHaveBeenCalledWith(
+      STAGED,
+      expect.any(Object),
+      controller.signal,
+    ));
+    controller.abort(new Error('abort after publish commit'));
+    finalizeGate.resolve(DOWNLOADED);
+
+    await expect(operation).resolves.toBe(DOWNLOADED);
+    expect(harness.cleanup).not.toHaveBeenCalled();
   });
 
   it('awaits toolchain, root, probe, prepare, delay, media, and finalize stages', async () => {
@@ -941,7 +1073,7 @@ describe('downloadVideo', () => {
 
     await downloadVideo(INPUT, harness.dependencies);
 
-    expect(harness.writeMetadata).toHaveBeenCalledWith(SAFE_METADATA);
+    expect(harness.writeMetadata).toHaveBeenCalledWith(SAFE_METADATA, undefined);
     expect(JSON.stringify(harness.writeMetadata.mock.calls[0]?.[0]))
       .not.toMatch(/cookie-value-marker|signed-url-marker|profile-marker|header-marker/u);
   });
