@@ -153,6 +153,7 @@ const expectResolverError = async (
     caught = error;
   }
   expect(caught).toMatchObject({name: 'DownloadError', code, message});
+  expect((caught as Error & {cause?: unknown}).cause).toBeUndefined();
   for (const marker of privateMarkers) {
     expect(String(caught)).not.toContain(marker);
   }
@@ -216,6 +217,26 @@ describe('resolveDownloaderToolchain', () => {
     expect(fixture.runProcess).not.toHaveBeenCalled();
     expect(fixture.resolveExecutable).not.toHaveBeenCalled();
   });
+
+  it.each(['EACCES', 'EIO'] as const)(
+    'maps a managed directory %s failure to invalid without leaking details',
+    async (code) => {
+      const fixture = createResolverFixture();
+      const privateMarker = `private ${code} ${paths.versionDirectory}`;
+      fixture.directoryExists.mockRejectedValueOnce(
+        Object.assign(new Error(privateMarker), {code}),
+      );
+
+      await expectResolverError(
+        resolveDownloaderToolchain({homeDirectory}, fixture.dependencies),
+        'DOWNLOAD_TOOLCHAIN_INVALID',
+        INVALID_TOOLCHAIN_MESSAGE,
+        [privateMarker, paths.versionDirectory],
+      );
+      expect(fixture.runProcess).not.toHaveBeenCalled();
+      expect(fixture.resolveExecutable).not.toHaveBeenCalled();
+    },
+  );
 
   it('does not fall back to PATH after an invalid managed downloader', async () => {
     const fixture = createResolverFixture();

@@ -4,6 +4,7 @@ import {describe, expect, it, vi} from 'vitest';
 import {
   buildDownloaderChildEnvironment,
   compareYtDlpVersions,
+  directoryExists,
   pluginEntriesMatch,
   validateDownloaderCapabilities,
   type DownloaderCapabilityDependencies,
@@ -69,6 +70,7 @@ interface CapabilityFixture {
   failures: Set<'provider-self-check' | 'impersonation'>;
   missingExecutables: Set<'deno' | 'ffmpeg'>;
   runProcess: ReturnType<typeof vi.fn<DownloadProcessRunner>>;
+  lstat: ReturnType<typeof vi.fn<DownloaderCapabilityDependencies['lstat']>>;
   readFile: ReturnType<typeof vi.fn<DownloaderCapabilityDependencies['readFile']>>;
   resolveExecutable: ReturnType<
     typeof vi.fn<DownloaderCapabilityDependencies['resolveExecutable']>
@@ -82,6 +84,12 @@ const regularFileStats = (
   uid,
   isFile: () => !symbolicLink,
   isSymbolicLink: () => symbolicLink,
+}) as Stats;
+
+const nonRegularStats = (): Stats => ({
+  uid: currentUid,
+  isFile: () => false,
+  isSymbolicLink: () => false,
 }) as Stats;
 
 const resultFor = (
@@ -177,10 +185,13 @@ const createCapabilityFixture = (
     }
     return name === 'deno' ? denoExecutable : ffmpegExecutable;
   });
+  const lstatFile = vi.fn<DownloaderCapabilityDependencies['lstat']>(
+    async (candidate) => stats.get(candidate) ?? regularFileStats(),
+  );
   const dependencies: DownloaderCapabilityDependencies = {
     runProcess,
     directoryExists: vi.fn(async () => true),
-    lstat: vi.fn(async (candidate) => stats.get(candidate) ?? regularFileStats()),
+    lstat: lstatFile,
     readFile,
     hashFile: vi.fn(async (candidate) => {
       const digest = hashes.get(candidate);
@@ -199,6 +210,7 @@ const createCapabilityFixture = (
     failures,
     missingExecutables,
     runProcess,
+    lstat: lstatFile,
     readFile,
     resolveExecutable,
   };
@@ -299,6 +311,33 @@ describe('downloader toolchain capability helpers', () => {
       .toEqual([]);
     expect(Object.isFrozen(environment)).toBe(true);
   });
+
+  it.each(['ENOENT', 'ENOTDIR'] as const)(
+    'treats only %s lstat failures as a missing directory',
+    async (code) => {
+      const candidate = '/private/managed-version';
+      const error = Object.assign(new Error(`private ${code} ${candidate}`), {code});
+      const lstatFile = vi.fn<(value: string) => Promise<Stats>>(async () => {
+        throw error;
+      });
+
+      await expect(directoryExists(candidate, lstatFile)).resolves.toBe(false);
+      expect(lstatFile).toHaveBeenCalledWith(candidate);
+    },
+  );
+
+  it.each(['EACCES', 'EIO'] as const)(
+    'preserves non-missing %s lstat failures for resolver classification',
+    async (code) => {
+      const candidate = '/private/managed-version';
+      const error = Object.assign(new Error(`private ${code} ${candidate}`), {code});
+      const lstatFile = vi.fn<(value: string) => Promise<Stats>>(async () => {
+        throw error;
+      });
+
+      await expect(directoryExists(candidate, lstatFile)).rejects.toBe(error);
+    },
+  );
 });
 
 describe('validateDownloaderCapabilities', () => {
@@ -394,6 +433,28 @@ describe('validateDownloaderCapabilities', () => {
     });
     expect(resolved.audit).not.toHaveProperty('managedAssetSha256');
     expect(fixture.resolveExecutable.mock.calls).toEqual([['deno']]);
+  });
+
+  it.each([
+    ['symlink', regularFileStats(currentUid, true)],
+    ['foreign ownership', regularFileStats(currentUid + 1)],
+    ['non-regular file', nonRegularStats()],
+  ])('rejects an override downloader that is a %s', async (_caseName, overrideStats) => {
+    const fixture = createCapabilityFixture();
+    const ytDlpOverride = '/private/overrides/untrusted-yt-dlp';
+    fixture.stats.set(ytDlpOverride, overrideStats);
+
+    await expectControlledError(
+      validateFixture(fixture, {
+        source: 'override',
+        ytDlpExecutable: ytDlpOverride,
+      }),
+      'DOWNLOAD_TOOLCHAIN_INVALID',
+      INVALID_TOOLCHAIN_MESSAGE,
+      [ytDlpOverride],
+    );
+    expect(fixture.lstat).toHaveBeenCalledWith(ytDlpOverride);
+    expect(fixture.lstat).not.toHaveBeenCalledWith(paths.ytDlpExecutable);
   });
 
   it('skips only the installed manifest read in staging mode', async () => {

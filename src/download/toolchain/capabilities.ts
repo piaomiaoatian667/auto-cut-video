@@ -130,11 +130,22 @@ const hashFile = async (candidate: string): Promise<string> => {
   return createHash('sha256').update(contents).digest('hex');
 };
 
-const directoryExists = async (candidate: string): Promise<boolean> => {
+type LstatFile = (candidate: string) => Promise<Stats>;
+
+export const directoryExists = async (
+  candidate: string,
+  lstatFile: LstatFile = lstat,
+): Promise<boolean> => {
   try {
-    return (await lstat(candidate)).isDirectory();
-  } catch {
-    return false;
+    return (await lstatFile(candidate)).isDirectory();
+  } catch (error) {
+    const code = typeof error === 'object'
+      && error !== null
+      && 'code' in error
+      ? error.code
+      : undefined;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return false;
+    throw error;
   }
 };
 
