@@ -581,6 +581,99 @@ describe('installDownloaderToolchain', () => {
     }
   });
 
+  it('isolates provider dependency installation from ambient npm configuration', async () => {
+    const hostHome = '/private/host-home';
+    const poisonedValues = [
+      'https://private-registry.example.test/',
+      '/private/user-npmrc',
+      '/private/global-npmrc',
+      'private-npm-token',
+      'private-npm-auth-token',
+      'private-node-auth-token',
+      'private-deno-auth-tokens',
+    ];
+    vi.stubEnv('HOME', hostHome);
+    vi.stubEnv('NPM_CONFIG_REGISTRY', poisonedValues[0]);
+    vi.stubEnv('npm_config_userconfig', poisonedValues[1]);
+    vi.stubEnv('NpM_CoNfIg_GlObAlCoNfIg', poisonedValues[2]);
+    vi.stubEnv('NPM_TOKEN', poisonedValues[3]);
+    vi.stubEnv('nPm_AuTh_ToKeN', poisonedValues[4]);
+    vi.stubEnv('node_auth_token', poisonedValues[5]);
+    vi.stubEnv('DeNo_AuTh_ToKeNs', poisonedValues[6]);
+    vi.stubEnv('HTTP_PROXY', 'http://private-http-proxy.test');
+    vi.stubEnv('TOOLCHAIN_SAFE_ENV', 'preserved');
+    const fixture = await createInstallerFixture();
+
+    await expect(installDownloaderToolchain(
+      {homeDirectory: fixture.homeDirectory},
+      fixture.dependencies,
+    )).resolves.toEqual({status: 'installed', version: '2026.07.04'});
+
+    const frozenInstall = fixture.runProcess.mock.calls.find(([, args]) =>
+      args[0] === 'install'
+    );
+    const installEnvironment = frozenInstall?.[2]?.env;
+    const stagingDirectory = fixture.stagingDirectories[0];
+    expect(stagingDirectory).toBeDefined();
+    expect(Object.isFrozen(installEnvironment)).toBe(true);
+    expect(installEnvironment).toMatchObject({
+      HOME: path.join(stagingDirectory as string, 'deno/provider-cache'),
+      NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
+      NPM_CONFIG_USERCONFIG: '/dev/null',
+      NPM_CONFIG_GLOBALCONFIG: '/dev/null',
+      DENO_DIR: path.join(stagingDirectory as string, 'deno'),
+      XDG_CACHE_HOME: path.join(stagingDirectory as string, 'deno/provider-cache'),
+      DENO_NO_PROMPT: '1',
+      DENO_NO_UPDATE_CHECK: '1',
+      FORCE_COLOR: 'false',
+      TOOLCHAIN_SAFE_ENV: 'preserved',
+    });
+    expect(installEnvironment?.HOME).not.toBe(hostHome);
+    expect(Object.keys(installEnvironment ?? {}).filter((key) =>
+      key.toLowerCase().startsWith('npm_config_')
+    ).sort()).toEqual([
+      'NPM_CONFIG_GLOBALCONFIG',
+      'NPM_CONFIG_REGISTRY',
+      'NPM_CONFIG_USERCONFIG',
+    ]);
+    expect(Object.keys(installEnvironment ?? {}).filter((key) => [
+      'npm_token',
+      'npm_auth_token',
+      'node_auth_token',
+      'deno_auth_tokens',
+    ].includes(key.toLowerCase()))).toEqual([]);
+    expect(Object.keys(installEnvironment ?? {}).filter((key) =>
+      key.toLowerCase().includes('proxy')
+    )).toEqual([]);
+    expect(Object.values(installEnvironment ?? {}).filter((value) =>
+      value !== undefined && poisonedValues.includes(value)
+    )).toEqual([]);
+
+    const unchangedCalls = [
+      fixture.runProcess.mock.calls.find(([command, args]) =>
+        command === 'git' && args[0] === '--version'
+      ),
+      fixture.runProcess.mock.calls.find(([command, args]) =>
+        command === denoExecutable && args[0] === 'run'
+      ),
+    ];
+    expect(unchangedCalls.every((call) => call !== undefined)).toBe(true);
+    for (const call of unchangedCalls) {
+      if (call === undefined) continue;
+      const [, , options] = call;
+      expect(options?.env).toMatchObject({
+        HOME: hostHome,
+        NPM_CONFIG_REGISTRY: poisonedValues[0],
+        npm_config_userconfig: poisonedValues[1],
+        NpM_CoNfIg_GlObAlCoNfIg: poisonedValues[2],
+        NPM_TOKEN: poisonedValues[3],
+        nPm_AuTh_ToKeN: poisonedValues[4],
+        node_auth_token: poisonedValues[5],
+        DeNo_AuTh_ToKeNs: poisonedValues[6],
+      });
+    }
+  });
+
   it('reuses a valid published toolchain without fetches or runtime checks', async () => {
     const fixture = await createInstallerFixture();
     await seedValidPublishedToolchain(fixture.paths);

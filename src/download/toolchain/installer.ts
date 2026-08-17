@@ -46,6 +46,12 @@ const ALLOWED_REDIRECT_HOSTS = new Set([
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const INSTALL_DIRECTORY_PREFIX = '.install-';
 const QUARANTINE_DIRECTORY_PREFIX = '.quarantine-';
+const PROVIDER_DEPENDENCY_AUTH_ENVIRONMENT_KEYS = new Set([
+  'deno_auth_tokens',
+  'node_auth_token',
+  'npm_auth_token',
+  'npm_token',
+]);
 const CACHE_PATH_COMPONENTS = [
   'Library',
   'Caches',
@@ -602,6 +608,27 @@ const checkoutPinnedProvider = async (
   }
 };
 
+const buildProviderDependencyEnvironment = (
+  stagingPaths: DownloaderToolchainPaths,
+): Readonly<NodeJS.ProcessEnv> => {
+  const environment = Object.fromEntries(
+    Object.entries(buildDownloaderChildEnvironment(stagingPaths)).filter(
+      ([key]) => {
+        const normalizedKey = key.toLowerCase();
+        return !normalizedKey.startsWith('npm_config_')
+          && !PROVIDER_DEPENDENCY_AUTH_ENVIRONMENT_KEYS.has(normalizedKey);
+      },
+    ),
+  );
+  return Object.freeze({
+    ...environment,
+    HOME: stagingPaths.providerCacheDirectory,
+    NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org/',
+    NPM_CONFIG_USERCONFIG: '/dev/null',
+    NPM_CONFIG_GLOBALCONFIG: '/dev/null',
+  });
+};
+
 const installProviderDependencies = async (
   stagingPaths: DownloaderToolchainPaths,
   denoExecutable: string,
@@ -614,7 +641,7 @@ const installProviderDependencies = async (
     '--frozen',
   ], {
     cwd: stagingPaths.providerServerDirectory,
-    env: buildDownloaderChildEnvironment(stagingPaths),
+    env: buildProviderDependencyEnvironment(stagingPaths),
     ...(signal === undefined ? {} : {signal}),
   });
 };
