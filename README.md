@@ -30,7 +30,12 @@ file and symlink under `server/node_modules`. Canonical records bind relative
 path, executable bits, file SHA-256 or raw symlink target, and entry counts.
 Traversal also requires current-UID ownership, rejects special files and
 escaping or absolute symlinks, and never trusts the installed Git object
-database. After Deno installation, setup safely removes only
+database. Verification opens the provider root and every child directory with
+`O_DIRECTORY | O_NOFOLLOW`, enumerates each opened inode through its
+`/dev/fd/<fd>` authority, and requires the descriptor and original path to keep
+the same type, UID, mode, device, inode, and stable metadata before and after
+processing. A replaced directory path is therefore rejected without traversing
+the replacement target. After Deno installation, setup safely removes only
 `server/node_modules/.deno/.setup-cache.bin` before verification and
 publication using descriptor-bound `openat`/`unlinkat` operations that do not
 follow a replaced parent chain. The pinned dependency identity is 9,715 entries

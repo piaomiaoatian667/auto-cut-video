@@ -274,6 +274,15 @@ is SHA-256 hashed. Source verification excludes `.git/**` and
 `server/node_modules`. Symlink targets must be relative and resolve within the
 tree being verified.
 
+The provider root is opened once with `O_DIRECTORY | O_NOFOLLOW` and remains
+the authority for both source and dependency verification. Every child
+directory is likewise opened without following the final component, checked
+against its path `lstat`, and enumerated through `opendir(/dev/fd/<fd>)` so a
+later path rename or symlink replacement cannot redirect enumeration. Before
+and after entry processing, descriptor and original-path stats must retain the
+same directory type, UID, mode, device, inode, size, and modification metadata;
+any detected replacement or mutation fails closed.
+
 Regular files are opened with `O_RDONLY | O_NOFOLLOW`. The verifier compares
 the opened descriptor with the path `lstat` identity (type, UID, mode, device,
 and inode), streams the content hash, then repeats descriptor and path checks,

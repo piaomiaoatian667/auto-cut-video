@@ -7,6 +7,7 @@ import {
   mkdir,
   mkdtemp,
   open as openFile,
+  opendir as openDirectory,
   readFile,
   rename,
   rm,
@@ -48,6 +49,7 @@ interface ProviderFixture {
   root: string;
   providerDirectory: string;
   nodeModulesDirectory: string;
+  binDirectory: string;
   sourceFile: string;
   sourceImport: string;
   moduleFile: string;
@@ -64,6 +66,7 @@ const createProviderFixture = async (): Promise<ProviderFixture> => {
     'server/node_modules',
   );
   const sourceFile = path.join(providerDirectory, 'README.md');
+  const binDirectory = path.join(providerDirectory, 'bin');
   const sourceImport = path.join(
     providerDirectory,
     'server/src/generate_once.ts',
@@ -78,14 +81,14 @@ const createProviderFixture = async (): Promise<ProviderFixture> => {
 
   await Promise.all([
     mkdir(path.join(providerDirectory, '.git/objects'), {recursive: true}),
-    mkdir(path.join(providerDirectory, 'bin'), {recursive: true}),
+    mkdir(binDirectory, {recursive: true}),
     mkdir(path.dirname(sourceImport), {recursive: true}),
     mkdir(moduleDirectory, {recursive: true}),
   ]);
   await Promise.all([
     writeFile(sourceFile, 'provider fixture\n', {mode: 0o600}),
     writeFile(
-      path.join(providerDirectory, 'bin/provider'),
+      path.join(binDirectory, 'provider'),
       '#!/bin/sh\nexit 0\n',
       {mode: 0o700},
     ),
@@ -111,6 +114,7 @@ const createProviderFixture = async (): Promise<ProviderFixture> => {
     root,
     providerDirectory,
     nodeModulesDirectory,
+    binDirectory,
     sourceFile,
     sourceImport,
     moduleFile,
@@ -295,6 +299,99 @@ describe('provider integrity verifier', () => {
     }));
   });
 
+  it.each(['absolute', 'escaping'] as const)(
+    'rejects a source directory replaced by an %s symlink after lstat',
+    async (targetKind) => {
+      const fixture = await createProviderFixture();
+      const outsideBin = path.join(fixture.root, 'outside-bin');
+      const outsideProvider = path.join(outsideBin, 'provider');
+      await mkdir(outsideBin);
+      await writeFile(outsideProvider, '#!/bin/sh\nexit 0\n', {mode: 0o700});
+      const outsideStats = await lstat(outsideProvider);
+      const target = targetKind === 'absolute'
+        ? outsideBin
+        : path.relative(path.dirname(fixture.binDirectory), outsideBin);
+      let replaced = false;
+      let outsideRead = false;
+
+      await expectProviderFailure(verifyFixture(fixture, canonicalIdentity, {
+        dependencies: {
+          lstat: async (candidate) => {
+            const stats = await lstat(candidate);
+            if (candidate === fixture.binDirectory && !replaced) {
+              replaced = true;
+              await rm(fixture.binDirectory, {recursive: true});
+              await symlink(target, fixture.binDirectory);
+            }
+            return stats;
+          },
+          open: async (candidate, flags) => {
+            const handle = await openFile(candidate, flags);
+            const openedStats = await handle.stat();
+            if (
+              openedStats.dev === outsideStats.dev
+              && openedStats.ino === outsideStats.ino
+            ) {
+              outsideRead = true;
+            }
+            return handle;
+          },
+        },
+      }), [target, outsideProvider]);
+      expect(replaced).toBe(true);
+      expect(outsideRead).toBe(false);
+      await expect(readFile(outsideProvider, 'utf8'))
+        .resolves.toBe('#!/bin/sh\nexit 0\n');
+    },
+  );
+
+  it('rejects a source directory replaced before enumeration', async () => {
+    const fixture = await createProviderFixture();
+    const outsideBin = path.join(fixture.root, 'outside-bin');
+    const outsideProvider = path.join(outsideBin, 'provider');
+    const originalBin = path.join(fixture.providerDirectory, 'bin-original');
+    await mkdir(outsideBin);
+    await writeFile(outsideProvider, '#!/bin/sh\nexit 0\n', {mode: 0o700});
+    const outsideStats = await lstat(outsideProvider);
+    let replaced = false;
+    let outsideRead = false;
+    let binDirectoryDescriptor: number | undefined;
+
+    await expectProviderFailure(verifyFixture(fixture, canonicalIdentity, {
+      dependencies: {
+        opendir: async (candidate) => {
+          if (
+            binDirectoryDescriptor !== undefined
+            && candidate === `/dev/fd/${binDirectoryDescriptor}`
+            && !replaced
+          ) {
+            replaced = true;
+            await rename(fixture.binDirectory, originalBin);
+            await symlink(outsideBin, fixture.binDirectory);
+          }
+          return await openDirectory(candidate);
+        },
+        open: async (candidate, flags) => {
+          const handle = await openFile(candidate, flags);
+          if (candidate === fixture.binDirectory) {
+            binDirectoryDescriptor = handle.fd;
+          }
+          const openedStats = await handle.stat();
+          if (
+            openedStats.dev === outsideStats.dev
+            && openedStats.ino === outsideStats.ino
+          ) {
+            outsideRead = true;
+          }
+          return handle;
+        },
+      },
+    }), [outsideBin, outsideProvider]);
+    expect(binDirectoryDescriptor).toBeDefined();
+    expect(replaced).toBe(true);
+    expect(outsideRead).toBe(false);
+  });
+
   it('does not follow a file replaced by a symlink between lstat and open', async () => {
     const fixture = await createProviderFixture();
     const outsideFile = path.join(fixture.root, 'outside-provider-source');
@@ -393,11 +490,11 @@ describe('provider integrity verifier', () => {
 
   it('maps filesystem errors to the fixed provider error', async () => {
     const fixture = await createProviderFixture();
-    const privateMarker = 'private readdir failure';
+    const privateMarker = 'private opendir failure';
 
     await expectProviderFailure(verifyFixture(fixture, canonicalIdentity, {
       dependencies: {
-        readdir: async () => {
+        opendir: async () => {
           throw new Error(privateMarker);
         },
       },

@@ -1,9 +1,9 @@
 import {createHash} from 'node:crypto';
-import {constants, type Stats} from 'node:fs';
+import {constants, type Dir, type Stats} from 'node:fs';
 import {
   lstat,
   open,
-  readdir,
+  opendir,
   readlink,
   type FileHandle,
 } from 'node:fs/promises';
@@ -159,7 +159,7 @@ export interface UnlinkProviderSetupCacheOptions {
 export interface ProviderIntegrityDependencies {
   lstat(candidate: string): Promise<Stats>;
   open(candidate: string, flags: number): Promise<FileHandle>;
-  readdir(candidate: string): Promise<string[]>;
+  opendir(candidate: string): Promise<Dir>;
   readlink(candidate: string): Promise<string>;
   unlinkSetupCache(options: UnlinkProviderSetupCacheOptions): Promise<void>;
 }
@@ -202,7 +202,7 @@ const unlinkSetupCacheAt = async (
 const defaultProviderIntegrityDependencies: ProviderIntegrityDependencies = {
   lstat,
   open: async (candidate, flags) => await open(candidate, flags),
-  readdir: async (candidate) => await readdir(candidate),
+  opendir: async (candidate) => await opendir(candidate),
   readlink: async (candidate) => await readlink(candidate),
   unlinkSetupCache: unlinkSetupCacheAt,
 };
@@ -218,6 +218,12 @@ type ActualTreeIdentity = {
   files: number;
   symlinks: number;
   sha256: string;
+};
+
+type DirectoryAuthority = {
+  absolutePath: string;
+  handle: FileHandle;
+  stats: Stats;
 };
 
 const invalidProvider = (): DownloadError => new DownloadError(
@@ -286,6 +292,7 @@ const sameOwnedDirectory = (
   expected: Stats,
   actual: Stats,
   currentUid: number,
+  requireStableContents = false,
 ): boolean => (
   !expected.isSymbolicLink()
   && expected.isDirectory()
@@ -296,7 +303,138 @@ const sameOwnedDirectory = (
   && actual.mode === expected.mode
   && actual.dev === expected.dev
   && actual.ino === expected.ino
+  && (
+    !requireStableContents
+    || (
+      actual.size === expected.size
+      && actual.mtimeMs === expected.mtimeMs
+      && actual.ctimeMs === expected.ctimeMs
+    )
+  )
 );
+
+const directoryDescriptorPath = (handle: FileHandle): string =>
+  `/dev/fd/${handle.fd}`;
+
+const requireDirectoryAuthorityStable = async (
+  authority: DirectoryAuthority,
+  currentUid: number,
+  signal: AbortSignal | undefined,
+  dependencies: ProviderIntegrityDependencies,
+): Promise<void> => {
+  throwIfDownloadCancelled(signal);
+  const handleStats = await authority.handle.stat();
+  const pathStats = await dependencies.lstat(authority.absolutePath);
+  throwIfDownloadCancelled(signal);
+  if (
+    !sameOwnedDirectory(authority.stats, handleStats, currentUid, true)
+    || !sameOwnedDirectory(authority.stats, pathStats, currentUid, true)
+  ) {
+    throw invalidProvider();
+  }
+};
+
+const openRootDirectoryAuthority = async (
+  candidate: string,
+  currentUid: number,
+  signal: AbortSignal | undefined,
+  dependencies: ProviderIntegrityDependencies,
+): Promise<DirectoryAuthority> => {
+  throwIfDownloadCancelled(signal);
+  const pathStats = await dependencies.lstat(candidate);
+  requireOwnedDirectory(pathStats, currentUid);
+  const handle = await dependencies.open(
+    candidate,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    const openedStats = await handle.stat();
+    if (!sameOwnedDirectory(pathStats, openedStats, currentUid)) {
+      throw invalidProvider();
+    }
+    return {absolutePath: candidate, handle, stats: openedStats};
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+};
+
+const openChildDirectoryAuthority = async (
+  parent: DirectoryAuthority,
+  candidate: string,
+  pathStats: Stats,
+  currentUid: number,
+  signal: AbortSignal | undefined,
+  dependencies: ProviderIntegrityDependencies,
+): Promise<DirectoryAuthority> => {
+  if (path.dirname(candidate) !== parent.absolutePath) throw invalidProvider();
+  requireOwnedDirectory(pathStats, currentUid);
+  await requireDirectoryAuthorityStable(
+    parent,
+    currentUid,
+    signal,
+    dependencies,
+  );
+  const handle = await dependencies.open(
+    candidate,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    const openedStats = await handle.stat();
+    if (!sameOwnedDirectory(pathStats, openedStats, currentUid)) {
+      throw invalidProvider();
+    }
+    await requireDirectoryAuthorityStable(
+      parent,
+      currentUid,
+      signal,
+      dependencies,
+    );
+    const currentPathStats = await dependencies.lstat(candidate);
+    if (!sameOwnedDirectory(openedStats, currentPathStats, currentUid)) {
+      throw invalidProvider();
+    }
+    return {absolutePath: candidate, handle, stats: openedStats};
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+};
+
+const readDirectoryNames = async (
+  authority: DirectoryAuthority,
+  currentUid: number,
+  signal: AbortSignal | undefined,
+  dependencies: ProviderIntegrityDependencies,
+): Promise<string[]> => {
+  await requireDirectoryAuthorityStable(
+    authority,
+    currentUid,
+    signal,
+    dependencies,
+  );
+  const directory = await dependencies.opendir(
+    directoryDescriptorPath(authority.handle),
+  );
+  const names: string[] = [];
+  try {
+    while (true) {
+      throwIfDownloadCancelled(signal);
+      const entry = await directory.read();
+      if (entry === null) break;
+      names.push(entry.name);
+    }
+  } finally {
+    await directory.close();
+  }
+  await requireDirectoryAuthorityStable(
+    authority,
+    currentUid,
+    signal,
+    dependencies,
+  );
+  return names.sort();
+};
 
 const executableMode = (stats: Stats): string =>
   (stats.mode & 0o111).toString(8).padStart(3, '0');
@@ -330,13 +468,19 @@ const throwMappedProviderError = (
 };
 
 const hashRegularFile = async (
+  parent: DirectoryAuthority,
   candidate: string,
   pathStats: Stats,
   currentUid: number,
   signal: AbortSignal | undefined,
   dependencies: ProviderIntegrityDependencies,
 ): Promise<string> => {
-  throwIfDownloadCancelled(signal);
+  await requireDirectoryAuthorityStable(
+    parent,
+    currentUid,
+    signal,
+    dependencies,
+  );
   const handle = await dependencies.open(
     candidate,
     constants.O_RDONLY | constants.O_NOFOLLOW,
@@ -348,6 +492,12 @@ const hashRegularFile = async (
     if (!sameRegularFile(pathStats, openedStats, currentUid, false)) {
       throw invalidProvider();
     }
+    await requireDirectoryAuthorityStable(
+      parent,
+      currentUid,
+      signal,
+      dependencies,
+    );
     while (true) {
       throwIfDownloadCancelled(signal);
       const {bytesRead} = await handle.read(
@@ -361,7 +511,19 @@ const hashRegularFile = async (
       hash.update(buffer.subarray(0, bytesRead));
     }
     const finalHandleStats = await handle.stat();
+    await requireDirectoryAuthorityStable(
+      parent,
+      currentUid,
+      signal,
+      dependencies,
+    );
     const finalPathStats = await dependencies.lstat(candidate);
+    await requireDirectoryAuthorityStable(
+      parent,
+      currentUid,
+      signal,
+      dependencies,
+    );
     if (
       !sameRegularFile(openedStats, finalHandleStats, currentUid, true)
       || !sameRegularFile(openedStats, finalPathStats, currentUid, true)
@@ -399,6 +561,23 @@ const sameRegularFile = (
   )
 );
 
+const sameSymbolicLink = (
+  expected: Stats,
+  actual: Stats,
+  currentUid: number,
+): boolean => (
+  expected.isSymbolicLink()
+  && actual.isSymbolicLink()
+  && expected.uid === currentUid
+  && actual.uid === currentUid
+  && actual.mode === expected.mode
+  && actual.dev === expected.dev
+  && actual.ino === expected.ino
+  && actual.size === expected.size
+  && actual.mtimeMs === expected.mtimeMs
+  && actual.ctimeMs === expected.ctimeMs
+);
+
 const targetStaysWithinRoot = (
   root: string,
   linkPath: string,
@@ -416,41 +595,72 @@ const targetStaysWithinRoot = (
 };
 
 const measureTree = async (
-  root: string,
+  root: DirectoryAuthority,
+  logicalRoot: string,
   currentUid: number,
   excludedDirectories: ReadonlySet<string>,
   signal: AbortSignal | undefined,
   dependencies: ProviderIntegrityDependencies,
 ): Promise<ActualTreeIdentity> => {
-  throwIfDownloadCancelled(signal);
-  requireOwnedDirectory(await dependencies.lstat(root), currentUid);
   const records: IntegrityRecord[] = [];
 
   const visitDirectory = async (
-    directory: string,
+    directory: DirectoryAuthority,
     relativeDirectory: string,
   ): Promise<void> => {
-    throwIfDownloadCancelled(signal);
-    const names = (await dependencies.readdir(directory)).sort();
+    const names = await readDirectoryNames(
+      directory,
+      currentUid,
+      signal,
+      dependencies,
+    );
     for (const name of names) {
-      throwIfDownloadCancelled(signal);
-      const candidate = path.join(directory, name);
+      await requireDirectoryAuthorityStable(
+        directory,
+        currentUid,
+        signal,
+        dependencies,
+      );
+      const candidate = path.join(directory.absolutePath, name);
       const relativePath = relativeDirectory.length === 0
         ? name
         : `${relativeDirectory}/${name}`;
       const stats = await dependencies.lstat(candidate);
-      throwIfDownloadCancelled(signal);
+      await requireDirectoryAuthorityStable(
+        directory,
+        currentUid,
+        signal,
+        dependencies,
+      );
       requireOwnedEntry(stats, currentUid);
 
       if (stats.isDirectory() && !stats.isSymbolicLink()) {
-        requireOwnedDirectory(stats, currentUid);
-        if (!excludedDirectories.has(relativePath)) {
-          await visitDirectory(candidate, relativePath);
+        const child = await openChildDirectoryAuthority(
+          directory,
+          candidate,
+          stats,
+          currentUid,
+          signal,
+          dependencies,
+        );
+        try {
+          if (!excludedDirectories.has(relativePath)) {
+            await visitDirectory(child, relativePath);
+          }
+          await requireDirectoryAuthorityStable(
+            child,
+            currentUid,
+            signal,
+            dependencies,
+          );
+        } finally {
+          await child.handle.close();
         }
         continue;
       }
       if (stats.isFile() && !stats.isSymbolicLink()) {
         const payload = await hashRegularFile(
+          directory,
           candidate,
           stats,
           currentUid,
@@ -470,9 +680,24 @@ const measureTree = async (
         continue;
       }
       if (stats.isSymbolicLink()) {
+        await requireDirectoryAuthorityStable(
+          directory,
+          currentUid,
+          signal,
+          dependencies,
+        );
         const target = await dependencies.readlink(candidate);
-        throwIfDownloadCancelled(signal);
-        if (!targetStaysWithinRoot(root, candidate, target)) {
+        const finalStats = await dependencies.lstat(candidate);
+        await requireDirectoryAuthorityStable(
+          directory,
+          currentUid,
+          signal,
+          dependencies,
+        );
+        if (
+          !sameSymbolicLink(stats, finalStats, currentUid)
+          || !targetStaysWithinRoot(logicalRoot, candidate, target)
+        ) {
           throw invalidProvider();
         }
         records.push({
@@ -489,6 +714,12 @@ const measureTree = async (
       }
       throw invalidProvider();
     }
+    await requireDirectoryAuthorityStable(
+      directory,
+      currentUid,
+      signal,
+      dependencies,
+    );
   };
 
   await visitDirectory(root, '');
@@ -538,25 +769,84 @@ export const verifyProviderIntegrity = async (
       providerDirectory,
       'server/node_modules',
     );
-    const source = await measureTree(
+    const providerRoot = await openRootDirectoryAuthority(
       providerDirectory,
       options.currentUid,
-      SOURCE_EXCLUDED_DIRECTORIES,
       options.signal,
       dependencies,
     );
-    if (!treeIdentityMatches(source, options.identity.source)) {
-      throw invalidProvider();
-    }
-    const nodeModules = await measureTree(
-      nodeModulesDirectory,
-      options.currentUid,
-      new Set(),
-      options.signal,
-      dependencies,
-    );
-    if (!treeIdentityMatches(nodeModules, options.identity.nodeModules)) {
-      throw invalidProvider();
+    let serverDirectory: DirectoryAuthority | undefined;
+    let nodeModulesRoot: DirectoryAuthority | undefined;
+    try {
+      const source = await measureTree(
+        providerRoot,
+        providerDirectory,
+        options.currentUid,
+        SOURCE_EXCLUDED_DIRECTORIES,
+        options.signal,
+        dependencies,
+      );
+      if (!treeIdentityMatches(source, options.identity.source)) {
+        throw invalidProvider();
+      }
+      const serverPath = path.join(providerDirectory, 'server');
+      await requireDirectoryAuthorityStable(
+        providerRoot,
+        options.currentUid,
+        options.signal,
+        dependencies,
+      );
+      const serverStats = await dependencies.lstat(serverPath);
+      serverDirectory = await openChildDirectoryAuthority(
+        providerRoot,
+        serverPath,
+        serverStats,
+        options.currentUid,
+        options.signal,
+        dependencies,
+      );
+      const nodeModulesStats = await dependencies.lstat(nodeModulesDirectory);
+      nodeModulesRoot = await openChildDirectoryAuthority(
+        serverDirectory,
+        nodeModulesDirectory,
+        nodeModulesStats,
+        options.currentUid,
+        options.signal,
+        dependencies,
+      );
+      const nodeModules = await measureTree(
+        nodeModulesRoot,
+        nodeModulesDirectory,
+        options.currentUid,
+        new Set(),
+        options.signal,
+        dependencies,
+      );
+      if (!treeIdentityMatches(nodeModules, options.identity.nodeModules)) {
+        throw invalidProvider();
+      }
+      await requireDirectoryAuthorityStable(
+        nodeModulesRoot,
+        options.currentUid,
+        options.signal,
+        dependencies,
+      );
+      await requireDirectoryAuthorityStable(
+        serverDirectory,
+        options.currentUid,
+        options.signal,
+        dependencies,
+      );
+      await requireDirectoryAuthorityStable(
+        providerRoot,
+        options.currentUid,
+        options.signal,
+        dependencies,
+      );
+    } finally {
+      await nodeModulesRoot?.handle.close();
+      await serverDirectory?.handle.close();
+      await providerRoot.handle.close();
     }
   } catch (error) {
     throwMappedProviderError(error, options.signal);
