@@ -383,14 +383,21 @@ export const validateDownloaderCapabilities = async (
   dependencies: DownloaderCapabilityDependencies =
     defaultDownloaderCapabilityDependencies,
 ): Promise<ResolvedDownloaderToolchain> => {
-  const capabilityCwd = process.cwd();
-  const ytDlpExecutable = path.resolve(
-    capabilityCwd,
-    options.ytDlpExecutable,
-  );
+  const relativeInputPresent = !path.isAbsolute(options.ytDlpExecutable)
+    || (
+      options.ffmpegOverride !== undefined
+      && !path.isAbsolute(options.ffmpegOverride)
+    );
+  const capabilityCwd = relativeInputPresent ? process.cwd() : undefined;
+  const canonicalizeExecutable = (candidate: string): string => {
+    if (path.isAbsolute(candidate)) return candidate;
+    if (capabilityCwd === undefined) throw invalidToolchain();
+    return path.resolve(capabilityCwd, candidate);
+  };
+  const ytDlpExecutable = canonicalizeExecutable(options.ytDlpExecutable);
   const ffmpegOverride = options.ffmpegOverride === undefined
     ? undefined
-    : path.resolve(capabilityCwd, options.ffmpegOverride);
+    : canonicalizeExecutable(options.ffmpegOverride);
   const {
     source,
     validationMode,

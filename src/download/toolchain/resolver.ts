@@ -1,4 +1,5 @@
 import {homedir} from 'node:os';
+import path from 'node:path';
 import {
   downloadCancellationFrom,
   throwIfDownloadCancelled,
@@ -29,6 +30,13 @@ export const resolveDownloaderToolchain = async (
   dependencies: DownloaderCapabilityDependencies =
     defaultDownloaderCapabilityDependencies,
 ): Promise<ResolvedDownloaderToolchain> => {
+  const resolverCwd = process.cwd();
+  const ytDlpOverride = options.ytDlpOverride === undefined
+    ? undefined
+    : path.resolve(resolverCwd, options.ytDlpOverride);
+  const ffmpegOverride = options.ffmpegOverride === undefined
+    ? undefined
+    : path.resolve(resolverCwd, options.ffmpegOverride);
   throwIfDownloadCancelled(options.signal);
   if (process.platform !== 'darwin' || process.arch !== 'arm64') {
     throw invalidToolchain();
@@ -53,13 +61,13 @@ export const resolveDownloaderToolchain = async (
     );
   }
   return await validateDownloaderCapabilities({
-    source: options.ytDlpOverride === undefined ? 'managed' : 'override',
+    source: ytDlpOverride === undefined ? 'managed' : 'override',
     validationMode: 'published',
-    ytDlpExecutable: options.ytDlpOverride ?? paths.ytDlpExecutable,
+    ytDlpExecutable: ytDlpOverride ?? paths.ytDlpExecutable,
     paths,
-    ...(options.ffmpegOverride === undefined
+    ...(ffmpegOverride === undefined
       ? {}
-      : {ffmpegOverride: options.ffmpegOverride}),
+      : {ffmpegOverride}),
     ...(options.signal === undefined ? {} : {signal: options.signal}),
   }, dependencies);
 };

@@ -256,11 +256,14 @@ The setup command does not accept arbitrary asset URLs or redirect hosts.
 `FFMPEG_PATH` keeps its existing precedence. Otherwise use the system `ffmpeg`
 resolution already implemented by the application.
 
-At the start of capability validation, capture the current working directory
-before any asynchronous work and resolve both explicit override strings against
-that one directory. Validation, the returned toolchain, metadata probes, staged
-JXA downloads, and `--ffmpeg-location` must all reuse those exact absolute
-strings. Do not call `realpath`; existing symlink validation remains unchanged.
+At resolver entry, capture the current working directory before any asynchronous
+work and resolve both explicit override strings against that one directory.
+Capability validation must reuse those absolute inputs without reading a later
+working directory; direct capability callers may resolve relative inputs once
+before their own first await. Validation, the returned toolchain, metadata
+probes, staged JXA downloads, and `--ffmpeg-location` must all reuse those exact
+absolute strings. Do not call `realpath`; existing symlink validation remains
+unchanged.
 
 ### 7.5 Capability validation
 
