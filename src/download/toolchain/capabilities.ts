@@ -151,6 +151,7 @@ export interface ValidateDownloaderCapabilitiesOptions {
   source: DownloaderToolchainSource;
   validationMode: 'published' | 'staging';
   ytDlpExecutable: string;
+  validatedSystemDenoExecutable?: string;
   ffmpegOverride?: string;
   paths: DownloaderToolchainPaths;
   signal?: AbortSignal;
@@ -364,6 +365,7 @@ export const validateDownloaderCapabilities = async (
     source,
     validationMode,
     ytDlpExecutable,
+    validatedSystemDenoExecutable,
     ffmpegOverride,
     paths,
     signal,
@@ -412,7 +414,8 @@ export const validateDownloaderCapabilities = async (
   let systemDenoExecutable: string;
   let ffmpegExecutable: string;
   try {
-    systemDenoExecutable = await dependencies.resolveExecutable('deno');
+    systemDenoExecutable = validatedSystemDenoExecutable
+      ?? await dependencies.resolveExecutable('deno');
     ffmpegExecutable = ffmpegOverride
       ?? await dependencies.resolveExecutable('ffmpeg');
   } catch (error) {

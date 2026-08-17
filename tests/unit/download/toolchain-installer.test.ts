@@ -161,6 +161,9 @@ interface InstallerFixture {
   stagingDirectories: string[];
   fetch: ReturnType<typeof vi.fn<typeof globalThis.fetch>>;
   runProcess: ReturnType<typeof vi.fn<DownloadProcessRunner>>;
+  resolveExecutable: ReturnType<
+    typeof vi.fn<DownloaderCapabilityDependencies['resolveExecutable']>
+  >;
   open: ReturnType<typeof vi.fn<InstallerDependencies['open']>>;
   mkdtemp: ReturnType<typeof vi.fn>;
   rename: ReturnType<typeof vi.fn>;
@@ -336,6 +339,9 @@ const createInstallerFixture = async (): Promise<InstallerFixture> => {
     await removeFile(candidate, options);
   });
   const randomUUID = vi.fn(() => '00000000-0000-4000-8000-000000000001');
+  const resolveExecutable = vi.fn<
+    DownloaderCapabilityDependencies['resolveExecutable']
+  >(async (name) => name === 'deno' ? denoExecutable : ffmpegExecutable);
   const capabilityDependencies: DownloaderCapabilityDependencies = {
     runProcess,
     directoryExists: async (candidate) => {
@@ -350,9 +356,7 @@ const createInstallerFixture = async (): Promise<InstallerFixture> => {
     readFile: async (candidate, encoding) => await readFile(candidate, encoding),
     hashFile: async (candidate) => sha256(await readFile(candidate)),
     currentUid: () => currentUid,
-    resolveExecutable: async (name) => name === 'deno'
-      ? denoExecutable
-      : ffmpegExecutable,
+    resolveExecutable,
   };
   const dependencies: InstallerDependencies = {
     fetch,
@@ -379,6 +383,7 @@ const createInstallerFixture = async (): Promise<InstallerFixture> => {
     stagingDirectories,
     fetch,
     runProcess,
+    resolveExecutable,
     open,
     mkdtemp,
     rename,
@@ -686,6 +691,43 @@ describe('installDownloaderToolchain', () => {
     ].join('\n'));
     expect(await exists(maliciousCapturePath)).toBe(false);
     expect(process.env.HOME).toBe(parentHome);
+  });
+
+  it('reuses the initially validated Deno throughout staging validation', async () => {
+    const fixture = await createInstallerFixture();
+    let denoResolutions = 0;
+    fixture.resolveExecutable.mockImplementation(async (name) => {
+      if (name === 'ffmpeg') return ffmpegExecutable;
+      denoResolutions += 1;
+      if (denoResolutions > 1) {
+        throw new Error('private second Deno resolution');
+      }
+      return denoExecutable;
+    });
+
+    await expect(installDownloaderToolchain(
+      {homeDirectory: fixture.homeDirectory},
+      fixture.dependencies,
+    )).resolves.toEqual({status: 'installed', version: '2026.07.04'});
+
+    expect(fixture.resolveExecutable.mock.calls.filter(([name]) => name === 'deno'))
+      .toEqual([['deno']]);
+    expect(fixture.runProcess.mock.calls.filter(([command, args]) =>
+      command === denoExecutable
+      && args.length === 1
+      && args[0] === '--version'
+    )).toHaveLength(2);
+    expect(fixture.runProcess.mock.calls).toContainEqual([
+      denoExecutable,
+      providerInstallArguments,
+      expect.objectContaining({cwd: expect.stringContaining('/provider/server')}),
+    ]);
+    const providerProbe = fixture.runProcess.mock.calls.find(
+      ([command, args]) => path.basename(command) === 'deno-isolated'
+        && args[0] === 'run',
+    );
+    expect(providerProbe?.[2]?.env?.[DENO_EXECUTABLE_ENVIRONMENT_KEY])
+      .toBe(denoExecutable);
   });
 
   it.each(['relative', 'wrapper'] as const)(

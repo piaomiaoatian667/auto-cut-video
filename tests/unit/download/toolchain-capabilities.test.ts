@@ -557,6 +557,51 @@ describe('validateDownloaderCapabilities', () => {
       .toBe(denoExecutable);
   });
 
+  it('reuses a prevalidated staging Deno without resolving it again', async () => {
+    const fixture = createCapabilityFixture();
+    fixture.resolveExecutable.mockImplementation(async (name) => {
+      if (name === 'deno') {
+        throw new Error('private repeated Deno resolution');
+      }
+      return ffmpegExecutable;
+    });
+
+    const resolved = await validateFixture(fixture, {
+      validationMode: 'staging',
+      validatedSystemDenoExecutable: denoExecutable,
+    });
+
+    expect(fixture.resolveExecutable.mock.calls).toEqual([['ffmpeg']]);
+    expect(fixture.runProcess.mock.calls).toContainEqual([
+      denoExecutable,
+      ['--version'],
+      expect.objectContaining({env: expect.any(Object)}),
+    ]);
+    expect(resolved.childEnvironment[DENO_EXECUTABLE_ENVIRONMENT_KEY])
+      .toBe(denoExecutable);
+  });
+
+  it.each([
+    ['a relative path', 'relative-deno'],
+    ['the managed wrapper', denoWrapperExecutable],
+  ] as const)('rejects prevalidated staging Deno using %s', async (
+    _caseName,
+    validatedSystemDenoExecutable,
+  ) => {
+    const fixture = createCapabilityFixture();
+
+    await expectControlledError(
+      validateFixture(fixture, {
+        validationMode: 'staging',
+        validatedSystemDenoExecutable,
+      }),
+      'DOWNLOAD_TOOLCHAIN_INVALID',
+      INVALID_TOOLCHAIN_MESSAGE,
+      [validatedSystemDenoExecutable],
+    );
+    expect(fixture.resolveExecutable).not.toHaveBeenCalledWith('deno');
+  });
+
   it('forwards one signal with the proxy-free environment to every process', async () => {
     vi.stubEnv('http_PROXY', 'http://mixed-proxy.invalid');
     vi.stubEnv('HTTPS_PROXY', 'https://uppercase-proxy.invalid');

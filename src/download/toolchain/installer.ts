@@ -691,6 +691,7 @@ const writeDenoWrapper = async (
 
 const validateStagedToolchain = async (
   stagingPaths: DownloaderToolchainPaths,
+  validatedSystemDenoExecutable: string,
   ffmpegOverride: string | undefined,
   dependencies: InstallerDependencies,
   signal?: AbortSignal,
@@ -717,6 +718,7 @@ const validateStagedToolchain = async (
     source: 'managed',
     validationMode: 'staging',
     ytDlpExecutable: stagingPaths.ytDlpExecutable,
+    validatedSystemDenoExecutable,
     ...(ffmpegOverride === undefined ? {} : {ffmpegOverride}),
     paths: stagingPaths,
     ...(signal === undefined ? {} : {signal}),
@@ -867,6 +869,7 @@ const installDownloaderToolchainTransaction = async (
     );
     await validateStagedToolchain(
       stagingPaths,
+      denoExecutable,
       options.ffmpegOverride,
       dependencies,
       options.signal,
