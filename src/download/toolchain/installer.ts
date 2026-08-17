@@ -17,6 +17,11 @@ import {
 import path from 'node:path';
 import {isDeepStrictEqual} from 'node:util';
 import {runProcess as runSystemProcess, type RunProcessOptions} from '../../process/run-process';
+import {
+  DownloadCancellationError,
+  downloadCancellationFrom,
+  throwIfDownloadCancelled,
+} from '../cancellation';
 import {DownloadError} from '../errors';
 import type {DownloadProcessRunner} from '../yt-dlp';
 import {
@@ -37,6 +42,7 @@ import {buildToolchainExecutablePath} from './environment';
 import {currentUidHomeDirectory} from './home';
 import {snapshotOverridePaths} from './override-paths';
 import {resolveDownloaderToolchainPaths} from './paths';
+import {normalizeProviderInstallation} from './provider-integrity';
 import type {
   DownloaderToolchainPaths,
   SetupDownloaderResult,
@@ -63,6 +69,13 @@ const invalidToolchain = (): DownloadError => new DownloadError(
   'DOWNLOAD_TOOLCHAIN_INVALID',
   INVALID_TOOLCHAIN_MESSAGE,
 );
+
+const cancellationFor = (
+  error: unknown,
+  signal?: AbortSignal,
+): DownloadCancellationError | undefined =>
+  downloadCancellationFrom(error)
+  ?? (signal?.aborted === true ? new DownloadCancellationError() : undefined);
 
 export interface InstallerDependencies {
   fetch: typeof globalThis.fetch;
@@ -346,6 +359,7 @@ const pathsForVersionDirectory = (
 const validatePublishedToolchainIntegrity = async (
   paths: DownloaderToolchainPaths,
   dependencies: InstallerDependencies,
+  signal?: AbortSignal,
 ): Promise<void> => {
   const providerHeadPath = path.join(paths.providerDirectory, '.git/HEAD');
   const providerScriptPath = path.join(
@@ -422,6 +436,18 @@ const validatePublishedToolchainIntegrity = async (
   ) {
     throw invalidToolchain();
   }
+  try {
+    await dependencies.capabilities.verifyProviderIntegrity({
+      providerDirectory: paths.providerDirectory,
+      identity: DOWNLOADER_TOOLCHAIN_MANIFEST.potProvider.integrity,
+      currentUid: dependencies.currentUid(),
+      ...(signal === undefined ? {} : {signal}),
+    });
+  } catch (error) {
+    const cancellation = cancellationFor(error, signal);
+    if (cancellation !== undefined) throw cancellation;
+    throw invalidToolchain();
+  }
 };
 
 const publishedToolchainIsValid = async (
@@ -429,16 +455,14 @@ const publishedToolchainIsValid = async (
   dependencies: InstallerDependencies,
   signal?: AbortSignal,
 ): Promise<boolean> => {
-  const throwIfAborted = (): void => {
-    if (signal?.aborted === true) throw signal.reason;
-  };
   try {
-    throwIfAborted();
-    await validatePublishedToolchainIntegrity(paths, dependencies);
-    throwIfAborted();
+    throwIfDownloadCancelled(signal);
+    await validatePublishedToolchainIntegrity(paths, dependencies, signal);
+    throwIfDownloadCancelled(signal);
     return true;
   } catch (error) {
-    throwIfAborted();
+    const cancellation = cancellationFor(error, signal);
+    if (cancellation !== undefined) throw cancellation;
     if (isMissingPathError(error)) return false;
     if (error instanceof DownloadError) return false;
     throw invalidToolchain();
@@ -864,6 +888,11 @@ const installDownloaderToolchainTransaction = async (
       dependencies,
       options.signal,
     );
+    await normalizeProviderInstallation({
+      providerDirectory: stagingPaths.providerDirectory,
+      currentUid: dependencies.currentUid(),
+      ...(options.signal === undefined ? {} : {signal: options.signal}),
+    });
     await validateStagedToolchain(
       stagingPaths,
       denoExecutable,
@@ -886,16 +915,19 @@ const installDownloaderToolchainTransaction = async (
       quarantineDirectory = undefined;
     }
     return {status: 'installed', version: '2026.07.04'};
-  } catch {
+  } catch (error) {
+    const cancellation = cancellationFor(error, options.signal);
     if (!published && quarantineDirectory !== undefined) {
       try {
         await restoreQuarantine(quarantineDirectory, paths, dependencies);
         await syncDirectory(paths.cacheRoot, dependencies);
         quarantineDirectory = undefined;
       } catch {
+        if (cancellation !== undefined) throw cancellation;
         throw invalidToolchain();
       }
     }
+    if (cancellation !== undefined) throw cancellation;
     throw invalidToolchain();
   } finally {
     let cleanupFailed = false;
@@ -915,7 +947,12 @@ const installDownloaderToolchainTransaction = async (
     } catch {
       cleanupFailed = true;
     }
-    if (cleanupFailed) throw invalidToolchain();
+    if (cleanupFailed) {
+      if (options.signal?.aborted === true) {
+        throw new DownloadCancellationError();
+      }
+      throw invalidToolchain();
+    }
   }
 };
 
@@ -925,7 +962,9 @@ export const installDownloaderToolchain = async (
 ): Promise<SetupDownloaderResult> => {
   try {
     return await installDownloaderToolchainTransaction(options, dependencies);
-  } catch {
+  } catch (error) {
+    const cancellation = cancellationFor(error, options.signal);
+    if (cancellation !== undefined) throw cancellation;
     throw invalidToolchain();
   }
 };

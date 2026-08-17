@@ -164,6 +164,9 @@ interface InstallerFixture {
   resolveExecutable: ReturnType<
     typeof vi.fn<DownloaderCapabilityDependencies['resolveExecutable']>
   >;
+  verifyProviderIntegrity: ReturnType<
+    typeof vi.fn<DownloaderCapabilityDependencies['verifyProviderIntegrity']>
+  >;
   open: ReturnType<typeof vi.fn<InstallerDependencies['open']>>;
   mkdtemp: ReturnType<typeof vi.fn>;
   rename: ReturnType<typeof vi.fn>;
@@ -280,6 +283,15 @@ const createInstallerFixture = async (): Promise<InstallerFixture> => {
           path.join(options.cwd, 'node_modules'),
           {recursive: true, mode: 0o700},
         );
+        await mkdirDirectory(
+          path.join(options.cwd, 'node_modules/.deno'),
+          {recursive: true, mode: 0o700},
+        );
+        await writeFile(
+          path.join(options.cwd, 'node_modules/.deno/.setup-cache.bin'),
+          'unstable Deno setup cache',
+          {mode: 0o600},
+        );
         return resultFor(command, args);
       }
       if (args.length === 1 && args[0] === '--version') {
@@ -295,7 +307,7 @@ const createInstallerFixture = async (): Promise<InstallerFixture> => {
         (command === denoExecutable || path.basename(command) === 'deno-isolated')
         && args[0] === 'run'
       ) {
-        return resultFor(command, args);
+        return resultFor(command, args, '1.3.1\n');
       }
       if (args.length === 1 && args[0] === '--list-impersonate-targets') {
         return resultFor(command, args, targetsOutput);
@@ -342,6 +354,9 @@ const createInstallerFixture = async (): Promise<InstallerFixture> => {
   const resolveExecutable = vi.fn<
     DownloaderCapabilityDependencies['resolveExecutable']
   >(async (name) => name === 'deno' ? denoExecutable : ffmpegExecutable);
+  const verifyProviderIntegrity = vi.fn<
+    DownloaderCapabilityDependencies['verifyProviderIntegrity']
+  >(async () => {});
   const capabilityDependencies: DownloaderCapabilityDependencies = {
     runProcess,
     directoryExists: async (candidate) => {
@@ -357,6 +372,7 @@ const createInstallerFixture = async (): Promise<InstallerFixture> => {
     hashFile: async (candidate) => sha256(await readFile(candidate)),
     currentUid: () => currentUid,
     resolveExecutable,
+    verifyProviderIntegrity,
   };
   const dependencies: InstallerDependencies = {
     fetch,
@@ -384,6 +400,7 @@ const createInstallerFixture = async (): Promise<InstallerFixture> => {
     fetch,
     runProcess,
     resolveExecutable,
+    verifyProviderIntegrity,
     open,
     mkdtemp,
     rename,
@@ -610,6 +627,10 @@ describe('installDownloaderToolchain', () => {
       operation === `sync:${fixture.paths.cacheRoot}`
     )).toBeGreaterThan(publication);
     expect(await exists(fixture.paths.setupLock)).toBe(false);
+    expect(await exists(path.join(
+      fixture.paths.providerServerDirectory,
+      'node_modules/.deno/.setup-cache.bin',
+    ))).toBe(false);
     expect(await Promise.all(fixture.stagingDirectories.map(exists)))
       .toEqual(fixture.stagingDirectories.map(() => false));
   });
@@ -1150,8 +1171,64 @@ describe('installDownloaderToolchain', () => {
     expect(fixture.mkdtemp).not.toHaveBeenCalled();
     expect(fixture.rename).not.toHaveBeenCalled();
     expect(fixture.randomUUID).not.toHaveBeenCalled();
+    expect(fixture.verifyProviderIntegrity).toHaveBeenCalledWith({
+      providerDirectory: fixture.paths.providerDirectory,
+      identity: DOWNLOADER_TOOLCHAIN_MANIFEST.potProvider.integrity,
+      currentUid,
+    });
     expect(await exists(fixture.paths.versionDirectory)).toBe(true);
     expect(await exists(fixture.paths.setupLock)).toBe(false);
+  });
+
+  it('quarantines and reinstalls when pinned HEAD has tampered source', async () => {
+    const fixture = await createInstallerFixture();
+    await seedValidPublishedToolchain(fixture.paths);
+    const sourceImport = path.join(
+      fixture.paths.providerServerDirectory,
+      'src/generate_once.ts',
+    );
+    await writeFile(sourceImport, 'private tampered provider source\n');
+    fixture.verifyProviderIntegrity.mockRejectedValueOnce(
+      new Error('private published source root mismatch'),
+    );
+
+    await expect(installDownloaderToolchain(
+      {homeDirectory: fixture.homeDirectory},
+      fixture.dependencies,
+    )).resolves.toEqual({status: 'installed', version: '2026.07.04'});
+
+    expect(fixture.fetch).toHaveBeenCalledTimes(2);
+    expect(fixture.verifyProviderIntegrity).toHaveBeenCalledTimes(2);
+    expect(fixture.verifyProviderIntegrity.mock.calls[0]?.[0])
+      .toMatchObject({providerDirectory: fixture.paths.providerDirectory});
+    expect(fixture.verifyProviderIntegrity.mock.calls[1]?.[0].providerDirectory)
+      .toContain('/.install-');
+    expect(await readFile(
+      path.join(fixture.paths.providerDirectory, '.git/HEAD'),
+      'utf8',
+    )).toBe(`${DOWNLOADER_TOOLCHAIN_MANIFEST.potProvider.commit}\n`);
+    expect(await readFile(sourceImport, 'utf8')).toBe('export {};\n');
+  });
+
+  it('normalizes the Deno setup cache before staging verification', async () => {
+    const fixture = await createInstallerFixture();
+    let setupCachePresentAtVerification: boolean | undefined;
+    fixture.verifyProviderIntegrity.mockImplementation(async ({
+      providerDirectory,
+    }) => {
+      if (!providerDirectory.includes('/.install-')) return;
+      setupCachePresentAtVerification = await exists(path.join(
+        providerDirectory,
+        'server/node_modules/.deno/.setup-cache.bin',
+      ));
+    });
+
+    await expect(installDownloaderToolchain(
+      {homeDirectory: fixture.homeDirectory},
+      fixture.dependencies,
+    )).resolves.toEqual({status: 'installed', version: '2026.07.04'});
+
+    expect(setupCachePresentAtVerification).toBe(false);
   });
 
   it.each([
@@ -1337,12 +1414,25 @@ describe('installDownloaderToolchain', () => {
       );
     });
 
-    await expectInvalidToolchain(
-      installDownloaderToolchain(
+    let caught: unknown;
+    try {
+      await installDownloaderToolchain(
         {homeDirectory: fixture.homeDirectory, signal: controller.signal},
         fixture.dependencies,
-      ),
-      ['private cancellation reason', DOWNLOADER_TOOLCHAIN_MANIFEST.ytDlp.url],
+      );
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      name: 'DownloadCancellationError',
+      message: 'The download operation was cancelled.',
+    });
+    expect(`${String(caught)}${JSON.stringify(caught)}`).not.toContain(
+      'private cancellation reason',
+    );
+    expect(String(caught)).not.toContain(
+      DOWNLOADER_TOOLCHAIN_MANIFEST.ytDlp.url,
     );
 
     expect(await Promise.all(fixture.stagingDirectories.map(exists)))

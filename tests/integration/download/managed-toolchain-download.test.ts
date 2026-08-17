@@ -16,6 +16,7 @@ import {parseDownloadProxy} from '../../../src/download/network-options';
 import {DownloadReceiptSchema} from '../../../src/download/receipt-schema';
 import type {DownloadPlatform} from '../../../src/download/platforms';
 import {DENO_EXECUTABLE_ENVIRONMENT_KEY} from '../../../src/download/toolchain/deno-wrapper';
+import {DOWNLOADER_TOOLCHAIN_MANIFEST} from '../../../src/download/toolchain/manifest';
 import {
   FAKE_YT_DLP_FIXTURE,
   FIXED_DOWNLOAD_TIME,
@@ -222,6 +223,11 @@ describe('managed multi-platform download integration', () => {
     );
     expect(providerChecks).toHaveLength(1);
     expect(providerChecks[0]?.args[0]).toBe('run');
+    expect(fixture.providerIntegrityChecks).toEqual([{
+      providerDirectory: fixture.paths.providerDirectory,
+      identity: DOWNLOADER_TOOLCHAIN_MANIFEST.potProvider.integrity,
+      currentUid: typeof process.getuid === 'function' ? process.getuid() : -1,
+    }]);
     const serializedEnvironments = JSON.stringify(
       fixture.subprocesses.map((subprocess) => subprocess.environment),
     );
@@ -262,6 +268,35 @@ describe('managed multi-platform download integration', () => {
       rawFileSha256(await readFile(fixture.paths.pluginArchive)),
     );
   });
+
+  it.each(['source', 'node_modules'] as const)(
+    'does not download when the %s verifier fails',
+    async (tree) => {
+      const fixture = await createManagedDownloadFixture();
+      fixtures.push(fixture);
+      fixture.providerIntegrityFailures.add(tree);
+      const run = fixture.createCommandHarness();
+
+      const exitCode = await runVideoctl([
+        'download',
+        'https://www.youtube.com/watch?v=integrity-failure',
+        '--rights-confirmed',
+        '--json',
+      ], run.dependencies);
+
+      expect(exitCode).toBe(EXIT_CODES.environmentFailed);
+      expect(JSON.parse(run.stdout())).toEqual({
+        command: 'download',
+        ok: false,
+        code: 'DOWNLOAD_PO_TOKEN_UNAVAILABLE',
+        message: 'The YouTube compatibility provider is unavailable.',
+      });
+      expect(run.stdout()).not.toContain(`private ${tree}`);
+      expect(run.stderr()).toBe('');
+      expect(fixture.providerIntegrityChecks).toHaveLength(1);
+      expect(fixture.operations).toEqual([]);
+    },
+  );
 
   it('uses one absolute override identity for doctor, probe, and staged download', async () => {
     const fixture = await createManagedDownloadFixture({relativeOverrides: true});

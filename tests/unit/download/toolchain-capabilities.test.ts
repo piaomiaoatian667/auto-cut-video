@@ -18,7 +18,11 @@ import {
 import {DENO_EXECUTABLE_ENVIRONMENT_KEY} from '../../../src/download/toolchain/deno-wrapper';
 import {resolveDownloaderToolchainPaths} from '../../../src/download/toolchain/paths';
 import type {DownloaderToolchainPaths} from '../../../src/download/toolchain/types';
-import type {DownloadError, DownloadErrorCode} from '../../../src/download/errors';
+import {
+  DownloadError,
+  type DownloadErrorCode,
+} from '../../../src/download/errors';
+import {DownloadCancellationError} from '../../../src/download/cancellation';
 import type {DownloadProcessRunner} from '../../../src/download/yt-dlp';
 import type {ProcessResult} from '../../../src/process/run-process';
 
@@ -86,6 +90,7 @@ interface CapabilityOutputs {
   help: string;
   deno: string;
   plugin: string;
+  provider: string;
   targets: string;
   ffmpeg: string;
 }
@@ -103,6 +108,9 @@ interface CapabilityFixture {
   readFile: ReturnType<typeof vi.fn<DownloaderCapabilityDependencies['readFile']>>;
   resolveExecutable: ReturnType<
     typeof vi.fn<DownloaderCapabilityDependencies['resolveExecutable']>
+  >;
+  verifyProviderIntegrity: ReturnType<
+    typeof vi.fn<DownloaderCapabilityDependencies['verifyProviderIntegrity']>
   >;
 }
 
@@ -146,6 +154,7 @@ const createCapabilityFixture = (
     help: helpOutput,
     deno: denoOutput,
     plugin: pluginOutput,
+    provider: '1.3.1\n',
     targets: targetsOutput,
     ffmpeg: ffmpegOutput,
   };
@@ -189,7 +198,7 @@ const createCapabilityFixture = (
             `provider stderr private-marker ${toolchainPaths.providerServerDirectory}`,
           );
         }
-        return resultFor(command, args);
+        return resultFor(command, args, outputs.provider);
       }
       if (args.length === 1 && args[0] === '--list-impersonate-targets') {
         if (failures.has('impersonation')) {
@@ -221,6 +230,9 @@ const createCapabilityFixture = (
   const lstatFile = vi.fn<DownloaderCapabilityDependencies['lstat']>(
     async (candidate) => stats.get(candidate) ?? regularFileStats(),
   );
+  const verifyProviderIntegrity = vi.fn<
+    DownloaderCapabilityDependencies['verifyProviderIntegrity']
+  >(async () => {});
   const dependencies: DownloaderCapabilityDependencies = {
     runProcess,
     directoryExists: vi.fn(async () => true),
@@ -233,6 +245,7 @@ const createCapabilityFixture = (
     }),
     currentUid: () => currentUid,
     resolveExecutable,
+    verifyProviderIntegrity,
   };
   return {
     dependencies,
@@ -246,6 +259,7 @@ const createCapabilityFixture = (
     lstat: lstatFile,
     readFile,
     resolveExecutable,
+    verifyProviderIntegrity,
   };
 };
 
@@ -572,6 +586,11 @@ describe('validateDownloaderCapabilities', () => {
       },
     ]);
     expect(fixture.readFile).toHaveBeenCalledWith(denoWrapperExecutable, 'utf8');
+    expect(fixture.verifyProviderIntegrity).toHaveBeenCalledWith({
+      providerDirectory: paths.providerDirectory,
+      identity: DOWNLOADER_TOOLCHAIN_MANIFEST.potProvider.integrity,
+      currentUid,
+    });
     expect(fixture.runProcess.mock.calls.slice(5)).toEqual([
       [
         paths.ytDlpExecutable,
@@ -874,6 +893,11 @@ describe('validateDownloaderCapabilities', () => {
       .resolves.toMatchObject({source: 'managed'});
     expect(fixture.readFile).not.toHaveBeenCalledWith(paths.installedManifest, 'utf8');
     expect(fixture.readFile).toHaveBeenCalledWith(providerHeadPath, 'utf8');
+    expect(fixture.verifyProviderIntegrity).toHaveBeenCalledWith({
+      providerDirectory: paths.providerDirectory,
+      identity: DOWNLOADER_TOOLCHAIN_MANIFEST.potProvider.integrity,
+      currentUid,
+    });
   });
 
   it('rejects a managed downloader hash mismatch without exposing the digest', async () => {
@@ -1073,6 +1097,37 @@ describe('validateDownloaderCapabilities', () => {
     );
   });
 
+  it.each(['source', 'node_modules'])(
+    'maps a %s verifier failure to the fixed provider error',
+    async (tree) => {
+      const fixture = createCapabilityFixture();
+      const privateMarker = `private ${tree} verifier failure`;
+      fixture.verifyProviderIntegrity.mockRejectedValueOnce(
+        new Error(privateMarker),
+      );
+
+      await expectControlledError(
+        validateFixture(fixture),
+        'DOWNLOAD_PO_TOKEN_UNAVAILABLE',
+        INVALID_PROVIDER_MESSAGE,
+        [privateMarker, paths.providerDirectory],
+      );
+      expect(fixture.runProcess).not.toHaveBeenCalled();
+    },
+  );
+
+  it('preserves cancellation from the provider verifier', async () => {
+    const fixture = createCapabilityFixture();
+    fixture.verifyProviderIntegrity.mockRejectedValueOnce(
+      new DownloadCancellationError(),
+    );
+
+    await expect(validateFixture(fixture)).rejects.toMatchObject({
+      name: 'DownloadCancellationError',
+      message: 'The download operation was cancelled.',
+    });
+  });
+
   it('rejects foreign provider HEAD ownership as toolchain integrity failure', async () => {
     const fixture = createCapabilityFixture();
     fixture.stats.set(providerHeadPath, regularFileStats(currentUid + 1));
@@ -1094,6 +1149,23 @@ describe('validateDownloaderCapabilities', () => {
       'DOWNLOAD_PO_TOKEN_UNAVAILABLE',
       INVALID_PROVIDER_MESSAGE,
       ['provider stderr', 'private-marker', paths.providerServerDirectory],
+    );
+  });
+
+  it.each([
+    ['wrong version', '1.3.0\n'],
+    ['extra line', '1.3.1\nextra\n'],
+    ['leading whitespace', ' 1.3.1\n'],
+    ['trailing whitespace', '1.3.1 \n'],
+  ])('rejects provider %s output', async (_caseName, output) => {
+    const fixture = createCapabilityFixture();
+    fixture.outputs.provider = output;
+
+    await expectControlledError(
+      validateFixture(fixture),
+      'DOWNLOAD_PO_TOKEN_UNAVAILABLE',
+      INVALID_PROVIDER_MESSAGE,
+      ['1.3.0', 'extra', paths.providerServerDirectory],
     );
   });
 

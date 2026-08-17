@@ -105,7 +105,7 @@ const createResolverFixture = (): ResolverFixture => {
     if (command === '/usr/bin/unzip') {
       return resultFor(command, args, pluginOutput);
     }
-    if (args[0] === 'run') return resultFor(command, args);
+    if (args[0] === 'run') return resultFor(command, args, '1.3.1\n');
     if (args.length === 1 && args[0] === '--list-impersonate-targets') {
       return resultFor(command, args, targetsOutput);
     }
@@ -135,6 +135,7 @@ const createResolverFixture = (): ResolverFixture => {
     hashFile,
     currentUid: () => currentUid,
     resolveExecutable,
+    verifyProviderIntegrity: vi.fn(async () => {}),
   };
   return {
     dependencies,

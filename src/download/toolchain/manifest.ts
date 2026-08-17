@@ -30,6 +30,18 @@ const pinnedToolchainIdentity = {
     repository: 'https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git',
     version: '1.3.1',
     commit: '7608dd51ee813b48cf9a6d68c6e42cb197ce10e0',
+    integrity: {
+      source: {
+        entries: 30,
+        sha256: '1307dade1714cac0f6569377a5930be39b02ec719b0179f77de773c753c6bbf2',
+      },
+      nodeModules: {
+        entries: 9715,
+        files: 8906,
+        symlinks: 809,
+        sha256: '6723ebf44c2cc5bdb02395fac7689615ba164d7ae869bb6e7a6c4f96cc8f2b94',
+      },
+    },
   },
 } as const;
 
@@ -94,6 +106,30 @@ const potProviderSchema = z.object({
   repository: pinnedUrlSchema(pinnedToolchainIdentity.potProvider.repository),
   version: z.literal(pinnedToolchainIdentity.potProvider.version),
   commit: pinnedCommitSchema(pinnedToolchainIdentity.potProvider.commit),
+  integrity: z.object({
+    source: z.object({
+      entries: pinnedPositiveIntegerSchema(
+        pinnedToolchainIdentity.potProvider.integrity.source.entries,
+      ),
+      sha256: pinnedSha256Schema(
+        pinnedToolchainIdentity.potProvider.integrity.source.sha256,
+      ),
+    }).strict(),
+    nodeModules: z.object({
+      entries: pinnedPositiveIntegerSchema(
+        pinnedToolchainIdentity.potProvider.integrity.nodeModules.entries,
+      ),
+      files: pinnedPositiveIntegerSchema(
+        pinnedToolchainIdentity.potProvider.integrity.nodeModules.files,
+      ),
+      symlinks: pinnedPositiveIntegerSchema(
+        pinnedToolchainIdentity.potProvider.integrity.nodeModules.symlinks,
+      ),
+      sha256: pinnedSha256Schema(
+        pinnedToolchainIdentity.potProvider.integrity.nodeModules.sha256,
+      ),
+    }).strict(),
+  }).strict(),
 }).strict();
 
 const downloaderToolchainManifestSchema = z.object({
@@ -140,5 +176,6 @@ export const installedManifestForPinnedToolchain = () => ({
   potProvider: {
     version: '1.3.1' as const,
     commit: '7608dd51ee813b48cf9a6d68c6e42cb197ce10e0' as const,
+    integrity: DOWNLOADER_TOOLCHAIN_MANIFEST.potProvider.integrity,
   },
 });

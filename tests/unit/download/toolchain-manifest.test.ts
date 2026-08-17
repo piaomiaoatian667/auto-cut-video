@@ -27,6 +27,18 @@ const validManifest = () => ({
     repository: 'https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git',
     version: '1.3.1',
     commit: '7608dd51ee813b48cf9a6d68c6e42cb197ce10e0',
+    integrity: {
+      source: {
+        entries: 30,
+        sha256: '1307dade1714cac0f6569377a5930be39b02ec719b0179f77de773c753c6bbf2',
+      },
+      nodeModules: {
+        entries: 9715,
+        files: 8906,
+        symlinks: 809,
+        sha256: '6723ebf44c2cc5bdb02395fac7689615ba164d7ae869bb6e7a6c4f96cc8f2b94',
+      },
+    },
   },
 });
 
@@ -88,6 +100,18 @@ describe('managed downloader toolchain manifest', () => {
       potProvider: {
         version: '1.3.1',
         commit: '7608dd51ee813b48cf9a6d68c6e42cb197ce10e0',
+        integrity: {
+          source: {
+            entries: 30,
+            sha256: '1307dade1714cac0f6569377a5930be39b02ec719b0179f77de773c753c6bbf2',
+          },
+          nodeModules: {
+            entries: 9715,
+            files: 8906,
+            symlinks: 809,
+            sha256: '6723ebf44c2cc5bdb02395fac7689615ba164d7ae869bb6e7a6c4f96cc8f2b94',
+          },
+        },
       },
     });
   });
@@ -174,6 +198,61 @@ describe('managed downloader toolchain manifest', () => {
   });
 
   it.each([
+    [
+      'source entry count',
+      {source: {...validManifest().potProvider.integrity.source, entries: 31}},
+    ],
+    [
+      'source root',
+      {source: {...validManifest().potProvider.integrity.source, sha256: 'a'.repeat(64)}},
+    ],
+    [
+      'node_modules entry count',
+      {
+        nodeModules: {
+          ...validManifest().potProvider.integrity.nodeModules,
+          entries: 9716,
+        },
+      },
+    ],
+    [
+      'node_modules file count',
+      {
+        nodeModules: {
+          ...validManifest().potProvider.integrity.nodeModules,
+          files: 8905,
+        },
+      },
+    ],
+    [
+      'node_modules symlink count',
+      {
+        nodeModules: {
+          ...validManifest().potProvider.integrity.nodeModules,
+          symlinks: 810,
+        },
+      },
+    ],
+    [
+      'node_modules root',
+      {
+        nodeModules: {
+          ...validManifest().potProvider.integrity.nodeModules,
+          sha256: 'a'.repeat(64),
+        },
+      },
+    ],
+  ])('rejects a replacement provider %s', (_caseName, replacement) => {
+    const manifest = validManifest();
+    expectInvalidManifest(withPotProvider({
+      integrity: {
+        ...manifest.potProvider.integrity,
+        ...replacement,
+      },
+    }));
+  });
+
+  it.each([
     ['top-level key', {...validManifest(), unexpected: true}],
     [
       'asset key',
@@ -187,6 +266,19 @@ describe('managed downloader toolchain manifest', () => {
       {
         ...validManifest(),
         potProvider: {...validManifest().potProvider, unexpected: true},
+      },
+    ],
+    [
+      'provider integrity key',
+      {
+        ...validManifest(),
+        potProvider: {
+          ...validManifest().potProvider,
+          integrity: {
+            ...validManifest().potProvider.integrity,
+            unexpected: true,
+          },
+        },
       },
     ],
   ])('rejects an unexpected %s', (_caseName, manifest) => {

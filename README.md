@@ -23,6 +23,17 @@ either `installed` or `already-present`; otherwise it emits a controlled error.
 Ordinary `download` and `doctor-downloader` commands never install or update
 executable code.
 
+The pinned BgUtils provider is accepted only when both canonical full-tree
+identities match the checked-in manifest: the source tree excludes `.git/**`
+and `server/node_modules/**`, while the dependency tree covers every regular
+file and symlink under `server/node_modules`. Canonical records bind relative
+path, executable bits, file SHA-256 or raw symlink target, and entry counts.
+Traversal also requires current-UID ownership, rejects special files and
+escaping or absolute symlinks, and never trusts the installed Git object
+database. After Deno installation, setup safely removes only
+`server/node_modules/.deno/.setup-cache.bin` before verification and
+publication.
+
 Every setup subprocess, including Git checks and checkout, Deno validation and
 frozen dependency installation, and staging capability validation, receives a
 frozen staging-local environment built from zero. Its `HOME` and `TMPDIR` point
@@ -49,8 +60,9 @@ pnpm --silent video download \
   --json
 ```
 
-`doctor-downloader` verifies the installed version, integrity, Deno, EJS,
-YouTube PO-provider, Chrome impersonation, and FFmpeg capabilities. It can also
+`doctor-downloader` verifies the installed version, both provider tree roots,
+Deno, EJS, the exact BgUtils provider version `1.3.1`, Chrome impersonation,
+and FFmpeg capabilities. It can also
 perform one metadata-only eligibility check with `--check-url`,
 `--rights-confirmed`, and the same explicit proxy or Chrome options used for a
 download. A metadata check does not write media.

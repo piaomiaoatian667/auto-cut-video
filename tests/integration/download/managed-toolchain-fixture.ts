@@ -41,6 +41,7 @@ import {
   installedManifestForPinnedToolchain,
 } from '../../../src/download/toolchain/manifest';
 import {resolveDownloaderToolchainPaths} from '../../../src/download/toolchain/paths';
+import type {VerifyProviderIntegrityOptions} from '../../../src/download/toolchain/provider-integrity';
 import {resolveDownloaderToolchain} from '../../../src/download/toolchain/resolver';
 import type {ResolvedDownloaderToolchain} from '../../../src/download/toolchain/types';
 import type {DownloadProcessRunner} from '../../../src/download/yt-dlp';
@@ -132,6 +133,8 @@ export interface ManagedDownloadRuntime {
   processFailures: ProcessExecutionError[];
   delays: number[];
   actualHashes: Map<string, string>;
+  providerIntegrityChecks: VerifyProviderIntegrityOptions[];
+  providerIntegrityFailures: Set<'source' | 'node_modules'>;
   paths: ReturnType<typeof resolveDownloaderToolchainPaths>;
   recordDirectory: string;
   recordPath: string;
@@ -338,7 +341,10 @@ const initializeManagedCache = async (
       "  process.stdout.write('deno 2.8.3\\n');",
       '  process.exit(0);',
       '}',
-      "if (args[0] === 'run') process.exit(0);",
+      "if (args[0] === 'run' && args.at(-1) === '--version') {",
+      "  process.stdout.write('1.3.1\\n');",
+      '  process.exit(0);',
+      '}',
       'process.exit(2);',
       '',
     ].join('\n')),
@@ -383,6 +389,8 @@ export const createManagedDownloadRuntime = (
   const processFailures: ProcessExecutionError[] = [];
   const delays: number[] = [];
   const actualHashes = new Map<string, string>();
+  const providerIntegrityChecks: VerifyProviderIntegrityOptions[] = [];
+  const providerIntegrityFailures = new Set<'source' | 'node_modules'>();
   const createHarnessEnvironment = (
     environmentOptions: ManagedFixtureSubprocessEnvironmentOptions = {},
   ): Readonly<NodeJS.ProcessEnv> => fixtureHarnessEnvironment(
@@ -444,6 +452,13 @@ export const createManagedDownloadRuntime = (
       ? layout.denoExecutable
       : layout.ffmpegExecutable,
     runProcess: processRunner,
+    verifyProviderIntegrity: async (verification) => {
+      providerIntegrityChecks.push(verification);
+      const failure = providerIntegrityFailures.values().next().value;
+      if (failure !== undefined) {
+        throw new Error(`private ${failure} provider root mismatch`);
+      }
+    },
   };
   const resolveToolchain = async (
     signal?: AbortSignal,
@@ -484,6 +499,8 @@ export const createManagedDownloadRuntime = (
     processFailures,
     delays,
     actualHashes,
+    providerIntegrityChecks,
+    providerIntegrityFailures,
     paths: layout.paths,
     recordDirectory: layout.recordDirectory,
     recordPath: path.join(layout.recordDirectory, 'operations.jsonl'),

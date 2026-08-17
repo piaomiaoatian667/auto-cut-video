@@ -24,6 +24,10 @@ import {
 } from './manifest';
 import {snapshotOverridePaths} from './override-paths';
 import {
+  verifyProviderIntegrity as verifyInstalledProviderIntegrity,
+  type VerifyProviderIntegrityOptions,
+} from './provider-integrity';
+import {
   DENO_EXECUTABLE_ENVIRONMENT_KEY,
   DENO_WRAPPER_SOURCE,
 } from './deno-wrapper';
@@ -158,6 +162,7 @@ export interface DownloaderCapabilityDependencies {
   hashFile(candidate: string): Promise<string>;
   currentUid(): number;
   resolveExecutable(name: 'deno' | 'ffmpeg'): Promise<string>;
+  verifyProviderIntegrity(options: VerifyProviderIntegrityOptions): Promise<void>;
 }
 
 export interface ValidateDownloaderCapabilitiesOptions {
@@ -222,6 +227,7 @@ export const defaultDownloaderCapabilityDependencies:
   currentUid: () =>
     typeof process.getuid === 'function' ? process.getuid() : -1,
   resolveExecutable,
+  verifyProviderIntegrity: verifyInstalledProviderIntegrity,
 };
 
 const requireOwnedRegularFile = async (
@@ -325,14 +331,41 @@ const runProviderCheck = async (
   command: string,
   args: readonly string[],
   options: RunProcessOptions,
-): Promise<void> => {
+): Promise<ProcessResult> => {
   try {
-    await runner(command, args, options);
+    return await runner(command, args, options);
   } catch (error) {
     const cancellation = downloadCancellationFrom(error);
     if (cancellation !== undefined) throw cancellation;
     throw invalidProvider();
   }
+};
+
+const requireProviderIntegrity = async (
+  paths: DownloaderToolchainPaths,
+  signal: AbortSignal | undefined,
+  dependencies: DownloaderCapabilityDependencies,
+): Promise<void> => {
+  try {
+    await dependencies.verifyProviderIntegrity({
+      providerDirectory: paths.providerDirectory,
+      identity: DOWNLOADER_TOOLCHAIN_MANIFEST.potProvider.integrity,
+      currentUid: dependencies.currentUid(),
+      ...(signal === undefined ? {} : {signal}),
+    });
+  } catch (error) {
+    const cancellation = downloadCancellationFrom(error);
+    if (cancellation !== undefined) throw cancellation;
+    throwIfDownloadCancelled(signal);
+    throw invalidProvider();
+  }
+};
+
+const providerVersionMatches = (stdout: string): boolean => {
+  const version = DOWNLOADER_TOOLCHAIN_MANIFEST.potProvider.version;
+  return stdout === version
+    || stdout === `${version}\n`
+    || stdout === `${version}\r\n`;
 };
 
 const selectChromeMacosTarget = (stdout: string): string => {
@@ -409,6 +442,7 @@ export const validateDownloaderCapabilities = async (
   );
   await requireManagedDenoWrapper(paths, dependencies);
   await requireOwnedRegularFile(providerHead, dependencies, invalidToolchain);
+  await requireProviderIntegrity(paths, signal, dependencies);
 
   if (validationMode === 'published') {
     await requirePublishedManifest(paths, dependencies);
@@ -512,18 +546,23 @@ export const validateDownloaderCapabilities = async (
     throw invalidProvider();
   }
 
-  await runProviderCheck(dependencies.runProcess, paths.denoWrapperExecutable, [
-    'run',
-    '--allow-env',
-    `--allow-ffi=${denoPathList(path.join(paths.providerServerDirectory, 'node_modules'))}`,
-    `--allow-read=${denoPathList(paths.providerServerDirectory, path.join(paths.providerServerDirectory, 'node_modules'), paths.providerCacheDirectory)}`,
-    `--allow-write=${denoPathList(paths.providerCacheDirectory)}`,
-    path.join(paths.providerServerDirectory, 'src/generate_once.ts'),
-    '--version',
-  ], {
-    ...processOptions,
-    cwd: paths.providerServerDirectory,
-  });
+  const providerResult = await runProviderCheck(
+    dependencies.runProcess,
+    paths.denoWrapperExecutable,
+    [
+      'run',
+      '--allow-env',
+      `--allow-ffi=${denoPathList(path.join(paths.providerServerDirectory, 'node_modules'))}`,
+      `--allow-read=${denoPathList(paths.providerServerDirectory, path.join(paths.providerServerDirectory, 'node_modules'), paths.providerCacheDirectory)}`,
+      `--allow-write=${denoPathList(paths.providerCacheDirectory)}`,
+      path.join(paths.providerServerDirectory, 'src/generate_once.ts'),
+      '--version',
+    ], {
+      ...processOptions,
+      cwd: paths.providerServerDirectory,
+    },
+  );
+  if (!providerVersionMatches(providerResult.stdout)) throw invalidProvider();
 
   let targetsResult: ProcessResult;
   try {

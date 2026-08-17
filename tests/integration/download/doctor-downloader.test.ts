@@ -18,6 +18,7 @@ import {
   createSystemVideoctlDependencies,
   runVideoctl,
 } from '../../../src/cli/videoctl';
+import {EXIT_CODES} from '../../../src/cli/exit-codes';
 import {
   createSystemDownloadDependencies,
   type DownloadDependencies,
@@ -32,6 +33,7 @@ import {
   installedManifestForPinnedToolchain,
 } from '../../../src/download/toolchain/manifest';
 import {resolveDownloaderToolchainPaths} from '../../../src/download/toolchain/paths';
+import type {VerifyProviderIntegrityOptions} from '../../../src/download/toolchain/provider-integrity';
 import {resolveDownloaderToolchain} from '../../../src/download/toolchain/resolver';
 import type {ResolvedDownloaderToolchain} from '../../../src/download/toolchain/types';
 import {runProcess as runSystemProcess} from '../../../src/process/run-process';
@@ -108,6 +110,8 @@ interface ManagedFixture {
   probeEnvironments: Array<Readonly<NodeJS.ProcessEnv> | undefined>;
   probeArgs: string[][];
   actualHashes: Map<string, string>;
+  providerIntegrityChecks: VerifyProviderIntegrityOptions[];
+  providerIntegrityFailures: Set<'source' | 'node_modules'>;
   paths: ReturnType<typeof resolveDownloaderToolchainPaths>;
 }
 
@@ -166,7 +170,10 @@ const createManagedFixture = async (): Promise<ManagedFixture> => {
       "  process.stdout.write('deno 2.8.3\\n');",
       '  process.exit(0);',
       '}',
-      "if (args[0] === 'run') process.exit(0);",
+      "if (args[0] === 'run' && args.at(-1) === '--version') {",
+      "  process.stdout.write('1.3.1\\n');",
+      '  process.exit(0);',
+      '}',
       'process.exit(2);',
       '',
     ].join('\n')),
@@ -179,6 +186,8 @@ const createManagedFixture = async (): Promise<ManagedFixture> => {
 
   const actualHashes = new Map<string, string>();
   const capabilityCommands: Array<{command: string; args: string[]}> = [];
+  const providerIntegrityChecks: VerifyProviderIntegrityOptions[] = [];
+  const providerIntegrityFailures = new Set<'source' | 'node_modules'>();
   const capabilityDependencies: DownloaderCapabilityDependencies = {
     ...defaultDownloaderCapabilityDependencies,
     runProcess: async (command, args, options) => {
@@ -200,6 +209,13 @@ const createManagedFixture = async (): Promise<ManagedFixture> => {
     },
     resolveExecutable: async (name) =>
       name === 'deno' ? denoExecutable : ffmpegExecutable,
+    verifyProviderIntegrity: async (verification) => {
+      providerIntegrityChecks.push(verification);
+      const failure = providerIntegrityFailures.values().next().value;
+      if (failure !== undefined) {
+        throw new Error(`private ${failure} provider root mismatch`);
+      }
+    },
   };
   const resolveToolchain = async (
     signal?: AbortSignal,
@@ -239,6 +255,8 @@ const createManagedFixture = async (): Promise<ManagedFixture> => {
     probeEnvironments,
     probeArgs,
     actualHashes,
+    providerIntegrityChecks,
+    providerIntegrityFailures,
     paths,
   };
 };
@@ -320,10 +338,42 @@ describe('doctor-downloader managed integration', () => {
     );
     expect(providerChecks).toHaveLength(1);
     expect(providerChecks[0]?.args[0]).toBe('run');
+    expect(fixture.providerIntegrityChecks).toEqual([{
+      providerDirectory: fixture.paths.providerDirectory,
+      identity: DOWNLOADER_TOOLCHAIN_MANIFEST.potProvider.integrity,
+      currentUid: typeof process.getuid === 'function' ? process.getuid() : -1,
+    }]);
     expect(run.stdout()).not.toContain('Doctor fixture');
     expect(run.stdout()).not.toContain('https://');
     expect(run.stdout()).not.toContain(fixture.homeDirectory);
   });
+
+  it.each(['source', 'node_modules'] as const)(
+    'does not report verified integrity when the %s verifier fails',
+    async (tree) => {
+      const fixture = await createManagedFixture();
+      fixture.providerIntegrityFailures.add(tree);
+      const run = commandDependencies(fixture);
+
+      const exitCode = await runVideoctl(
+        ['doctor-downloader', '--json'],
+        run.dependencies,
+      );
+
+      expect(exitCode).toBe(EXIT_CODES.environmentFailed);
+      expect(JSON.parse(run.stdout())).toEqual({
+        command: 'doctor-downloader',
+        ok: false,
+        code: 'DOWNLOAD_PO_TOKEN_UNAVAILABLE',
+        message: 'The YouTube compatibility provider is unavailable.',
+      });
+      expect(run.stdout()).not.toContain('"integrity": "verified"');
+      expect(run.stdout()).not.toContain(`private ${tree}`);
+      expect(run.stderr()).toBe('');
+      expect(fixture.providerIntegrityChecks).toHaveLength(1);
+      expect(fixture.capabilityCommands).toEqual([]);
+    },
+  );
 
   it('runs exactly one metadata probe with the same managed toolchain', async () => {
     const fixture = await createManagedFixture();

@@ -196,12 +196,26 @@ interface DownloaderToolchainManifest {
     repository: 'https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git';
     version: '1.3.1';
     commit: '7608dd51ee813b48cf9a6d68c6e42cb197ce10e0';
+    integrity: {
+      source: {
+        entries: 30;
+        sha256: '1307dade1714cac0f6569377a5930be39b02ec719b0179f77de773c753c6bbf2';
+      };
+      nodeModules: {
+        entries: 9715;
+        files: 8906;
+        symlinks: 809;
+        sha256: '6723ebf44c2cc5bdb02395fac7689615ba164d7ae869bb6e7a6c4f96cc8f2b94';
+      };
+    };
   };
 }
 ```
 
 Only application code may load this manifest. CLI text cannot replace its URLs,
-digests, sizes, versions, platform, repository, or commit.
+digests, sizes, versions, platform, repository, commit, provider roots, or
+provider entry counts. The installed `manifest.json` repeats the provider
+version, commit, roots, and counts so an older weaker identity is not accepted.
 
 ### 7.3 Setup flow
 
@@ -212,7 +226,8 @@ digests, sizes, versions, platform, repository, or commit.
    path.
 3. Acquire a same-user exclusive setup lock.
 4. If the published version directory exactly matches the checked-in manifest,
-   return `already-present` without network access.
+   including both canonical provider trees, return `already-present` without
+   network access.
 5. If the exact application-owned version path exists but is invalid, rename it
    within the same cache parent to a unique quarantine name after validating
    ownership, location, and non-symlink directory identity. Do not delete it
@@ -228,15 +243,35 @@ digests, sizes, versions, platform, repository, or commit.
 12. Run Deno dependency installation from the provider's `server` directory
     using its committed lockfile, `--frozen`, the toolchain-scoped `DENO_DIR`,
     and only the provider-documented `npm:canvas` install-script permission.
-13. Run local capability checks before publication.
-14. Write a canonical `manifest.json` recording installed file hashes and
+13. Safely remove only
+    `server/node_modules/.deno/.setup-cache.bin`, whose final eight bytes vary
+    across otherwise valid Deno installations.
+14. Verify both canonical provider trees and require the provider `--version`
+    stdout to be the single exact `1.3.1` line, with at most one platform line
+    ending.
+15. Run all remaining local capability checks before publication.
+16. Write a canonical `manifest.json` recording installed file hashes and
     component versions.
-15. `fsync` required files and directories, then atomically rename staging to
+17. `fsync` required files and directories, then atomically rename staging to
     the final version directory.
-16. After successful replacement publication, delete only the quarantined
+18. After successful replacement publication, delete only the quarantined
     application-owned version that step 5 renamed.
-17. On failure or cancellation, remove only the owned staging directory and, if
+19. On failure or cancellation, remove only the owned staging directory and, if
     replacement has not published, atomically restore the quarantined version.
+
+Provider tree verification is shared by published setup validation, staging
+validation, doctor, and download resolution. It walks sequentially without
+following symlinks or retaining all file contents. Directories are omitted from
+the root but must be traversable, current-UID-owned directories; sockets,
+FIFOs, and devices are rejected. Regular files and symlinks produce records
+`[kind, POSIX relative path, executable bits, payload]`, where file payload is
+content SHA-256 and symlink payload is the raw target. Each field is encoded as
+`byteLength:value`, fields are joined with `|`, records are sorted by relative
+path and joined with `\n` including the final newline, and the complete stream
+is SHA-256 hashed. Source verification excludes `.git/**` and
+`server/node_modules/**`; dependency verification covers all of
+`server/node_modules`. Symlink targets must be relative and resolve within the
+tree being verified.
 
 All setup subprocesses use a frozen staging-local environment built from zero.
 This includes Git validation and checkout, Deno validation and frozen dependency
@@ -285,10 +320,12 @@ Before network access, require:
 - the managed executable's SHA-256 matches the manifest;
 - `deno --version` reports Deno 2 or newer;
 - the fixed plugin ZIP exists and matches its digest;
-- the provider checkout equals the pinned commit;
+- `.git/HEAD` is a current-UID-owned regular file containing the pinned commit;
+- the provider source and `node_modules` canonical roots and counts equal the
+  strict manifest identity even when `.git/HEAD` still names the pinned commit;
 - the plugin archive has the expected closed entry set and the pinned provider
-  script entry point completes its local help/self-check without video-network
-  access;
+  script entry point reports only the exact provider version `1.3.1` without
+  video-network access;
 - `yt-dlp --list-impersonate-targets` includes a supported macOS Chrome target;
 - `ffmpeg -version` succeeds.
 
