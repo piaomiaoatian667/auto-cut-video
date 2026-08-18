@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "account": {
+    "expectedName": "目标抖音账号昵称"
+  },
+  "video": "output/final-video.mp4",
+  "cover": "output/thumbnail.jpg",
+  "title": "视频标题",
+  "topics": [
+    "人工智能",
+    "视频剪辑"
+  ],
+  "visibility": "public",
+  "allowDownload": true,
+  "publish": {
+    "mode": "immediate",
+    "allowDuplicate": false
+  }
+}

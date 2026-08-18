@@ -8,6 +8,7 @@
   },
   "scripts": {
     "test": "vitest run",
+    "test:douyin-skill": "node --test tests/skills/douyin-auto-publish/*.test.mjs",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "video": "tsx src/cli/videoctl.ts",

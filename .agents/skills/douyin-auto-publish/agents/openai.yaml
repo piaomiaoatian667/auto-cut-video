@@ -1,0 +1,7 @@
+interface:
+  display_name: "抖音自动发布"
+  short_description: "通过抖音创作者中心校验配置、上传视频并记录安全发布回执"
+  default_prompt: "使用 $douyin-auto-publish 按 publish/douyin.json 将成片直接发布到抖音。"
+
+policy:
+  allow_implicit_invocation: true

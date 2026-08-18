@@ -1,0 +1,40 @@
+{
+  "version": 2,
+  "status": "downloaded",
+  "platform": "douyin",
+  "videoId": "7654841525762919726",
+  "title": "国人独有的宏大国风美学 #我做了一个梦 #中式古建 #山水 #治愈系风景 #AI创作浪潮计划",
+  "canonicalUrl": "https://www.douyin.com/video/7654841525762919726",
+  "downloadedAt": "2026-08-15T03:25:26.420Z",
+  "purpose": "learning-analysis",
+  "rightsConfirmed": true,
+  "transcoded": false,
+  "tools": {
+    "ytDlpVersion": "2026.06.09",
+    "ffmpegVersion": "ffmpeg version 8.1.2 Copyright (c) 2000-2026 the FFmpeg developers"
+  },
+  "files": [
+    {
+      "role": "metadata",
+      "path": "video.info.json",
+      "bytes": 306,
+      "sha256": "sha256:3687e4764aca2a681fc09c9bf5e454e416e6d61ad606653d3628d66db1276816"
+    },
+    {
+      "role": "thumbnail",
+      "path": "video.jpeg",
+      "bytes": 28136,
+      "sha256": "sha256:af87afb67becc9d521ab75e443aab665c658d502e9c9faf7caee063d34e5df4f"
+    },
+    {
+      "role": "media",
+      "path": "video.mp4",
+      "bytes": 5024851,
+      "sha256": "sha256:1cd781bf50ca82f0a4b9e597f2258436739df423b4da692cd6ae2f0213361cbe"
+    }
+  ],
+  "browserCookies": {
+    "used": true,
+    "source": "chrome"
+  }
+}
